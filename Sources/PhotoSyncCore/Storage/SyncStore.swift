@@ -68,6 +68,14 @@ public final class SyncStore: @unchecked Sendable {
         try await perform { try self.requireChange("UPDATE source SET enabled = 0 WHERE id = ?", [.text(id.uuidString)]) }
     }
 
+    public func sources() async throws -> [RegisteredSource] {
+        try await perform {
+            try self.rows("SELECT id, path, enabled FROM source ORDER BY path", []).map {
+                RegisteredSource(id: try self.uuid($0[0]), url: URL(fileURLWithPath: try self.text($0[1])), enabled: try self.int($0[2]) != 0)
+            }
+        }
+    }
+
     public func source(id: UUID) async throws -> RegisteredSource {
         try await perform {
             guard let row = try self.one("SELECT id, path, enabled FROM source WHERE id = ?", [.text(id.uuidString)]) else { throw SyncStoreError.notFound(id) }
@@ -137,6 +145,13 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    public func countFiles(state: FileState) async throws -> Int {
+        try await perform {
+            guard let row = try self.one("SELECT COUNT(*) FROM file_record WHERE state = ?", [.text(state.rawValue)]) else { return 0 }
+            return Int(try self.int64(row[0]))
+        }
+    }
+
     public func listFiles(state: FileState, afterID: UUID?, limit: Int) async throws -> [StoredFile] {
         try await perform {
             guard limit > 0 else { return [] }
@@ -149,11 +164,15 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    public func candidates(filename: String, excludingID: UUID?) async throws -> [MatchCandidate] {
+    public func candidates(filename: String, excludingID: UUID?, olderPendingOnly: Bool = false) async throws -> [MatchCandidate] {
         try await perform {
             var sql = "SELECT id, state, metadata_json, success_id, success_metadata_json FROM file_record WHERE filename = ?"
             var bindings: [Binding] = [.text(filename)]
             if let excludingID { sql += " AND id != ?"; bindings.append(.text(excludingID.uuidString)) }
+            if olderPendingOnly, let excludingID {
+                sql += " AND (state != 'pending' OR created_order < (SELECT created_order FROM file_record WHERE id = ?))"
+                bindings.append(.text(excludingID.uuidString))
+            }
             sql += " AND (state IN ('pending', 'importing', 'imported') OR (state = 'skipped' AND success_id IS NOT NULL)) ORDER BY created_order"
             return try self.rows(sql, bindings).compactMap { row in
                 let metadataJSON: String

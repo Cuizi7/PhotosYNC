@@ -63,10 +63,11 @@ public actor ReadExecutor {
             try await withCheckedThrowingContinuation { continuation in
                 state.install(continuation)
                 queue.addOperation { [weak self] in
-                    if state.beginPhysicalWork() {
-                        state.finish(Result { try operation() })
+                    let result = state.beginPhysicalWork() ? Result { try operation() } : nil
+                    Task {
+                        await self?.completed(source: sourceID)
+                        if let result { state.finish(result) }
                     }
-                    Task { await self?.completed(source: sourceID) }
                 }
                 state.startTimeout(after: timeout ?? self.defaultTimeout)
             }
@@ -92,14 +93,13 @@ public actor ReadExecutor {
                 state.install(continuation)
                 Task { [weak self] in
                     self?.beforeAsyncOperationStart?()
+                    let result: Result<Value, Error>?
                     if state.beginPhysicalWork() {
-                        do {
-                            state.finish(.success(try await operation()))
-                        } catch {
-                            state.finish(.failure(error))
-                        }
-                    }
+                        do { result = .success(try await operation()) }
+                        catch { result = .failure(error) }
+                    } else { result = nil }
                     await self?.completed(source: sourceID)
+                    if let result { state.finish(result) }
                 }
                 state.startTimeout(after: timeout ?? self.defaultTimeout)
             }

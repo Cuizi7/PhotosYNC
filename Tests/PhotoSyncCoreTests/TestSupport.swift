@@ -1,7 +1,9 @@
 import Foundation
+@testable import PhotoSyncCore
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
+import SQLite3
 
 func temporaryDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory
@@ -90,4 +92,98 @@ private func makeJPEGFixture(
 
 enum FixtureError: Error {
     case unavailable(String)
+}
+
+// Test-only Photos implementation. Never asks for system authorization.
+actor FakePhotosGateway: PhotosGateway {
+    private(set) var createCount = 0
+    private var candidates: [MatchCandidate] = []
+    private var loadFailure = false
+    var evidence: ImportEvidence = .unknown
+    private var creationGate: EngineTestGate?
+    private var creationError: PhotoKitGatewayError?
+    private var failIndexAfterCreate = false
+    func setCreationGate(_ gate: EngineTestGate) { creationGate = gate }
+    func setCreationError(_ error: PhotoKitGatewayError?) { creationError = error }
+    func setFailIndexAfterCreate() { failIndexAfterCreate = true }
+    func setCandidates(_ values: [MatchCandidate]) { candidates = values }
+    func setLoadFailure(_ value: Bool) { loadFailure = value }
+    func setEvidence(_ value: ImportEvidence) { evidence = value }
+    func loadCandidates() async throws -> [MatchCandidate] {
+        if loadFailure { throw PhotoKitGatewayError.libraryUnavailable }
+        return candidates
+    }
+    func reconcile(placeholder: String?) async throws -> ImportEvidence { evidence }
+    func create(fileURL: URL, kind: MediaKind, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+        createCount += 1
+        let id = "fake-\(createCount)"
+        try onPlaceholder(id)
+        if let creationGate { await creationGate.wait() }
+        if let creationError { throw creationError }
+        if failIndexAfterCreate { loadFailure = true }
+        let metadata = try await MetadataReader().read(url: fileURL, filename: fileURL.lastPathComponent)
+        candidates.append(MatchCandidate(key: id, metadata: metadata))
+        return id
+    }
+}
+
+func engineSourceFile(sourceID: UUID, directory: URL) async throws -> SourceFile {
+    let url = directory.appendingPathComponent("same.jpg")
+    return SourceFile(sourceID: sourceID, relativePath: "same.jpg", url: url,
+        stamp: try await DirectoryReader(sourceID: sourceID).stamp(of: url),
+        metadata: try await MetadataReader(sourceID: sourceID).read(url: url, filename: "same.jpg"))
+}
+
+func makeEngineFixture(sourceCount: Int = 2) async throws -> (engine: SyncEngine, sourceIDs: [UUID], photos: FakePhotosGateway, store: SyncStore, directories: [URL], databaseURL: URL) {
+    let root = try temporaryDirectory()
+    let databaseURL = root.appendingPathComponent("store.sqlite")
+    let store = try SyncStore(url: databaseURL)
+    var ids: [UUID] = []
+    var directories: [URL] = []
+    for index in 0..<sourceCount {
+        let directory = root.appendingPathComponent("source-\(index)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try makeJPEGFixture(at: directory.appendingPathComponent("same.jpg"), captureTime: "2026:09:13 10:15:30", offset: "+08:00", make: "Fixture", model: "Camera")
+        ids.append(try await store.registerSource(url: directory))
+        directories.append(directory)
+    }
+    let photos = FakePhotosGateway()
+    return (SyncEngine(store: store, photos: photos), ids, photos, store, directories, databaseURL)
+}
+
+actor EngineTestGate {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var entered = false
+    func wait() async {
+        entered = true
+        guard !released else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func release() { released = true; waiters.forEach { $0.resume() }; waiters = [] }
+}
+
+struct GatedDirectoryReader: DirectoryReading {
+    let reader: DirectoryReader
+    let gate: EngineTestGate
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        await gate.wait()
+        return try await reader.entries(in: directory)
+    }
+    func stamp(of file: URL) async throws -> FileStamp { try await reader.stamp(of: file) }
+}
+
+func injectEngineSQL(_ sql: String, at url: URL) throws {
+    var db: OpaquePointer?
+    guard sqlite3_open(url.path, &db) == SQLITE_OK else { throw FixtureError.unavailable("sqlite open") }
+    defer { sqlite3_close(db) }
+    guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw FixtureError.unavailable(String(cString: sqlite3_errmsg(db))) }
+}
+
+func engineEventually(_ condition: () async throws -> Bool) async rethrows -> Bool {
+    for _ in 0..<500 {
+        if try await condition() { return true }
+        try? await Task.sleep(nanoseconds: 2_000_000)
+    }
+    return false
 }
