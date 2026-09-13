@@ -2,7 +2,7 @@
 
 ## Scope completed
 
-- Added the three-target macOS Xcode project: `PhotoSync` app, `PhotoSyncCore` static library linked with system SQLite3, and hostless `PhotoSyncCoreTests`.
+- Added the three-target macOS Xcode project: `PhotoSync` app, `PhotoSyncCore` framework linked with system SQLite3, and hostless `PhotoSyncCoreTests`.
 - Set every target's deployment target to macOS 14.0.
 - Added the empty SwiftUI app shell. It imports no Photos framework and performs no Photos access or writes.
 - Added public, `Sendable`, concrete-initializable domain record types for framework boundaries.
@@ -98,3 +98,29 @@ Output:
 ## Concerns
 
 `xcodebuild test` completed the build but its test-runner handoff was unreliable in this environment: sandboxed attempts hit `testmanagerd` error 159, and an outside-sandbox attempt stalled after build. The same hostless XCTest bundle was built successfully and executed directly with `xcrun xctest`, passing all 11 tests. This is an environment runner limitation, not a Core test failure.
+
+## Review repair: framework boundary and runtime linkage
+
+The review correctly identified that a static Core library would leak SQLite linkage to final consumers and change the planned integration boundary. The Core product is now restored to `PhotoSyncCore.framework`.
+
+- `SQLite3.tbd` remains linked by the framework itself.
+- The app and hostless test bundle both link and embed `PhotoSyncCore.framework`.
+- The framework install name is `@rpath/PhotoSyncCore.framework/...`; the app uses `@executable_path/../Frameworks` and the hostless test bundle uses `@loader_path/../Frameworks`.
+
+Repair verification on September 13, 2026:
+
+```sh
+xcodebuild build-for-testing -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Debug -destination 'platform=macOS,arch=arm64' -derivedDataPath work/DerivedData
+xcrun xctest work/DerivedData/Build/Products/Debug/PhotoSyncCoreTests.xctest
+```
+
+Output:
+
+```text
+** TEST BUILD SUCCEEDED **
+PhotoSyncCoreTests.xctest: Executed 11 tests, with 0 failures
+```
+
+`otool -L` confirmed the test bundle resolves `@rpath/PhotoSyncCore.framework/Versions/A/PhotoSyncCore`, and `Contents/Frameworks/PhotoSyncCore.framework` is present. The final `xcodebuild build` also succeeded with the app framework embedded at `PhotoSync.app/Contents/Frameworks/PhotoSyncCore.framework`.
+
+The test-only Unix-second floor helper remains intentionally narrow until source metadata extraction is introduced. At that point, its coverage must move to the production conversion path, including a negative pre-epoch fractional timestamp if supported by the source representation.
