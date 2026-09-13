@@ -11,7 +11,6 @@
 		000000000000000000000003 /* DuplicatePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000103 /* DuplicatePolicy.swift */; };
 		000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000104 /* DuplicatePolicyTests.swift */; };
 		000000000000000000000005 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000105 /* TestSupport.swift */; };
-		000000000000000000000006 /* TestSupportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000106 /* TestSupportTests.swift */; };
 		000000000000000000000007 /* PhotoSyncCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000201 /* PhotoSyncCore.framework */; };
 		000000000000000000000008 /* PhotoSyncCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000201 /* PhotoSyncCore.framework */; };
 		000000000000000000000009 /* SQLite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000301 /* SQLite3.tbd */; };
@@ -21,6 +20,12 @@
 		000000000000000000000013 /* SourceRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000108 /* SourceRegistry.swift */; };
 		000000000000000000000014 /* RunLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000109 /* RunLogger.swift */; };
 		000000000000000000000015 /* StoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010A /* StoreTests.swift */; };
+		000000000000000000000016 /* DirectoryReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010C /* DirectoryReader.swift */; };
+		000000000000000000000017 /* MetadataReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010D /* MetadataReader.swift */; };
+		000000000000000000000018 /* ReadExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010E /* ReadExecutor.swift */; };
+		000000000000000000000019 /* SourceReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010F /* SourceReaderTests.swift */; };
+		000000000000000000000020 /* ImageIO.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000302 /* ImageIO.framework */; };
+		000000000000000000000021 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000303 /* AVFoundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -38,21 +43,26 @@
 		000000000000000000000103 /* DuplicatePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuplicatePolicy.swift; sourceTree = "<group>"; };
 		000000000000000000000104 /* DuplicatePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuplicatePolicyTests.swift; sourceTree = "<group>"; };
 		000000000000000000000105 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
-		000000000000000000000106 /* TestSupportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupportTests.swift; sourceTree = "<group>"; };
 		000000000000000000000107 /* SyncStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncStore.swift; sourceTree = "<group>"; };
 		000000000000000000000108 /* SourceRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceRegistry.swift; sourceTree = "<group>"; };
 		000000000000000000000109 /* RunLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunLogger.swift; sourceTree = "<group>"; };
 		00000000000000000000010A /* StoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoreTests.swift; sourceTree = "<group>"; };
 		00000000000000000000010B /* Schema.sql */ = {isa = PBXFileReference; lastKnownFileType = text.sql; path = Schema.sql; sourceTree = "<group>"; };
+		00000000000000000000010C /* DirectoryReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectoryReader.swift; sourceTree = "<group>"; };
+		00000000000000000000010D /* MetadataReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetadataReader.swift; sourceTree = "<group>"; };
+		00000000000000000000010E /* ReadExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadExecutor.swift; sourceTree = "<group>"; };
+		00000000000000000000010F /* SourceReaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceReaderTests.swift; sourceTree = "<group>"; };
 		000000000000000000000201 /* PhotoSyncCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = PhotoSyncCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000202 /* PhotoSync.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoSync.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000203 /* PhotoSyncCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoSyncCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000301 /* SQLite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = SQLite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+		000000000000000000000302 /* ImageIO.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ImageIO.framework; path = System/Library/Frameworks/ImageIO.framework; sourceTree = SDKROOT; };
+		000000000000000000000303 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		000000000000000000000401 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000007 /* PhotoSyncCore.framework in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
-		000000000000000000000402 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000009 /* SQLite3.tbd in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000402 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000009 /* SQLite3.tbd in Frameworks */, 000000000000000000000020 /* ImageIO.framework in Frameworks */, 000000000000000000000021 /* AVFoundation.framework in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
 		000000000000000000000403 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000008 /* PhotoSyncCore.framework in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
@@ -61,14 +71,14 @@
 		000000000000000000000502 = {isa = PBXGroup; children = (000000000000000000000506 /* PhotoSyncApp */, 000000000000000000000507 /* PhotoSyncCore */,); path = Sources; sourceTree = "<group>"; };
 		000000000000000000000503 = {isa = PBXGroup; children = (000000000000000000000508 /* PhotoSyncCoreTests */,); path = Tests; sourceTree = "<group>"; };
 		000000000000000000000504 = {isa = PBXGroup; children = (000000000000000000000202 /* PhotoSync.app */, 000000000000000000000201 /* PhotoSyncCore.framework */, 000000000000000000000203 /* PhotoSyncCoreTests.xctest */,); name = Products; sourceTree = "<group>"; };
-		000000000000000000000505 = {isa = PBXGroup; children = (000000000000000000000301 /* SQLite3.tbd */,); name = Frameworks; sourceTree = "<group>"; };
+		000000000000000000000505 = {isa = PBXGroup; children = (000000000000000000000301 /* SQLite3.tbd */, 000000000000000000000302 /* ImageIO.framework */, 000000000000000000000303 /* AVFoundation.framework */,); name = Frameworks; sourceTree = "<group>"; };
 		000000000000000000000506 = {isa = PBXGroup; children = (000000000000000000000101 /* PhotoSyncApp.swift */,); path = PhotoSyncApp; sourceTree = "<group>"; };
 		000000000000000000000507 = {isa = PBXGroup; children = (000000000000000000000509 /* Domain */, 000000000000000000000510 /* Matching */, 000000000000000000000511 /* Storage */, 000000000000000000000512 /* Sources */, 000000000000000000000513 /* Logging */,); path = PhotoSyncCore; sourceTree = "<group>"; };
-		000000000000000000000508 = {isa = PBXGroup; children = (000000000000000000000104 /* DuplicatePolicyTests.swift */, 000000000000000000000105 /* TestSupport.swift */, 000000000000000000000106 /* TestSupportTests.swift */, 00000000000000000000010A /* StoreTests.swift */,); path = PhotoSyncCoreTests; sourceTree = "<group>"; };
+		000000000000000000000508 = {isa = PBXGroup; children = (000000000000000000000104 /* DuplicatePolicyTests.swift */, 000000000000000000000105 /* TestSupport.swift */, 00000000000000000000010A /* StoreTests.swift */, 00000000000000000000010F /* SourceReaderTests.swift */,); path = PhotoSyncCoreTests; sourceTree = "<group>"; };
 		000000000000000000000509 = {isa = PBXGroup; children = (000000000000000000000102 /* MediaRecord.swift */,); path = Domain; sourceTree = "<group>"; };
 		000000000000000000000510 = {isa = PBXGroup; children = (000000000000000000000103 /* DuplicatePolicy.swift */,); path = Matching; sourceTree = "<group>"; };
 		000000000000000000000511 = {isa = PBXGroup; children = (000000000000000000000107 /* SyncStore.swift */, 00000000000000000000010B /* Schema.sql */,); path = Storage; sourceTree = "<group>"; };
-		000000000000000000000512 = {isa = PBXGroup; children = (000000000000000000000108 /* SourceRegistry.swift */,); path = Sources; sourceTree = "<group>"; };
+		000000000000000000000512 = {isa = PBXGroup; children = (000000000000000000000108 /* SourceRegistry.swift */, 00000000000000000000010C /* DirectoryReader.swift */, 00000000000000000000010D /* MetadataReader.swift */, 00000000000000000000010E /* ReadExecutor.swift */,); path = Sources; sourceTree = "<group>"; };
 		000000000000000000000513 = {isa = PBXGroup; children = (000000000000000000000109 /* RunLogger.swift */,); path = Logging; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
@@ -84,8 +94,8 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		000000000000000000000801 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000001 /* PhotoSyncApp.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
-		000000000000000000000803 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000002 /* MediaRecord.swift in Sources */, 000000000000000000000003 /* DuplicatePolicy.swift in Sources */, 000000000000000000000012 /* SyncStore.swift in Sources */, 000000000000000000000013 /* SourceRegistry.swift in Sources */, 000000000000000000000014 /* RunLogger.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
-		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000006 /* TestSupportTests.swift in Sources */, 000000000000000000000015 /* StoreTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000803 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000002 /* MediaRecord.swift in Sources */, 000000000000000000000003 /* DuplicatePolicy.swift in Sources */, 000000000000000000000012 /* SyncStore.swift in Sources */, 000000000000000000000013 /* SourceRegistry.swift in Sources */, 000000000000000000000014 /* RunLogger.swift in Sources */, 000000000000000000000016 /* DirectoryReader.swift in Sources */, 000000000000000000000017 /* MetadataReader.swift in Sources */, 000000000000000000000018 /* ReadExecutor.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000015 /* StoreTests.swift in Sources */, 000000000000000000000019 /* SourceReaderTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */
