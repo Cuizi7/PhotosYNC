@@ -1,13 +1,15 @@
 import Foundation
 
 public final class RunLogger: @unchecked Sendable {
+    private let onFailure: @Sendable (String) -> Void
     private let directory: URL
     private let queue = DispatchQueue(label: "PhotoSync.RunLogger")
     private var reportedFailure = false
     private let maximumFiles = 10
     private let maximumBytes = 10 * 1024 * 1024
 
-    public init(directory: URL) throws {
+    public init(directory: URL, onFailure: @escaping @Sendable (String) -> Void = { _ in }) throws {
+        self.onFailure = onFailure
         self.directory = directory
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
@@ -33,6 +35,7 @@ public final class RunLogger: @unchecked Sendable {
         } catch {
             guard !reportedFailure else { return }
             reportedFailure = true
+            onFailure(error.localizedDescription)
             fputs("PhotoSync logging failed: \(error.localizedDescription)\n", stderr)
         }
     }

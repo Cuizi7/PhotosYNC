@@ -1,6 +1,7 @@
 import Foundation
 
 public struct EngineSnapshot: Sendable {
+    public init() {}
     /// These counters describe the latest accepted scan round, including its recovery work.
     public var checked = 0
     public var imported = 0
@@ -59,6 +60,7 @@ public actor SyncEngine {
     public func startupScan() async { await scanEnabledSources() }
     public func manualScan() async { await scanEnabledSources() }
     public func wakeScan() async { await scanEnabledSources() }
+    public func setPaused(_ paused: Bool) { status.isPaused = paused }
     public func pause() async {
         status.isPaused = true
         logEvent(phase: "scan", result: "paused")

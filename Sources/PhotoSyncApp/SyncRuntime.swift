@@ -1,0 +1,153 @@
+import Foundation
+import Photos
+import PhotoSyncCore
+
+struct RuntimeState: Sendable {
+    var snapshot = EngineSnapshot()
+    var sources: [RegisteredSource] = []
+    var authorized = false
+    var nextScan: Date?
+    var message: String?
+}
+
+/// Owns one engine and gateway for the entire process. A poisoned gateway is never replaced.
+actor SyncRuntime {
+    private var engine: SyncEngine?
+    private var store: SyncStore?
+    private var logger: RunLogger?
+    private let executor = ReadExecutor()
+    private var schedule = ScanSchedule()
+    private var round: Task<Void, Never>?
+    private var state = RuntimeState()
+    private var started = false
+    private var stopped = false
+    private var loggingError: String?
+    private var registeredFailures = Set<UUID>()
+    let logsURL: URL
+    private let databaseURL: URL
+
+    init() {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PhotoSync", isDirectory: true)
+        logsURL = support.appendingPathComponent("Logs", isDirectory: true)
+        databaseURL = support.appendingPathComponent("sync.sqlite")
+    }
+
+    func bootstrap() async {
+        guard !started else { return }
+        started = true
+        do {
+            let logger = try RunLogger(directory: logsURL, onFailure: { [weak self] message in
+                Task { await self?.logFailed(message) }
+            })
+            self.logger = logger
+            store = try SyncStore(url: databaseURL)
+            try await refreshSources()
+            await tick(force: true)
+        } catch { state.message = error.localizedDescription }
+    }
+
+    private func logFailed(_ message: String) { loggingError = "日志写入失败：\(message)" }
+
+    func current() async -> RuntimeState {
+        state.authorized = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+        if let engine { state.snapshot = await engine.snapshot() }
+        state.nextScan = schedule.nextScanAt
+        var result = state
+        if let loggingError { result.message = loggingError }
+        return result
+    }
+
+    func requestAuthorization() async {
+        _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        await tick(force: true)
+    }
+
+    func add(_ url: URL) async throws {
+        guard let store else { throw CocoaError(.fileReadUnknown) }
+        if let engine { _ = try await engine.addSource(url: url) }
+        else { _ = try await store.registerSource(url: url) }
+        try await refreshSources()
+        await tick(force: true)
+    }
+
+    func disable(_ id: UUID) async throws {
+        if let engine { try await engine.disableSource(id: id) }
+        else { try await store?.disableSource(id: id) }
+        schedule.recordSourceRecovered(id)
+        registeredFailures.remove(id)
+        try await refreshSources()
+    }
+
+    private func refreshSources() async throws {
+        state.sources = try await store?.sources() ?? []
+    }
+
+    func pause() async {
+        schedule.pause()
+        state.snapshot.isPaused = true
+        await engine?.pause()
+    }
+
+    func resume() async {
+        guard !stopped else { return }
+        // Resume clears engine pause without dispatching a second competing scan.
+        await engine?.setPaused(false)
+        state.snapshot.isPaused = false
+        if schedule.resume(now: Date()) { schedule.finished(now: Date()) }
+        await tick(force: true)
+    }
+
+    func stop() async {
+        stopped = true
+        schedule.pause()
+        await engine?.pause()
+        // Do not cancel physical Photos submission: the engine persists its callback.
+    }
+
+    func tick(force: Bool = false) async {
+        guard !stopped else { return }
+        state.authorized = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+        guard state.authorized, state.sources.contains(where: \.enabled), !state.snapshot.isPaused else { return }
+        if engine == nil, let store {
+            let executor = self.executor
+            engine = SyncEngine(store: store, photos: PhotoKitGateway(),
+                                directory: { DirectoryReader(sourceID: $0, executor: executor) },
+                                metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger)
+        }
+        guard let engine, round == nil else { return }
+        let now = Date()
+        let enabled = Set(state.sources.filter(\.enabled).map(\.id))
+        let due = Set(schedule.dueRecoverySources(now: now)).intersection(enabled)
+        let ids: [UUID]
+        if force {
+            guard schedule.requestNow(now: now) else { return }
+            ids = Array(enabled)
+        } else if schedule.request(now: now) {
+            ids = Array(enabled.subtracting(registeredFailures).union(due))
+        } else if (!due.isEmpty || state.snapshot.blockingError != nil), schedule.requestRecovery(now: now) {
+            ids = state.snapshot.blockingError != nil ? Array(enabled.subtracting(registeredFailures).union(due)) : Array(due)
+        } else { return }
+        round = Task {
+            await engine.scan(sourceIDs: ids)
+            await self.finishedRound(ids: ids, snapshot: await engine.snapshot())
+        }
+    }
+
+    private func finishedRound(ids: [UUID], snapshot: EngineSnapshot) {
+        state.snapshot = snapshot
+        let enabled = Set(state.sources.filter(\.enabled).map(\.id))
+        // Count failures once per attempted round, never once per UI polling tick.
+        for id in ids where enabled.contains(id) {
+            if snapshot.waitingSources[id] != nil {
+                schedule.recordSourceFailure(id, now: Date())
+                registeredFailures.insert(id)
+            } else {
+                schedule.recordSourceRecovered(id)
+                registeredFailures.remove(id)
+            }
+        }
+        schedule.finished(now: Date())
+        round = nil
+    }
+}
