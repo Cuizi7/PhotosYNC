@@ -2,5 +2,6 @@
 /work/
 /outputs/PhotoSync.app/
 /outputs/PhotoSync.dmg
+/outputs/PhotoSync.provenance
 
 /.worktrees/

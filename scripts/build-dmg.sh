@@ -45,6 +45,9 @@ is_within "$dmg_path" "$app_path" && fail "Output DMG must not be inside the app
 plist_path="$app_path/Contents/Info.plist"
 [[ -f "$plist_path" ]] || fail "Missing app Info.plist: $plist_path" 66
 plutil -lint "$plist_path" >/dev/null || fail "Invalid app Info.plist: $plist_path" 66
+package_type=$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$plist_path" 2>/dev/null) || \
+  fail "Missing CFBundlePackageType in app Info.plist: $plist_path" 66
+[[ "$package_type" == "APPL" ]] || fail "Invalid CFBundlePackageType in app Info.plist: $plist_path" 66
 executable_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist_path" 2>/dev/null) || \
   fail "Missing CFBundleExecutable in app Info.plist: $plist_path" 66
 [[ -n "$executable_name" && "$executable_name" != */* ]] || \
