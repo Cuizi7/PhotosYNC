@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import ImageIO
+import UniformTypeIdentifiers
 
 public protocol MetadataReading: Sendable {
     func read(url: URL, filename: String) async throws -> MediaMetadata
@@ -12,16 +13,24 @@ public enum MetadataError: Error {
 }
 
 public struct MetadataReader: MetadataReading {
-    public init() {}
+    private let sourceID: UUID
+    private let executor: ReadExecutor
+
+    public init(sourceID: UUID = UUID(), executor: ReadExecutor = .shared) {
+        self.sourceID = sourceID
+        self.executor = executor
+    }
 
     public func read(url: URL, filename: String) async throws -> MediaMetadata {
         if isRaw(url) {
             throw MetadataError.unsupported
         }
         if isVideo(url) {
-            return try await readVideo(url: url, filename: filename)
+            return try await executor.executeAsync(sourceID: sourceID) {
+                try await readVideo(url: url, filename: filename)
+            }
         }
-        return try await ReadExecutor.shared.execute(sourceID: url.absoluteString) {
+        return try await executor.execute(sourceID: sourceID) {
             try readImage(url: url, filename: filename)
         }
     }
@@ -37,14 +46,17 @@ public struct MetadataReader: MetadataReading {
     private func readVideo(url: URL, filename: String) async throws -> MediaMetadata {
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration)
+        let creationDate = try await asset.load(.creationDate)
         let metadata = try await asset.load(.commonMetadata)
-        let rawCaptureTime = metadata.first(where: { $0.commonKey == .commonKeyCreationDate })?.stringValue
+        let rawCaptureTime = creationDate?.stringValue
+            ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })?.stringValue
         let dimensions = try? await asset.load(.tracks).first(where: { $0.mediaType == .video })?.load(.naturalSize)
         return MediaMetadata(
             filename: filename,
             kind: .video,
-            captureSecond: nil,
+            captureSecond: videoCaptureSecond(rawCaptureTime),
             rawCaptureTime: rawCaptureTime,
+            rawCaptureOffset: videoOffset(rawCaptureTime),
             make: nil,
             model: nil,
             width: dimensions.map { Int(abs($0.width)) },
@@ -69,6 +81,7 @@ private func readImage(url: URL, filename: String) throws -> MediaMetadata {
         kind: .image,
         captureSecond: MetadataReader.captureSecond(rawCaptureTime: rawCaptureTime, offsetTimeOriginal: offset),
         rawCaptureTime: rawCaptureTime,
+        rawCaptureOffset: offset,
         make: tiff?[kCGImagePropertyTIFFMake] as? String,
         model: tiff?[kCGImagePropertyTIFFModel] as? String,
         width: properties[kCGImagePropertyPixelWidth] as? Int,
@@ -91,19 +104,48 @@ private func parseDate(_ raw: String, offsetTimeOriginal: String) -> Date? {
 }
 
 private func timeZone(_ offset: String) -> TimeZone? {
-    guard offset.count == 6,
-          let sign = offset.first,
-          sign == "+" || sign == "-",
-          offset.dropFirst().dropLast(3).allSatisfy({ $0.isNumber }),
-          offset.suffix(2).allSatisfy({ $0.isNumber }) else { return nil }
-    let hours = Int(offset.dropFirst().prefix(2))!
-    let minutes = Int(offset.suffix(2))!
-    let seconds = (hours * 3_600 + minutes * 60) * (sign == "-" ? -1 : 1)
+    let bytes = Array(offset.utf8)
+    guard bytes.count == 6,
+          bytes[0] == 43 || bytes[0] == 45,
+          bytes[3] == 58,
+          bytes[1...2].allSatisfy(isASCIIDigit),
+          bytes[4...5].allSatisfy(isASCIIDigit),
+          let hours = Int(String(decoding: bytes[1...2], as: UTF8.self)),
+          let minutes = Int(String(decoding: bytes[4...5], as: UTF8.self)),
+          hours <= 23,
+          minutes <= 59 else { return nil }
+    let seconds = (hours * 3_600 + minutes * 60) * (bytes[0] == 45 ? -1 : 1)
     return TimeZone(secondsFromGMT: seconds)
 }
 
+private func isASCIIDigit(_ byte: UInt8) -> Bool {
+    byte >= 48 && byte <= 57
+}
+
+private func videoCaptureSecond(_ rawCaptureTime: String?) -> Int64? {
+    guard let rawCaptureTime,
+          let date = ISO8601DateFormatter().date(from: rawCaptureTime),
+          videoOffset(rawCaptureTime) != nil else { return nil }
+    return Int64(date.timeIntervalSince1970.rounded(.down))
+}
+
+private func videoOffset(_ rawCaptureTime: String?) -> String? {
+    guard let rawCaptureTime else { return nil }
+    if rawCaptureTime.hasSuffix("Z") { return "+00:00" }
+    guard rawCaptureTime.count >= 6 else { return nil }
+    let suffix = String(rawCaptureTime.suffix(6))
+    return timeZone(suffix) == nil ? nil : suffix
+}
+
 private func isRaw(_ url: URL) -> Bool {
-    ["arw", "cr2", "cr3", "dng", "nef", "orf", "raf", "rw2"].contains(url.pathExtension.lowercased())
+    let rawExtensions: Set<String> = [
+        "3fr", "arw", "bay", "cap", "cr2", "cr3", "crw", "dcr", "dcs", "dng", "drf", "eip", "erf", "fff",
+        "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "obm", "orf", "pef", "ptx", "pxn",
+        "r3d", "raf", "raw", "rwl", "rw2", "rwz", "sr2", "srf", "srw", "x3f"
+    ]
+    if rawExtensions.contains(url.pathExtension.lowercased()) { return true }
+    guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+    return type.conforms(to: .rawImage)
 }
 
 private func isVideo(_ url: URL) -> Bool {

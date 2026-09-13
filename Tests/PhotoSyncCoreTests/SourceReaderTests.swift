@@ -5,7 +5,7 @@ final class SourceReaderTests: XCTestCase {
     func testDirectoryReaderExcludesHiddenLinksAndPackages() async throws {
         let directory = try sourceFixtureDirectory()
 
-        let entries = try await DirectoryReader().entries(in: directory)
+        let entries = try await DirectoryReader(sourceID: UUID()).entries(in: directory)
         let names = Set(entries.map { $0.url.lastPathComponent })
 
         XCTAssertEqual(names, ["corrupt.jpg", "no-exif.png", "normal.jpg", "photo.CR3", "subdirectory"])
@@ -19,7 +19,7 @@ final class SourceReaderTests: XCTestCase {
         let url = directory.appendingPathComponent("no-exif.png")
         let before = try sourceSnapshot(url)
 
-        let value = try await MetadataReader().read(url: url, filename: "no-exif.png")
+        let value = try await MetadataReader(sourceID: UUID()).read(url: url, filename: "no-exif.png")
 
         XCTAssertNil(value.captureSecond)
         XCTAssertNil(value.make)
@@ -29,12 +29,26 @@ final class SourceReaderTests: XCTestCase {
         XCTAssertEqual(after.modified, before.modified)
     }
 
+    func testMetadataReaderReadsGeneratedJPEGExifAndTiffProperties() async throws {
+        let directory = try sourceFixtureDirectory()
+        let metadata = try await MetadataReader(sourceID: UUID()).read(
+            url: directory.appendingPathComponent("normal.jpg"),
+            filename: "normal.jpg"
+        )
+
+        XCTAssertEqual(metadata.rawCaptureTime, "2026:09:13 10:15:30")
+        XCTAssertEqual(metadata.rawCaptureOffset, "+08:00")
+        XCTAssertEqual(metadata.make, "Fixture Make")
+        XCTAssertEqual(metadata.model, "Fixture Model")
+        XCTAssertNotNil(metadata.captureSecond)
+    }
+
     func testCorruptImageThrows() async throws {
         let directory = try sourceFixtureDirectory()
         let url = directory.appendingPathComponent("corrupt.jpg")
 
         await XCTAssertThrowsErrorAsync {
-            _ = try await MetadataReader().read(url: url, filename: "corrupt.jpg")
+            _ = try await MetadataReader(sourceID: UUID()).read(url: url, filename: "corrupt.jpg")
         }
     }
 
@@ -42,7 +56,19 @@ final class SourceReaderTests: XCTestCase {
         let directory = try sourceFixtureDirectory()
 
         await XCTAssertThrowsErrorAsync {
-            _ = try await MetadataReader().read(url: directory.appendingPathComponent("photo.CR3"), filename: "photo.CR3")
+            _ = try await MetadataReader(sourceID: UUID()).read(url: directory.appendingPathComponent("photo.CR3"), filename: "photo.CR3")
+        }
+    }
+
+    func testBroadRawExtensionIsUnsupported() async throws {
+        let directory = try sourceFixtureDirectory()
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await MetadataReader(sourceID: UUID()).read(url: directory.appendingPathComponent("photo.CR3"), filename: "photo.CR3")
+        }
+        try Data("raw marker".utf8).write(to: directory.appendingPathComponent("photo.x3f"))
+        await XCTAssertThrowsErrorAsync {
+            _ = try await MetadataReader(sourceID: UUID()).read(url: directory.appendingPathComponent("photo.x3f"), filename: "photo.x3f")
         }
     }
 
@@ -58,6 +84,14 @@ final class SourceReaderTests: XCTestCase {
         XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2026:09:13 10:15:30", offsetTimeOriginal: nil))
     }
 
+    func testMalformedExifOffsetsRemainUncertain() {
+        let captureTime = "2026:09:13 10:15:30"
+
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: captureTime, offsetTimeOriginal: "+00x00"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: captureTime, offsetTimeOriginal: "+00:60"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: captureTime, offsetTimeOriginal: "+２３:００"))
+    }
+
     func testReadExecutorKeepsTimedOutSlotOccupiedUntilBlockingWorkReturns() async throws {
         let executor = ReadExecutor(maxConcurrentOperations: 2, defaultTimeout: .milliseconds(20))
         let latch = TestLatch()
@@ -67,7 +101,7 @@ final class SourceReaderTests: XCTestCase {
                 latch.wait()
                 return 1
         }
-        try? await Task.sleep(for: .milliseconds(5))
+        try await waitUntil { await executor.snapshot().physicalOccupancy == 1 }
         let independent = try await executor.execute(sourceID: UUID()) { 2 }
         XCTAssertEqual(independent, 2)
         do {
@@ -78,7 +112,7 @@ final class SourceReaderTests: XCTestCase {
         let timedOutSnapshot = await executor.snapshot()
         XCTAssertEqual(timedOutSnapshot.physicalOccupancy, 1)
 
-        await XCTAssertThrowsErrorAsync {
+        await XCTAssertThrowsReadExecutorError(.sourceBusy) {
             _ = try await executor.execute(sourceID: source) { 3 }
         }
 
@@ -96,8 +130,8 @@ final class SourceReaderTests: XCTestCase {
 
         async let firstResult: Int = executor.execute(sourceID: UUID()) { first.wait(); return 1 }
         async let secondResult: Int = executor.execute(sourceID: UUID()) { second.wait(); return 2 }
-        try? await Task.sleep(for: .milliseconds(5))
-        await XCTAssertThrowsErrorAsync {
+        try await waitUntil { await executor.snapshot().physicalOccupancy == 2 }
+        await XCTAssertThrowsReadExecutorError(.resourceExhausted) {
             _ = try await executor.execute(sourceID: UUID()) { thirdStarted.release(); return 3 }
         }
         let blockedSnapshot = await executor.snapshot()
@@ -110,6 +144,71 @@ final class SourceReaderTests: XCTestCase {
         _ = try? await secondResult
         try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
         XCTAssertFalse(thirdStarted.isReleased)
+    }
+
+    func testReadExecutorKeepsOneSourceOccupiedAcrossDifferentURLsAfterTimeout() async throws {
+        let executor = ReadExecutor(maxConcurrentOperations: 2, defaultTimeout: .milliseconds(20))
+        let source = UUID()
+        let latch = TestLatch()
+
+        async let timedOut: Int = executor.execute(sourceID: source) { latch.wait(); return 1 }
+        try await waitUntil { await executor.snapshot().physicalOccupancy == 1 }
+        await XCTAssertThrowsReadExecutorError(.sourceBusy) {
+            _ = try await executor.execute(sourceID: source) { 2 }
+        }
+        do {
+            _ = try await timedOut
+            XCTFail("expected timeout")
+        } catch let error as ReadExecutorError {
+            XCTAssertEqual(error, .timedOut)
+        }
+
+        latch.release()
+        try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
+    }
+
+    func testReadExecutorCancellationBeforeAdmissionDoesNotStartWork() async throws {
+        let executor = ReadExecutor()
+        let started = TestLatch()
+        let task = Task<Int, Error> {
+            try await executor.execute(sourceID: UUID()) { started.release(); return 1 }
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+        }
+        XCTAssertFalse(started.isReleased)
+        let snapshot = await executor.snapshot()
+        XCTAssertEqual(snapshot.physicalOccupancy, 0)
+    }
+
+    func testReadExecutorCancellationDuringWorkRetainsSlotUntilReturn() async throws {
+        let executor = ReadExecutor(maxConcurrentOperations: 1, defaultTimeout: .seconds(1))
+        let started = TestLatch()
+        let release = TestLatch()
+        let source = UUID()
+        let task = Task<Int, Error> {
+            try await executor.execute(sourceID: source) { started.release(); release.wait(); return 1 }
+        }
+        try await started.waitAsync()
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+        }
+        let occupiedSnapshot = await executor.snapshot()
+        XCTAssertEqual(occupiedSnapshot.physicalOccupancy, 1)
+        await XCTAssertThrowsReadExecutorError(.sourceBusy) {
+            _ = try await executor.execute(sourceID: source) { 2 }
+        }
+
+        release.release()
+        try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
     }
 }
 
@@ -149,6 +248,22 @@ private func XCTAssertThrowsErrorAsync<T>(
     }
 }
 
+private func XCTAssertThrowsReadExecutorError<T>(
+    _ expected: ReadExecutorError,
+    _ expression: @escaping @Sendable () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected \(expected)", file: file, line: line)
+    } catch let error as ReadExecutorError {
+        XCTAssertEqual(error, expected, file: file, line: line)
+    } catch {
+        XCTFail("expected \(expected), got \(error)", file: file, line: line)
+    }
+}
+
 private final class TestLatch: @unchecked Sendable {
     private let condition = NSCondition()
     private var released = false
@@ -172,5 +287,14 @@ private final class TestLatch: @unchecked Sendable {
         released = true
         condition.broadcast()
         condition.unlock()
+    }
+
+    func waitAsync() async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global().async {
+                self.wait()
+                continuation.resume()
+            }
+        }
     }
 }

@@ -33,6 +33,7 @@ public struct MediaMetadata: Codable, Equatable, Sendable {
     public let kind: MediaKind
     public let captureSecond: Int64?
     public let rawCaptureTime: String?
+    public let rawCaptureOffset: String?
     public let make: String?
     public let model: String?
     public let width: Int?
@@ -44,6 +45,7 @@ public struct MediaMetadata: Codable, Equatable, Sendable {
         kind: MediaKind,
         captureSecond: Int64?,
         rawCaptureTime: String?,
+        rawCaptureOffset: String? = nil,
         make: String?,
         model: String?,
         width: Int?,
@@ -54,6 +56,7 @@ public struct MediaMetadata: Codable, Equatable, Sendable {
         self.kind = kind
         self.captureSecond = captureSecond
         self.rawCaptureTime = rawCaptureTime
+        self.rawCaptureOffset = rawCaptureOffset
         self.make = make
         self.model = model
         self.width = width

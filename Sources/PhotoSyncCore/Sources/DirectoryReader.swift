@@ -18,10 +18,16 @@ public protocol DirectoryReading: Sendable {
 }
 
 public struct DirectoryReader: DirectoryReading {
-    public init() {}
+    private let sourceID: UUID
+    private let executor: ReadExecutor
+
+    public init(sourceID: UUID = UUID(), executor: ReadExecutor = .shared) {
+        self.sourceID = sourceID
+        self.executor = executor
+    }
 
     public func entries(in directory: URL) async throws -> [DirectoryEntry] {
-        try await ReadExecutor.shared.execute(sourceID: directory.absoluteString) {
+        try await executor.execute(sourceID: sourceID) {
             let keys: Set<URLResourceKey> = [
                 .isDirectoryKey,
                 .isHiddenKey,
@@ -41,7 +47,8 @@ public struct DirectoryReader: DirectoryReading {
                 guard values.isHidden != true,
                       values.isSymbolicLink != true,
                       values.isAliasFile != true,
-                      values.isPackage != true else {
+                      values.isPackage != true,
+                      url.pathExtension.lowercased() != "photoslibrary" else {
                     return nil
                 }
                 let isDirectory = values.isDirectory == true
@@ -56,7 +63,7 @@ public struct DirectoryReader: DirectoryReading {
     }
 
     public func stamp(of file: URL) async throws -> FileStamp {
-        try await ReadExecutor.shared.execute(sourceID: file.absoluteString) {
+        try await executor.execute(sourceID: sourceID) {
             let values = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             return try fileStamp(values: values)
         }
