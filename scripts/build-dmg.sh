@@ -39,7 +39,7 @@ output_dir=${dmg_path:h}
 
 app_path=$(canonical_path "$app_path")
 output_dir=$(canonical_path "$output_dir")
-[[ ! -e "$dmg_path" ]] || dmg_path=$(canonical_path "$dmg_path")
+dmg_path="$output_dir/${dmg_path:t}"
 is_within "$dmg_path" "$app_path" && fail "Output DMG must not be inside the app bundle: $dmg_path" 64
 
 plist_path="$app_path/Contents/Info.plist"
