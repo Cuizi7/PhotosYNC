@@ -66,3 +66,15 @@ Output: `** TEST BUILD SUCCEEDED **`; `Executed 37 tests, with 0 failures`; `git
 ### Self-review
 
 The changes remain limited to reader/executor/metadata-domain code and synthetic tests. They do not access PhotoKit, write personal media, or change source data after fixture creation. The only unresolved acceptance gap is an actual AVFoundation synthetic video fixture with an explicit offset: ffmpeg writes the requested field (confirmed with ffprobe), but this runtime's AVFoundation metadata APIs returned no creation-date item for that generated asset.
+
+## Fix 2 (2026-09-13)
+
+- Guarded `ReadExecutor.executeAsync` with `beginPhysicalWork()` before invoking its child operation. A caller cancelled after admission now completes logically while the spawned task performs only unconditional source/slot cleanup.
+- Added a direct cancellation-before-child-work regression test and a parser-only explicit-offset video timestamp test. The AVFoundation synthetic-fixture limitation remains documented above.
+
+Verification repeated:
+
+```text
+** TEST BUILD SUCCEEDED **
+Executed 39 tests, with 0 failures
+```

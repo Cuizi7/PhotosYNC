@@ -92,6 +92,14 @@ final class SourceReaderTests: XCTestCase {
         XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: captureTime, offsetTimeOriginal: "+２３:００"))
     }
 
+    func testExplicitOffsetVideoTimestampUsesUnixSecond() {
+        XCTAssertEqual(
+            MetadataReader.videoCaptureSecond(rawCaptureTime: "2026-09-13T10:15:30+08:00"),
+            1_789_265_730
+        )
+        XCTAssertNil(MetadataReader.videoCaptureSecond(rawCaptureTime: "2026-09-13T10:15:30"))
+    }
+
     func testReadExecutorKeepsTimedOutSlotOccupiedUntilBlockingWorkReturns() async throws {
         let executor = ReadExecutor(maxConcurrentOperations: 2, defaultTimeout: .milliseconds(20))
         let latch = TestLatch()
@@ -209,6 +217,26 @@ final class SourceReaderTests: XCTestCase {
 
         release.release()
         try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
+    }
+
+    func testReadExecutorAsyncCancellationBeforeChildWorkDoesNotStartOperation() async throws {
+        let executor = ReadExecutor()
+        let started = TestLatch()
+        let task = Task<Int, Error> {
+            try await executor.executeAsync(sourceID: UUID()) {
+                started.release()
+                return 1
+            }
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+        }
+        try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
+        XCTAssertFalse(started.isReleased)
     }
 }
 

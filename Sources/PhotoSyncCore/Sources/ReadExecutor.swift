@@ -77,10 +77,12 @@ public actor ReadExecutor {
             try await withCheckedThrowingContinuation { continuation in
                 state.install(continuation)
                 Task { [weak self] in
-                    do {
-                        state.finish(.success(try await operation()))
-                    } catch {
-                        state.finish(.failure(error))
+                    if state.beginPhysicalWork() {
+                        do {
+                            state.finish(.success(try await operation()))
+                        } catch {
+                            state.finish(.failure(error))
+                        }
                     }
                     await self?.completed(source: sourceID)
                 }

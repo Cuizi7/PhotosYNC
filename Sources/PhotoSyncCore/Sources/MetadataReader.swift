@@ -43,6 +43,10 @@ public struct MetadataReader: MetadataReading {
         return Int64(date.timeIntervalSince1970.rounded(.down))
     }
 
+    public static func videoCaptureSecond(rawCaptureTime: String?) -> Int64? {
+        parsedVideoCaptureSecond(rawCaptureTime)
+    }
+
     private func readVideo(url: URL, filename: String) async throws -> MediaMetadata {
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration)
@@ -54,7 +58,7 @@ public struct MetadataReader: MetadataReading {
         return MediaMetadata(
             filename: filename,
             kind: .video,
-            captureSecond: videoCaptureSecond(rawCaptureTime),
+            captureSecond: MetadataReader.videoCaptureSecond(rawCaptureTime: rawCaptureTime),
             rawCaptureTime: rawCaptureTime,
             rawCaptureOffset: videoOffset(rawCaptureTime),
             make: nil,
@@ -122,7 +126,7 @@ private func isASCIIDigit(_ byte: UInt8) -> Bool {
     byte >= 48 && byte <= 57
 }
 
-private func videoCaptureSecond(_ rawCaptureTime: String?) -> Int64? {
+private func parsedVideoCaptureSecond(_ rawCaptureTime: String?) -> Int64? {
     guard let rawCaptureTime,
           let date = ISO8601DateFormatter().date(from: rawCaptureTime),
           videoOffset(rawCaptureTime) != nil else { return nil }
