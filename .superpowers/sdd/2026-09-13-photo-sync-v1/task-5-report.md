@@ -44,3 +44,9 @@ Addressed Task5 review P1 and P2 only. P1 now rechecks pause, storage/global blo
 RED `/tmp/task5-fix-red-tests.log`: 16 Engine tests with 7 failures. Held pre-submit stat plus another source's SQLite trigger produced an unauthorized create (1 versus 0) and imported versus pending. Submission-stat failure had no next retry, failure count or incomplete/error scan journal, and no retry count. These tests use two independently released barriers and temporary SQLite triggers.
 
 GREEN `/tmp/task5-fix-green-build.log`: build succeeded; `/tmp/task5-fix-green-tests.log`: 67 Core tests, 0 failures (16 Engine; other suites unchanged). Commands are the same build-for-testing plus direct xctest above. No system Photos API call or live media write performed. Self-review confirmed the final admission check has no intervening engine await before Photos dispatch, and prohibited dispatch after a prepared attempt uses explicit no-dispatch evidence rather than a fetch miss.
+
+## Scoped review fix round 2
+
+Fixed remaining P2 journal finalization race only. `finishScan` now atomically adds scan-local failures to already persisted submission failures, preserves the existing error, and cannot mark a run complete when it already has a failure. Thus either operation ordering (submission failure before/after finalization) preserves journal truth.
+
+Deterministic RED `/tmp/task5-fix2-red-tests.log`: a source with an existing pending record blocked while enumerating its subdirectory; another source completed and started the drain; pending-source submission stat failed and journal failed=1 was observed before releasing enumeration. Old finalization overwrote that count to 0 and marked complete, producing 2 failures. GREEN `/tmp/task5-fix2-green-build.log` and `/tmp/task5-fix2-green-tests.log`: build succeeded; 68 Core tests, 0 failures, including 17 Engine tests. No production behavior outside journal accumulation changed.

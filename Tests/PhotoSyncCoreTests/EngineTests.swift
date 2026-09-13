@@ -256,4 +256,30 @@ final class EngineTests: XCTestCase {
         let count = await f.photos.createCount
         XCTAssertEqual(count, 0)
     }
+
+    func testFinalizingScanPreservesConcurrentSubmissionFailureJournal() async throws {
+        let f = try await makeEngineFixture()
+        let readyGate = EngineTestGate(), heldGate = EngineTestGate()
+        let pendingID = f.sourceIDs[1]
+        try FileManager.default.createDirectory(at: f.directories[1].appendingPathComponent("held"), withIntermediateDirectories: true)
+        let pendingFile = try await engineSourceFile(sourceID: pendingID, directory: f.directories[1])
+        _ = try await f.store.save(pendingFile, decision: .importNew)
+        let reader = JournalRaceReader(sourceID: pendingID, gate: heldGate)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { id in
+            if id == pendingID { return reader }
+            return GatedDirectoryReader(reader: DirectoryReader(sourceID: id), gate: readyGate)
+        })
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let held = await engineEventually { await heldGate.entered }
+        XCTAssertTrue(held)
+        await readyGate.release()
+        let failureRecorded = try await engineEventually {
+            try engineSQLInteger("SELECT COALESCE(SUM(failed),0) FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL) == 1
+        }
+        XCTAssertTrue(failureRecorded)
+        await heldGate.release()
+        await scan.value
+        XCTAssertEqual(try engineSQLInteger("SELECT failed FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run WHERE source_id = '\(pendingID.uuidString)' AND complete = 0 AND last_error IS NOT NULL AND ended_at IS NOT NULL", at: f.databaseURL), 1)
+    }
 }

@@ -217,3 +217,19 @@ func engineSQLInteger(_ sql: String, at url: URL) throws -> Int {
     }
     return Int(sqlite3_column_int64(statement, 0))
 }
+
+actor JournalRaceReader: DirectoryReading {
+    let real: DirectoryReader
+    let directoryGate: EngineTestGate
+    private var stamps = 0
+    init(sourceID: UUID, gate: EngineTestGate) { real = DirectoryReader(sourceID: sourceID); directoryGate = gate }
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        if directory.lastPathComponent == "held" { await directoryGate.wait() }
+        return try await real.entries(in: directory)
+    }
+    func stamp(of file: URL) async throws -> FileStamp {
+        stamps += 1
+        if stamps > 1 { throw FixtureError.unavailable("pending submission stat failed") }
+        return try await real.stamp(of: file)
+    }
+}
