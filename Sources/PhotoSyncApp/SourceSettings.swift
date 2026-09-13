@@ -44,6 +44,8 @@ struct SourceSettings: View {
                 Button("授权访问照片", action: model.authorize).disabled(model.demo || !model.ready)
             }
             Divider()
+            Toggle("来源首次失败和恢复时通知", isOn: Binding(get: { model.notificationsEnabled }, set: model.setNotifications))
+                .disabled(model.demo)
             Toggle("登录时启动", isOn: Binding(get: { model.loginEnabled }, set: model.setLogin))
                 .disabled(model.demo || model.changingLogin)
             if model.loginNeedsApproval { Text("请在系统设置的“登录项”中批准 PhotoSync。").font(.caption) }

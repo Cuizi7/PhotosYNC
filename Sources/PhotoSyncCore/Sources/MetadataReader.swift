@@ -22,10 +22,10 @@ public struct MetadataReader: MetadataReading {
     }
 
     public func read(url: URL, filename: String) async throws -> MediaMetadata {
-        if isRaw(url) {
+        if Self.classification(url) != "image" && Self.classification(url) != "video" {
             throw MetadataError.unsupported
         }
-        if isVideo(url) {
+        if Self.classification(url) == "video" {
             return try await executor.executeAsync(sourceID: sourceID) {
                 try await readVideo(url: url, filename: filename)
             }
@@ -33,6 +33,20 @@ public struct MetadataReader: MetadataReading {
         return try await executor.execute(sourceID: sourceID) {
             try readImage(url: url, filename: filename)
         }
+    }
+
+    public static func classification(_ url: URL) -> String {
+        if isRaw(url) { return "raw" }
+        if ["xmp", "aae", "thm", "lrv", "srt"].contains(url.pathExtension.lowercased()) { return "sidecar" }
+        // Stable built-in formats also work when LaunchServices type registration is unavailable.
+        let ext = url.pathExtension.lowercased()
+        if ["jpg", "jpeg", "jpe", "png", "gif", "tif", "tiff", "bmp", "heic", "heif", "webp", "ico", "jp2"].contains(ext) { return "image" }
+        if ["mov", "mp4", "m4v", "avi", "mpeg", "mpg", "3gp", "3g2"].contains(ext) { return "video" }
+        guard let type = UTType(filenameExtension: ext) else { return "unsupported" }
+        if type.conforms(to: .movie) { return "video" }
+        let supported = CGImageSourceCopyTypeIdentifiers() as! [String]
+        if type.conforms(to: .image), supported.contains(type.identifier), !type.conforms(to: .svg) { return "image" }
+        return "unsupported"
     }
 
     public static func captureSecond(rawCaptureTime: String?, offsetTimeOriginal: String?) -> Int64? {
@@ -52,8 +66,8 @@ public struct MetadataReader: MetadataReading {
         let duration = try await asset.load(.duration)
         let creationDate = try await asset.load(.creationDate)
         let metadata = try await asset.load(.commonMetadata)
-        let rawCaptureTime = creationDate?.stringValue
-            ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })?.stringValue
+        let creationItem = creationDate ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })
+        let rawCaptureTime = try await creationItem?.load(.stringValue)
         let dimensions = try? await asset.load(.tracks).first(where: { $0.mediaType == .video })?.load(.naturalSize)
         return MediaMetadata(
             filename: filename,
@@ -150,8 +164,4 @@ private func isRaw(_ url: URL) -> Bool {
     if rawExtensions.contains(url.pathExtension.lowercased()) { return true }
     guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
     return type.conforms(to: .rawImage)
-}
-
-private func isVideo(_ url: URL) -> Bool {
-    ["avi", "m4v", "mov", "mp4", "mpeg", "mpg"].contains(url.pathExtension.lowercased())
 }

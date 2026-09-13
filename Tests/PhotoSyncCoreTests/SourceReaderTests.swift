@@ -337,3 +337,58 @@ private final class TestLatch: @unchecked Sendable {
         }
     }
 }
+
+extension SourceReaderTests {
+    func testAncestorLinkAndReplacedRootAreRejected() async throws {
+        let root = try temporaryDirectory().resolvingSymlinksInPath()
+        let real = root.appendingPathComponent("real")
+        let child = real.appendingPathComponent("child")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        XCTAssertThrowsError(try SourceRegistry.normalizedURL(link.appendingPathComponent("child")))
+        _ = try SourceRegistry.normalizedURL(child)
+        try FileManager.default.removeItem(at: child)
+        try FileManager.default.createSymbolicLink(at: child, withDestinationURL: root)
+        await XCTAssertThrowsErrorAsync { _ = try await DirectoryReader().entries(in: child) }
+    }
+
+    func testChildAttributeFailureDoesNotDiscardHealthySiblings() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let bad = fixture.directories[0].appendingPathComponent("bad.jpg")
+        try Data().write(to: bad)
+        let engine = SyncEngine(store: fixture.store, photos: fixture.photos, directory: { id in
+            DirectoryReader(sourceID: id, attributes: { url, keys in
+                if url.lastPathComponent == "bad.jpg" { throw FixtureError.unavailable("child attributes denied") }
+                return try url.resourceValues(forKeys: keys)
+            })
+        })
+        await engine.scan(sourceIDs: fixture.sourceIDs)
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.imported, 1)
+        XCTAssertEqual(snapshot.failed, 1)
+        XCTAssertNotNil(snapshot.waitingSources[fixture.sourceIDs[0]])
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT complete FROM scan_run", at: fixture.databaseURL), 0)
+    }
+
+    func testAuxiliaryFilesAreAttributeOnlySkipsWithoutRecovery() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        for name in ["same.xmp", "notes.txt", "capture.CR3"] {
+            try Data("auxiliary".utf8).write(to: fixture.directories[0].appendingPathComponent(name))
+        }
+        await fixture.engine.scan(sourceIDs: fixture.sourceIDs)
+        let snapshot = await fixture.engine.snapshot()
+        XCTAssertEqual(snapshot.imported, 1)
+        XCTAssertEqual(snapshot.skipped, 3)
+        XCTAssertEqual(snapshot.failed, 0)
+        XCTAssertTrue(snapshot.waitingSources.isEmpty)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip WHERE state = 'skipped' AND skip_reason = 'unsupportedFormat'", at: fixture.databaseURL), 3)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 1)
+        await fixture.engine.scan(sourceIDs: fixture.sourceIDs)
+        let again = await fixture.engine.snapshot()
+        XCTAssertTrue(again.waitingSources.isEmpty)
+        XCTAssertEqual(again.imported, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 3)
+    }
+}

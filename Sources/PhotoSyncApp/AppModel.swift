@@ -3,6 +3,7 @@ import SwiftUI
 import Combine
 import PhotoSyncCore
 import ServiceManagement
+import UserNotifications
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -11,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var loginEnabled = false
     @Published var loginNeedsApproval = false
     @Published var changingLogin = false
+    @Published var notificationsEnabled = false
     @Published var ready = false
     @Published var demoStatus: GlobalStatus = .unconfigured
     let demo: Bool
@@ -40,6 +42,7 @@ final class AppModel: ObservableObject {
             return
         }
         refreshLogin()
+        notificationsEnabled = UserDefaults.standard.bool(forKey: "sourceNotifications")
         polling = Task { [weak self] in
             let runtime = SyncRuntime()
             self?.runtime = runtime
@@ -131,6 +134,23 @@ final class AppModel: ObservableObject {
             } catch { self.error = "登录启动设置失败：\(error.localizedDescription)" }
         }
     }
+    func setNotifications(_ enabled: Bool) {
+        guard !demo else { return }
+        if !enabled {
+            notificationsEnabled = false
+            UserDefaults.standard.set(false, forKey: "sourceNotifications")
+            return
+        }
+        Task {
+            do {
+                let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                notificationsEnabled = granted
+                UserDefaults.standard.set(granted, forKey: "sourceNotifications")
+                if !granted { error = "通知未获授权；可在系统设置中允许 PhotoSync 通知。" }
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+
     func quit() {
         polling?.cancel()
         Task { await runtime?.stop(); NSApplication.shared.terminate(nil) }

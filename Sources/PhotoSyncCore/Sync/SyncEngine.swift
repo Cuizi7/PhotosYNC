@@ -10,6 +10,7 @@ public struct EngineSnapshot: Sendable {
     /// Pending is a current persisted queue count, not a cumulative total.
     public var pending = 0
     public var activeWork = false
+    public var sourcePhases: [UUID: String] = [:]
     public var waitingSources: [UUID: String] = [:]
     public var blockingError: String?
     public var isPaused = false
@@ -24,6 +25,7 @@ public actor SyncEngine {
     private let metadata: MetadataFactory
     private let policy: DuplicatePolicy
     private let logger: RunLogger?
+    private let notify: @Sendable (UUID, Bool) -> Void
     private var status = EngineSnapshot()
     private var scanning = false
     private var recovering = false
@@ -41,9 +43,10 @@ public actor SyncEngine {
     public init(store: SyncStore, photos: any PhotosGateway,
                 directory: @escaping DirectoryFactory = { DirectoryReader(sourceID: $0) },
                 metadata: @escaping MetadataFactory = { MetadataReader(sourceID: $0) },
-                policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil) {
+                policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
+                notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in }) {
         self.store = store; self.photos = photos; self.directory = directory
-        self.metadata = metadata; self.policy = policy; self.logger = logger
+        self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
     }
 
     public func sources() async throws -> [RegisteredSource] { try await store.sources() }
@@ -135,6 +138,8 @@ public actor SyncEngine {
     }
 
     private func scanSource(_ sourceID: UUID) async {
+        status.sourcePhases[sourceID] = "扫描目录与元数据"
+        defer { status.sourcePhases.removeValue(forKey: sourceID) }
         var checked = 0, failed = 0
         var run: UUID?
         do {
@@ -155,6 +160,7 @@ public actor SyncEngine {
                         if entry.isDirectory { directories.append((entry.url, folder.relative + entry.url.lastPathComponent + "/")); continue }
                         checked += 1; status.checked += 1
                         do {
+                            if let failure = entry.failure { throw NSError(domain: "PhotoSync.DirectoryEntry", code: 1, userInfo: [NSLocalizedDescriptionKey: failure]) }
                             let stamp = try await reader.stamp(of: entry.url)
                             let relative = folder.relative + entry.url.lastPathComponent
                             if let old = try await store.file(sourceID: sourceID, relativePath: relative) {
@@ -166,14 +172,20 @@ public actor SyncEngine {
                                 }
                                 continue
                             }
+                            let classification = MetadataReader.classification(entry.url)
+                            guard classification == "image" || classification == "video" else {
+                                try await store.saveNonMedia(sourceID: sourceID, relativePath: relative, stamp: stamp, disposition: classification)
+                                status.skipped += 1
+                                logEvent(phase: "classification", result: classification, sourceID: sourceID, runID: run, path: entry.url.path)
+                                continue
+                            }
                             let info = try await metadataReader.read(url: entry.url, filename: entry.url.lastPathComponent)
                             let file = SourceFile(sourceID: sourceID, relativePath: relative, url: entry.url, stamp: stamp, metadata: info)
                             let decision = policy.evaluate(info, candidates: indexed)
                             let evidence = matchingCandidates(decision, candidates: indexed)
                             _ = try await store.save(file, decision: decision, candidates: evidence)
                             if case .skip = decision { status.skipped += 1 }
-                        } catch MetadataError.unsupported { continue }
-                        catch let error as SyncStoreError { throw error }
+                        } catch let error as SyncStoreError { throw error }
                         catch {
                             failed += 1; status.failed += 1
                             lastFailure = error.localizedDescription
@@ -260,6 +272,8 @@ public actor SyncEngine {
                 }
                 do {
                     let store = self.store
+                    status.sourcePhases[record.file.sourceID] = "新增到照片"
+                    defer { status.sourcePhases.removeValue(forKey: record.file.sourceID) }
                     let id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind) { identifier in
                         try store.checkpointPlaceholder(fileID: record.id, attemptID: attempt, identifier: identifier)
                     }
@@ -322,11 +336,13 @@ public actor SyncEngine {
 
     private func logSourceWaiting(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
         guard reportedWaitingSources.insert(sourceID).inserted else { return }
+        notify(sourceID, false)
         logEvent(phase: "recovery", result: "waiting", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
     }
 
     private func logSourceRecovered(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
         guard reportedWaitingSources.remove(sourceID) != nil else { return }
+        notify(sourceID, true)
         logEvent(phase: "recovery", result: "recovered", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
     }
 

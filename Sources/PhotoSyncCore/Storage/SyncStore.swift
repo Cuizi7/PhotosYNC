@@ -40,8 +40,13 @@ public final class SyncStore: @unchecked Sendable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let ruleVersion = 1
+    private let readExecutor: ReadExecutor
+    private let validateSource: @Sendable (URL) throws -> URL
 
-    public init(url: URL) throws {
+    public init(url: URL, readExecutor: ReadExecutor = .shared,
+                validateSource: @escaping @Sendable (URL) throws -> URL = { try SourceRegistry.normalizedURL($0) }) throws {
+        self.readExecutor = readExecutor
+        self.validateSource = validateSource
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK, let handle else {
@@ -62,7 +67,9 @@ public final class SyncStore: @unchecked Sendable {
     deinit { sqlite3_close(database) }
 
     public func registerSource(url: URL) async throws -> UUID {
-        try await perform { try self.registerSourceSync(url: url) }
+        let normalized = try await readExecutor.execute(sourceID: UUID()) { try self.validateSource(url) }
+        try Task.checkCancellation()
+        return try await perform { try self.transaction { try self.registerSourceSync(url: normalized) } }
     }
 
     public func disableSource(id: UUID) async throws {
@@ -101,6 +108,14 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 return id
             }
+        }
+    }
+
+    /// Attribute-only terminal dispositions never enter media matching or the import queue.
+    public func saveNonMedia(sourceID: UUID, relativePath: String, stamp: FileStamp, disposition: String) async throws {
+        try await perform {
+            try self.execute("INSERT INTO non_media_skip (source_id, relative_path, size, modified_ns, disposition, state, skip_reason) VALUES (?, ?, ?, ?, ?, 'skipped', 'unsupportedFormat') ON CONFLICT(source_id, relative_path) DO UPDATE SET size = excluded.size, modified_ns = excluded.modified_ns, disposition = excluded.disposition",
+                [.text(sourceID.uuidString), .text(relativePath), .int64(stamp.size), .int64(stamp.modifiedNanoseconds), .text(disposition)])
         }
     }
 
@@ -233,7 +248,7 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     private func registerSourceSync(url: URL) throws -> UUID {
-        let normalized = try SourceRegistry.normalizedURL(url)
+        let normalized = url
         let path = normalized.path
         let existing = try rows("SELECT id, path, enabled FROM source", []).map { (try uuid($0[0]), URL(fileURLWithPath: try text($0[1])), try int($0[2]) != 0) }
         for (id, existingURL, enabled) in existing where SourceRegistry.conflicts(normalized, existingURL) {
@@ -258,11 +273,12 @@ public final class SyncStore: @unchecked Sendable {
 
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 1 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version == 0 else { return }
+        guard version <= 2 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 2 else { return }
         try transaction {
-            try execute(Self.schema)
-            try execute("PRAGMA user_version = 1")
+            if version == 0 { try execute(Self.schema) }
+            try execute("CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path))")
+            try execute("PRAGMA user_version = 2")
         }
     }
 

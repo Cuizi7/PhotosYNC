@@ -8,6 +8,11 @@ struct StatusMenu: View {
             Label(model.statusDescription, systemImage: model.status.symbol)
                 .font(.headline).accessibilityLabel(model.statusDescription)
             if model.state.snapshot.activeWork { ProgressView().controlSize(.small) }
+            ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
+                if let phase = model.enabledWaiting[source.id] ?? model.state.snapshot.sourcePhases[source.id] {
+                    Text("\(source.url.lastPathComponent)：\(phase)").font(.caption).lineLimit(2).help(source.url.path)
+                }
+            }
             Text(model.counters).font(.caption).foregroundStyle(.secondary)
             if let detail = model.detail {
                 Text(detail).font(.caption).lineLimit(3)

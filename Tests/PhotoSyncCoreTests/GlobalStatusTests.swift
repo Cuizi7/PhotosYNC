@@ -109,3 +109,56 @@ private struct RuntimePhotos: PhotosGateway {
     }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
 }
+
+extension RuntimeIntegrationTests {
+    func testImageAndSidecarDoNotScheduleRecoveryRounds() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        try Data("sidecar".utf8).write(to: fixture.directories[0].appendingPathComponent("same.xmp"))
+        let clock = RuntimeClock()
+        let runtime = SyncRuntime(store: fixture.store, engine: fixture.engine, now: { clock.read() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        for second in [5.0, 15.0, 30.0, 60.0] {
+            clock.set(second)
+            await runtime.tick()
+            await runtime.waitForRound()
+        }
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: fixture.databaseURL), 1)
+        let state = await runtime.current()
+        XCTAssertTrue(state.snapshot.waitingSources.isEmpty)
+        XCTAssertEqual(state.snapshot.skipped, 1)
+        XCTAssertEqual(state.snapshot.imported, 1)
+    }
+
+    func testFailureAndRecoveryNotificationTransitionsAreDeduplicated() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let transitions = NotificationTransitions()
+        let reader = FailingNotificationDirectory()
+        let engine = SyncEngine(store: fixture.store, photos: fixture.photos, directory: { _ in reader },
+                                notify: { _, recovered in transitions.append(recovered) })
+        await engine.scan(sourceIDs: fixture.sourceIDs)
+        await engine.scan(sourceIDs: fixture.sourceIDs)
+        XCTAssertEqual(transitions.read(), [false])
+        await reader.recover()
+        await engine.scan(sourceIDs: fixture.sourceIDs)
+        await engine.scan(sourceIDs: fixture.sourceIDs)
+        XCTAssertEqual(transitions.read(), [false, true])
+    }
+}
+
+private final class NotificationTransitions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Bool] = []
+    func append(_ value: Bool) { lock.lock(); defer { lock.unlock() }; values.append(value) }
+    func read() -> [Bool] { lock.lock(); defer { lock.unlock() }; return values }
+}
+private actor FailingNotificationDirectory: DirectoryReading {
+    var failed = true
+    func recover() { failed = false }
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        if failed { throw FixtureError.unavailable("source offline") }
+        return []
+    }
+    func stamp(of file: URL) async throws -> FileStamp { throw FixtureError.unavailable("unused") }
+}

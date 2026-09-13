@@ -4,11 +4,13 @@ public struct DirectoryEntry: Sendable {
     public let url: URL
     public let isDirectory: Bool
     public let stamp: FileStamp?
+    public let failure: String?
 
-    public init(url: URL, isDirectory: Bool, stamp: FileStamp?) {
+    public init(url: URL, isDirectory: Bool, stamp: FileStamp?, failure: String? = nil) {
         self.url = url
         self.isDirectory = isDirectory
         self.stamp = stamp
+        self.failure = failure
     }
 }
 
@@ -20,10 +22,13 @@ public protocol DirectoryReading: Sendable {
 public struct DirectoryReader: DirectoryReading {
     private let sourceID: UUID
     private let executor: ReadExecutor
+    private let attributes: @Sendable (URL, Set<URLResourceKey>) throws -> URLResourceValues
 
-    public init(sourceID: UUID = UUID(), executor: ReadExecutor = .shared) {
+    public init(sourceID: UUID = UUID(), executor: ReadExecutor = .shared,
+                attributes: @escaping @Sendable (URL, Set<URLResourceKey>) throws -> URLResourceValues = { try $0.resourceValues(forKeys: $1) }) {
         self.sourceID = sourceID
         self.executor = executor
+        self.attributes = attributes
     }
 
     public func entries(in directory: URL) async throws -> [DirectoryEntry] {
@@ -37,13 +42,15 @@ public struct DirectoryReader: DirectoryReading {
                 .fileSizeKey,
                 .contentModificationDateKey
             ]
+            let verified = try SourceRegistry.normalizedURL(directory)
             let contents = try FileManager.default.contentsOfDirectory(
-                at: directory,
+                at: verified,
                 includingPropertiesForKeys: Array(keys),
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
             )
-            return try contents.compactMap { url in
-                let values = try url.resourceValues(forKeys: keys)
+            return contents.compactMap { url in
+                do {
+                let values = try attributes(url, keys)
                 guard values.isHidden != true,
                       values.isSymbolicLink != true,
                       values.isAliasFile != true,
@@ -57,6 +64,9 @@ public struct DirectoryReader: DirectoryReading {
                     isDirectory: isDirectory,
                     stamp: isDirectory ? nil : try fileStamp(values: values)
                 )
+                } catch {
+                    return DirectoryEntry(url: url, isDirectory: false, stamp: nil, failure: error.localizedDescription)
+                }
             }
             .sorted { $0.url.path < $1.url.path }
         }
@@ -64,6 +74,9 @@ public struct DirectoryReader: DirectoryReading {
 
     public func stamp(of file: URL) async throws -> FileStamp {
         try await executor.execute(sourceID: sourceID) {
+            _ = try SourceRegistry.normalizedURL(file.deletingLastPathComponent())
+            let fileAttributes = try FileManager.default.attributesOfItem(atPath: file.path)
+            guard fileAttributes[.type] as? FileAttributeType == .typeRegular else { throw DirectoryReaderError.missingFileAttributes }
             let values = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             return try fileStamp(values: values)
         }

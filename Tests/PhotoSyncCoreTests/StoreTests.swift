@@ -248,14 +248,14 @@ final class StoreTests: XCTestCase {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(database.path, &handle), SQLITE_OK)
         defer { sqlite3_close(handle) }
-        XCTAssertEqual(sqlite3_exec(handle, "PRAGMA user_version = 2", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(handle, "PRAGMA user_version = 3", nil, nil, nil), SQLITE_OK)
 
         XCTAssertThrowsError(try SyncStore(url: database))
         var statement: OpaquePointer?
         XCTAssertEqual(sqlite3_prepare_v2(handle, "PRAGMA user_version", -1, &statement, nil), SQLITE_OK)
         defer { sqlite3_finalize(statement) }
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
-        XCTAssertEqual(sqlite3_column_int(statement, 0), 2)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 3)
     }
 
     private func makeRoot() throws -> URL {
@@ -290,4 +290,53 @@ private func XCTAssertThrowsErrorAsync<T>(
         _ = try await expression()
         XCTFail("Expected an error", file: file, line: line)
     } catch {}
+}
+
+extension StoreTests {
+    func testHeldSourceValidationCannotBlockStoreOrPlaceholderCheckpoint() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let gate = DispatchSemaphore(value: 0)
+        let entered = expectation(description: "physical validation entered")
+        let reader = ReadExecutor(maxConcurrentOperations: 1, defaultTimeout: .seconds(30))
+        let store = try SyncStore(url: fixture.databaseURL, readExecutor: reader, validateSource: { url in
+            entered.fulfill()
+            gate.wait()
+            return try SourceRegistry.normalizedURL(url)
+        })
+        let file = try await engineSourceFile(sourceID: fixture.sourceIDs[0], directory: fixture.directories[0])
+        let fileID = try await store.save(file, decision: .importNew)
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: fileID, attemptID: attempt)
+        let second = try temporaryDirectory()
+        let registration = Task { try await store.registerSource(url: second) }
+        defer { gate.signal() }
+        await fulfillment(of: [entered], timeout: 2)
+        let checked = expectation(description: "checkpoint and DB reads remain live")
+        let checkpoint = Task.detached {
+            try store.checkpointPlaceholder(fileID: fileID, attemptID: attempt, identifier: "held-validation-proof")
+            _ = try await store.sources()
+            checked.fulfill()
+        }
+        await fulfillment(of: [checked], timeout: 2)
+        gate.signal()
+        _ = try await registration.value
+        try await checkpoint.value
+        let result = try await store.file(sourceID: fixture.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(result?.placeholderID, "held-validation-proof")
+    }
+}
+
+extension StoreTests {
+    func testSchemaOneMigrationRetainsMediaAndAddsAttributeOnlyDispositions() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let file = try await engineSourceFile(sourceID: fixture.sourceIDs[0], directory: fixture.directories[0])
+        _ = try await fixture.store.save(file, decision: .importNew)
+        try injectEngineSQL("DROP TABLE non_media_skip; PRAGMA user_version = 1", at: fixture.databaseURL)
+        let migrated = try SyncStore(url: fixture.databaseURL)
+        try await migrated.saveNonMedia(sourceID: fixture.sourceIDs[0], relativePath: "photo.xmp", stamp: FileStamp(size: 2, modifiedNanoseconds: 3), disposition: "sidecar")
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: fixture.databaseURL), 2)
+        let pending = try await migrated.countFiles(state: .pending)
+        XCTAssertEqual(pending, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 1)
+    }
 }

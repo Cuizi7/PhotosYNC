@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UserNotifications
 import PhotoSyncCore
 
 struct RuntimeState: Sendable {
@@ -60,7 +61,7 @@ actor SyncRuntime {
                 Task { await self?.logFailed(message) }
             })
             self.logger = logger
-            store = try SyncStore(url: databaseURL)
+            store = try SyncStore(url: databaseURL, readExecutor: executor)
             try await refreshSources()
             await tick(force: true)
         } catch { state.message = error.localizedDescription }
@@ -132,7 +133,18 @@ actor SyncRuntime {
             let executor = self.executor
             engine = SyncEngine(store: store, photos: PhotoKitGateway(),
                                 directory: { DirectoryReader(sourceID: $0, executor: executor) },
-                                metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger)
+                                metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger,
+                                notify: { _, recovered in
+                                    guard UserDefaults.standard.bool(forKey: "sourceNotifications") else { return }
+                                    Task {
+                                        let center = UNUserNotificationCenter.current()
+                                        guard await center.notificationSettings().authorizationStatus == .authorized else { return }
+                                        let content = UNMutableNotificationContent()
+                                        content.title = recovered ? "PhotoSync 来源已恢复" : "PhotoSync 来源等待恢复"
+                                        content.body = recovered ? "来源已恢复正常同步。" : "同步遇到错误，将自动重试。请在来源与设置中查看详情。"
+                                        try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+                                    }
+                                })
         }
         guard let engine else { return }
         let now = now()
@@ -154,7 +166,7 @@ actor SyncRuntime {
         } else { return }
         round = Task {
             await engine.scan(sourceIDs: ids)
-            await self.finishedRound(ids: ids, snapshot: await engine.snapshot())
+            self.finishedRound(ids: ids, snapshot: await engine.snapshot())
         }
     }
 

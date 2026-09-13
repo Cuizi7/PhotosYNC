@@ -28,3 +28,5 @@ CREATE TABLE scan_run (
 );
 CREATE INDEX file_state_retry ON file_record(state, next_retry_at);
 CREATE INDEX file_name ON file_record(filename);
+
+CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path));

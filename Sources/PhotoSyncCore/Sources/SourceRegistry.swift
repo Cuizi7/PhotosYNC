@@ -3,7 +3,26 @@ import Foundation
 public enum SourceRegistry {
     public static func normalizedURL(_ url: URL) throws -> URL {
         guard url.isFileURL else { throw SourceRegistryError.notFileURL }
-        let standardized = url.standardizedFileURL
+        // Only the OS-owned /var and /tmp aliases are canonicalized, and only if
+        // their link destinations are exactly the expected /private paths.
+        var standardized = url.standardizedFileURL
+        for name in ["var", "tmp"] where standardized.pathComponents.dropFirst().first == name {
+            let alias = "/" + name
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: alias)) == "private/" + name ||
+                (try? FileManager.default.destinationOfSymbolicLink(atPath: alias)) == "/private/" + name {
+                standardized = URL(fileURLWithPath: "/private" + standardized.path)
+            }
+        }
+        var componentURL = URL(fileURLWithPath: "/", isDirectory: true)
+        for component in standardized.pathComponents.dropFirst() {
+            componentURL.appendPathComponent(component)
+            let attributes = try FileManager.default.attributesOfItem(atPath: componentURL.path)
+            guard attributes[.type] as? FileAttributeType != .typeSymbolicLink else {
+                throw SourceRegistryError.aliasOrLink(componentURL)
+            }
+            let values = try componentURL.resourceValues(forKeys: [.isAliasFileKey])
+            guard values.isAliasFile != true else { throw SourceRegistryError.aliasOrLink(componentURL) }
+        }
         let values = try standardized.resourceValues(forKeys: [.isDirectoryKey, .isAliasFileKey, .isSymbolicLinkKey])
         guard values.isDirectory == true else { throw SourceRegistryError.notDirectory(standardized) }
         guard values.isAliasFile != true, values.isSymbolicLink != true else { throw SourceRegistryError.aliasOrLink(standardized) }
