@@ -1,0 +1,102 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		000000000000000000000001 /* PhotoSyncApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000101 /* PhotoSyncApp.swift */; };
+		000000000000000000000002 /* MediaRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000102 /* MediaRecord.swift */; };
+		000000000000000000000003 /* DuplicatePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000103 /* DuplicatePolicy.swift */; };
+		000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000104 /* DuplicatePolicyTests.swift */; };
+		000000000000000000000005 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000105 /* TestSupport.swift */; };
+		000000000000000000000006 /* TestSupportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000106 /* TestSupportTests.swift */; };
+		000000000000000000000007 /* libPhotoSyncCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000201 /* libPhotoSyncCore.a */; };
+		000000000000000000000008 /* libPhotoSyncCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000201 /* libPhotoSyncCore.a */; };
+		000000000000000000000009 /* SQLite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000301 /* SQLite3.tbd */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		000000000000000000000A01 = {isa = PBXContainerItemProxy; containerPortal = 000000000000000000000F01 /* Project object */; proxyType = 1; remoteGlobalIDString = 000000000000000000000602; remoteInfo = PhotoSyncCore; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		000000000000000000000101 /* PhotoSyncApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoSyncApp.swift; sourceTree = "<group>"; };
+		000000000000000000000102 /* MediaRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaRecord.swift; sourceTree = "<group>"; };
+		000000000000000000000103 /* DuplicatePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuplicatePolicy.swift; sourceTree = "<group>"; };
+		000000000000000000000104 /* DuplicatePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuplicatePolicyTests.swift; sourceTree = "<group>"; };
+		000000000000000000000105 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
+		000000000000000000000106 /* TestSupportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupportTests.swift; sourceTree = "<group>"; };
+		000000000000000000000201 /* libPhotoSyncCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libPhotoSyncCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000202 /* PhotoSync.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoSync.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000203 /* PhotoSyncCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoSyncCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000301 /* SQLite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = SQLite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		000000000000000000000401 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000007 /* libPhotoSyncCore.a in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000402 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000009 /* SQLite3.tbd in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000403 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000008 /* libPhotoSyncCore.a in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		000000000000000000000501 = {isa = PBXGroup; children = (000000000000000000000502 /* Sources */, 000000000000000000000503 /* Tests */, 000000000000000000000504 /* Products */, 000000000000000000000505 /* Frameworks */,); sourceTree = "<group>"; };
+		000000000000000000000502 = {isa = PBXGroup; children = (000000000000000000000506 /* PhotoSyncApp */, 000000000000000000000507 /* PhotoSyncCore */,); path = Sources; sourceTree = "<group>"; };
+		000000000000000000000503 = {isa = PBXGroup; children = (000000000000000000000508 /* PhotoSyncCoreTests */,); path = Tests; sourceTree = "<group>"; };
+		000000000000000000000504 = {isa = PBXGroup; children = (000000000000000000000202 /* PhotoSync.app */, 000000000000000000000201 /* libPhotoSyncCore.a */, 000000000000000000000203 /* PhotoSyncCoreTests.xctest */,); name = Products; sourceTree = "<group>"; };
+		000000000000000000000505 = {isa = PBXGroup; children = (000000000000000000000301 /* SQLite3.tbd */,); name = Frameworks; sourceTree = "<group>"; };
+		000000000000000000000506 = {isa = PBXGroup; children = (000000000000000000000101 /* PhotoSyncApp.swift */,); path = PhotoSyncApp; sourceTree = "<group>"; };
+		000000000000000000000507 = {isa = PBXGroup; children = (000000000000000000000509 /* Domain */, 000000000000000000000510 /* Matching */,); path = PhotoSyncCore; sourceTree = "<group>"; };
+		000000000000000000000508 = {isa = PBXGroup; children = (000000000000000000000104 /* DuplicatePolicyTests.swift */, 000000000000000000000105 /* TestSupport.swift */, 000000000000000000000106 /* TestSupportTests.swift */,); path = PhotoSyncCoreTests; sourceTree = "<group>"; };
+		000000000000000000000509 = {isa = PBXGroup; children = (000000000000000000000102 /* MediaRecord.swift */,); path = Domain; sourceTree = "<group>"; };
+		000000000000000000000510 = {isa = PBXGroup; children = (000000000000000000000103 /* DuplicatePolicy.swift */,); path = Matching; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		000000000000000000000601 = {isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000701; buildPhases = (000000000000000000000801, 000000000000000000000401, 000000000000000000000802,); buildRules = (); dependencies = (000000000000000000000901,); name = PhotoSync; productName = PhotoSync; productReference = 000000000000000000000202; productType = "com.apple.product-type.application"; };
+		000000000000000000000602 = {isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000702; buildPhases = (000000000000000000000803, 000000000000000000000402, 000000000000000000000804,); buildRules = (); dependencies = (); name = PhotoSyncCore; productName = PhotoSyncCore; productReference = 000000000000000000000201; productType = "com.apple.product-type.library.static"; };
+		000000000000000000000603 = {isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000703; buildPhases = (000000000000000000000805, 000000000000000000000403, 000000000000000000000806,); buildRules = (); dependencies = (000000000000000000000902,); name = PhotoSyncCoreTests; productName = PhotoSyncCoreTests; productReference = 000000000000000000000203; productType = "com.apple.product-type.bundle.unit-test"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		000000000000000000000F01 = {isa = PBXProject; attributes = { LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = { 000000000000000000000601 = {CreatedOnToolsVersion = 26.6;}; 000000000000000000000602 = {CreatedOnToolsVersion = 26.6;}; 000000000000000000000603 = {CreatedOnToolsVersion = 26.6;}; }; }; buildConfigurationList = 000000000000000000000700; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = 000000000000000000000501; minimizedProjectReferenceProxies = 1; preferredProjectObjectVersion = 77; productRefGroup = 000000000000000000000504; projectDirPath = ""; projectRoot = ""; targets = (000000000000000000000601, 000000000000000000000602, 000000000000000000000603,); };
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		000000000000000000000801 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000001 /* PhotoSyncApp.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000803 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000002 /* MediaRecord.swift in Sources */, 000000000000000000000003 /* DuplicatePolicy.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000006 /* TestSupportTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		000000000000000000000802 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000804 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000806 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		000000000000000000000901 = {isa = PBXTargetDependency; target = 000000000000000000000602; targetProxy = 000000000000000000000A01; };
+		000000000000000000000902 = {isa = PBXTargetDependency; target = 000000000000000000000602; targetProxy = 000000000000000000000A01; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		000000000000000000000710 = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Debug; };
+		000000000000000000000711 = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
+		000000000000000000000720 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "-"; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.PhotoSync; PRODUCT_MODULE_NAME = PhotoSync; PRODUCT_NAME = PhotoSync; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Debug; };
+		000000000000000000000721 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "-"; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.PhotoSync; PRODUCT_MODULE_NAME = PhotoSync; PRODUCT_NAME = PhotoSync; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
+		000000000000000000000730 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "-"; DEFINES_MODULE = YES; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.PhotoSyncCore; PRODUCT_MODULE_NAME = PhotoSyncCore; PRODUCT_NAME = PhotoSyncCore; SDKROOT = macosx; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_VERSION = 5.0; }; name = Debug; };
+		000000000000000000000731 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "-"; DEFINES_MODULE = YES; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.PhotoSyncCore; PRODUCT_MODULE_NAME = PhotoSyncCore; PRODUCT_NAME = PhotoSyncCore; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
+		000000000000000000000740 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "-"; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.PhotoSyncCoreTests; PRODUCT_MODULE_NAME = PhotoSyncCoreTests; PRODUCT_NAME = PhotoSyncCoreTests; SDKROOT = macosx; SWIFT_VERSION = 5.0; TEST_HOST = ""; }; name = Debug; };
+		000000000000000000000741 = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "-"; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.PhotoSyncCoreTests; PRODUCT_MODULE_NAME = PhotoSyncCoreTests; PRODUCT_NAME = PhotoSyncCoreTests; SDKROOT = macosx; SWIFT_VERSION = 5.0; TEST_HOST = ""; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		000000000000000000000700 = {isa = XCConfigurationList; buildConfigurations = (000000000000000000000710, 000000000000000000000711,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		000000000000000000000701 = {isa = XCConfigurationList; buildConfigurations = (000000000000000000000720, 000000000000000000000721,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		000000000000000000000702 = {isa = XCConfigurationList; buildConfigurations = (000000000000000000000730, 000000000000000000000731,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		000000000000000000000703 = {isa = XCConfigurationList; buildConfigurations = (000000000000000000000740, 000000000000000000000741,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = 000000000000000000000F01;
+}
