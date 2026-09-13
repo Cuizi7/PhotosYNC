@@ -1,5 +1,5 @@
 import XCTest
-import PhotoSyncCore
+@testable import PhotoSyncCore
 
 final class SourceReaderTests: XCTestCase {
     func testDirectoryReaderExcludesHiddenLinksAndPackages() async throws {
@@ -219,15 +219,25 @@ final class SourceReaderTests: XCTestCase {
         try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
     }
 
-    func testReadExecutorAsyncCancellationBeforeChildWorkDoesNotStartOperation() async throws {
-        let executor = ReadExecutor()
-        let started = TestLatch()
+    func testReadExecutorAsyncCancellationAfterAdmissionBeforeChildWorkDoesNotStartOperation() async throws {
+        let childTaskStarted = TestLatch()
+        let allowChildTaskToProceed = TestLatch()
+        let executor = ReadExecutor(
+            maxConcurrentOperations: 2,
+            defaultTimeout: .seconds(1),
+            beforeAsyncOperationStart: {
+                childTaskStarted.release()
+                allowChildTaskToProceed.wait()
+            }
+        )
+        let operationInvoked = TestLatch()
         let task = Task<Int, Error> {
             try await executor.executeAsync(sourceID: UUID()) {
-                started.release()
+                operationInvoked.release()
                 return 1
             }
         }
+        try await childTaskStarted.waitAsync()
         task.cancel()
 
         do {
@@ -235,8 +245,9 @@ final class SourceReaderTests: XCTestCase {
             XCTFail("expected cancellation")
         } catch is CancellationError {
         }
+        allowChildTaskToProceed.release()
         try await waitUntil { await executor.snapshot().physicalOccupancy == 0 }
-        XCTAssertFalse(started.isReleased)
+        XCTAssertFalse(operationInvoked.isReleased)
     }
 }
 

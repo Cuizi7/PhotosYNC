@@ -78,3 +78,15 @@ Verification repeated:
 ** TEST BUILD SUCCEEDED **
 Executed 39 tests, with 0 failures
 ```
+
+## Fix 3 (2026-09-13)
+
+- Added an internal executor start gate used only by the test target. The regression now deterministically admits the async read, blocks the spawned child task before `beginPhysicalWork()`, cancels the caller, releases the gate, and verifies that the supplied async operation was never invoked while physical cleanup completed.
+- The parser-only video test covers explicit-offset conversion; this report does not claim full `readVideo` fixture coverage because the AVFoundation fixture limitation remains unresolved.
+
+Verification repeated:
+
+```text
+** TEST BUILD SUCCEEDED **
+Executed 39 tests, with 0 failures
+```

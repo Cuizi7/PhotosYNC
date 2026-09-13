@@ -17,12 +17,26 @@ public actor ReadExecutor {
     private let queue: OperationQueue
     private let maxConcurrentOperations: Int
     private let defaultTimeout: Duration
+    private let beforeAsyncOperationStart: (@Sendable () -> Void)?
     private var inFlightSources = Set<UUID>()
     private var physicalOccupancy = 0
 
     public init(maxConcurrentOperations: Int = 2, defaultTimeout: Duration = .seconds(60)) {
+        self.init(
+            maxConcurrentOperations: maxConcurrentOperations,
+            defaultTimeout: defaultTimeout,
+            beforeAsyncOperationStart: nil
+        )
+    }
+
+    init(
+        maxConcurrentOperations: Int,
+        defaultTimeout: Duration,
+        beforeAsyncOperationStart: (@Sendable () -> Void)?
+    ) {
         self.maxConcurrentOperations = maxConcurrentOperations
         self.defaultTimeout = defaultTimeout
+        self.beforeAsyncOperationStart = beforeAsyncOperationStart
         queue = OperationQueue()
         queue.name = "PhotoSyncCore.ReadExecutor"
         queue.maxConcurrentOperationCount = maxConcurrentOperations
@@ -77,6 +91,7 @@ public actor ReadExecutor {
             try await withCheckedThrowingContinuation { continuation in
                 state.install(continuation)
                 Task { [weak self] in
+                    self?.beforeAsyncOperationStart?()
                     if state.beginPhysicalWork() {
                         do {
                             state.finish(.success(try await operation()))
