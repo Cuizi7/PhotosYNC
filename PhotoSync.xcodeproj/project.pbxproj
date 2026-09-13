@@ -34,6 +34,8 @@
 		000000000000000000000027 /* Photos.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000304 /* Photos.framework */; };
 		000000000000000000000029 = {isa = PBXBuildFile; fileRef = 000000000000000000000116; };
 		000000000000000000000028 = {isa = PBXBuildFile; fileRef = 000000000000000000000115; };
+		000000000000000000000030 = {isa = PBXBuildFile; fileRef = 000000000000000000000117; };
+		000000000000000000000031 = {isa = PBXBuildFile; fileRef = 000000000000000000000118; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -74,6 +76,8 @@
 		000000000000000000000304 /* Photos.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Photos.framework; path = System/Library/Frameworks/Photos.framework; sourceTree = SDKROOT; };
 		000000000000000000000116 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineTests.swift; sourceTree = "<group>"; };
 		000000000000000000000115 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncEngine.swift; sourceTree = "<group>"; };
+		000000000000000000000117 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanSchedule.swift; sourceTree = "<group>"; };
+		000000000000000000000118 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScheduleTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -90,14 +94,14 @@
 		000000000000000000000505 = {isa = PBXGroup; children = (000000000000000000000301 /* SQLite3.tbd */, 000000000000000000000302 /* ImageIO.framework */, 000000000000000000000303 /* AVFoundation.framework */, 000000000000000000000304 /* Photos.framework */,); name = Frameworks; sourceTree = "<group>"; };
 		000000000000000000000506 = {isa = PBXGroup; children = (000000000000000000000101 /* PhotoSyncApp.swift */,); path = PhotoSyncApp; sourceTree = "<group>"; };
 		000000000000000000000507 = {isa = PBXGroup; children = (000000000000000000000509 /* Domain */, 000000000000000000000510 /* Matching */, 000000000000000000000511 /* Storage */, 000000000000000000000512 /* Sources */, 000000000000000000000513 /* Logging */, 000000000000000000000514 /* Photos */, 000000000000000000000515 /* Sync */,); path = PhotoSyncCore; sourceTree = "<group>"; };
-		000000000000000000000508 = {isa = PBXGroup; children = (000000000000000000000104 /* DuplicatePolicyTests.swift */, 000000000000000000000105 /* TestSupport.swift */, 00000000000000000000010A /* StoreTests.swift */, 00000000000000000000010F /* SourceReaderTests.swift */, 000000000000000000000110 /* RecoveryTests.swift */, 000000000000000000000111 /* PhotoKitContractTests.swift */, 000000000000000000000116,); path = PhotoSyncCoreTests; sourceTree = "<group>"; };
+		000000000000000000000508 = {isa = PBXGroup; children = (000000000000000000000104 /* DuplicatePolicyTests.swift */, 000000000000000000000105 /* TestSupport.swift */, 00000000000000000000010A /* StoreTests.swift */, 00000000000000000000010F /* SourceReaderTests.swift */, 000000000000000000000110 /* RecoveryTests.swift */, 000000000000000000000111 /* PhotoKitContractTests.swift */, 000000000000000000000116, 000000000000000000000118 /* ScheduleTests.swift */,); path = PhotoSyncCoreTests; sourceTree = "<group>"; };
 		000000000000000000000509 = {isa = PBXGroup; children = (000000000000000000000102 /* MediaRecord.swift */,); path = Domain; sourceTree = "<group>"; };
 		000000000000000000000510 = {isa = PBXGroup; children = (000000000000000000000103 /* DuplicatePolicy.swift */,); path = Matching; sourceTree = "<group>"; };
 		000000000000000000000511 = {isa = PBXGroup; children = (000000000000000000000107 /* SyncStore.swift */, 00000000000000000000010B /* Schema.sql */,); path = Storage; sourceTree = "<group>"; };
 		000000000000000000000512 = {isa = PBXGroup; children = (000000000000000000000108 /* SourceRegistry.swift */, 00000000000000000000010C /* DirectoryReader.swift */, 00000000000000000000010D /* MetadataReader.swift */, 00000000000000000000010E /* ReadExecutor.swift */,); path = Sources; sourceTree = "<group>"; };
 		000000000000000000000513 = {isa = PBXGroup; children = (000000000000000000000109 /* RunLogger.swift */,); path = Logging; sourceTree = "<group>"; };
 		000000000000000000000514 = {isa = PBXGroup; children = (000000000000000000000112 /* PhotosGateway.swift */, 000000000000000000000114 /* PhotoKitGateway.swift */,); path = Photos; sourceTree = "<group>"; };
-		000000000000000000000515 = {isa = PBXGroup; children = (000000000000000000000113 /* ImportRecovery.swift */, 000000000000000000000115,); path = Sync; sourceTree = "<group>"; };
+		000000000000000000000515 = {isa = PBXGroup; children = (000000000000000000000113 /* ImportRecovery.swift */, 000000000000000000000115, 000000000000000000000117 /* ScanSchedule.swift */,); path = Sync; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -112,8 +116,8 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		000000000000000000000801 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000001 /* PhotoSyncApp.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
-		000000000000000000000803 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000002 /* MediaRecord.swift in Sources */, 000000000000000000000003 /* DuplicatePolicy.swift in Sources */, 000000000000000000000012 /* SyncStore.swift in Sources */, 000000000000000000000013 /* SourceRegistry.swift in Sources */, 000000000000000000000014 /* RunLogger.swift in Sources */, 000000000000000000000016 /* DirectoryReader.swift in Sources */, 000000000000000000000017 /* MetadataReader.swift in Sources */, 000000000000000000000018 /* ReadExecutor.swift in Sources */, 000000000000000000000024 /* PhotosGateway.swift in Sources */, 000000000000000000000025 /* ImportRecovery.swift in Sources */, 000000000000000000000028, 000000000000000000000026 /* PhotoKitGateway.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
-		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000015 /* StoreTests.swift in Sources */, 000000000000000000000019 /* SourceReaderTests.swift in Sources */, 000000000000000000000022 /* RecoveryTests.swift in Sources */, 000000000000000000000023 /* PhotoKitContractTests.swift in Sources */, 000000000000000000000029,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000803 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000002 /* MediaRecord.swift in Sources */, 000000000000000000000003 /* DuplicatePolicy.swift in Sources */, 000000000000000000000012 /* SyncStore.swift in Sources */, 000000000000000000000013 /* SourceRegistry.swift in Sources */, 000000000000000000000014 /* RunLogger.swift in Sources */, 000000000000000000000016 /* DirectoryReader.swift in Sources */, 000000000000000000000017 /* MetadataReader.swift in Sources */, 000000000000000000000018 /* ReadExecutor.swift in Sources */, 000000000000000000000024 /* PhotosGateway.swift in Sources */, 000000000000000000000025 /* ImportRecovery.swift in Sources */, 000000000000000000000028, 000000000000000000000026 /* PhotoKitGateway.swift in Sources */, 000000000000000000000030 /* ScanSchedule.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000015 /* StoreTests.swift in Sources */, 000000000000000000000019 /* SourceReaderTests.swift in Sources */, 000000000000000000000022 /* RecoveryTests.swift in Sources */, 000000000000000000000023 /* PhotoKitContractTests.swift in Sources */, 000000000000000000000029, 000000000000000000000031 /* ScheduleTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */

@@ -3,6 +3,22 @@ import PhotoSyncCore
 import SQLite3
 
 final class StoreTests: XCTestCase {
+    func testSuccessfulRetryResetsFailureCount() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("store.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let file = source(sourceID: sourceID, root: root)
+        let id = try await store.save(file, decision: .importNew)
+        let failedAttempt = UUID()
+        try await store.beginAttempt(fileID: id, attemptID: failedAttempt)
+        try await store.recordRetry(fileID: id, attemptID: failedAttempt, nextRetry: Date(), error: "temporary", definitelyNotCommitted: true)
+        let successfulAttempt = UUID()
+        try await store.beginAttempt(fileID: id, attemptID: successfulAttempt)
+        try await store.markImported(fileID: id, attemptID: successfulAttempt, identifier: "asset")
+
+        let stored = try await store.file(sourceID: sourceID, relativePath: "a.jpg")
+        XCTAssertEqual(stored?.retryCount, 0)
+    }
     private var roots: [URL] = []
 
     override func tearDownWithError() throws {

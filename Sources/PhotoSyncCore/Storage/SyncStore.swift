@@ -8,6 +8,7 @@ public struct StoredFile: Sendable {
     public let attemptID: UUID?
     public let placeholderID: String?
     public let successID: String?
+    public let retryCount: Int
     public let nextRetryAt: Date?
 }
 
@@ -128,7 +129,7 @@ public final class SyncStore: @unchecked Sendable {
 
     public func markImported(fileID: UUID, attemptID: UUID, identifier: String) async throws {
         try await perform {
-            try self.requireChange("UPDATE file_record SET state = 'imported', success_id = ?, success_metadata_json = metadata_json, succeeded_at = ?, attempt_id = NULL, placeholder_id = NULL, next_retry_at = NULL, last_error = NULL WHERE id = ? AND state = 'importing' AND attempt_id = ?", [.text(identifier), .double(Date().timeIntervalSince1970), .text(fileID.uuidString), .text(attemptID.uuidString)])
+            try self.requireChange("UPDATE file_record SET state = 'imported', success_id = ?, success_metadata_json = metadata_json, succeeded_at = ?, attempt_id = NULL, placeholder_id = NULL, retry_count = 0, next_retry_at = NULL, last_error = NULL WHERE id = ? AND state = 'importing' AND attempt_id = ?", [.text(identifier), .double(Date().timeIntervalSince1970), .text(fileID.uuidString), .text(attemptID.uuidString)])
         }
     }
 
@@ -341,11 +342,11 @@ public final class SyncStore: @unchecked Sendable {
         return sqlite3_errcode(database) == SQLITE_CONSTRAINT ? .constraint(message) : .sqlite(message)
     }
 
-    private static let fileColumns = "file_record.id, file_record.source_id, relative_path, source.path, size, modified_ns, metadata_json, state, attempt_id, placeholder_id, success_id, next_retry_at"
+    private static let fileColumns = "file_record.id, file_record.source_id, relative_path, source.path, size, modified_ns, metadata_json, state, attempt_id, placeholder_id, success_id, retry_count, next_retry_at"
     private func storedFile(_ sql: String, _ bindings: [Binding]) throws -> StoredFile? { try one(sql, bindings).map(decodeStoredFile) }
     private func decodeStoredFile(_ row: [Value]) throws -> StoredFile {
         let metadata = try decode(MediaMetadata.self, from: try text(row[6]))
-        return StoredFile(id: try uuid(row[0]), file: SourceFile(sourceID: try uuid(row[1]), relativePath: try text(row[2]), url: URL(fileURLWithPath: try text(row[3])).appendingPathComponent(try text(row[2])), stamp: FileStamp(size: try int64(row[4]), modifiedNanoseconds: try int64(row[5])), metadata: metadata), state: try fileState(row[7]), attemptID: optionalUUID(row[8]), placeholderID: optionalText(row[9]), successID: optionalText(row[10]), nextRetryAt: optionalDouble(row[11]).map(Date.init(timeIntervalSince1970:)))
+        return StoredFile(id: try uuid(row[0]), file: SourceFile(sourceID: try uuid(row[1]), relativePath: try text(row[2]), url: URL(fileURLWithPath: try text(row[3])).appendingPathComponent(try text(row[2])), stamp: FileStamp(size: try int64(row[4]), modifiedNanoseconds: try int64(row[5])), metadata: metadata), state: try fileState(row[7]), attemptID: optionalUUID(row[8]), placeholderID: optionalText(row[9]), successID: optionalText(row[10]), retryCount: Int(try int64(row[11])), nextRetryAt: optionalDouble(row[12]).map(Date.init(timeIntervalSince1970:)))
     }
     private func fileState(_ value: Value) throws -> FileState { guard let state = FileState(rawValue: try text(value)) else { throw SyncStoreError.sqlite("Invalid file state.") }; return state }
     private func encode<T: Encodable>(_ value: T) throws -> String { String(decoding: try encoder.encode(value), as: UTF8.self) }
