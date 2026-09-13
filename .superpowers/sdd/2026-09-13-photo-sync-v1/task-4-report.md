@@ -28,7 +28,7 @@ xcodebuild build-for-testing -project PhotoSync.xcodeproj -scheme PhotoSync \
 xcrun xctest work/DerivedData-task4/Build/Products/Debug/PhotoSyncCoreTests.xctest
 ```
 
-The build reported `** TEST BUILD SUCCEEDED **`. The direct XCTest bundle ran 50 tests with 0 failures, including the 3 recovery tests and 8 PhotoKit lifecycle/contract tests.
+The build reported `** TEST BUILD SUCCEEDED **`. The direct XCTest bundle ran 51 tests with 0 failures, including the 3 recovery tests and 9 PhotoKit lifecycle/contract tests.
 
 ## Self-review
 
@@ -37,6 +37,7 @@ The build reported `** TEST BUILD SUCCEEDED **`. The direct XCTest bundle ran 50
 - The gateway returns a target identifier only after the PhotoKit change callback succeeds; a later missing fetch is health evidence, not a negative proof.
 - The lifecycle seam keeps static PhotoKit calls in one system adapter and drives the production gateway with an in-memory mock for copy option, checkpoint order/failure, failed completion, post-commit health loss, and library-change races.
 - Tests instantiate only the lifecycle-injected adapter and never access a Photos library. There was no personal-library authorization, source-media mutation, or PhotoKit write during this task.
+- The system lifecycle preserves a checkpoint-failure result even when `performChanges` subsequently throws; the combined mock regression keeps that outcome unknown and blocks further additions.
 
 ## Remaining Acceptance Gap
 

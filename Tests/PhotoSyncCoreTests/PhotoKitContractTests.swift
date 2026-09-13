@@ -60,6 +60,20 @@ final class PhotoKitContractTests: XCTestCase {
         })
     }
 
+    func testCheckpointFailureWinsWhenCompletionAlsoFails() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.submitError = NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "failed completion"])
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.loadCandidates()
+
+        await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in
+            throw CheckpointError.failed
+        } }, verify: { error in
+            XCTAssertEqual(error as? PhotoKitGatewayError, .resultUnknown("The placeholder checkpoint failed."))
+        })
+        await assertThrows { try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }
+    }
+
     func testCommittedCreateReturnsIdentifierWhenFetchOrPermissionHealthFails() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         lifecycle.fetchResult = false
@@ -151,6 +165,7 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
         } catch {
             events.append("placeholder")
             events.append("completion")
+            if let submitError { throw PhotoKitSubmissionError.checkpointFailed(submitError) }
             return .checkpointFailed
         }
         if let submitError { throw submitError }

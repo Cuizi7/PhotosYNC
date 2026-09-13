@@ -15,6 +15,10 @@ enum PhotoKitSubmissionResult: Sendable {
     case preventedBeforeMutation
 }
 
+enum PhotoKitSubmissionError: Error {
+    case checkpointFailed(Error)
+}
+
 protocol PhotoKitLifecycle: Sendable {
     func currentAccess() -> PhotoKitAccess
     func requestReadWriteAuthorization() async -> PhotoKitAccess
@@ -86,6 +90,10 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
                 onPlaceholder: onPlaceholder
             )
         } catch {
+            if case .checkpointFailed = error as? PhotoKitSubmissionError {
+                state.blockAdditions()
+                throw PhotoKitGatewayError.resultUnknown("The placeholder checkpoint failed.")
+            }
             throw classifyChangeFailure(error)
         }
 
@@ -203,15 +211,20 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     }
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         let state = SubmissionState()
-        try await photoLibrary.performChanges {
-            guard beforeMutation() else { state.prevent(); return }
-            let options = PHAssetResourceCreationOptions()
-            options.shouldMoveFile = command.shouldMoveFile
-            let request = PHAssetCreationRequest.forAsset()
-            request.addResource(with: command.kind == .image ? .photo : .video, fileURL: command.fileURL, options: options)
-            guard let identifier = request.placeholderForCreatedAsset?.localIdentifier else { state.checkpointFailed(); return }
-            do { try onPlaceholder(identifier); state.commit(identifier: identifier) }
-            catch { state.checkpointFailed() }
+        do {
+            try await photoLibrary.performChanges {
+                guard beforeMutation() else { state.prevent(); return }
+                let options = PHAssetResourceCreationOptions()
+                options.shouldMoveFile = command.shouldMoveFile
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: command.kind == .image ? .photo : .video, fileURL: command.fileURL, options: options)
+                guard let identifier = request.placeholderForCreatedAsset?.localIdentifier else { state.checkpointFailed(); return }
+                do { try onPlaceholder(identifier); state.commit(identifier: identifier) }
+                catch { state.checkpointFailed() }
+            }
+        } catch {
+            if state.isCheckpointFailed { throw PhotoKitSubmissionError.checkpointFailed(error) }
+            throw error
         }
         return state.result()
     }
@@ -229,6 +242,7 @@ private final class SubmissionState: @unchecked Sendable {
     func checkpointFailed() { lock.lock(); value = .checkpointFailed; lock.unlock() }
     func commit(identifier: String) { lock.lock(); value = .committed(identifier: identifier); lock.unlock() }
     func result() -> PhotoKitSubmissionResult { lock.lock(); defer { lock.unlock() }; return value }
+    var isCheckpointFailed: Bool { lock.lock(); defer { lock.unlock() }; if case .checkpointFailed = value { return true }; return false }
 }
 
 private final class PhotoKitState: @unchecked Sendable {
