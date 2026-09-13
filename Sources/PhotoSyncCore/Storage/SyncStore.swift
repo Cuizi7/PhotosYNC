@@ -75,7 +75,7 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    public func save(_ file: SourceFile, decision: MatchDecision) async throws -> UUID {
+    public func save(_ file: SourceFile, decision: MatchDecision, candidates: [MatchCandidate] = []) async throws -> UUID {
         try await perform {
             try self.transaction {
                 let id = UUID()
@@ -85,7 +85,10 @@ public final class SyncStore: @unchecked Sendable {
                     VALUES (?, (SELECT COALESCE(MAX(created_order), 0) + 1 FROM file_record), ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """, [.text(id.uuidString), .text(file.sourceID.uuidString), .text(file.relativePath), .text(file.metadata.filename), .int64(file.stamp.size), .int64(file.stamp.modifiedNanoseconds), .text(metadata), .int64(Int64(self.ruleVersion))])
                 if case .skip(let keys) = decision {
-                    try self.markSkippedSync(fileID: id, reason: .suspectedDuplicate, candidates: keys.map { MatchCandidate(key: $0, metadata: file.metadata) })
+                    guard Set(keys) == Set(candidates.map(\.key)), keys.count == candidates.count else {
+                        throw SyncStoreError.invalidTransition("Skipped files require the complete compared candidate snapshots.")
+                    }
+                    try self.markSkippedSync(fileID: id, reason: .suspectedDuplicate, candidates: candidates)
                 }
                 return id
             }
@@ -166,9 +169,18 @@ public final class SyncStore: @unchecked Sendable {
 
     public func recordRetry(fileID: UUID, attemptID: UUID?, nextRetry: Date, error: String, definitelyNotCommitted: Bool) async throws {
         try await perform {
-            var sql = "UPDATE file_record SET state = 'pending', attempt_id = NULL, placeholder_id = NULL, retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, definitely_not_committed = ? WHERE id = ?"
+            let sql: String
             var bindings: [Binding] = [.double(nextRetry.timeIntervalSince1970), .text(error), .int64(definitelyNotCommitted ? 1 : 0), .text(fileID.uuidString)]
-            if let attemptID { sql += " AND state = 'importing' AND attempt_id = ?"; bindings.append(.text(attemptID.uuidString)) }
+            if let attemptID {
+                if definitelyNotCommitted {
+                    sql = "UPDATE file_record SET state = 'pending', attempt_id = NULL, placeholder_id = NULL, retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, definitely_not_committed = ? WHERE id = ? AND state = 'importing' AND attempt_id = ?"
+                } else {
+                    sql = "UPDATE file_record SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, definitely_not_committed = ? WHERE id = ? AND state = 'importing' AND attempt_id = ?"
+                }
+                bindings.append(.text(attemptID.uuidString))
+            } else {
+                sql = "UPDATE file_record SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, definitely_not_committed = ? WHERE id = ? AND state = 'pending'"
+            }
             try self.requireChange(sql, bindings)
         }
     }

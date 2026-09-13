@@ -139,6 +139,93 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(state, .pending)
     }
 
+    func testSaveSkipPersistsActualCandidateSnapshots() async throws {
+        let root = try makeRoot()
+        let database = root.appendingPathComponent("state.sqlite")
+        let store = try SyncStore(url: database)
+        let sourceID = try await store.registerSource(url: root)
+        let candidate = MatchCandidate(key: "photos:1", metadata: media("existing.jpg", second: 20, make: "Canon", model: "R5"))
+
+        let id = try await store.save(source(sourceID: sourceID, root: root), decision: .skip(candidateKeys: [candidate.key]), candidates: [candidate])
+
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(handle, "SELECT candidate_json FROM match_evidence WHERE file_id = ?", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_bind_text(statement, 1, id.uuidString, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let stored = try JSONDecoder().decode(MatchCandidate.self, from: Data(String(cString: sqlite3_column_text(statement, 0)).utf8))
+        XCTAssertEqual(stored, candidate)
+    }
+
+    func testUncertainRetryKeepsAttemptAndPlaceholderImporting() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let id = try await store.save(source(sourceID: sourceID, root: root), decision: .importNew)
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: id, attemptID: attempt)
+        try store.checkpointPlaceholder(fileID: id, attemptID: attempt, identifier: "placeholder")
+
+        try await store.recordRetry(fileID: id, attemptID: attempt, nextRetry: Date(), error: "unknown", definitelyNotCommitted: false)
+
+        let maybeStored = try await store.file(sourceID: sourceID, relativePath: "a.jpg")
+        let stored = try XCTUnwrap(maybeStored)
+        XCTAssertEqual(stored.state, .importing)
+        XCTAssertEqual(stored.attemptID, attempt)
+        XCTAssertEqual(stored.placeholderID, "placeholder")
+    }
+
+    func testRetryRejectsNilOrOldAttemptAgainstImportingAndImportedRecords() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let id = try await store.save(source(sourceID: sourceID, root: root), decision: .importNew)
+        let first = UUID()
+        try await store.beginAttempt(fileID: id, attemptID: first)
+        await XCTAssertThrowsErrorAsync(try await store.recordRetry(fileID: id, attemptID: nil, nextRetry: Date(), error: "late", definitelyNotCommitted: true))
+        await XCTAssertThrowsErrorAsync(try await store.recordRetry(fileID: id, attemptID: UUID(), nextRetry: Date(), error: "old", definitelyNotCommitted: true))
+        try await store.markImported(fileID: id, attemptID: first, identifier: "asset")
+        await XCTAssertThrowsErrorAsync(try await store.recordRetry(fileID: id, attemptID: nil, nextRetry: Date(), error: "late", definitelyNotCommitted: true))
+        let finalState = try await store.state(of: id)
+        XCTAssertEqual(finalState, .imported)
+    }
+
+    func testOldRetryCannotResetNewAttempt() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let id = try await store.save(source(sourceID: sourceID, root: root), decision: .importNew)
+        let oldAttempt = UUID()
+        let newAttempt = UUID()
+        try await store.beginAttempt(fileID: id, attemptID: oldAttempt)
+        try await store.recordRetry(fileID: id, attemptID: oldAttempt, nextRetry: Date(), error: "definite", definitelyNotCommitted: true)
+        try await store.beginAttempt(fileID: id, attemptID: newAttempt)
+
+        await XCTAssertThrowsErrorAsync(try await store.recordRetry(fileID: id, attemptID: oldAttempt, nextRetry: Date(), error: "late", definitelyNotCommitted: true))
+        let maybeStored = try await store.file(sourceID: sourceID, relativePath: "a.jpg")
+        let stored = try XCTUnwrap(maybeStored)
+        XCTAssertEqual(stored.state, .importing)
+        XCTAssertEqual(stored.attemptID, newAttempt)
+    }
+
+    func testSourceRegistrationRejectsFilesAndLinks() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let directory = root.appendingPathComponent("photos")
+        let file = root.appendingPathComponent("not-a-directory")
+        let link = root.appendingPathComponent("photos-link")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: file.path, contents: Data())
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: directory)
+
+        _ = try await store.registerSource(url: directory)
+        await XCTAssertThrowsErrorAsync(try await store.registerSource(url: file))
+        await XCTAssertThrowsErrorAsync(try await store.registerSource(url: link))
+    }
+
     func testFutureSchemaIsRejectedWithoutReplacingDatabase() throws {
         let root = try makeRoot()
         let database = root.appendingPathComponent("state.sqlite")
