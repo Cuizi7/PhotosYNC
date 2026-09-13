@@ -6,7 +6,8 @@
 - Added `PhotoKitGateway`, which requests read-write access, verifies library availability and authorization before every query or write, and requires a complete candidate load for the current library generation before creating an asset.
 - Candidate enumeration includes hidden and burst assets and emits candidates from public `PHAssetResource.originalFilename` values. It does not read Photos.sqlite, use private APIs, read device metadata through KVC, or download iCloud originals. Existing Photos metadata leaves unknown capture time/offset and device fields as nil.
 - The only write path uses `PHPhotoLibrary.performChanges`, `PHAssetCreationRequest.forAsset()`, a photo/video resource, and `shouldMoveFile = false`. It creates no albums and contains no delete or edit request.
-- Placeholder persistence is synchronous inside the change block through the gateway callback. A checkpoint error, missing placeholder, absent confirmation fetch, or lost/unknown result returns `resultUnknown` and blocks additional writes in that gateway process. A single missing reconciliation fetch remains `unknown`; it never proves non-commit.
+- Placeholder persistence is synchronous inside the change block through the gateway callback. A checkpoint error returns `resultUnknown` and blocks additional writes in that gateway process. A successful system completion returns its identifier even if later fetch, availability, or authorization health checks fail; those checks block the next addition without erasing confirmed success. A single missing reconciliation fetch remains `unknown`; it never proves non-commit.
+- The unknown-outcome block is intentionally released only by coordinator recreation after all outstanding attempts have been reconciled, never by an unrelated successful fetch.
 - Added the app Photos usage description, contract/recovery unit tests, and `Design/Validation.md` with a test-account-only manual procedure. Real import acceptance is not executed.
 
 ## RED
@@ -27,14 +28,15 @@ xcodebuild build-for-testing -project PhotoSync.xcodeproj -scheme PhotoSync \
 xcrun xctest work/DerivedData-task4/Build/Products/Debug/PhotoSyncCoreTests.xctest
 ```
 
-The build reported `** TEST BUILD SUCCEEDED **`. The direct XCTest bundle ran 44 tests with 0 failures, including the 3 recovery tests and 2 PhotoKit contract tests.
+The build reported `** TEST BUILD SUCCEEDED **`. The direct XCTest bundle ran 50 tests with 0 failures, including the 3 recovery tests and 8 PhotoKit lifecycle/contract tests.
 
 ## Self-review
 
 - `git diff --check` passed.
 - `PhotoKitGateway.swift` uses only public Photos APIs and never calls a Photos resource manager, so it cannot trigger full original downloads.
-- The gateway returns a target identifier only after the PhotoKit change callback succeeds and a fetch finds exactly that identifier. It does not treat a missing fetch as a negative proof.
-- Tests do not instantiate the gateway or access a Photos library. There was no personal-library authorization, source-media mutation, or PhotoKit write during this task.
+- The gateway returns a target identifier only after the PhotoKit change callback succeeds; a later missing fetch is health evidence, not a negative proof.
+- The lifecycle seam keeps static PhotoKit calls in one system adapter and drives the production gateway with an in-memory mock for copy option, checkpoint order/failure, failed completion, post-commit health loss, and library-change races.
+- Tests instantiate only the lifecycle-injected adapter and never access a Photos library. There was no personal-library authorization, source-media mutation, or PhotoKit write during this task.
 
 ## Remaining Acceptance Gap
 
