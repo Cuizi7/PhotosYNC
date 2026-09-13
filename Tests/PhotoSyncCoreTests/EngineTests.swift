@@ -215,4 +215,45 @@ final class EngineTests: XCTestCase {
         let total = await f.photos.createCount
         XCTAssertEqual(total, 2)
     }
+
+    func testStorageFailureDuringSubmissionStampBlocksDispatch() async throws {
+        let f = try await makeEngineFixture()
+        let submitGate = EngineTestGate(), sourceGate = EngineTestGate()
+        let healthyID = f.sourceIDs[0], failingID = f.sourceIDs[1]
+        let reader = SubmissionStampReader(sourceID: healthyID, gate: submitGate)
+        try injectEngineSQL("CREATE TRIGGER fail_second_source BEFORE INSERT ON file_record WHEN NEW.source_id = '\(failingID.uuidString)' BEGIN SELECT RAISE(FAIL, 'injected other source failure'); END", at: f.databaseURL)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { id in
+            if id == healthyID { return reader }
+            return GatedDirectoryReader(reader: DirectoryReader(sourceID: id), gate: sourceGate)
+        })
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let held = await engineEventually { await submitGate.entered }
+        XCTAssertTrue(held)
+        await sourceGate.release()
+        let stopped = await engineEventually { await engine.snapshot().blockingError != nil }
+        XCTAssertTrue(stopped)
+        await submitGate.release()
+        await scan.value
+        let count = await f.photos.createCount
+        XCTAssertEqual(count, 0)
+        let record = try await f.store.file(sourceID: healthyID, relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .pending)
+    }
+
+    func testSubmissionStampFailurePersistsRetryAndScanJournal() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], failSubmissionStamp: true)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .pending)
+        XCTAssertNotNil(record?.nextRetryAt)
+        let failed = await engine.snapshot().failed
+        XCTAssertEqual(failed, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT SUM(failed) FROM scan_run", at: f.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run WHERE complete = 0 AND last_error IS NOT NULL", at: f.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT retry_count FROM file_record", at: f.databaseURL), 1)
+        let count = await f.photos.createCount
+        XCTAssertEqual(count, 0)
+    }
 }

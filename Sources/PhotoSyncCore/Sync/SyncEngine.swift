@@ -32,6 +32,8 @@ public actor SyncEngine {
     private var uncertainSubmissions: Set<UUID> = []
     private var indexed: [MatchCandidate] = []
     private var eligibleSources: Set<UUID> = []
+    private var disabledSources: Set<UUID> = []
+    private var scanRuns: [UUID: UUID] = [:]
 
     public init(store: SyncStore, photos: any PhotosGateway,
                 directory: @escaping DirectoryFactory = { DirectoryReader(sourceID: $0) },
@@ -42,8 +44,16 @@ public actor SyncEngine {
     }
 
     public func sources() async throws -> [RegisteredSource] { try await store.sources() }
-    public func addSource(url: URL) async throws -> UUID { try await store.registerSource(url: url) }
-    public func disableSource(id: UUID) async throws { try await store.disableSource(id: id) }
+    public func addSource(url: URL) async throws -> UUID {
+        let id = try await store.registerSource(url: url)
+        disabledSources.remove(id)
+        return id
+    }
+    public func disableSource(id: UUID) async throws {
+        // Admission closes before the durable update suspends this actor.
+        disabledSources.insert(id)
+        try await store.disableSource(id: id)
+    }
     public func pause() async { status.isPaused = true }
     public func resume() async { status.isPaused = false; await scanEnabledSources() }
     public func snapshot() async -> EngineSnapshot {
@@ -113,6 +123,7 @@ public actor SyncEngine {
             let source = try await store.source(id: sourceID)
             guard source.enabled, !status.isPaused else { return }
             run = try await store.beginScan(sourceID: sourceID, now: Date())
+            scanRuns[sourceID] = run
             let reader = directory(sourceID)
             let metadataReader = metadata(sourceID)
             var directories: [(url: URL, relative: String)] = [(source.url, "")]
@@ -181,21 +192,39 @@ public actor SyncEngine {
                         status.skipped += 1; continue
                     }
                 } catch let error as SyncStoreError { throw error }
-                catch { status.waitingSources[record.file.sourceID] = error.localizedDescription; continue }
+                catch {
+                    let message = error.localizedDescription
+                    status.waitingSources[record.file.sourceID] = message
+                    status.failed += 1
+                    logger?.log(["source": record.file.sourceID.uuidString, "path": record.file.url.path, "error": message, "phase": "submission-stamp"])
+                    try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: Date().addingTimeInterval(60), error: message, definitelyNotCommitted: true)
+                    if let run = scanRuns[record.file.sourceID] { try await store.recordScanFailure(runID: run, error: message) }
+                    continue
+                }
+                guard canSubmit(sourceID: record.file.sourceID) else { break }
                 do { indexed = try await photos.loadCandidates() }
                 catch { status.blockingError = error.localizedDescription; break }
                 let local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
+                guard canSubmit(sourceID: record.file.sourceID) else { break }
                 let candidates = indexed + local
                 let decision = policy.evaluate(record.file.metadata, candidates: candidates)
                 if case .skip = decision {
                     try await store.markSkipped(fileID: record.id, reason: .suspectedDuplicate, candidates: matchingCandidates(decision, candidates: candidates))
                     status.skipped += 1; continue
                 }
-                guard !status.isPaused else { break }
+                guard canSubmit(sourceID: record.file.sourceID) else { break }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
+                guard canSubmit(sourceID: record.file.sourceID) else { break }
                 let attempt = UUID()
-                try await store.beginAttempt(fileID: record.id, attemptID: attempt)
                 activeAttempt = attempt
+                try await store.beginAttempt(fileID: record.id, attemptID: attempt)
+                let enabled = try await store.source(id: record.file.sourceID).enabled
+                guard enabled, canSubmit(sourceID: record.file.sourceID) else {
+                    // A durable attempt exists, but no Photos request has been dispatched.
+                    try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: Date(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
+                    activeAttempt = nil
+                    break
+                }
                 do {
                     let store = self.store
                     let id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind) { identifier in
@@ -220,8 +249,12 @@ public actor SyncEngine {
                 }
                 activeAttempt = nil
             }
-        } catch { stopStorage(error) }
+        } catch { activeAttempt = nil; stopStorage(error) }
         await updatePending()
+    }
+
+    private func canSubmit(sourceID: UUID) -> Bool {
+        !status.isPaused && !storageFailed && status.blockingError == nil && uncertainSubmissions.isEmpty && !disabledSources.contains(sourceID)
     }
 
     private func allFiles(_ state: FileState) async throws -> [StoredFile] {

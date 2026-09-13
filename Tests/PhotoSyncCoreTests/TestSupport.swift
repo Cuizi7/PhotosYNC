@@ -187,3 +187,33 @@ func engineEventually(_ condition: () async throws -> Bool) async rethrows -> Bo
     }
     return false
 }
+
+actor SubmissionStampReader: DirectoryReading {
+    let reader: DirectoryReader
+    let gate: EngineTestGate?
+    let failSubmissionStamp: Bool
+    private var stamps = 0
+    init(sourceID: UUID, gate: EngineTestGate? = nil, failSubmissionStamp: Bool = false) {
+        reader = DirectoryReader(sourceID: sourceID)
+        self.gate = gate; self.failSubmissionStamp = failSubmissionStamp
+    }
+    func entries(in directory: URL) async throws -> [DirectoryEntry] { try await reader.entries(in: directory) }
+    func stamp(of file: URL) async throws -> FileStamp {
+        stamps += 1
+        if stamps > 1 {
+            if let gate { await gate.wait() }
+            if failSubmissionStamp { throw FixtureError.unavailable("submission stat unavailable") }
+        }
+        return try await reader.stamp(of: file)
+    }
+}
+
+func engineSQLInteger(_ sql: String, at url: URL) throws -> Int {
+    var db: OpaquePointer?, statement: OpaquePointer?
+    guard sqlite3_open(url.path, &db) == SQLITE_OK else { throw FixtureError.unavailable("sqlite open") }
+    defer { sqlite3_finalize(statement); sqlite3_close(db) }
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, sqlite3_step(statement) == SQLITE_ROW else {
+        throw FixtureError.unavailable("sqlite query")
+    }
+    return Int(sqlite3_column_int64(statement, 0))
+}
