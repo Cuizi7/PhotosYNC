@@ -69,4 +69,24 @@ final class ScheduleTests: XCTestCase {
         XCTAssertEqual(retryDelay(failureCount: 4), 60)
         XCTAssertEqual(retryDelay(failureCount: 99), 60)
     }
+
+    func testSourceRecoveryTracksIndependentBackoffDeadlines() {
+        var schedule = ScanSchedule()
+        let start = Date(timeIntervalSince1970: 0)
+        let first = UUID(), second = UUID()
+
+        XCTAssertEqual(schedule.recordSourceFailure(first, now: start), start.addingTimeInterval(5))
+        XCTAssertEqual(schedule.recordSourceFailure(second, now: start), start.addingTimeInterval(5))
+        XCTAssertEqual(Set(schedule.dueRecoverySources(now: start.addingTimeInterval(5))), Set([first, second]))
+        XCTAssertFalse(schedule.requestRecovery(now: start.addingTimeInterval(4)))
+        XCTAssertTrue(schedule.requestRecovery(now: start.addingTimeInterval(5)))
+        schedule.finished(now: start.addingTimeInterval(6))
+
+        schedule.recordSourceRecovered(second)
+        XCTAssertEqual(schedule.recordSourceFailure(first, now: start.addingTimeInterval(6)), start.addingTimeInterval(21))
+        XCTAssertEqual(schedule.nextRecoveryAt, start.addingTimeInterval(21))
+        XCTAssertEqual(schedule.recordSourceFailure(first, now: start.addingTimeInterval(21)), start.addingTimeInterval(51))
+        XCTAssertEqual(schedule.recordSourceFailure(first, now: start.addingTimeInterval(51)), start.addingTimeInterval(111))
+        XCTAssertEqual(schedule.nextRecoveryAt, start.addingTimeInterval(65))
+    }
 }

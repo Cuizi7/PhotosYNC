@@ -6,8 +6,11 @@ public struct ScanSchedule: Sendable {
     private var running = false
     private var paused = false
     private var lastObservedAt: Date?
-    private var nextRecoveryAt: Date?
+    private var recoveryPollAt: Date?
+    private var sourceFailures: [UUID: Int] = [:]
+    private var sourceRetryAt: [UUID: Date] = [:]
     public private(set) var nextScanAt: Date?
+    public private(set) var nextRecoveryAt: Date?
 
     public init() {}
 
@@ -55,18 +58,46 @@ public struct ScanSchedule: Sendable {
         observeClock(now)
         guard !paused else { return false }
         guard nextRecoveryAt == nil || now >= nextRecoveryAt! else { return false }
-        nextRecoveryAt = now.addingTimeInterval(60)
+        recoveryPollAt = now.addingTimeInterval(60)
+        refreshRecoveryDeadline()
         guard !running else { return false }
         running = true
         return true
     }
 
+    @discardableResult
+    public mutating func recordSourceFailure(_ sourceID: UUID, now: Date) -> Date {
+        let count = (sourceFailures[sourceID] ?? 0) + 1
+        sourceFailures[sourceID] = count
+        let retryAt = now.addingTimeInterval(retryDelay(failureCount: count))
+        sourceRetryAt[sourceID] = retryAt
+        refreshRecoveryDeadline()
+        return retryAt
+    }
+
+    public mutating func recordSourceRecovered(_ sourceID: UUID) {
+        sourceFailures.removeValue(forKey: sourceID)
+        sourceRetryAt.removeValue(forKey: sourceID)
+        refreshRecoveryDeadline()
+    }
+
+    public func dueRecoverySources(now: Date) -> [UUID] {
+        sourceRetryAt.compactMap { sourceID, retryAt in retryAt <= now ? sourceID : nil }
+            .sorted { $0.uuidString < $1.uuidString }
+    }
+
     private mutating func observeClock(_ now: Date) {
         if let lastObservedAt, now < lastObservedAt {
             nextScanAt = now.addingTimeInterval(Self.interval)
-            nextRecoveryAt = now.addingTimeInterval(60)
+            recoveryPollAt = now.addingTimeInterval(60)
+            sourceRetryAt = sourceRetryAt.mapValues { _ in now.addingTimeInterval(60) }
+            refreshRecoveryDeadline()
         }
         lastObservedAt = now
+    }
+
+    private mutating func refreshRecoveryDeadline() {
+        nextRecoveryAt = (sourceRetryAt.values + [recoveryPollAt].compactMap { $0 }).min()
     }
 }
 

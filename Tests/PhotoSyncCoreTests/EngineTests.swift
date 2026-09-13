@@ -2,6 +2,79 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class EngineTests: XCTestCase {
+    func testUnknownImportDoesNotEmitRecoveredAfterSuccessfulTraversal() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let engine = SyncEngine(store: f.store, photos: f.photos, logger: logger)
+        let file = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        let id = try await f.store.save(file, decision: .importNew)
+        try await f.store.beginAttempt(fileID: id, attemptID: UUID())
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await engine.snapshot()
+        XCTAssertNotNil(snapshot.waitingSources[f.sourceIDs[0]])
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let written = await engineEventually { FileManager.default.fileExists(atPath: logURL.path) }
+        XCTAssertTrue(written)
+        let lines = try String(contentsOf: logURL).split(separator: "\n")
+        let recoveryResults = try lines.compactMap { line -> String? in
+            let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+            return object?["phase"] == "recovery" ? object?["result"] : nil
+        }
+        XCTAssertEqual(recoveryResults.filter { $0 == "waiting" }.count, 1)
+        XCTAssertFalse(recoveryResults.contains("recovered"))
+    }
+
+    func testMetadataFailureLogsSourcePathAndRun() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        try Data("bad JPEG".utf8).write(to: f.directories[0].appendingPathComponent("same.jpg"))
+        let engine = SyncEngine(store: f.store, photos: f.photos, logger: logger)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let written = await engineEventually { FileManager.default.fileExists(atPath: logURL.path) }
+        XCTAssertTrue(written)
+        let lines = try String(contentsOf: logURL).split(separator: "\n")
+        let metadata = try XCTUnwrap(lines.compactMap { line -> [String: String]? in
+            let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+            return object?["phase"] == "metadata" && object?["result"] == "failed" ? object : nil
+        }.first)
+        XCTAssertTrue(metadata["path"]?.hasSuffix("/source-0/same.jpg") == true)
+        XCTAssertEqual(metadata["source"], f.sourceIDs[0].uuidString)
+        XCTAssertNotNil(metadata["run"])
+        XCTAssertNotNil(metadata["error"])
+    }
+
+    func testDefiniteSubmissionFailureLogsFileAndAttempt() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        await f.photos.setCreationError(.definitelyNotCommitted("test failure"))
+        let engine = SyncEngine(store: f.store, photos: f.photos, logger: logger)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let written = await engineEventually { FileManager.default.fileExists(atPath: logURL.path) }
+        XCTAssertTrue(written)
+        let lines = try String(contentsOf: logURL).split(separator: "\n")
+        let submission = try XCTUnwrap(lines.compactMap { line -> [String: String]? in
+            let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+            return object?["phase"] == "submission" && object?["result"] == "failed" ? object : nil
+        }.first)
+        XCTAssertEqual(submission["source"], f.sourceIDs[0].uuidString)
+        XCTAssertNotNil(submission["run"])
+        XCTAssertNotNil(submission["file"])
+        XCTAssertNotNil(submission["attempt"])
+        XCTAssertNotNil(submission["error"])
+    }
+
     func testTwoSourcesSubmitOnlyOnce() async throws {
         let f = try await makeEngineFixture()
         await f.engine.scan(sourceIDs: f.sourceIDs)
@@ -273,8 +346,8 @@ final class EngineTests: XCTestCase {
         let held = await engineEventually { await heldGate.entered }
         XCTAssertTrue(held)
         await readyGate.release()
-        let failureRecorded = try await engineEventually {
-            try engineSQLInteger("SELECT COALESCE(SUM(failed),0) FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL) == 1
+        let failureRecorded = await engineEventually {
+            (try? engineSQLInteger("SELECT COALESCE(SUM(failed),0) FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL)) == 1
         }
         XCTAssertTrue(failureRecorded)
         await heldGate.release()

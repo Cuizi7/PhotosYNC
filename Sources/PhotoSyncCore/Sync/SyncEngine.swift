@@ -35,6 +35,7 @@ public actor SyncEngine {
     private var disabledSources: Set<UUID> = []
     private var scanRuns: [UUID: UUID] = [:]
     private var reportedWaitingSources: Set<UUID> = []
+    private var sourceIssues: [UUID: [String: String]] = [:]
 
     public init(store: SyncStore, photos: any PhotosGateway,
                 directory: @escaping DirectoryFactory = { DirectoryReader(sourceID: $0) },
@@ -82,7 +83,7 @@ public actor SyncEngine {
         guard !scanning, !status.isPaused, !storageFailed else { return }
         scanning = true
         status.checked = 0; status.imported = 0; status.skipped = 0; status.failed = 0
-        status.waitingSources = [:]; status.blockingError = nil
+        status.blockingError = nil
         await recoverImports()
         if !uncertainSubmissions.isEmpty {
             status.blockingError = "A Photos submission from this session remains uncertain. Waiting for confirmation."
@@ -115,19 +116,17 @@ public actor SyncEngine {
                         try await store.markImported(fileID: record.id, attemptID: attempt, identifier: id)
                         uncertainSubmissions.remove(record.id)
                         status.imported += 1
-                        logSourceRecovered(record.file.sourceID, fileID: record.id, attemptID: attempt)
+                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id))
                     case .definitelyNotCommitted:
                         try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: Date(), error: "Confirmed not committed", definitelyNotCommitted: true)
                         uncertainSubmissions.remove(record.id)
-                        logSourceRecovered(record.file.sourceID, fileID: record.id, attemptID: attempt)
+                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id))
                     case .unknown:
-                        status.waitingSources[record.file.sourceID] = "An earlier Photos import is awaiting confirmation."
-                        logSourceWaiting(record.file.sourceID, fileID: record.id, attemptID: attempt, error: nil)
+                        setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: "An earlier Photos import is awaiting confirmation.", fileID: record.id, attemptID: attempt, error: nil)
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
-                    status.waitingSources[record.file.sourceID] = error.localizedDescription
-                    logSourceWaiting(record.file.sourceID, fileID: record.id, attemptID: attempt, error: error)
+                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: error.localizedDescription, fileID: record.id, attemptID: attempt, error: error)
                 }
             }
         } catch { stopStorage(error) }
@@ -145,6 +144,7 @@ public actor SyncEngine {
             let reader = directory(sourceID)
             let metadataReader = metadata(sourceID)
             var directories: [(url: URL, relative: String)] = [(source.url, "")]
+            var lastFailure: String?
             while !directories.isEmpty, !status.isPaused, !storageFailed {
                 let folder = directories.removeFirst()
                 do {
@@ -173,25 +173,25 @@ public actor SyncEngine {
                         catch let error as SyncStoreError { throw error }
                         catch {
                             failed += 1; status.failed += 1
-                            if error is ReadExecutorError {
-                                status.waitingSources[sourceID] = error.localizedDescription
-                                logSourceWaiting(sourceID, runID: run, error: error)
-                            }
-                            logEvent(phase: "metadata", result: "failed", sourceID: sourceID, runID: run, error: error)
+                            lastFailure = error.localizedDescription
+                            setSourceIssue(sourceID, key: "scan", message: error.localizedDescription, runID: run, error: error)
+                            logEvent(phase: "metadata", result: "failed", sourceID: sourceID, runID: run, path: entry.url.path, error: error)
                         }
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
                     failed += 1; status.failed += 1
-                    status.waitingSources[sourceID] = error.localizedDescription
-                    logSourceWaiting(sourceID, runID: run, error: error)
+                    lastFailure = error.localizedDescription
+                    setSourceIssue(sourceID, key: "scan", message: error.localizedDescription, runID: run, error: error)
                     logEvent(phase: "directory", result: "failed", sourceID: sourceID, runID: run, error: error)
                 }
             }
             if let run {
-                try await store.finishScan(runID: run, now: Date(), complete: failed == 0 && !status.isPaused && !storageFailed, checked: checked, failed: failed, error: status.waitingSources[sourceID])
-                if failed == 0 { logSourceRecovered(sourceID, runID: run) }
-                logEvent(phase: "scan", result: failed == 0 ? "completed" : "failed", sourceID: sourceID, runID: run)
+                let complete = failed == 0 && !status.isPaused && !storageFailed
+                try await store.finishScan(runID: run, now: Date(), complete: complete, checked: checked, failed: failed, error: lastFailure)
+                if complete { resolveSourceIssue(sourceID, key: "scan", runID: run) }
+                let result = status.isPaused ? "paused" : (complete ? "completed" : "failed")
+                logEvent(phase: "scan", result: result, sourceID: sourceID, runID: run)
             }
             startDrain()
         } catch { stopStorage(error) }
@@ -220,9 +220,8 @@ public actor SyncEngine {
                 } catch let error as SyncStoreError { throw error }
                 catch {
                     let message = error.localizedDescription
-                    status.waitingSources[record.file.sourceID] = message
                     status.failed += 1
-                    logSourceWaiting(record.file.sourceID, runID: scanRuns[record.file.sourceID], fileID: record.id, error: error)
+                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: message, runID: scanRuns[record.file.sourceID], fileID: record.id, error: error)
                     logEvent(phase: "submission-stamp", result: "failed", sourceID: record.file.sourceID, runID: scanRuns[record.file.sourceID], fileID: record.id, error: error)
                     try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)
                     if let run = scanRuns[record.file.sourceID] { try await store.recordScanFailure(runID: run, error: message) }
@@ -261,17 +260,15 @@ public actor SyncEngine {
                     try await store.markImported(fileID: record.id, attemptID: attempt, identifier: id)
                     indexed.append(MatchCandidate(key: id, metadata: record.file.metadata))
                     status.imported += 1
-                    logSourceRecovered(record.file.sourceID, runID: scanRuns[record.file.sourceID], fileID: record.id, attemptID: attempt)
+                    resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: scanRuns[record.file.sourceID], fileID: record.id, attemptID: attempt)
                     logEvent(phase: "submission", result: "imported", sourceID: record.file.sourceID, runID: scanRuns[record.file.sourceID], fileID: record.id, attemptID: attempt)
                 } catch let error as SyncStoreError { activeAttempt = nil; throw error }
                 catch {
                     let definite = (error as? PhotoKitGatewayError)?.recoveryEvidence == .definitelyNotCommitted
                     try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: nextRetry(for: record), error: error.localizedDescription, definitelyNotCommitted: definite)
                     status.failed += 1
-                    if !definite {
-                        status.waitingSources[record.file.sourceID] = error.localizedDescription
-                        logSourceWaiting(record.file.sourceID, runID: scanRuns[record.file.sourceID], fileID: record.id, attemptID: attempt, error: error)
-                    }
+                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: error.localizedDescription, runID: scanRuns[record.file.sourceID], fileID: record.id, attemptID: attempt, error: error)
+                    logEvent(phase: "submission", result: "failed", sourceID: record.file.sourceID, runID: scanRuns[record.file.sourceID], fileID: record.id, attemptID: attempt, error: error)
                     // A gateway reporting unknown may still own a physical request. Keep this
                     // instance and stop submissions until its own lifecycle permits recovery.
                     if !definite {
@@ -293,6 +290,29 @@ public actor SyncEngine {
         now.addingTimeInterval(retryDelay(failureCount: record.retryCount + 1))
     }
 
+    private func issueKey(for fileID: UUID) -> String { "file:\(fileID.uuidString)" }
+
+    private func setSourceIssue(_ sourceID: UUID, key: String, message: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+        sourceIssues[sourceID, default: [:]][key] = message
+        syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
+    }
+
+    private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
+        sourceIssues[sourceID]?.removeValue(forKey: key)
+        if sourceIssues[sourceID]?.isEmpty == true { sourceIssues.removeValue(forKey: sourceID) }
+        syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: nil)
+    }
+
+    private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+        if let message = sourceIssues[sourceID]?.values.sorted().first {
+            status.waitingSources[sourceID] = message
+            logSourceWaiting(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
+        } else {
+            status.waitingSources.removeValue(forKey: sourceID)
+            logSourceRecovered(sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
+        }
+    }
+
     private func logSourceWaiting(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
         guard reportedWaitingSources.insert(sourceID).inserted else { return }
         logEvent(phase: "recovery", result: "waiting", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
@@ -303,12 +323,13 @@ public actor SyncEngine {
         logEvent(phase: "recovery", result: "recovered", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
     }
 
-    private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error? = nil) {
+    private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, error: Error? = nil) {
         var fields = ["phase": phase, "result": result]
         if let sourceID { fields["source"] = sourceID.uuidString }
         if let runID { fields["run"] = runID.uuidString }
         if let fileID { fields["file"] = fileID.uuidString }
         if let attemptID { fields["attempt"] = attemptID.uuidString }
+        if let path { fields["path"] = path }
         if let error { fields["error"] = error.localizedDescription }
         logger?.log(fields)
     }
