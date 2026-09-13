@@ -1,5 +1,22 @@
 # PhotoKit Manual Validation
 
+## Current Validation Status (2026-09-13)
+
+| Specification acceptance case | Status | Evidence type and result |
+| --- | --- | --- |
+| 1. Conservative matching rules | Pass | Mock/unit: `DuplicatePolicyTests` covers filenames, second-level time conflicts, device conflicts, missing fields, time-zone uncertainty, and multiple candidates. |
+| 2. Multi-source duplicate submission and retained successful history | Pass | Mock/unit: `EngineTests` and `StoreTests` cover de-duplication and history retention after the target disappears. |
+| 3. Metadata failure versus missing metadata | Pass | Mock/unit: `SourceReaderTests` and `EngineTests` distinguish read failure from absent fields and rediscover later. |
+| 4. Source stamp changes | Pass | Mock/unit: `EngineTests` and `StoreTests` record a conservative `sourceChanged` skip. |
+| 5. Four-state recovery | Pass (mock) | Mock/unit: `RecoveryTests`, `PhotoKitContractTests`, and `EngineTests` cover definite failures, placeholder reconciliation, state-write failure, and unknown outcomes. Real PhotoKit fault injection is not run. |
+| 6. Directory recovery, bounded slow I/O, and responsive status | Pass (mock) | Mock/unit: `SourceReaderTests`, `EngineTests`, `GlobalStatusTests`; a non-interruptible saturated worker pool remains a documented controlled-degradation case. |
+| 7. Scheduling and login behavior | Pass (mock) | Mock/unit: `ScheduleTests` covers launch, 30-minute cadence, pause/resume, no overlap/backlog, and wake behavior. Login-item approval remains a manual macOS check. |
+| 8. Native UI and menu-bar behavior | Pass (GUI demo) | Manual GUI demo was checked in dark/light appearance, including long error text. Native control, status icon, skip counter, and Finder-log entry are present. |
+| 9. Permission/library/space/database failures | Pass (mock) | Mock/unit: `PhotoKitContractTests`, `RecoveryTests`, and `EngineTests` cover permission, unavailable/changed library, explicit failure, and storage failure states. Real disk-full and library-switch checks are not run. |
+| 10. Source immutability, additive Photos behavior, and no media cache | Not run (real PhotoKit) | Requires the isolated account procedure below. Build inspection confirms no source-media cache directory is packaged; no personal library, test library, or source file was mutated during this task. |
+
+The current local package has only the ad-hoc signature produced by the unsigned Xcode build. It is not Developer ID signed, notarized, stapled, or Gatekeeper-accepted. The host is macOS 26.6.2 with Xcode 26.6; the deployment target remains macOS 14.0. The real PhotoKit and macOS 14 host acceptance items remain open.
+
 ## Preconditions
 
 1. Use a user-confirmed, separate macOS test account and that account's system Photos library.

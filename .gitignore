@@ -1,4 +1,6 @@
 .DS_Store
 /work/
+/outputs/PhotoSync.app/
+/outputs/PhotoSync.dmg
 
 /.worktrees/
