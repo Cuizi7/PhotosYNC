@@ -12,6 +12,8 @@ Fix round 1 makes retry deadlines source-scoped and exposes the earliest deadlin
 
 Task 7 note: keep adapter poison/recreation recovery separate until its semantics are fully resolved. An explicitly surfaced safe restart fallback is acceptable; never recreate a Photos adapter blindly while an import result remains uncertain.
 
+Fix round 2 clears a `file:<id>` source issue only after a durable terminal `recordSourceChange` or duplicate `markSkipped` transition. It preserves other unresolved file and scan issues for that source. The regression covers a failed retry which later becomes a duplicate skip, leaving no pending/importing record and no stale waiting state.
+
 ## Verification
 
 Commands run from the task worktree:
@@ -26,5 +28,5 @@ Output summary:
 
 ```text
 ** TEST BUILD SUCCEEDED **
-Executed 79 tests, with 0 failures (0 unexpected)
+Executed 80 tests, with 0 failures (0 unexpected)
 ```

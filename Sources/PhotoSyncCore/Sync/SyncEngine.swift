@@ -160,6 +160,7 @@ public actor SyncEngine {
                                 if old.state != .importing, old.file.stamp != stamp {
                                     try await store.recordSourceChange(fileID: old.id, stamp: stamp)
                                     status.skipped += 1
+                                    resolveSourceIssue(sourceID, key: issueKey(for: old.id), runID: run, fileID: old.id)
                                 }
                                 continue
                             }
@@ -215,7 +216,9 @@ public actor SyncEngine {
                     let stamp = try await directory(record.file.sourceID).stamp(of: record.file.url)
                     guard stamp == record.file.stamp else {
                         try await store.recordSourceChange(fileID: record.id, stamp: stamp)
-                        status.skipped += 1; continue
+                        status.skipped += 1
+                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: scanRuns[record.file.sourceID], fileID: record.id)
+                        continue
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
@@ -236,7 +239,9 @@ public actor SyncEngine {
                 let decision = policy.evaluate(record.file.metadata, candidates: candidates)
                 if case .skip = decision {
                     try await store.markSkipped(fileID: record.id, reason: .suspectedDuplicate, candidates: matchingCandidates(decision, candidates: candidates))
-                    status.skipped += 1; continue
+                    status.skipped += 1
+                    resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: scanRuns[record.file.sourceID], fileID: record.id)
+                    continue
                 }
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }

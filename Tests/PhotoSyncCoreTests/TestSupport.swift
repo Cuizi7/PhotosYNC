@@ -192,17 +192,22 @@ actor SubmissionStampReader: DirectoryReading {
     let reader: DirectoryReader
     let gate: EngineTestGate?
     let failSubmissionStamp: Bool
+    let failSubmissionStampOnce: Bool
     private var stamps = 0
-    init(sourceID: UUID, gate: EngineTestGate? = nil, failSubmissionStamp: Bool = false) {
+    private var emittedFailure = false
+    init(sourceID: UUID, gate: EngineTestGate? = nil, failSubmissionStamp: Bool = false, failSubmissionStampOnce: Bool = false) {
         reader = DirectoryReader(sourceID: sourceID)
-        self.gate = gate; self.failSubmissionStamp = failSubmissionStamp
+        self.gate = gate; self.failSubmissionStamp = failSubmissionStamp; self.failSubmissionStampOnce = failSubmissionStampOnce
     }
     func entries(in directory: URL) async throws -> [DirectoryEntry] { try await reader.entries(in: directory) }
     func stamp(of file: URL) async throws -> FileStamp {
         stamps += 1
         if stamps > 1 {
             if let gate { await gate.wait() }
-            if failSubmissionStamp { throw FixtureError.unavailable("submission stat unavailable") }
+            if failSubmissionStamp && (!failSubmissionStampOnce || !emittedFailure) {
+                emittedFailure = true
+                throw FixtureError.unavailable("submission stat unavailable")
+            }
         }
         return try await reader.stamp(of: file)
     }

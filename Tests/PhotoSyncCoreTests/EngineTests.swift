@@ -330,6 +330,30 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    func testTerminalDuplicateSkipClearsOnlyItsRetryIssue() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], failSubmissionStamp: true, failSubmissionStampOnce: true)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let waitingAfterFailure = await engine.snapshot().waitingSources[f.sourceIDs[0]]
+        XCTAssertNotNil(waitingAfterFailure)
+        try injectEngineSQL("UPDATE file_record SET next_retry_at = 0", at: f.databaseURL)
+        let file = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        await f.photos.setCandidates([MatchCandidate(key: "existing", metadata: file.metadata)])
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .skipped)
+        let waitingAfterSkip = await engine.snapshot().waitingSources[f.sourceIDs[0]]
+        let pending = try await f.store.countFiles(state: .pending)
+        let importing = try await f.store.countFiles(state: .importing)
+        XCTAssertNil(waitingAfterSkip)
+        XCTAssertEqual(pending, 0)
+        XCTAssertEqual(importing, 0)
+    }
+
     func testFinalizingScanPreservesConcurrentSubmissionFailureJournal() async throws {
         let f = try await makeEngineFixture()
         let readyGate = EngineTestGate(), heldGate = EngineTestGate()
