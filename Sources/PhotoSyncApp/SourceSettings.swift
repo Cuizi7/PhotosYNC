@@ -52,7 +52,7 @@ struct SourceSettings: View {
             Button("在 Finder 中打开日志目录", action: model.openLogs).disabled(model.demo)
             if let error = model.detail {
                 Text(error).foregroundStyle(.red).textSelection(.enabled).lineLimit(5)
-                Button("关闭提示") { model.error = nil }
+                if model.error != nil { Button("关闭提示") { model.error = nil } }
             }
         }
         .padding(24)

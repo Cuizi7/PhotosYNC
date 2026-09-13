@@ -25,8 +25,27 @@ actor SyncRuntime {
     private var registeredFailures = Set<UUID>()
     let logsURL: URL
     private let databaseURL: URL
+    private let now: @Sendable () -> Date
+    private let authorized: @Sendable () -> Bool
+
+    init(store: SyncStore, engine: SyncEngine, now: @escaping @Sendable () -> Date,
+         authorized: @escaping @Sendable () -> Bool) {
+        self.store = store; self.engine = engine
+        self.now = now; self.authorized = authorized
+        logsURL = URL(fileURLWithPath: "/unused")
+        databaseURL = URL(fileURLWithPath: "/unused")
+    }
+
+    func prepareInjectedRuntime() async throws {
+        started = true
+        try await refreshSources()
+    }
+
+    func waitForRound() async { await round?.value }
 
     init() {
+        now = { Date() }
+        authorized = { PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized }
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PhotoSync", isDirectory: true)
         logsURL = support.appendingPathComponent("Logs", isDirectory: true)
@@ -50,7 +69,7 @@ actor SyncRuntime {
     private func logFailed(_ message: String) { loggingError = "日志写入失败：\(message)" }
 
     func current() async -> RuntimeState {
-        state.authorized = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+        state.authorized = authorized()
         if let engine { state.snapshot = await engine.snapshot() }
         state.nextScan = schedule.nextScanAt
         var result = state
@@ -94,7 +113,7 @@ actor SyncRuntime {
         // Resume clears engine pause without dispatching a second competing scan.
         await engine?.setPaused(false)
         state.snapshot.isPaused = false
-        if schedule.resume(now: Date()) { schedule.finished(now: Date()) }
+        if schedule.resume(now: now()) { schedule.finished(now: now()) }
         await tick(force: true)
     }
 
@@ -107,7 +126,7 @@ actor SyncRuntime {
 
     func tick(force: Bool = false) async {
         guard !stopped else { return }
-        state.authorized = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+        state.authorized = authorized()
         guard state.authorized, state.sources.contains(where: \.enabled), !state.snapshot.isPaused else { return }
         if engine == nil, let store {
             let executor = self.executor
@@ -115,8 +134,13 @@ actor SyncRuntime {
                                 directory: { DirectoryReader(sourceID: $0, executor: executor) },
                                 metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger)
         }
-        guard let engine, round == nil else { return }
-        let now = Date()
+        guard let engine else { return }
+        let now = now()
+        if round != nil {
+            // Observe periodic ticks even while busy so their cadence is advanced and dropped.
+            if !force { _ = schedule.request(now: now) }
+            return
+        }
         let enabled = Set(state.sources.filter(\.enabled).map(\.id))
         let due = Set(schedule.dueRecoverySources(now: now)).intersection(enabled)
         let ids: [UUID]
@@ -140,14 +164,14 @@ actor SyncRuntime {
         // Count failures once per attempted round, never once per UI polling tick.
         for id in ids where enabled.contains(id) {
             if snapshot.waitingSources[id] != nil {
-                schedule.recordSourceFailure(id, now: Date())
+                schedule.recordSourceFailure(id, now: now())
                 registeredFailures.insert(id)
             } else {
                 schedule.recordSourceRecovered(id)
                 registeredFailures.remove(id)
             }
         }
-        schedule.finished(now: Date())
+        schedule.finished(now: now())
         round = nil
     }
 }

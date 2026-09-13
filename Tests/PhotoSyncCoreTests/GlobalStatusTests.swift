@@ -30,3 +30,82 @@ final class GlobalStatusTests: XCTestCase {
         XCTAssertEqual(Set(GlobalStatus.allCases.map(\.symbol)).count, 6)
     }
 }
+
+final class RuntimeIntegrationTests: XCTestCase {
+    func testLongRoundDropsScheduledTickWithoutCatchup() async throws {
+        let root = try temporaryDirectory()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let folder = root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        _ = try await store.registerSource(url: folder)
+        let reader = HeldRuntimeDirectory()
+        let engine = SyncEngine(store: store, photos: RuntimePhotos(), directory: { _ in reader })
+        let clock = RuntimeClock()
+        let runtime = SyncRuntime(store: store, engine: engine, now: { clock.read() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        await runtime.tick(force: true)
+        while await reader.calls == 0 { await Task.yield() }
+        clock.set(1800)
+        await runtime.tick()
+        clock.set(2400)
+        await reader.release()
+        await runtime.waitForRound()
+        await runtime.tick()
+        let state = await runtime.current()
+        XCTAssertEqual(state.nextScan, Date(timeIntervalSince1970: 3600))
+        let calls = await reader.calls
+        XCTAssertEqual(calls, 1)
+        await runtime.stop()
+        await reader.release()
+    }
+
+    func testDisabledPendingHistoryIsNotActionable() async throws {
+        let root = try temporaryDirectory()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let first = root.appendingPathComponent("first")
+        let second = root.appendingPathComponent("second")
+        for url in [first, second] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+        let id = try await store.registerSource(url: first)
+        _ = try await store.registerSource(url: second)
+        let file = SourceFile(sourceID: id, relativePath: "pending.jpg", url: first.appendingPathComponent("pending.jpg"),
+                              stamp: FileStamp(size: 1, modifiedNanoseconds: 1),
+                              metadata: MediaMetadata(filename: "pending.jpg", kind: .image, captureSecond: nil, rawCaptureTime: nil, rawCaptureOffset: nil, make: nil, model: nil, width: nil, height: nil, duration: nil))
+        _ = try await store.save(file, decision: .importNew)
+        let engine = SyncEngine(store: store, photos: RuntimePhotos())
+        let runtime = SyncRuntime(store: store, engine: engine, now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        try await runtime.disable(id)
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        let state = await runtime.current()
+        XCTAssertEqual(state.snapshot.pending, 0)
+        let historical = try await store.countFiles(state: .pending)
+        XCTAssertEqual(historical, 1)
+        XCTAssertFalse(state.snapshot.activeWork)
+    }
+}
+
+private final class RuntimeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seconds: TimeInterval = 0
+    func read() -> Date { lock.lock(); defer { lock.unlock() }; return Date(timeIntervalSince1970: seconds) }
+    func set(_ value: TimeInterval) { lock.lock(); defer { lock.unlock() }; seconds = value }
+}
+private actor HeldRuntimeDirectory: DirectoryReading {
+    var calls = 0
+    var continuation: CheckedContinuation<Void, Never>?
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        calls += 1
+        await withCheckedContinuation { continuation = $0 }
+        return []
+    }
+    func stamp(of file: URL) async throws -> FileStamp { FileStamp(size: 1, modifiedNanoseconds: 1) }
+    func release() { continuation?.resume(); continuation = nil }
+}
+private struct RuntimePhotos: PhotosGateway {
+    func loadCandidates() async throws -> [MatchCandidate] { [] }
+    func create(fileURL: URL, kind: MediaKind, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+        throw PhotoKitGatewayError.definitelyNotCommitted("Test never imports")
+    }
+    func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
+}

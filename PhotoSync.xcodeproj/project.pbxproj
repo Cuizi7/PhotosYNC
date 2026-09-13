@@ -42,6 +42,7 @@
 		000000000000000000002068 = {isa = PBXBuildFile; fileRef = 000000000000000000002004; };
 		000000000000000000002069 = {isa = PBXBuildFile; fileRef = 000000000000000000002005; };
 		00000000000000000000206A = {isa = PBXBuildFile; fileRef = 000000000000000000002006; };
+000000000000000000003001 = {isa = PBXBuildFile; fileRef = 000000000000000000002003; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -129,7 +130,7 @@
 /* Begin PBXSourcesBuildPhase section */
 		000000000000000000000801 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (00000000000000000000206A, 000000000000000000002069, 000000000000000000002068, 000000000000000000002067, 000000000000000000000001 /* PhotoSyncApp.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
 		000000000000000000000803 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000002066, 000000000000000000000002 /* MediaRecord.swift in Sources */, 000000000000000000000003 /* DuplicatePolicy.swift in Sources */, 000000000000000000000012 /* SyncStore.swift in Sources */, 000000000000000000000013 /* SourceRegistry.swift in Sources */, 000000000000000000000014 /* RunLogger.swift in Sources */, 000000000000000000000016 /* DirectoryReader.swift in Sources */, 000000000000000000000017 /* MetadataReader.swift in Sources */, 000000000000000000000018 /* ReadExecutor.swift in Sources */, 000000000000000000000024 /* PhotosGateway.swift in Sources */, 000000000000000000000025 /* ImportRecovery.swift in Sources */, 000000000000000000000028, 000000000000000000000026 /* PhotoKitGateway.swift in Sources */, 000000000000000000000030 /* ScanSchedule.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
-		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000002065, 000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000015 /* StoreTests.swift in Sources */, 000000000000000000000019 /* SourceReaderTests.swift in Sources */, 000000000000000000000022 /* RecoveryTests.swift in Sources */, 000000000000000000000023 /* PhotoKitContractTests.swift in Sources */, 000000000000000000000029, 000000000000000000000031 /* ScheduleTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000805 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000003001, 000000000000000000002065, 000000000000000000000004 /* DuplicatePolicyTests.swift in Sources */, 000000000000000000000005 /* TestSupport.swift in Sources */, 000000000000000000000015 /* StoreTests.swift in Sources */, 000000000000000000000019 /* SourceReaderTests.swift in Sources */, 000000000000000000000022 /* RecoveryTests.swift in Sources */, 000000000000000000000023 /* PhotoKitContractTests.swift in Sources */, 000000000000000000000029, 000000000000000000000031 /* ScheduleTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */

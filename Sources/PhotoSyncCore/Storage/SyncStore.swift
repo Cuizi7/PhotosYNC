@@ -153,6 +153,13 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    public func countEnabledFiles(state: FileState) async throws -> Int {
+        try await perform {
+            guard let row = try self.one("SELECT COUNT(*) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.state = ? AND source.enabled = 1", [.text(state.rawValue)]) else { return 0 }
+            return Int(try self.int64(row[0]))
+        }
+    }
+
     public func listFiles(state: FileState, afterID: UUID?, limit: Int) async throws -> [StoredFile] {
         try await perform {
             guard limit > 0 else { return [] }

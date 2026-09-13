@@ -355,7 +355,7 @@ public actor SyncEngine {
         return candidates.filter { keys.contains($0.key) }
     }
     private func updatePending() async {
-        do { status.pending = try await store.countFiles(state: .pending) }
+        do { status.pending = try await store.countEnabledFiles(state: .pending) }
         catch { stopStorage(error) }
     }
     private func stopStorage(_ error: Error) {
