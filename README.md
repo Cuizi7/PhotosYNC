@@ -4,7 +4,7 @@ PhotoSync v1 scans selected filesystem folders and adds eligible images and vide
 
 ## Install a local build
 
-The delivered `PhotoSync.app` and `PhotoSync.dmg` are local, unsigned build artifacts. They are not Developer ID signed or notarized. Gatekeeper may prevent them opening until a signed and notarized distribution is produced.
+The delivered `PhotoSync.app` and `PhotoSync.dmg` are local build artifacts with an ad-hoc signature. They are not Developer ID signed or notarized. Gatekeeper may prevent them opening until a signed and notarized distribution is produced.
 
 For a local build on macOS 14 or later with Xcode installed:
 
@@ -18,7 +18,7 @@ ditto work/Release/Build/Products/Release/PhotoSync.app outputs/PhotoSync.app
 scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
 ```
 
-Open the DMG, drag `PhotoSync.app` to `Applications`, then launch it. The menu-bar app asks for access to the **System Photo Library**, which is the one library macOS makes available to Photos-aware apps. It does not select, migrate, or mount another library, and it does not change iCloud Photos settings.
+Open the DMG, drag `PhotoSync.app` to `Applications`, then launch it. The menu-bar app asks for read-write access to the **System Photo Library** only after you choose **Authorize Photos**. Once macOS grants that access and at least one source is enabled, PhotoSync can scan and submit additions to that library. It does not select, migrate, or mount another library, and it does not change iCloud Photos settings.
 
 ## Daily behavior
 
