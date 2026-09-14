@@ -6,7 +6,7 @@ PhotoSync v1 scans selected filesystem folders and adds eligible images and vide
 
 The delivered `PhotoSync.app` and `PhotoSync.dmg` are local build artifacts with an ad-hoc signature. They are not Developer ID signed or notarized. Gatekeeper may prevent them opening until a signed and notarized distribution is produced.
 
-For a local build on macOS 14 or later with Xcode installed:
+For a local build on macOS 13 or later with Xcode installed:
 
 ```sh
 xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Release \
@@ -15,6 +15,9 @@ xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Release
 
 mkdir -p outputs
 ditto work/Release/Build/Products/Release/PhotoSync.app outputs/PhotoSync.app
+codesign --force --sign - --timestamp=none outputs/PhotoSync.app/Contents/Frameworks/PhotoSyncCore.framework
+codesign --force --sign - --timestamp=none outputs/PhotoSync.app
+codesign --verify --deep --strict --all-architectures outputs/PhotoSync.app
 scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
 ```
 

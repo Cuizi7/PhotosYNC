@@ -64,7 +64,7 @@ SQLite 常规调用通过串行队列；placeholder 用同步检查点入口。�
 
 ## 构建和自动测试
 
-最低 macOS 14；历史验证环境为 Xcode 26.6 / Swift 6.3.3。执行前用 `xcodebuild -version`、`xcrun swift --version` 复核。
+最低 macOS 13；历史验证环境为 Xcode 26.6 / Swift 6.3.3。执行前用 `xcodebuild -version`、`xcrun swift --version` 复核。
 
 从仓库根目录执行，产物及日志放到被忽略的 `work/`：
 
@@ -114,6 +114,9 @@ xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Release
 
 ```bash
 ditto work/Release/Build/Products/Release/PhotoSync.app outputs/PhotoSync.app
+codesign --force --sign - --timestamp=none outputs/PhotoSync.app/Contents/Frameworks/PhotoSyncCore.framework
+codesign --force --sign - --timestamp=none outputs/PhotoSync.app
+codesign --verify --deep --strict --all-architectures outputs/PhotoSync.app
 scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
 ```
 
@@ -127,7 +130,7 @@ scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
 
 - 真实 PhotoKit 导入、授权/图库变化、崩溃恢复、源不变性、只增不删。
 - 真实网络挂载断开/恢复、空间不足；不可中断 I/O 全占满时可能需重启。
-- macOS 14 实机、登录启动、系统通知、真实菜单/目录选择、键盘/VoiceOver。
+- macOS 13/14 实机、登录启动、系统通知、真实菜单/目录选择、键盘/VoiceOver。
 - 真实 Finder alias fixture、AVFoundation 从真实视频提取带 offset 的拍摄时间；parser 测试不能证明资源提取。
 - Developer ID 签名、公证、正式安装启动。
 
@@ -138,3 +141,5 @@ scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
 按风险缩放流程：文档/小改动直接做聚焦验证；复杂功能、状态持久化和并发修改先明确方案，使用独立分支/worktree、评审和验证。允许按需使用 explorer、docs_researcher、reviewer、tester 分担独立任务；单个所有者负责每块修改，不并行编辑相同区域，不撤销他人变更。用户指定子代理开发流程时按该流程执行，避免重复评审同一快照。
 
 报告必须分开列出：构建、自动测试、GUI 演示、真实 Photos、平台兼容、签名分发；未运行写清楚，不能互相替代。记录实际 commit、命令、结果和残余风险。合并/推送/发布遵守用户已授权的范围，不自行发布远端。
+
+兼容范围变更（2026-09-14，用户批准）：最低系统版本由 macOS 14 扩展为 macOS 13。macOS 13 设置入口使用受 AppModel 持有的原生 NSWindow；14+ 保留 SettingsLink。构建成功不等于 macOS 13 实机/真实 Photos 验收通过，结果需单独记录。

@@ -27,8 +27,12 @@ struct StatusMenu: View {
                 .disabled(!model.ready || model.state.snapshot.activeWork || model.state.snapshot.isPaused || !model.state.authorized || model.demo)
             Button(model.state.snapshot.isPaused ? "继续同步" : "暂停同步", action: model.togglePause)
                 .disabled(!model.ready || model.demo)
-            SettingsLink { Text("来源与设置…") }
-                .simultaneousGesture(TapGesture().onEnded { NSApp.activate(ignoringOtherApps: true) })
+            if #available(macOS 14.0, *) {
+                SettingsLink { Text("来源与设置…") }
+                    .simultaneousGesture(TapGesture().onEnded { NSApp.activate(ignoringOtherApps: true) })
+            } else {
+                Button("来源与设置…", action: model.openSettingsWindow)
+            }
             Button("在 Finder 中打开日志目录", action: model.openLogs).disabled(model.demo)
             Divider()
             Button("退出 PhotoSync", action: model.quit).keyboardShortcut("q")

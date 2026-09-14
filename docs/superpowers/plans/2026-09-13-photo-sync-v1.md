@@ -6,7 +6,7 @@
 
 **Architecture:** 单应用进程；同步协调、纯判重规则、目录读取、Photos 接入、SQLite 存储及原生界面分离。系统调用用具体适配器，测试通过小型协议替换；不建设插件框架、独立后台服务或媒体缓存。
 
-**Tech Stack:** Swift、SwiftUI/AppKit、PhotoKit、Image I/O、AVFoundation、系统 SQLite3、ServiceManagement、XCTest；最低 macOS 14。不引入第三方运行时依赖。
+**Tech Stack:** Swift、SwiftUI/AppKit、PhotoKit、Image I/O、AVFoundation、系统 SQLite3、ServiceManagement、XCTest；最低 macOS 13。不引入第三方运行时依赖。
 
 **Spec:** `outputs/2026-09-13-photo-sync-v1-design.md`（用户于 2026-09-13 批准并要求编写计划；执行者必须先读全文）。
 
@@ -31,7 +31,7 @@
 
 ## 执行前状态与方式
 
-当前目录只有设计文档，没有应用或 Git 仓库。2026-09-13 已只读确认本机 Xcode 26.6、Swift 6.3.3；这不是构建或运行验收。执行时复核工具链，不以当前 SDK 的新 API 代替 macOS 14 可用 API。
+当前目录只有设计文档，没有应用或 Git 仓库。2026-09-13 已只读确认本机 Xcode 26.6、Swift 6.3.3；这不是构建或运行验收。执行时复核工具链，不以当前 SDK 的新 API 代替 macOS 13 可用 API。
 
 在开始实现时建立代码仓库并提交设计和计划；如果用户指定已有项目，先读该项目及父目录的 CLAUDE.md/AGENTS.md 并采用其结构，不覆盖用户改动。仓库初始化属于执行阶段，本次没有建立仓库或应用工程。
 
@@ -42,7 +42,7 @@
 ## 文件布局和责任
 
 ```text
-PhotoSync.xcodeproj/                    # 三个目标及共享 PhotoSync scheme，部署目标 14.0
+PhotoSync.xcodeproj/                    # 三个目标及共享 PhotoSync scheme，部署目标 13.0
 Sources/PhotoSyncApp/
   PhotoSyncApp.swift                    # 唯一应用入口、MenuBarExtra、Settings
   AppModel.swift                        # MainActor 界面状态和指令桥接
@@ -152,7 +152,7 @@ struct DuplicatePolicy {
 }
 ```
 
-- [ ] 建立三目标、共享 scheme、无宿主 XCTest，Core 链接系统 SQLite3，部署目标统一 14.0。添加域类型和下面的失败测试。
+- [ ] 建立三目标、共享 scheme、无宿主 XCTest，Core 链接系统 SQLite3，部署目标统一 13.0。添加域类型和下面的失败测试。
 
 ```swift
 import XCTest
@@ -434,7 +434,7 @@ final class RecoveryTests: XCTestCase {
 ```
 
 - [ ] 运行失败测试，再实现转换；通过后实现系统适配。申请 `.readWrite`，只有充分查询授权和可用图库才建立索引；索引枚举应包含可查询的隐藏资产、burst 资产，按原始资源名列候选，不能只看默认可见缩略图列表。不可完整查询时停止新增并说明覆盖边界。
-- [ ] 使用 `PHAssetResource.originalFilename`（macOS 14 可用）；已有资产设备字段缺失按 nil，不使用私有 KVC 或读取 Photos.sqlite，不下载所有 iCloud 原片。`PHAsset.creationDate` 的来源/时区语义无法可靠确认时不要当作 EXIF offset 证据。
+- [ ] 使用 `PHAssetResource.originalFilename`（macOS 13 可用）；已有资产设备字段缺失按 nil，不使用私有 KVC 或读取 Photos.sqlite，不下载所有 iCloud 原片。`PHAsset.creationDate` 的来源/时区语义无法可靠确认时不要当作 EXIF offset 证据。
 - [ ] 新增唯一入口如下，强制复制语义；禁止删除、编辑资产及修改相簿请求。
 
 ```swift
@@ -449,7 +449,7 @@ let identifier = request.placeholderForCreatedAsset?.localIdentifier
 以上放进 `PHPhotoLibrary.shared().performChanges` change block；placeholder 由 `onPlaceholder` 在返回 change block 前持久化。调用任务 2 的 checkpointPlaceholder 同步检查点入口，所有常规异步存储调用与它复用同一 SQLite 串行队列；调用 performChanges 前必须结束数据库操作，严禁持锁或占据数据库队列等待 PhotoKit 回调。如果保存 checkpoint 失败，标记整个尝试为未知并停止新增；不能假定 PhotoKit 自动回滚。
 
 - [ ] 明確恢复依据：未调用 performChanges 之前的本地失败可重试；已收到系统确定未提交/原子事务失败结果可记录确定失败；成功 callback 后必须记录成功。崩溃丢失 callback 或 placeholder fetch 不存在均为 unknown，不把系统应用运行正常当否定证明。
-- [ ] 可取得库可用性事件时监听；所有查询/写入前复核授权，库变化或目标标识异常时停止新增。macOS 14 无法验证目标一致性的分支保持 unknown；不得伪造公开库 UUID。
+- [ ] 可取得库可用性事件时监听；所有查询/写入前复核授权，库变化或目标标识异常时停止新增。macOS 13 无法验证目标一致性的分支保持 unknown；不得伪造公开库 UUID。
 - [ ] 在 `Design/Validation.md` 写可执行人工验证：使用用户确认的独立 macOS 测试账号和系统照片图库，不启用 iCloud；从临时只读目录导入自制图片/视频；记录 placeholder、callback、fetch；源仍存在且属性不变；在指定故障点结束测试进程后恢复核对。不得在默认个人图库自动运行。
 - [ ] 无授权或无测试环境时完成 mock/编译验证，并将真实导入验收标记“未执行”；不能宣称接入通过。此缺口阻止正式开启用户图库自动导入，但不阻止任务 5–7 的 fake 验证。
 - [ ] 通过相关检查后提交 `feat: add PhotoKit import and conservative recovery`。
@@ -555,7 +555,7 @@ func testErrorIsNotReportedAsCompleted() {
 ```
 
 - [ ] 实现无来源→未配置；其他状态错误 > 暂停 > 等待恢复 > 运行 > 已完成。尚有提交返回时暂停显示“正在暂停”进度，不能伪报工作已停止。
-- [ ] 界面采用 `MenuBarExtra`、原生 Button/Text/Divider/ProgressView；图标分别采用 `exclamationmark.triangle`、`pause.circle`、`clock`、`arrow.triangle.2.circlepath`、`checkmark.circle`、`photo`，必须在 macOS 14 验证符号存在；提供 accessibilityLabel 和文本摘要，不能只靠颜色。
+- [ ] 界面采用 `MenuBarExtra`、原生 Button/Text/Divider/ProgressView；图标分别采用 `exclamationmark.triangle`、`pause.circle`、`clock`、`arrow.triangle.2.circlepath`、`checkmark.circle`、`photo`，必须在 macOS 13 验证符号存在；提供 accessibilityLabel 和文本摘要，不能只靠颜色。
 
 ```swift
 MenuBarExtra {

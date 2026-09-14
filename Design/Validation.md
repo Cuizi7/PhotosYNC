@@ -15,7 +15,7 @@
 | 9. Permission/library/space/database failures | Pass (mock) | Mock/unit: `PhotoKitContractTests`, `RecoveryTests`, and `EngineTests` cover permission, unavailable/changed library, explicit failure, and storage failure states. Real disk-full and library-switch checks are not run. |
 | 10. Source immutability, additive Photos behavior, and no media cache | Not run (real PhotoKit) | Requires the isolated account procedure below. Build inspection confirms no source-media cache directory is packaged; no personal library, test library, or source file was mutated during this task. |
 
-The current local package has an ad-hoc signature produced by the local Xcode build. It is not Developer ID signed, notarized, stapled, or Gatekeeper-accepted. The host is macOS 26.6.2 with Xcode 26.6; the deployment target remains macOS 14.0. The real PhotoKit and macOS 14 host acceptance items remain open.
+The current local package has an ad-hoc signature produced by the local Xcode build. It is not Developer ID signed, notarized, stapled, or Gatekeeper-accepted. The host is macOS 26.6.2 with Xcode 26.6; the deployment target is now macOS 13.0. The real PhotoKit and macOS 13 and 14 host acceptance items remain open.
 
 ## Preconditions
 

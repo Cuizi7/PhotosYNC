@@ -5,7 +5,7 @@
 
 ## 1. 目标和边界
 
-原生 macOS 菜单栏常驻应用，Swift + SwiftUI，最低 macOS 14；本地 SQLite 保存配置、元数据、同步记录和恢复信息。独立安装，未来采用 DMG 分发，不走 Mac App Store。
+原生 macOS 菜单栏常驻应用，Swift + SwiftUI，最低 macOS 13；本地 SQLite 保存配置、元数据、同步记录和恢复信息。独立安装，未来采用 DMG 分发，不走 Mac App Store。
 
 从多个文件系统目录递归导入位图照片和视频到 Photos。排除 RAW；不转码、不配对 Live Photo、不处理 XMP 等旁车编辑、不创建相簿和文件夹映射。不能导入的格式记录原因。
 
@@ -165,12 +165,12 @@ SQLite 使用版本化迁移和事务。四类逻辑数据，具体表数由实�
 
 ## 12. 技术依据与验证状态
 
-本次阅读 Apple 官方文档核实接口语义，未构建应用、未读取用户原片、未执行 Photos 导入。以下地址为文档出处，API 均需以 macOS 14 部署目标复核可用性。
+本次阅读 Apple 官方文档核实接口语义，未构建应用、未读取用户原片、未执行 Photos 导入。以下地址为文档出处，API 均需以 macOS 13 部署目标复核可用性。
 
 - [A1] `https://developer.apple.com/documentation/photos/phassetresourcecreationoptions/shouldmovefile`：false 时复制到 Photos；true 会移走源文件。本版强制 false。
 - [A2] `https://developer.apple.com/documentation/photos/phobjectplaceholder`：placeholder 与创建对象具有相同 localIdentifier，可在完成后 fetch；未提供与应用数据库的联合事务。
-- [A3] `https://developer.apple.com/documentation/photos/phassetresource/originalfilename`：导入/创建时的资源原始文件名；使用 macOS 14 可用 API，不直接依赖较新系统的重命名属性。
-- [A4] `https://developer.apple.com/documentation/photos/phphotolibrary`：授权、查询/变更、变更观察和共享图库入口；不把文档列出的最新 API 全部视为 macOS 14 可用。
+- [A3] `https://developer.apple.com/documentation/photos/phassetresource/originalfilename`：导入/创建时的资源原始文件名；使用 macOS 13 可用 API，不直接依赖较新系统的重命名属性。
+- [A4] `https://developer.apple.com/documentation/photos/phphotolibrary`：授权、查询/变更、变更观察和共享图库入口；不把文档列出的最新 API 全部视为 macOS 13 可用。
 - [A5] `https://developer.apple.com/documentation/servicemanagement/smappservice/mainapp`：对应主应用登录启动项，macOS 13 起可用。
 - [A6] `https://developer.apple.com/documentation/photos/phasset`：公开资产元数据范围；没有直接暴露完整设备型号，本版允许此字段缺失。
 - [A7] `https://developer.apple.com/documentation/imageio/exif-dictionary-keys`：源图像 EXIF 拍摄元数据；视频由 AVFoundation 可取得的元数据读取，不臆造缺失字段。
@@ -178,3 +178,5 @@ SQLite 使用版本化迁移和事务。四类逻辑数据，具体表数由实�
 实现计划必须将三类技术验证放在正式导入之前：原 URL 创建和权限、placeholder/崩溃恢复、慢读的有限并发及界面响应。系统无法给出足够证据的场景按本设计保持不确定，不静默放宽规则。
 
 - [A8] `https://support.apple.com/en-ie/104946`：系统照片图库的指定与其他应用访问规则；`https://developer.apple.com/documentation/photos/phphotolibrary/shared()`：shared() 返回共用的单例图库对象。
+
+兼容范围变更（2026-09-14，用户批准）：最低系统版本由 macOS 14 扩展为 macOS 13。macOS 13 设置入口使用受 AppModel 持有的原生 NSWindow；14+ 保留 SettingsLink。构建成功不等于 macOS 13 实机/真实 Photos 验收通过，结果需单独记录。

@@ -17,6 +17,7 @@ final class AppModel: ObservableObject {
     @Published var demoStatus: GlobalStatus = .unconfigured
     let demo: Bool
     private var demoWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var runtime: SyncRuntime?
     private var polling: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
@@ -81,6 +82,22 @@ final class AppModel: ObservableObject {
     var counters: String {
         let s = state.snapshot
         return "检查 \(s.checked) · 导入 \(s.imported) · 跳过 \(s.skipped) · 失败 \(s.failed) · 待处理 \(s.pending)"
+    }
+
+    func openSettingsWindow() {
+        if settingsWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 590),
+                                  styleMask: [.titled, .closable, .miniaturizable],
+                                  backing: .buffered, defer: false)
+            window.title = "PhotoSync 来源与设置"
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: SourceSettings(model: self))
+            window.center()
+            settingsWindow = window
+        }
+        settingsWindow?.deminiaturize(nil)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func authorize() { guard !demo else { return }; Task { await runtime?.requestAuthorization() } }
