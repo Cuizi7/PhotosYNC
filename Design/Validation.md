@@ -45,3 +45,13 @@ For each case, stop the test process only in the separate test account, restart 
 ## Acceptance Boundary
 
 Real PhotoKit import acceptance is **not executed** by unit tests or this task. It requires the explicit test-account procedure above. The application is capable of submitting additions after the user explicitly authorizes the System Photo Library; this task did not exercise that write path. Fake gateway tests do not prove real PhotoKit acceptance.
+
+## macOS 13 compatibility follow-up (2026-09-14)
+
+Code commit `7a57730` lowers the deployment target to 13.0 and adds a native settings-window fallback; macOS 14+ retains SettingsLink. Local build-for-testing and Release builds passed; all 94 Core tests passed on the local newer OS host. Both app and framework were explicitly ad-hoc signed and verified for all architectures. This is not Developer ID signing or notarization.
+
+Independent Codex on `user@mbp15.local` (macOS 13.7.8, Intel) verified minimum versions, executable checksum, strict signatures, demo launch, the running process and on-screen window/menu-bar-item records, and graceful exit. No product crash was observed.
+
+Settings-button interaction, window close/reopen/minimize behavior are **Blocked**, not passed: System Events timed out (-1712), and non-prompting probes reported no Accessibility/screen-capture authorization. The initial demo window is not evidence for the settings-button path. Normal-mode Photos import, login/notifications, and test-library ownership remain unverified. No Photos writes or system permission changes were performed.
+
+Retrieved reports: `outputs/remote-macos13/final.md` and `outputs/remote-macos13/compatibility.md`; raw remote evidence retained locally at `work/remote-qa/compat13-evidence/`. Those output/scratch files may not be Git-tracked. Remote originals remain under `/Users/user/Documents/PhotoSync-QA/2026-09-14/compat13/reports/`.
