@@ -28,8 +28,8 @@ codesign --verify --deep --strict --all-architectures "$app_path"
 [[ -s "$app_path/Contents/Resources/Assets.car" && -s "$app_path/Contents/Resources/PhotosYNC.icns" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.1.0' ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '1' ]]
-lipo -verify_arch arm64 x86_64 "$app_path/Contents/MacOS/PhotosYNC"
-lipo -verify_arch arm64 x86_64 "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore"
+lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch arm64 x86_64
+lipo "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore" -verify_arch arm64 x86_64
 scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg"
 hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg"
 cp docs/release/0.1.0-beta.md "$release_dir/RELEASE-NOTES.md"
