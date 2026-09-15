@@ -152,3 +152,8 @@ Exact evidence and retained failures: `work/ProductionWriteQA/report.md` and adj
 User authorized remote Mac SMB service. Isolated readonly Samba at192.168.10.107:1445, source /Volumes/PhotosYNC-QA selected by actual final-app NSOpenPanel. Two distinct selfmade JPEGs imported, README skipped. On test-service stop, final app reported timeout then missing directory/waiting; success count stayed2. Restart service +system remount led automatic recovery at12:10:52 local with no new submission; file hashes unchanged. Restart final app at12:11:53 completed startup scan, identical two successIDs. Evidence:work/SMBFinal/report.md and snapshots. This supersedes final-app GUI/source-picker blocker in closure report; previously no-source acceptance is now completed with realSMB+realPhotos.
 
 Remaining: system login/logout, notifications, sleep/wake and natural30minute enabled-source scan. Desktop locked at12:15. Test service/share/source retained for continued acceptance. System-managed mount disappearance is covered; retained empty manual mountpoint false recovery remains a planned fix.
+
+
+## Source configuration removal and content-sized Settings (2026-09-15)
+
+Schema3 removed flag retains history; source removal closes newwork, preserves callbacks, hides source; exactpath readd restoresUUID/history. Full127tests passed withreview findings resolved. Actualpreviousv2runtime upgraded intact and user-requested disabled SMB test source removed through nativeconfirmation, preserving2success records. Settings autoheight546→530pt (authorization section present); diagnosis bottom blank area eliminated. No source/Photosdeletion performed. Backup andscreenshots inwork/SourceRemoval; details docs/release/2026-09-15-source-removal.md.

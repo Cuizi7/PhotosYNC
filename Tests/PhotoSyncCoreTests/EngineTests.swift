@@ -238,6 +238,101 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    func testRemovingSourceStopsQueuedSubmissionButPersistsInFlightResult() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let queuedURL = f.directories[0].appendingPathComponent("queued.jpg")
+        try FileManager.default.copyItem(at: f.directories[0].appendingPathComponent("same.jpg"), to: queuedURL)
+        let first = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        let queued = SourceFile(
+            sourceID: f.sourceIDs[0],
+            relativePath: "queued.jpg",
+            url: queuedURL,
+            stamp: try await DirectoryReader(sourceID: f.sourceIDs[0]).stamp(of: queuedURL),
+            metadata: try await MetadataReader(sourceID: f.sourceIDs[0]).read(url: queuedURL, filename: "queued.jpg")
+        )
+        _ = try await f.store.save(first, decision: .importNew)
+        _ = try await f.store.save(queued, decision: .importNew)
+        let gate = EngineTestGate()
+        await f.photos.setCreationGate(gate)
+
+        let scan = Task { await f.engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        try await f.engine.removeSource(id: f.sourceIDs[0])
+        await gate.release()
+        await scan.value
+
+        let sources = try await f.engine.sources()
+        let imported = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let pending = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "queued.jpg")
+        let createCount = await f.photos.createCount
+        XCTAssertTrue(sources.isEmpty)
+        XCTAssertEqual(imported?.state, .imported)
+        XCTAssertEqual(pending?.state, .pending)
+        XCTAssertEqual(createCount, 1)
+    }
+
+    func testRemovingSourceWhileDirectoryReadIsHeldStopsNewRecords() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let gate = EngineTestGate()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { id in
+            GatedDirectoryReader(reader: DirectoryReader(sourceID: id), gate: gate)
+        })
+
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        try await engine.removeSource(id: f.sourceIDs[0])
+        await gate.release()
+        await scan.value
+
+        let sources = try await engine.sources()
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let createCount = await f.photos.createCount
+        XCTAssertTrue(sources.isEmpty)
+        XCTAssertNil(record)
+        XCTAssertEqual(createCount, 0)
+    }
+
+    func testRestartReconcilesRemovedUnknownWithoutVisibleWaitingSource() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let file = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        let fileID = try await f.store.save(file, decision: .importNew)
+        try await f.store.beginAttempt(fileID: fileID, attemptID: UUID())
+        try await f.store.removeSource(id: f.sourceIDs[0])
+        let notifications = NotificationRecorder()
+        let restarted = SyncEngine(store: f.store, photos: f.photos, notify: { sourceID, recovered in
+            notifications.record(sourceID: sourceID, recovered: recovered)
+        })
+
+        await restarted.recoverImports()
+
+        let snapshot = await restarted.snapshot()
+        let emittedNotifications = notifications.events
+        let sources = try await restarted.sources()
+        let state = try await f.store.state(of: fileID)
+        XCTAssertTrue(sources.isEmpty)
+        XCTAssertEqual(state, .importing)
+        XCTAssertNil(snapshot.waitingSources[f.sourceIDs[0]])
+        XCTAssertTrue(emittedNotifications.isEmpty)
+    }
+
+    func testRemoveSourceStorageFailureClosesAdmission() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        try injectEngineSQL("CREATE TRIGGER fail_source_removal BEFORE UPDATE ON source WHEN NEW.removed = 1 BEGIN SELECT RAISE(FAIL, 'injected removal failure'); END", at: f.databaseURL)
+
+        do {
+            try await f.engine.removeSource(id: f.sourceIDs[0])
+            XCTFail("Expected source removal to fail")
+        } catch {}
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await f.engine.snapshot()
+        let createCount = await f.photos.createCount
+        XCTAssertNotNil(snapshot.blockingError)
+        XCTAssertEqual(createCount, 0)
+    }
+
     func testCommittedResultSurvivesLaterIndexHealthFailure() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         await f.photos.setFailIndexAfterCreate()
@@ -427,5 +522,22 @@ private actor PreAdmissionFailurePhotosGateway: PhotosGateway {
         actualSubmissionCount += 1
         try onPlaceholder("submitted-1")
         return "submitted-1"
+    }
+}
+
+private final class NotificationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedEvents: [(UUID, Bool)] = []
+
+    var events: [(UUID, Bool)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedEvents
+    }
+
+    func record(sourceID: UUID, recovered: Bool) {
+        lock.lock()
+        recordedEvents.append((sourceID, recovered))
+        lock.unlock()
     }
 }

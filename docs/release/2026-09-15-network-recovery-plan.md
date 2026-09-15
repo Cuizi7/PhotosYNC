@@ -19,14 +19,14 @@
 
 ## 持久化与升级
 
-schema v2→v3事务新增source_identity一对一表，含version、可选volume_uuid/root_document_id/normalized_mount_origin/filesystem_type和验证时间；保留全部旧source/file_record成功历史。Schema.sql和迁移代码同步。旧来源没有基准时不能自动采纳当下空挂载点；建议首次升级要求“验证来源”。相同来源的重新验证保留UUID和历史；若确认为另一共享，停用旧来源并另建UUID，不静默复用相对路径历史。
+schema v3→v4事务新增source_identity一对一表，含version、可选volume_uuid/root_document_id/normalized_mount_origin/filesystem_type和验证时间；保留全部旧source/file_record成功历史。Schema.sql和迁移代码同步。旧来源没有基准时不能自动采纳当下空挂载点；建议首次升级要求“验证来源”。相同来源的重新验证保留UUID和历史；若确认为另一共享，停用旧来源并另建UUID，不静默复用相对路径历史。
 
 需要批准的取舍：旧来源首次升级要求人工验证；无法提供足够稳定身份的文件系统，在断开恢复后可能需要人工确认。这是保守方案的可用性代价。
 
 ## 实施顺序与验收
 
 1. 在真实目标NAS只读采样身份，验证重挂稳定性，确定支持/降级规则后再实现。
-2. 纯比较策略与fixture测试；v2→v3事务迁移/失败回滚测试。
+2. 纯比较策略与fixture测试；v3→v4事务迁移/失败回滚测试。
 3. 接入统一目录观察、扫描结束与提交前核对；多来源独立等待，继续用现有调度器。
 4. 原生设置增加身份不足/冲突提示与明确验证动作；通知只在完整恢复后发出。
 5. 真实WebDAV空挂载点、SMB手工空挂载点、系统管理挂载点消失、同共享重挂、不同共享替换、同卷根目录替换、合法空目录、重启后恢复、慢读/挂起I/O、扫描中断开逐项验收。断开不新增、恢复不重复、源不变、既有历史不清空。

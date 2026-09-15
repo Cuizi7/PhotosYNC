@@ -116,6 +116,17 @@ actor SyncRuntime {
         try await refreshSources()
     }
 
+    func removeSource(_ id: UUID) async throws {
+        guard let store else { throw CocoaError(.fileReadUnknown) }
+        if let engine { try await engine.removeSource(id: id) }
+        else { try await store.removeSource(id: id) }
+        schedule.recordSourceRecovered(id)
+        registeredFailures.remove(id)
+        state.snapshot.sourcePhases.removeValue(forKey: id)
+        state.snapshot.waitingSources.removeValue(forKey: id)
+        try await refreshSources()
+    }
+
     private func refreshSources() async throws {
         state.sources = try await store?.sources() ?? []
     }

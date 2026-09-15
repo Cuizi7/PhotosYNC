@@ -24,7 +24,7 @@ struct PhotoSyncApp: App {
             SourceSettings(model: model)
                 .onAppear { NSApp.activate(ignoringOtherApps: true) }
         }
-        .defaultSize(width: 600, height: 590)
+        .defaultSize(width: SourceSettings.preferredWidth, height: SourceSettings.initialWindowHeight)
 #endif
         Settings { SourceSettings(model: model) }
 

@@ -1,5 +1,6 @@
 CREATE TABLE source (
  id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL,
+ removed INTEGER NOT NULL DEFAULT 0,
  last_scan_at REAL, last_error TEXT
 );
 CREATE TABLE file_record (

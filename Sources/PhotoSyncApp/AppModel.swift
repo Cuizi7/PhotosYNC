@@ -76,7 +76,9 @@ final class AppModel: ObservableObject {
                let preview = GlobalStatus(rawValue: arguments[index + 1]) { demoStatus = preview }
             if demoStatus == .error { error = "示例错误：来源暂时不可用。此说明仅用于验证长错误摘要的布局与可读性，不访问真实目录或照片图库。" }
             Task { @MainActor in
-                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 648, height: 640),
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0,
+                                                           width: SourceSettings.preferredWidth,
+                                                           height: SourceSettings.initialWindowHeight),
                                       styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
                 if arguments.contains("--light") { window.appearance = NSAppearance(named: .aqua) }
                 window.title = "PhotosYNC 界面验证"
@@ -165,7 +167,9 @@ final class AppModel: ObservableObject {
 
     func openSettingsWindow() {
         if settingsWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 590),
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0,
+                                                       width: SourceSettings.preferredWidth,
+                                                       height: SourceSettings.initialWindowHeight),
                                   styleMask: [.titled, .closable, .miniaturizable],
                                   backing: .buffered, defer: false)
             window.title = "PhotosYNC 设置"
@@ -207,6 +211,20 @@ final class AppModel: ObservableObject {
         Task {
             do { try await runtime?.disable(id); await refresh() }
             catch { self.error = error.localizedDescription }
+        }
+    }
+    func remove(_ id: UUID) {
+        guard !demo else { return }
+        Task {
+            do { try await runtime?.removeSource(id); await refresh() }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+    func settingsContentHeightDidChange(_ height: CGFloat) {
+        let contentSize = NSSize(width: SourceSettings.preferredWidth, height: height)
+        for window in [demoWindow, settingsWindow].compactMap({ $0 }) {
+            guard abs((window.contentView?.bounds.height ?? 0) - height) > 0.5 else { continue }
+            window.setContentSize(contentSize)
         }
     }
     private func refresh() async { if let runtime { state = await runtime.current() } }

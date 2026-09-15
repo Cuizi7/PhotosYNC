@@ -73,12 +73,18 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     public func disableSource(id: UUID) async throws {
-        try await perform { try self.requireChange("UPDATE source SET enabled = 0 WHERE id = ?", [.text(id.uuidString)]) }
+        try await perform { try self.requireChange("UPDATE source SET enabled = 0 WHERE id = ? AND removed = 0", [.text(id.uuidString)]) }
+    }
+
+    /// Removes a source from configuration while retaining its file and submission history.
+    /// Existing callbacks can still resolve the source by ID for durable audit records.
+    public func removeSource(id: UUID) async throws {
+        try await perform { try self.requireChange("UPDATE source SET enabled = 0, removed = 1 WHERE id = ? AND removed = 0", [.text(id.uuidString)]) }
     }
 
     public func sources() async throws -> [RegisteredSource] {
         try await perform {
-            try self.rows("SELECT id, path, enabled FROM source ORDER BY path", []).map {
+            try self.rows("SELECT id, path, enabled FROM source WHERE removed = 0 ORDER BY path", []).map {
                 RegisteredSource(id: try self.uuid($0[0]), url: URL(fileURLWithPath: try self.text($0[1])), enabled: try self.int($0[2]) != 0)
             }
         }
@@ -88,6 +94,13 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             guard let row = try self.one("SELECT id, path, enabled FROM source WHERE id = ?", [.text(id.uuidString)]) else { throw SyncStoreError.notFound(id) }
             return RegisteredSource(id: try self.uuid(row[0]), url: URL(fileURLWithPath: try self.text(row[1])), enabled: try self.int(row[2]) != 0)
+        }
+    }
+
+    func isSourceRemoved(id: UUID) async throws -> Bool {
+        try await perform {
+            guard let row = try self.one("SELECT removed FROM source WHERE id = ?", [.text(id.uuidString)]) else { throw SyncStoreError.notFound(id) }
+            return try self.int(row[0]) != 0
         }
     }
 
@@ -170,7 +183,7 @@ public final class SyncStore: @unchecked Sendable {
 
     public func countEnabledFiles(state: FileState) async throws -> Int {
         try await perform {
-            guard let row = try self.one("SELECT COUNT(*) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.state = ? AND source.enabled = 1", [.text(state.rawValue)]) else { return 0 }
+            guard let row = try self.one("SELECT COUNT(*) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.state = ? AND source.enabled = 1 AND source.removed = 0", [.text(state.rawValue)]) else { return 0 }
             return Int(try self.int64(row[0]))
         }
     }
@@ -257,16 +270,23 @@ public final class SyncStore: @unchecked Sendable {
     private func registerSourceSync(url: URL) throws -> UUID {
         let normalized = url
         let path = normalized.path
-        let existing = try rows("SELECT id, path, enabled FROM source", []).map { (try uuid($0[0]), URL(fileURLWithPath: try text($0[1])), try int($0[2]) != 0) }
-        for (id, existingURL, enabled) in existing where SourceRegistry.conflicts(normalized, existingURL) {
-            if normalized.path == existingURL.path {
-                if !enabled { try requireChange("UPDATE source SET enabled = 1 WHERE id = ?", [.text(id.uuidString)]) }
-                return id
+        let existing = try rows("SELECT id, path, enabled, removed FROM source", []).map {
+            (id: try uuid($0[0]), url: URL(fileURLWithPath: try text($0[1])), enabled: try int($0[2]) != 0, removed: try int($0[3]) != 0)
+        }
+
+        // Tombstoned sources no longer reserve their paths. Active source conflicts must
+        // still be rejected before an exact-path tombstone can be restored.
+        for source in existing where !source.removed && normalized.path != source.url.path && SourceRegistry.conflicts(normalized, source.url) {
+            throw SourceRegistryError.overlappingSource(source.url)
+        }
+        if let source = existing.first(where: { $0.url.path == path }) {
+            if !source.enabled || source.removed {
+                try requireChange("UPDATE source SET enabled = 1, removed = 0 WHERE id = ?", [.text(source.id.uuidString)])
             }
-            throw SourceRegistryError.overlappingSource(existingURL)
+            return source.id
         }
         let id = UUID()
-        try requireChange("INSERT INTO source (id, path, enabled) VALUES (?, ?, 1)", [.text(id.uuidString), .text(path)])
+        try requireChange("INSERT INTO source (id, path, enabled, removed) VALUES (?, ?, 1, 0)", [.text(id.uuidString), .text(path)])
         return id
     }
 
@@ -280,13 +300,25 @@ public final class SyncStore: @unchecked Sendable {
 
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 2 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 2 else { return }
+        guard version <= 3 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 3 else { return }
         try transaction {
-            if version == 0 { try execute(Self.schema) }
-            try execute("CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path))")
-            try execute("PRAGMA user_version = 2")
+            if version == 0 {
+                try execute(Self.schema)
+            } else {
+                if version < 2 {
+                    try execute("CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path))")
+                }
+                if version < 3, !(try sourceHasColumn(named: "removed")) {
+                    try execute("ALTER TABLE source ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
+                }
+            }
+            try execute("PRAGMA user_version = 3")
         }
+    }
+
+    private func sourceHasColumn(named name: String) throws -> Bool {
+        try rows("PRAGMA table_info(source)", []).contains { try text($0[1]) == name }
     }
 
     private func perform<T>(_ operation: @escaping () throws -> T) async throws -> T {
@@ -390,10 +422,11 @@ public final class SyncStore: @unchecked Sendable {
     private func optionalUUID(_ value: Value) -> UUID? { optionalText(value).flatMap(UUID.init(uuidString:)) }
 
     private static let schema = """
-    CREATE TABLE source (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, last_scan_at REAL, last_error TEXT);
+    CREATE TABLE source (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0, last_scan_at REAL, last_error TEXT);
     CREATE TABLE file_record (id TEXT PRIMARY KEY, created_order INTEGER NOT NULL UNIQUE, source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, metadata_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','importing','imported','skipped')), skip_reason TEXT, rule_version INTEGER NOT NULL, attempt_id TEXT, placeholder_id TEXT, submitted_at REAL, definitely_not_committed INTEGER NOT NULL DEFAULT 0, success_id TEXT, success_metadata_json TEXT, succeeded_at REAL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT, UNIQUE(source_id, relative_path));
     CREATE TABLE match_evidence (file_id TEXT NOT NULL REFERENCES file_record(id), candidate_key TEXT NOT NULL, candidate_json TEXT NOT NULL, rule_version INTEGER NOT NULL, compared_at REAL NOT NULL, PRIMARY KEY(file_id, candidate_key));
     CREATE TABLE scan_run (id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source(id), started_at REAL NOT NULL, ended_at REAL, complete INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, last_error TEXT);
     CREATE INDEX file_state_retry ON file_record(state, next_retry_at); CREATE INDEX file_name ON file_record(filename);
+    CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path));
     """
 }

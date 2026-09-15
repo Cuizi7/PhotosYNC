@@ -36,6 +36,7 @@ public actor SyncEngine {
     private var indexed: [MatchCandidate] = []
     private var eligibleSources: Set<UUID> = []
     private var disabledSources: Set<UUID> = []
+    private var removedSources: Set<UUID> = []
     private var scanRuns: [UUID: UUID] = [:]
     private var reportedWaitingSources: Set<UUID> = []
     private var sourceIssues: [UUID: [String: String]] = [:]
@@ -53,12 +54,27 @@ public actor SyncEngine {
     public func addSource(url: URL) async throws -> UUID {
         let id = try await store.registerSource(url: url)
         disabledSources.remove(id)
+        removedSources.remove(id)
         return id
     }
     public func disableSource(id: UUID) async throws {
         // Admission closes before the durable update suspends this actor.
         disabledSources.insert(id)
+        eligibleSources.remove(id)
         try await store.disableSource(id: id)
+    }
+    public func removeSource(id: UUID) async throws {
+        // Removal must close both scan and Photos admission before the database update awaits.
+        disabledSources.insert(id)
+        removedSources.insert(id)
+        eligibleSources.remove(id)
+        clearRemovedSourceStatus(id)
+        do {
+            try await store.removeSource(id: id)
+        } catch {
+            stopStorage(error)
+            throw error
+        }
     }
     public func startupScan() async { await scanEnabledSources() }
     public func manualScan() async { await scanEnabledSources() }
@@ -96,7 +112,7 @@ public actor SyncEngine {
         guard !storageFailed else { scanning = false; return }
         do { indexed = try await photos.loadCandidates() }
         catch { status.blockingError = error.localizedDescription; scanning = false; return }
-        eligibleSources = Set(sourceIDs)
+        eligibleSources = Set(sourceIDs).subtracting(disabledSources)
         await withTaskGroup(of: Void.self) { group in
             for sourceID in Set(sourceIDs) { group.addTask { await self.scanSource(sourceID) } }
         }
@@ -116,6 +132,9 @@ public actor SyncEngine {
             for record in try await allFiles(.importing) where record.attemptID != activeAttempt {
                 guard let attempt = record.attemptID else { continue }
                 do {
+                    if try await store.isSourceRemoved(id: record.file.sourceID) {
+                        removedSources.insert(record.file.sourceID)
+                    }
                     switch try await photos.reconcile(placeholder: record.placeholderID) {
                     case .found(let id):
                         try await store.markImported(fileID: record.id, attemptID: attempt, identifier: id)
@@ -144,7 +163,7 @@ public actor SyncEngine {
         var run: UUID?
         do {
             let source = try await store.source(id: sourceID)
-            guard source.enabled, !status.isPaused else { return }
+            guard source.enabled, canScan(sourceID: sourceID) else { return }
             run = try await store.beginScan(sourceID: sourceID, now: Date())
             scanRuns[sourceID] = run
             logEvent(phase: "scan", result: "started", sourceID: sourceID, runID: run)
@@ -152,18 +171,20 @@ public actor SyncEngine {
             let metadataReader = metadata(sourceID)
             var directories: [(url: URL, relative: String)] = [(source.url, "")]
             var lastFailure: String?
-            while !directories.isEmpty, !status.isPaused, !storageFailed {
+            scanLoop: while !directories.isEmpty, canScan(sourceID: sourceID) {
                 let folder = directories.removeFirst()
                 do {
                     for entry in try await reader.entries(in: folder.url) {
-                        if status.isPaused || storageFailed { break }
+                        guard canScan(sourceID: sourceID) else { break scanLoop }
                         if entry.isDirectory { directories.append((entry.url, folder.relative + entry.url.lastPathComponent + "/")); continue }
                         checked += 1; status.checked += 1
                         do {
                             if let failure = entry.failure { throw NSError(domain: "PhotoSync.DirectoryEntry", code: 1, userInfo: [NSLocalizedDescriptionKey: failure]) }
                             let stamp = try await reader.stamp(of: entry.url)
+                            guard canScan(sourceID: sourceID) else { break scanLoop }
                             let relative = folder.relative + entry.url.lastPathComponent
                             if let old = try await store.file(sourceID: sourceID, relativePath: relative) {
+                                guard canScan(sourceID: sourceID) else { break scanLoop }
                                 // Never discard the identity of an unresolved actual import.
                                 if old.state != .importing, old.file.stamp != stamp {
                                     try await store.recordSourceChange(fileID: old.id, stamp: stamp)
@@ -180,6 +201,7 @@ public actor SyncEngine {
                                 continue
                             }
                             let info = try await metadataReader.read(url: entry.url, filename: entry.url.lastPathComponent)
+                            guard canScan(sourceID: sourceID) else { break scanLoop }
                             let file = SourceFile(sourceID: sourceID, relativePath: relative, url: entry.url, stamp: stamp, metadata: info)
                             let decision = policy.evaluate(info, candidates: indexed)
                             let evidence = matchingCandidates(decision, candidates: indexed)
@@ -202,10 +224,19 @@ public actor SyncEngine {
                 }
             }
             if let run {
-                let complete = failed == 0 && !status.isPaused && !storageFailed
+                let complete = failed == 0 && canScan(sourceID: sourceID)
                 try await store.finishScan(runID: run, now: Date(), complete: complete, checked: checked, failed: failed, error: lastFailure)
                 if complete { resolveSourceIssue(sourceID, key: "scan", runID: run) }
-                let result = status.isPaused ? "paused" : (complete ? "completed" : "failed")
+                let result: String
+                if status.isPaused {
+                    result = "paused"
+                } else if complete {
+                    result = "completed"
+                } else if disabledSources.contains(sourceID) {
+                    result = "stopped"
+                } else {
+                    result = "failed"
+                }
                 logEvent(phase: "scan", result: result, sourceID: sourceID, runID: run)
             }
             startDrain()
@@ -224,6 +255,7 @@ public actor SyncEngine {
                 let records = try await allFiles(.pending)
                 guard let record = records.first(where: { !visited.contains($0.id) && eligibleSources.contains($0.file.sourceID) }) else { break }
                 visited.insert(record.id)
+                guard canSubmit(sourceID: record.file.sourceID) else { continue }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
                 if let retry = record.nextRetryAt, retry > Date() { continue }
                 do {
@@ -307,6 +339,10 @@ public actor SyncEngine {
         !status.isPaused && !storageFailed && status.blockingError == nil && uncertainSubmissions.isEmpty && !disabledSources.contains(sourceID)
     }
 
+    private func canScan(sourceID: UUID) -> Bool {
+        !status.isPaused && !storageFailed && !disabledSources.contains(sourceID)
+    }
+
     private func nextRetry(for record: StoredFile, now: Date = Date()) -> Date {
         now.addingTimeInterval(retryDelay(failureCount: record.retryCount + 1))
     }
@@ -314,17 +350,20 @@ public actor SyncEngine {
     private func issueKey(for fileID: UUID) -> String { "file:\(fileID.uuidString)" }
 
     private func setSourceIssue(_ sourceID: UUID, key: String, message: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+        guard !removedSources.contains(sourceID) else { return }
         sourceIssues[sourceID, default: [:]][key] = message
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
     }
 
     private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
+        guard !removedSources.contains(sourceID) else { return }
         sourceIssues[sourceID]?.removeValue(forKey: key)
         if sourceIssues[sourceID]?.isEmpty == true { sourceIssues.removeValue(forKey: sourceID) }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: nil)
     }
 
     private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+        guard !removedSources.contains(sourceID) else { return }
         if let message = sourceIssues[sourceID]?.values.sorted().first {
             status.waitingSources[sourceID] = message
             logSourceWaiting(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
@@ -344,6 +383,14 @@ public actor SyncEngine {
         guard reportedWaitingSources.remove(sourceID) != nil else { return }
         notify(sourceID, true)
         logEvent(phase: "recovery", result: "recovered", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
+    }
+
+    private func clearRemovedSourceStatus(_ sourceID: UUID) {
+        status.sourcePhases.removeValue(forKey: sourceID)
+        status.waitingSources.removeValue(forKey: sourceID)
+        sourceIssues.removeValue(forKey: sourceID)
+        scanRuns.removeValue(forKey: sourceID)
+        reportedWaitingSources.remove(sourceID)
     }
 
     private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, error: Error? = nil) {
