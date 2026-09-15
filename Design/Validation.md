@@ -145,3 +145,10 @@ User authorized2 self-created images and cleanup. Current Core independently bui
 Fresh-store duplicate check exposed a limitation: identical-byte fixtures with unique01/02 names initially retained distinct resource names, but later both IDs reported01. The02 fresh-store attempt was intercepted by the harness2-call limit, so no third asset was created. This does not invalidate history-based protection; filename-only Photos matching without local history cannot reliably recover a name Photos changes. No content hashing was added to product.
 
 Exact evidence and retained failures: `work/ProductionWriteQA/report.md` and adjacent JSON/SQLite/build logs. This tests the real Core engine/gateway against production Photos, not production GUI source configuration. Cleanup exists only in the test harness.
+
+
+## Final PhotosYNC release, real remote SMB, native GUI (2026-09-15)
+
+User authorized remote Mac SMB service. Isolated readonly Samba at192.168.10.107:1445, source /Volumes/PhotosYNC-QA selected by actual final-app NSOpenPanel. Two distinct selfmade JPEGs imported, README skipped. On test-service stop, final app reported timeout then missing directory/waiting; success count stayed2. Restart service +system remount led automatic recovery at12:10:52 local with no new submission; file hashes unchanged. Restart final app at12:11:53 completed startup scan, identical two successIDs. Evidence:work/SMBFinal/report.md and snapshots. This supersedes final-app GUI/source-picker blocker in closure report; previously no-source acceptance is now completed with realSMB+realPhotos.
+
+Remaining: system login/logout, notifications, sleep/wake and natural30minute enabled-source scan. Desktop locked at12:15. Test service/share/source retained for continued acceptance. System-managed mount disappearance is covered; retained empty manual mountpoint false recovery remains a planned fix.

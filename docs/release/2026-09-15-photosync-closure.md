@@ -22,3 +22,7 @@ Existing successful production-library test and retained Recently Deleted test a
 - Network recovery proposal completed separately, not implemented; requires approval of manual verification fallback for old/unidentifiable sources and realNAS identity sampling.
 
 Thus four requested closure categories are tracked honestly: packaging and flaky resolution complete after final provenance/commit; final-package fullGUI and resident acceptance remain blocked by control-session access. Existing prior nativefake/readonly and productionCore write evidence still valid only for their original scopes.
+
+## Superseding SMB acceptance (2026-09-15 12:12 local)
+
+Final-app end-to-end is now PASS: real remote readonlySMB selected via native volume picker,2realPhotos imports, service loss→waiting, same-share explicit remount→automatic recovery, process restart→startup scan with no duplicate. See Design/Validation.md and work/SMBFinal/report.md. The previous source-picker blocker is resolved by native sidebar volume selection. Resident login/logout/notifications/sleepwake/natural30min remains unverified; desktop locked again. Network identity implementation still pending.
