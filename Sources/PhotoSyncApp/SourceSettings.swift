@@ -56,6 +56,9 @@ struct SourceSettings: View {
 
     private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 18) {
+            Text("PhotosYNC \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0") beta")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Label(model.statusDescription, systemImage: model.status.symbol)
                 .font(.headline)
                 .accessibilityIdentifier("photosync-settings-status")

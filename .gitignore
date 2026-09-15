@@ -8,3 +8,6 @@
 /outputs/PhotosYNC.provenance
 
 /.worktrees/
+
+# Versioned local distribution artifacts; source artwork stays in Design/Icons.
+/outputs/releases/

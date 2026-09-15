@@ -9,17 +9,15 @@ The delivered `PhotosYNC.app` and `PhotosYNC.dmg` are local build artifacts with
 For a local build on macOS 13 or later with Xcode installed:
 
 ```sh
-xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Release \
-  -destination 'platform=macOS' -derivedDataPath work/Release \
-  CODE_SIGNING_ALLOWED=NO build
-
-mkdir -p outputs
-ditto work/Release/Build/Products/Release/PhotosYNC.app outputs/PhotosYNC.app
-codesign --force --sign - --timestamp=none outputs/PhotosYNC.app/Contents/Frameworks/PhotoSyncCore.framework
-codesign --force --sign - --timestamp=none outputs/PhotosYNC.app
-codesign --verify --deep --strict --all-architectures outputs/PhotosYNC.app
-scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
+# Xcode 26+ is required to compile the Icon Composer source.
+# Run from a clean committed checkout. Existing release directories are preserved.
+scripts/package-release.sh
 ```
+
+Current frozen release: **0.1.0 beta (build 1)**. Artifacts are under
+`outputs/releases/0.1.0-beta/`; see [release notes](docs/release/0.1.0-beta.md).
+The package includes Apple Silicon and Intel code, the compiled layered icon and
+an ICNS fallback for older macOS.
 
 Open the DMG, drag `PhotosYNC.app` to `Applications`, then launch it. The menu-bar app asks for read-write access to the **System Photo Library** only after you choose **Authorize Photos**. Once macOS grants that access and at least one source is enabled, PhotosYNC can scan and submit additions to that library. It does not select, migrate, or mount another library, and it does not change iCloud Photos settings.
 

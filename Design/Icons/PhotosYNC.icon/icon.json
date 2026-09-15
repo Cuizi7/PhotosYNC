@@ -1,0 +1,49 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "extended-srgb:0.945,0.975,0.995,1",
+      "extended-srgb:0.960,0.945,0.990,1"
+    ],
+    "orientation": {
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "stop": {
+        "x": 1,
+        "y": 1
+      }
+    }
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "S-ribbon.png",
+          "name": "S-ribbon",
+          "position": {
+            "translation": {
+              "x": 0,
+              "y": 0
+            },
+            "scale": 0.8165869218500797
+          }
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.25
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      }
+    }
+  ],
+  "supported-platforms": {
+    "circles": [
+      "watchOS"
+    ],
+    "squares": "shared"
+  }
+}

@@ -146,3 +146,8 @@ scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
 
 
 2026-09-15 发布改名：用户可见名称/产品为 PhotosYNC；Xcode project、scheme、模块、bundle ID 和 Application Support/PhotoSync 数据目录保持不变。macOS默认文件系统不区分大小写，PhotoSync.app与PhotosYNC.app不能作为独立路径；更新产物应使用干净暂存目录，不能用ditto叠加旧包。网络恢复方案在docs/release/2026-09-15-network-recovery-plan.md，尚未实现。最近删除中的用户授权测试图按用户要求不再清理。
+
+
+2026-09-15 beta 冻结：版本 0.1.0 beta（build 1），Release 使用 scripts/package-release.sh 从已提交 git archive 快照构建 Universal 包，输出 outputs/releases/0.1.0-beta/，不覆盖旧包也不启动应用。图标源 Design/Icons/PhotosYNC.icon 已进入 app 资源阶段；Xcode 编译 Assets.car 和旧系统 ICNS。详情 docs/release/0.1.0-beta.md。历史未跟踪报告、候选图标及 remote-macos13 原始证据已归档 work/Archive/2026-09-15-beta-freeze/；旧 DerivedData 的 Build/模块缓存/索引已清理，日志和数据库备份保留。
+
+用户正在使用本机时，不通过全局模拟按键（尤其 ⌘W / ⌘Q）或抢占前台焦点控制工具；本次发布收尾仅用无界面命令行，不关闭用户窗口，不启动会自动扫描的生产 PhotosYNC。
