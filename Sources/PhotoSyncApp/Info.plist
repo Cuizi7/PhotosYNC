@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
+<key>CFBundleDisplayName</key><string>$(PRODUCT_NAME)</string>
 <key>LSUIElement</key><true/>
-<key>NSPhotoLibraryUsageDescription</key><string>PhotoSync reads your library to find duplicate candidates and adds files from your selected source folders.</string>
+<key>NSPhotoLibraryUsageDescription</key><string>$(PHOTO_LIBRARY_USAGE_DESCRIPTION)</string>
 </dict></plist>

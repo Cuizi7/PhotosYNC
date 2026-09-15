@@ -3,5 +3,8 @@
 /outputs/PhotoSync.app/
 /outputs/PhotoSync.dmg
 /outputs/PhotoSync.provenance
+/outputs/PhotosYNC.app/
+/outputs/PhotosYNC.dmg
+/outputs/PhotosYNC.provenance
 
 /.worktrees/

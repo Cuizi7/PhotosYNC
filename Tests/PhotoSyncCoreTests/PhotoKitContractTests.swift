@@ -18,6 +18,57 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(PhotoKitGatewayError.libraryUnavailable.recoveryEvidence, .unknown)
     }
 
+    func testLoadCandidatesDiscardsStaleSnapshotAfterOneLibraryChange() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let stale = candidate(key: "stale")
+        let refreshed = candidate(key: "refreshed")
+        lifecycle.candidates = [stale]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        lifecycle.loadHook = {
+            lifecycle.candidates = [refreshed]
+            lifecycle.loadHook = nil
+            gateway.recordLibraryChangeForTesting()
+        }
+
+        let candidates = try await gateway.loadCandidates()
+
+        XCTAssertEqual(candidates, [refreshed])
+        XCTAssertEqual(lifecycle.loadCount, 2)
+    }
+
+    func testLoadCandidatesFailsAfterBoundedPersistentLibraryChanges() async {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        lifecycle.loadHook = { gateway.recordLibraryChangeForTesting() }
+
+        await assertThrows({ try await gateway.loadCandidates() }, verify: { error in
+            XCTAssertEqual(error as? PhotoKitGatewayError, .libraryChanged)
+        })
+        XCTAssertEqual(lifecycle.loadCount, 3)
+    }
+
+    func testLoadCandidatesDoesNotRetryWhenAccessIsLostDuringRead() async {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        lifecycle.loadHook = { lifecycle.access = .denied }
+
+        await assertThrows({ try await gateway.loadCandidates() }, verify: { error in
+            XCTAssertEqual(error as? PhotoKitGatewayError, .authorizationRequired)
+        })
+        XCTAssertEqual(lifecycle.loadCount, 1)
+    }
+
+    func testLoadCandidatesDoesNotRetryWhenLibraryBecomesUnavailableDuringRead() async {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        lifecycle.loadHook = { lifecycle.available = false }
+
+        await assertThrows({ try await gateway.loadCandidates() }, verify: { error in
+            XCTAssertEqual(error as? PhotoKitGatewayError, .libraryUnavailable)
+        })
+        XCTAssertEqual(lifecycle.loadCount, 1)
+    }
+
     func testCreateUsesCopyCheckpointBeforeReturningCommittedIdentifier() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         let gateway = PhotoKitGateway(lifecycle: lifecycle)
@@ -85,6 +136,25 @@ final class PhotoKitContractTests: XCTestCase {
         await assertThrows { try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }
     }
 
+    func testReindexingDoesNotUnblockAdditionsAfterAnUnknownCommittedOutcome() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.fetchResult = false
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.loadCandidates()
+
+        let identifier = try await gateway.create(fileURL: temporaryFile(), kind: .image) { _ in }
+        XCTAssertEqual(identifier, "asset-1")
+        _ = try await gateway.loadCandidates()
+
+        await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }, verify: { error in
+            XCTAssertEqual(
+                error as? PhotoKitGatewayError,
+                .resultUnknown("New imports are blocked until the gateway is recreated after reconciliation.")
+            )
+        })
+        XCTAssertEqual(lifecycle.commands.count, 1)
+    }
+
     func testCommittedCreateReturnsIdentifierWhenPermissionIsLostAfterCompletion() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         lifecycle.loseAccessAfterCompletion = true
@@ -96,6 +166,22 @@ final class PhotoKitContractTests: XCTestCase {
         await assertThrows { try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }
     }
 
+    func testCreateRejectsAStaleCandidateIndexBeforePhotoKitSubmission() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.loadCandidates()
+        gateway.recordLibraryChangeForTesting()
+
+        await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }, verify: { error in
+            XCTAssertEqual(
+                error as? PhotoKitGatewayError,
+                .definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
+            )
+        })
+        XCTAssertTrue(lifecycle.commands.isEmpty)
+        XCTAssertTrue(lifecycle.events.isEmpty)
+    }
+
     func testEventBeforeChangeBlockPreventsSubmissionAndEventDuringReconcileDoesNotReturnFound() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         let gateway = PhotoKitGateway(lifecycle: lifecycle)
@@ -103,7 +189,10 @@ final class PhotoKitContractTests: XCTestCase {
         lifecycle.beforeMutation = { gateway.recordLibraryChangeForTesting() }
 
         await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }, verify: { error in
-            XCTAssertEqual(error as? PhotoKitGatewayError, .libraryChanged)
+            XCTAssertEqual(
+                error as? PhotoKitGatewayError,
+                .definitelyNotCommitted("The Photos submission was prevented before mutation.")
+            )
         })
         XCTAssertTrue(lifecycle.commands.isEmpty)
 
@@ -145,15 +234,22 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
     var submitError: Error?
     var fetchResult = true
     var beforeMutation: (() -> Void)?
+    var loadHook: (() -> Void)?
     var fetchHook: (() -> Void)?
     var loseAccessAfterCompletion = false
     var commands: [PhotoKitCreateCommand] = []
     var events: [String] = []
+    private(set) var loadCount = 0
 
     func currentAccess() -> PhotoKitAccess { access }
     func requestReadWriteAuthorization() async -> PhotoKitAccess { access }
     func isAvailable() -> Bool { available }
-    func loadCandidates() throws -> [MatchCandidate] { candidates }
+    func loadCandidates() throws -> [MatchCandidate] {
+        loadCount += 1
+        let snapshot = candidates
+        loadHook?()
+        return snapshot
+    }
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         self.beforeMutation?()
         events.append("beforeMutation")
@@ -184,4 +280,21 @@ private func temporaryFile() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("PhotoKitContract-\(UUID().uuidString).jpg")
     try Data([0]).write(to: url)
     return url
+}
+
+private func candidate(key: String) -> MatchCandidate {
+    MatchCandidate(
+        key: key,
+        metadata: MediaMetadata(
+            filename: "fixture.jpg",
+            kind: .image,
+            captureSecond: nil,
+            rawCaptureTime: nil,
+            make: nil,
+            model: nil,
+            width: nil,
+            height: nil,
+            duration: nil
+        )
+    )
 }

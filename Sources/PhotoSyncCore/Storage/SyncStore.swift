@@ -241,6 +241,13 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    func latestScanFailureCount(sourceID: UUID) async throws -> Int? {
+        try await perform {
+            guard let row = try self.one("SELECT failed FROM scan_run WHERE source_id = ? ORDER BY started_at DESC LIMIT 1", [.text(sourceID.uuidString)]) else { return nil }
+            return Int(try self.int64(row[0]))
+        }
+    }
+
     public func finishScan(runID: UUID, now: Date, complete: Bool, checked: Int, failed: Int, error: String?) async throws {
         try await perform {
             try self.requireChange("UPDATE scan_run SET ended_at = ?, complete = CASE WHEN failed > 0 THEN 0 ELSE ? END, checked = ?, failed = failed + ?, last_error = COALESCE(last_error, ?) WHERE id = ?", [.double(now.timeIntervalSince1970), .int64(complete ? 1 : 0), .int64(Int64(checked)), .int64(Int64(failed)), error.map(Binding.text) ?? .null, .text(runID.uuidString)])

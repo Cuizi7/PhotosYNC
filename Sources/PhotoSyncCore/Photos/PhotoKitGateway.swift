@@ -33,6 +33,7 @@ protocol PhotoKitLifecycle: Sendable {
 }
 
 public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable {
+    private static let candidateLoadAttempts = 3
     private let lifecycle: any PhotoKitLifecycle
     private let photoLibrary: PHPhotoLibrary?
     private let state = PhotoKitState()
@@ -62,11 +63,24 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
     }
 
     public func loadCandidates() async throws -> [MatchCandidate] {
-        let generation = try await usableGeneration()
-        let candidates = try lifecycle.loadCandidates()
-        try verifyUsable(generation: generation)
-        guard state.markIndexed(generation: generation) else { throw PhotoKitGatewayError.libraryChanged }
-        return candidates
+        for attempt in 0..<Self.candidateLoadAttempts {
+            let generation = try await usableGeneration()
+            let candidates = try lifecycle.loadCandidates()
+            do {
+                try verifyUsable(generation: generation)
+                guard state.markIndexed(generation: generation) else {
+                    // A change can arrive between verification and indexing. Recheck so
+                    // unavailability and permission loss do not become retryable races.
+                    try verifyUsable(generation: generation)
+                    throw PhotoKitGatewayError.libraryChanged
+                }
+                return candidates
+            } catch let error as PhotoKitGatewayError where error == .libraryChanged {
+                guard attempt + 1 < Self.candidateLoadAttempts else { throw error }
+                await Task.yield()
+            }
+        }
+        throw PhotoKitGatewayError.libraryChanged
     }
 
     public func create(
@@ -75,7 +89,11 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> String {
         let generation = try await usableGeneration()
-        try requireAdmission(generation: generation)
+        do {
+            try requireAdmission(generation: generation)
+        } catch PhotoKitGatewayError.libraryChanged {
+            throw PhotoKitGatewayError.definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
+        }
         guard fileURL.isFileURL, FileManager.default.fileExists(atPath: fileURL.path) else {
             throw PhotoKitGatewayError.definitelyNotCommitted("The source file was unavailable before PhotoKit submission.")
         }
@@ -99,7 +117,7 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
 
         switch result {
         case .preventedBeforeMutation:
-            throw PhotoKitGatewayError.libraryChanged
+            throw PhotoKitGatewayError.definitelyNotCommitted("The Photos submission was prevented before mutation.")
         case .checkpointFailed:
             state.blockAdditions()
             throw PhotoKitGatewayError.resultUnknown("The placeholder checkpoint failed.")

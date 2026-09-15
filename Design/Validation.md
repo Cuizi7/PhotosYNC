@@ -44,7 +44,7 @@ For each case, stop the test process only in the separate test account, restart 
 
 ## Acceptance Boundary
 
-Real PhotoKit import acceptance is **not executed** by unit tests or this task. It requires the explicit test-account procedure above. The application is capable of submitting additions after the user explicitly authorizes the System Photo Library; this task did not exercise that write path. Fake gateway tests do not prove real PhotoKit acceptance.
+Unit tests do not prove real PhotoKit acceptance. The original implementation task did not exercise the write path; the separately authorized backend acceptance on 2026-09-14 is recorded below.
 
 ## macOS 13 compatibility follow-up (2026-09-14)
 
@@ -55,3 +55,93 @@ Independent Codex on `user@mbp15.local` (macOS 13.7.8, Intel) verified minimum v
 Settings-button interaction, window close/reopen/minimize behavior are **Blocked**, not passed: System Events timed out (-1712), and non-prompting probes reported no Accessibility/screen-capture authorization. The initial demo window is not evidence for the settings-button path. Normal-mode Photos import, login/notifications, and test-library ownership remain unverified. No Photos writes or system permission changes were performed.
 
 Retrieved reports: `outputs/remote-macos13/final.md` and `outputs/remote-macos13/compatibility.md`; raw remote evidence retained locally at `work/remote-qa/compat13-evidence/`. Those output/scratch files may not be Git-tracked. Remote originals remain under `/Users/user/Documents/PhotoSync-QA/2026-09-14/compat13/reports/`.
+
+
+## Real backend acceptance and library-change fix (2026-09-14)
+
+The user confirmed the system library of `user@mbp15.local` as a dedicated test library and authorized additive self-made media tests through a backend harness, without PhotoSync GUI interaction. A Cocoa AuthQA test app obtained normal PhotoKit read-write authorization. Host execution succeeded; earlier sandbox LaunchServices and AVFoundation failures are not evidence of a broken host installation.
+
+The original Core imported JPEG and MOV successfully, then a library generation change interrupted indexing/admission. A pre-submission `libraryChanged` was incorrectly treated as an unknown commit by the engine. The old PNG record remains `importing` without a placeholder; that historical record was preserved, not automatically reset.
+
+The fix retries invalidated candidate snapshots at most three times and classifies only demonstrably unsubmitted admission/mutation-prevention failures as definitely not committed. Unknown/checkpoint blocking remains unchanged. Independent review passed. Local regression tests reproduced the old failure. The integrated build passed; the full rerun passed 101 tests. The first full run had three failed assertions in the existing concurrent scan-finalization test, followed by passing isolated and full reruns; retain this intermittent-test limitation.
+
+The fixed Core was compiled on macOS 13.7.8 Intel with only PhotoKitGateway.swift replaced; all other Core source inputs were unchanged. Fixed gateway SHA-256: `78844de2f2611b0b1440a86a259ec5acf6073a5320e0b24a93652f3990cf5d09`. Fresh isolated fixtures/database were used, preserving the earlier failed run.
+
+- JPEG, MOV and PNG imported successfully in the first round; repeat scans made no additional submissions.
+- Five cross-source same-filename cases were skipped with durable suspected-duplicate evidence. The real Photos adapter lacks reliable capture/device fields; source-only differences remain conservative skips, unlike complete-metadata rule tests.
+- Actual fixture-container path removal/restoration prevented offline submission and allowed a fourth image after restoration. This is filesystem unavailability simulation, not an SMB/NFS outage test.
+- Photos went from 2 to 6 assets: exactly 4 additions and 0 deletions. Added asset IDs, placeholders, successful callbacks and SQLite success relationships matched. Sources and old test records remained unchanged.
+- The fixed run passed 23 runtime assertions and independent database/asset verification. No retries or unknown results occurred in this successful run; those paths have injected regression evidence.
+
+Evidence: `outputs/remote-macos13/fixed-real/fixed-real-2BAD785A-9E35-41ED-9821-DD3E60A3A5AD/`, including app-events.jsonl, Photos snapshots and temporary SQLite databases. Source/artifact checks and the old PNG state are retained. Evidence outputs may be untracked. No deletion or cleanup of Photos assets was performed.
+
+Not established by this run: packaged PhotoSync GUI wiring, real network mounts/slow-I/O faults, disk-full behavior, actual process-crash recovery, login/notifications, macOS 14 hardware, Developer ID signing/notarization. Existing distributed app/DMG artifacts predate this fix and are not fixed-build evidence.
+
+
+## Real fault acceptance follow-up (2026-09-14)
+
+Remote macOS 13.7.8 backend tests used the same fixed Gateway and a dedicated QA wrapper; no product source changes were made for fault injection. Evidence and detailed limitations: `outputs/remote-macos13/faults/final.md` and `evidence-faults/` alongside it. The controller independently checked retrieved asset sets, source manifests, callback IDs and SQLite snapshots.
+
+- Four actual `_exit(86)`/restart cases: after durable intent before submit, inside the placeholder callback after checkpoint, after successful Gateway return before markImported, and after durable imported state. The first two retain unknown/importing with zero resubmissions; callback success is recovered by asset ID; fully imported history is not resubmitted. A missing placeholder fetch is not proof of non-commit. These are wrapper-controlled exits, not coverage of every OS transaction timing.
+- Database-volume exhaustion: a dedicated 128 MiB HFS+ image reached ENOSPC. A real successful Photos callback followed by a full database volume caused Core storage to stop (CANTOPEN); the next file was not submitted. Removing only the test filler and restarting recovered the first asset by ID and imported only the remaining file. A separate SQLite experiment produced SQLITE_FULL with rollback/integrity preservation. Core's error must not be mislabeled SQLITE_FULL; final Core state was verified via app snapshots because CLI volume reads later returned EPERM.
+- Real read-only loopback WebDAV mount: one asset imported directly from the mounted URL. Stopping the isolated service produced a waiting source; after service restoration and actual remount, the same engine resumed with unchanged source manifest and no duplicate submissions. This is WebDAV/loopback evidence, not SMB/NFS or WAN slow-I/O coverage.
+- Total observed additions across this follow-up: five; zero observed deletions; source manifests unchanged. Earlier runs and unknown records retained.
+
+Open finding: WebDAV auto-unmount leaves a readable empty mountpoint. In the first cycle, the engine reported recovery while scanning that empty directory before remount. Evidence is preserved; the later correct remount test does not erase this false-recovery status issue. Reliably distinguishing an empty source from a disappeared mount requires a separately scoped source-identity design; no automatic mounting or identity tracking was added in this test task.
+
+Still not run: Photos target-volume exhaustion (cannot isolate without moving/selecting the system library or filling the system disk), source-full read behavior, dedicated network throttling, independent log-failure callback verification. Raw disk image remains on the test machine; local evidence archive excludes mounted trees, virtualenv, app bundles and disk images.
+
+## SMB mountpoint comparison (2026-09-14)
+
+Dedicated loopback Samba tests on macOS 13.7.8 distinguish mount management from protocol. Public NetFSMountURLSync with mountpath=NULL created a previously nonexistent /Volumes test directory; normal diskutil unmount removed it automatically before any QA cleanup. Manual mkdir + mount_smbfs succeeded, but normal unmount left the manually created empty directory; the original SourceRegistry accepted it and DirectoryReader returned zero entries. Thus the WebDAV finding must not be generalized to every SMB connection.
+
+Stopping the isolated Samba service retained the mount initially; the 0/5/15/30s probes showed blocked reads. Near 60s non-atomic samples caught transition away from smbfs; by the first post-service-restoration check the system-managed directory was absent. Service restoration did not automatically remount; two explicit NetFS reconnects timed out. Online reads had network-volume TCC/EPERM interference, so successful-read/eject and successful-read/disconnect/recovery acceptance remain partial. No actual Finder GUI connection/eject was performed; these are NetFS API and manual CLI results.
+
+Evidence: outputs/remote-macos13/smb/final.md and evidence-smb/. Existing user SMB mounts were untouched, temporary services/mounts were cleaned up, source/artifact and fixture checks passed. No Photos calls or product modifications were made by these probes.
+
+
+## Local native GUI and single-instance acceptance (2026-09-14)
+
+Local Photos is the production system library. GUI testing uses the separate GUIQA build configuration and identity `local.photosync.guiqa.session3`, a new UUID database/log session per launch, and self-created read-only source fixtures. Fake mode never accesses PhotoKit; readonly mode can enumerate real PhotoKit candidates but its create method always refuses writes. Production PID 96680 and production runtime data were not operated on.
+
+Completed native GUI baseline (before the final visual polish):
+
+- Settings and native NSOpenPanel added two actual fixture directories. The QA Documents-folder permission prompt was approved normally; a timed-out add was retried after approval.
+- Ten distinct filenames imported into the fake gateway; the second source's one same-name file was skipped. Actual SQLite: imported=10, skipped=1.
+- Menu Pause displayed paused; Resume ran a new scan and returned to completed without more imports. All eleven fixture SHA256 checks remained unchanged.
+- Evidence: `work/GUIQA/evidence/stage1-baseline.md`, baseline-menu.png, baseline-settings.png and isolated stage1 SQLite. This is fake Photos integration evidence, not local real Photos writes.
+
+Final GUIQA build: `work/GUIQA/Integrated/Build/Products/GUIQA/PhotoSyncGUIQA.app`; locally re-identified/signed copy in `work/GUIQA/Final/PhotoSyncGUIQA3.app`. Current changes disable Pause/Resume with no enabled source (including action guard), rename the settings entry, move logs into settings, and revise native spacing/layout.
+
+Single-instance guard holds a per-user, per-bundle nonblocking flock before AppModel/SQLite/runtime initialization. Same-identity live legacy processes are checked while holding the lock; no disk bundle version is used to infer the running process's implementation. Actual isolated launch checks:
+
+- Old lock-unaware QA PID57737 running: final QA launched and exited; no final-fake session was created.
+- After terminating only old QA, final QA PID65307 started, creating exactly one session `60974D65-9AB0-4EC5-93DF-F08AD7851C59`.
+- A second final QA launch with a distinct requested root exited; original PID65307 remained and the requested second runtime directory did not exist.
+- Production PID96680 remained unchanged. Activation code is present; visible focus transfer was not separately confirmed. QA identities intentionally do not block the production identity.
+
+Current final focused tests: 18/18 (launch/path safety12, readonly gateway3, process lock3), `work/GUIQA/Integrated-focused-tests.log`. Full suite after startup fix:119/119, `work/single-instance-review-fix-full-tests.log`. Earlier logs contain intermittent concurrency-journal/log assertions; later passes do not prove those timing failures eliminated. Independent review found no remaining concurrency bypass in current startup guard.
+
+Residual startup limitation: during nearly simultaneous fresh launches, conservative legacy-peer detection can make both exit if the losing process does not disappear within200ms; it does not permit parallel synchronization.
+
+Remaining local GUI acceptance: final menu enabled state/visual polish, Finder log action, and real PhotoKit readonly stage. These were interrupted by confirmed system lock (`CGSSessionScreenIsLocked=1`, black capture and inaccessible windows) on September14 at about22:34. Unlock the local desktop before continuing; do not attempt authentication automation. The final QA PID65307 is an empty-source fake session. Production Photos writes remain outside the authorized local test scope.
+
+
+### Local GUI continuation after unlock (2026-09-15)
+
+Final pre-compact QA native menu confirmed Pause disabled with no sources via AX enabled=false; settings label is 设置…, only four action buttons remain and no dropdown log action. Screenshots: `work/GUIQA/evidence/final-menu-empty.png`, `final-settings-empty.png`. Settings log action opened a Finder window named Logs; exact Finder target path was not obtained (AXDocument missing). An unnecessary Finder Apple Events permission request from the verification command was declined; QA log opening itself succeeded. Final fake session imported10 self-created files after normal Documents permission and retry.
+
+Readonly session `final-readonly/Sessions/D2456A50-A2D2-424C-B641-9D663BD53BA0` ran PID78828 with explicit readonly args, isolated SQLite and approved Photos authorization. Native GUI added album-a. Engine completed real candidate loading (required before submission), then writes were rejected with `GUI QA readonly mode prohibits all Photos writes.` SQLite: pending10, success IDs0, placeholder IDs0; submission refusal logs retained. Candidate count and exact asset contents were not recorded. This validates the read-only QA adapter, not production gateway write lifecycle or all Photos APIs. No Photos write APIs are implemented in that adapter. QA was terminated after evidence capture to stop retries. All11 source fixture hashes still match.
+
+User reported excessive fixed-height source-list whitespace. SourceSettings replaced the168-point nested List with a content-sized native VStack and8-point header gap; outer settings ScrollView handles multiple sources. Compact-layout build and screenshot verification recorded below when complete.
+
+Compact layout verification: GUIQA build succeeded (`work/GUIQA/Compact-build.log`), independent static check confirmed all ForEach rows retained. Same isolated QA identity, fake backend, new `compact-fake` session. Native NSOpenPanel added album-a and GUI returned completed. Actual screenshot `work/GUIQA/evidence/compact-settings-one-source.png` confirms a single source uses its content height and diagnostics are visible without scrolling. No fixed168-point list remains. Runtime PID79862 is the isolated fake test app, not the production app.
+
+
+## Authorized local production-library write test (2026-09-15)
+
+User authorized2 self-created images and cleanup. Current Core independently built and linked to native test host; exactly2 successIDs matched SQLite, existing-history rescan created0. Live asset IDs1356→1358→1356; after targeted cleanup the live ID set exactly equals baseline and fixture hashes remain unchanged. Permanent cleanup in Recently Deleted is pending Photos album password unlock.
+
+Fresh-store duplicate check exposed a limitation: identical-byte fixtures with unique01/02 names initially retained distinct resource names, but later both IDs reported01. The02 fresh-store attempt was intercepted by the harness2-call limit, so no third asset was created. This does not invalidate history-based protection; filename-only Photos matching without local history cannot reliably recover a name Photos changes. No content hashing was added to product.
+
+Exact evidence and retained failures: `work/ProductionWriteQA/report.md` and adjacent JSON/SQLite/build logs. This tests the real Core engine/gateway against production Photos, not production GUI source configuration. Cleanup exists only in the test harness.

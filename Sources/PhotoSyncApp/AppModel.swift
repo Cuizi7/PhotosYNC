@@ -15,6 +15,9 @@ final class AppModel: ObservableObject {
     @Published var notificationsEnabled = false
     @Published var ready = false
     @Published var demoStatus: GlobalStatus = .unconfigured
+    @Published private(set) var qaMode: GUIQAMode?
+    @Published private(set) var qaRoot: URL?
+    @Published private(set) var qaBlockedReason: String?
     let demo: Bool
     private var demoWindow: NSWindow?
     private var settingsWindow: NSWindow?
@@ -24,6 +27,48 @@ final class AppModel: ObservableObject {
 
     init(demo: Bool = ProcessInfo.processInfo.arguments.contains("--demo")) {
         self.demo = demo
+#if GUI_QA
+        let arguments = ProcessInfo.processInfo.arguments
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PhotoSync", isDirectory: true)
+        do {
+            let configuration = try GUIQALaunchConfiguration.parse(
+                arguments: arguments,
+                workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+                productionSupportDirectory: support
+            )
+            qaMode = configuration.mode
+            qaRoot = configuration.root
+            polling = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let runtime = try GUIQARuntimeFactory.make(
+                        configuration: configuration,
+                        productionSupportDirectory: support
+                    )
+                    self.runtime = runtime
+                    try await runtime.prepareInjectedRuntime()
+                    self.ready = true
+                    await runtime.tick(force: true)
+                    self.state = await runtime.current()
+                    while !Task.isCancelled {
+                        await runtime.tick()
+                        self.state = await runtime.current()
+                        try? await Task.sleep(for: .seconds(1))
+                    }
+                } catch {
+                    self.qaBlockedReason = error.localizedDescription
+                    self.error = "GUI QA 已阻止：\(error.localizedDescription)"
+                    self.ready = true
+                }
+            }
+        } catch {
+            qaBlockedReason = error.localizedDescription
+            self.error = "GUI QA 已阻止：\(error.localizedDescription)"
+            ready = true
+        }
+        return
+#endif
         if demo {
             ready = true
             let arguments = ProcessInfo.processInfo.arguments
@@ -34,7 +79,7 @@ final class AppModel: ObservableObject {
                 let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 648, height: 640),
                                       styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
                 if arguments.contains("--light") { window.appearance = NSAppearance(named: .aqua) }
-                window.title = "PhotoSync 界面验证"
+                window.title = "PhotosYNC 界面验证"
                 window.contentView = NSHostingView(rootView: SourceSettings(model: self))
                 window.center(); window.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
@@ -62,6 +107,7 @@ final class AppModel: ObservableObject {
     }
 
     var status: GlobalStatus {
+        if qaBlockedReason != nil { return .error }
         if demo { return demoStatus }
         return .resolve(configured: state.sources.contains(where: \.enabled),
                         error: error != nil || state.message != nil || state.snapshot.blockingError != nil,
@@ -83,13 +129,46 @@ final class AppModel: ObservableObject {
         let s = state.snapshot
         return "检查 \(s.checked) · 导入 \(s.imported) · 跳过 \(s.skipped) · 失败 \(s.failed) · 待处理 \(s.pending)"
     }
+    var hasEnabledSources: Bool { state.sources.contains(where: \.enabled) }
+    var canTogglePause: Bool { ready && !demo && hasEnabledSources }
+    var isGUIQA: Bool {
+#if GUI_QA
+        true
+#else
+        false
+#endif
+    }
+    var isReadOnlyGUIQA: Bool { isGUIQA && qaMode == .readonly }
+    var allowsSystemIntegrations: Bool { !demo && !isGUIQA }
+    var qaModeDescription: String {
+        switch qaMode {
+        case .fake:
+            return "GUI QA · Fake Photos 网关：不访问系统照片图库"
+        case .readonly:
+            return "GUI QA · Photos 只读验证：禁止新增、编辑和删除"
+        case nil:
+            return "GUI QA 已阻止，未创建同步运行环境"
+        }
+    }
+    var photosAuthorizationDescription: String {
+        if isReadOnlyGUIQA {
+            return "GUI QA 只读验证只枚举现有 Photos 候选。系统授权类别仍显示为“照片”访问，但此构建不会调用任何新增、编辑或删除 API。"
+        }
+        return "需要“照片”的完整读写权限，才能核对重复并新增照片。请主动授权后开始同步。"
+    }
+    var syncBoundaryDescription: String {
+        if isReadOnlyGUIQA {
+            return "GUI QA 只读验证：来源文件和 Photos 仅供读取；所有 Photos 写入请求都会被测试构建拒绝。"
+        }
+        return "只读取来源文件，向“照片”新增内容。停用来源会保留同步记录。"
+    }
 
     func openSettingsWindow() {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 590),
                                   styleMask: [.titled, .closable, .miniaturizable],
                                   backing: .buffered, defer: false)
-            window.title = "PhotoSync 来源与设置"
+            window.title = "PhotosYNC 设置"
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: SourceSettings(model: self))
             window.center()
@@ -103,7 +182,7 @@ final class AppModel: ObservableObject {
     func authorize() { guard !demo else { return }; Task { await runtime?.requestAuthorization() } }
     func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true) } }
     func togglePause() {
-        guard !demo else { return }
+        guard canTogglePause else { return }
         Task {
             if state.snapshot.isPaused { await runtime?.resume() } else { await runtime?.pause() }
             if let runtime { state = await runtime.current() }
@@ -136,12 +215,12 @@ final class AppModel: ObservableObject {
         Task { if let url = runtime?.logsURL { NSWorkspace.shared.open(url) } }
     }
     func refreshLogin() {
-        guard !demo else { return }
+        guard allowsSystemIntegrations else { return }
         loginEnabled = SMAppService.mainApp.status == .enabled
         loginNeedsApproval = SMAppService.mainApp.status == .requiresApproval
     }
     func setLogin(_ enabled: Bool) {
-        guard !demo, !changingLogin else { return }
+        guard allowsSystemIntegrations, !changingLogin else { return }
         changingLogin = true
         Task {
             defer { refreshLogin(); changingLogin = false }
@@ -152,7 +231,7 @@ final class AppModel: ObservableObject {
         }
     }
     func setNotifications(_ enabled: Bool) {
-        guard !demo else { return }
+        guard allowsSystemIntegrations else { return }
         if !enabled {
             notificationsEnabled = false
             UserDefaults.standard.set(false, forKey: "sourceNotifications")
@@ -163,7 +242,7 @@ final class AppModel: ObservableObject {
                 let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
                 notificationsEnabled = granted
                 UserDefaults.standard.set(granted, forKey: "sourceNotifications")
-                if !granted { error = "通知未获授权；可在系统设置中允许 PhotoSync 通知。" }
+                if !granted { error = "通知未获授权；可在系统设置中允许 PhotosYNC 通知。" }
             } catch { self.error = error.localizedDescription }
         }
     }

@@ -28,13 +28,25 @@ actor SyncRuntime {
     private let databaseURL: URL
     private let now: @Sendable () -> Date
     private let authorized: @Sendable () -> Bool
+    private let requestAuthorizationAction: @Sendable () async -> Bool
+    private let notificationsEnabled: @Sendable () -> Bool
 
-    init(store: SyncStore, engine: SyncEngine, now: @escaping @Sendable () -> Date,
-         authorized: @escaping @Sendable () -> Bool) {
+    init(
+        store: SyncStore,
+        engine: SyncEngine,
+        logsURL: URL = URL(fileURLWithPath: "/unused"),
+        databaseURL: URL = URL(fileURLWithPath: "/unused"),
+        now: @escaping @Sendable () -> Date,
+        authorized: @escaping @Sendable () -> Bool,
+        requestAuthorization: @escaping @Sendable () async -> Bool = { false },
+        notificationsEnabled: @escaping @Sendable () -> Bool = { false }
+    ) {
         self.store = store; self.engine = engine
         self.now = now; self.authorized = authorized
-        logsURL = URL(fileURLWithPath: "/unused")
-        databaseURL = URL(fileURLWithPath: "/unused")
+        self.logsURL = logsURL
+        self.databaseURL = databaseURL
+        requestAuthorizationAction = requestAuthorization
+        self.notificationsEnabled = notificationsEnabled
     }
 
     func prepareInjectedRuntime() async throws {
@@ -47,6 +59,11 @@ actor SyncRuntime {
     init() {
         now = { Date() }
         authorized = { PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized }
+        requestAuthorizationAction = {
+            _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+            return PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+        }
+        notificationsEnabled = { UserDefaults.standard.bool(forKey: "sourceNotifications") }
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PhotoSync", isDirectory: true)
         logsURL = support.appendingPathComponent("Logs", isDirectory: true)
@@ -79,7 +96,7 @@ actor SyncRuntime {
     }
 
     func requestAuthorization() async {
-        _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        _ = await requestAuthorizationAction()
         await tick(force: true)
     }
 
@@ -135,13 +152,13 @@ actor SyncRuntime {
                                 directory: { DirectoryReader(sourceID: $0, executor: executor) },
                                 metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger,
                                 notify: { _, recovered in
-                                    guard UserDefaults.standard.bool(forKey: "sourceNotifications") else { return }
+                                    guard self.notificationsEnabled() else { return }
                                     Task {
                                         let center = UNUserNotificationCenter.current()
                                         guard await center.notificationSettings().authorizationStatus == .authorized else { return }
                                         let content = UNMutableNotificationContent()
-                                        content.title = recovered ? "PhotoSync 来源已恢复" : "PhotoSync 来源等待恢复"
-                                        content.body = recovered ? "来源已恢复正常同步。" : "同步遇到错误，将自动重试。请在来源与设置中查看详情。"
+                                        content.title = recovered ? "PhotosYNC 来源已恢复" : "PhotosYNC 来源等待恢复"
+                                        content.body = recovered ? "来源已恢复正常同步。" : "同步遇到错误，将自动重试。请在设置中查看详情。"
                                         try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
                                     }
                                 })

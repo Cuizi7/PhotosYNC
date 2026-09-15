@@ -38,13 +38,9 @@ final class EngineTests: XCTestCase {
         await engine.scan(sourceIDs: f.sourceIDs)
 
         let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
-        let written = await engineEventually { FileManager.default.fileExists(atPath: logURL.path) }
+        let written = await engineEventually { loggedEvent(at: logURL, phase: "metadata", result: "failed") != nil }
         XCTAssertTrue(written)
-        let lines = try String(contentsOf: logURL).split(separator: "\n")
-        let metadata = try XCTUnwrap(lines.compactMap { line -> [String: String]? in
-            let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
-            return object?["phase"] == "metadata" && object?["result"] == "failed" ? object : nil
-        }.first)
+        let metadata = try XCTUnwrap(loggedEvent(at: logURL, phase: "metadata", result: "failed"))
         XCTAssertTrue(metadata["path"]?.hasSuffix("/source-0/same.jpg") == true)
         XCTAssertEqual(metadata["source"], f.sourceIDs[0].uuidString)
         XCTAssertNotNil(metadata["run"])
@@ -61,18 +57,40 @@ final class EngineTests: XCTestCase {
         await engine.scan(sourceIDs: f.sourceIDs)
 
         let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
-        let written = await engineEventually { FileManager.default.fileExists(atPath: logURL.path) }
+        let written = await engineEventually { loggedEvent(at: logURL, phase: "submission", result: "failed") != nil }
         XCTAssertTrue(written)
-        let lines = try String(contentsOf: logURL).split(separator: "\n")
-        let submission = try XCTUnwrap(lines.compactMap { line -> [String: String]? in
-            let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
-            return object?["phase"] == "submission" && object?["result"] == "failed" ? object : nil
-        }.first)
+        let submission = try XCTUnwrap(loggedEvent(at: logURL, phase: "submission", result: "failed"))
         XCTAssertEqual(submission["source"], f.sourceIDs[0].uuidString)
         XCTAssertNotNil(submission["run"])
         XCTAssertNotNil(submission["file"])
         XCTAssertNotNil(submission["attempt"])
         XCTAssertNotNil(submission["error"])
+    }
+
+    func testPreAdmissionDefiniteFailureStaysPendingAndRetriesOneActualSubmission() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let photos = PreAdmissionFailurePhotosGateway()
+        let engine = SyncEngine(store: f.store, photos: photos)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let pending = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(pending?.state, .pending)
+        XCTAssertNil(pending?.placeholderID)
+        let firstSnapshot = await engine.snapshot()
+        let initialSubmissionCount = await photos.actualSubmissionCount
+        XCTAssertNil(firstSnapshot.blockingError)
+        XCTAssertEqual(initialSubmissionCount, 0)
+
+        try injectEngineSQL("UPDATE file_record SET next_retry_at = 0", at: f.databaseURL)
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let imported = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let finalSubmissionCount = await photos.actualSubmissionCount
+        let createCallCount = await photos.createCallCount
+        XCTAssertEqual(imported?.state, .imported)
+        XCTAssertEqual(finalSubmissionCount, 1)
+        XCTAssertEqual(createCallCount, 2)
     }
 
     func testTwoSourcesSubmitOnlyOnce() async throws {
@@ -370,13 +388,44 @@ final class EngineTests: XCTestCase {
         let held = await engineEventually { await heldGate.entered }
         XCTAssertTrue(held)
         await readyGate.release()
-        let failureRecorded = await engineEventually {
-            (try? engineSQLInteger("SELECT COALESCE(SUM(failed),0) FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL)) == 1
+        let failureJournaled = try await engineEventually {
+            try await f.store.latestScanFailureCount(sourceID: pendingID) == 1
         }
-        XCTAssertTrue(failureRecorded)
+        XCTAssertTrue(failureJournaled)
         await heldGate.release()
         await scan.value
         XCTAssertEqual(try engineSQLInteger("SELECT failed FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run WHERE source_id = '\(pendingID.uuidString)' AND complete = 0 AND last_error IS NOT NULL AND ended_at IS NOT NULL", at: f.databaseURL), 1)
+    }
+}
+
+private func loggedEvent(at url: URL, phase: String, result: String) -> [String: String]? {
+    guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return nil }
+    return text.split(separator: "\n").compactMap { line in
+        let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: String]
+        return object?["phase"] == phase && object?["result"] == result ? object : nil
+    }.first
+}
+
+private actor PreAdmissionFailurePhotosGateway: PhotosGateway {
+    private(set) var createCallCount = 0
+    private(set) var actualSubmissionCount = 0
+
+    func loadCandidates() async throws -> [MatchCandidate] { [] }
+
+    func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
+
+    func create(
+        fileURL: URL,
+        kind: MediaKind,
+        onPlaceholder: @escaping @Sendable (String) throws -> Void
+    ) async throws -> String {
+        createCallCount += 1
+        guard createCallCount > 1 else {
+            throw PhotoKitGatewayError.definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
+        }
+        actualSubmissionCount += 1
+        try onPlaceholder("submitted-1")
+        return "submitted-1"
     }
 }

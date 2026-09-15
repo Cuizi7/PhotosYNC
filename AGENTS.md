@@ -1,4 +1,4 @@
-# PhotoSync：后续开发与测试交接
+# PhotosYNC：后续开发与测试交接
 
 本文件面向接手本仓库的代理。先核对当前工作树；历史报告不是当前代码或环境的保证。用户当前指令优先于本文件，已明确授权的操作不要重复询问。
 
@@ -92,7 +92,7 @@ xcrun xctest work/Validation/Build/Products/Debug/PhotoSyncCoreTests.xctest \
 - 仅检查布局时使用 `--demo`，此分支不建立真实 runtime/store/gateway。可追加 `--status error --light`；其他状态值见 `GlobalStatus.swift`。
 
 ```bash
-open -n work/Validation/Build/Products/Debug/PhotoSync.app --args --demo --status error --light
+open -n work/Validation/Build/Products/Debug/PhotosYNC.app --args --demo --status error --light
 ```
 
 在需要系统批准的环境正常请求工具执行权限。不要为演示授权 Photos、启用登录项或更改通知权限；这些系统动作的实测应明确列出。
@@ -113,14 +113,14 @@ xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Release
 构建成功后再执行：
 
 ```bash
-ditto work/Release/Build/Products/Release/PhotoSync.app outputs/PhotoSync.app
-codesign --force --sign - --timestamp=none outputs/PhotoSync.app/Contents/Frameworks/PhotoSyncCore.framework
-codesign --force --sign - --timestamp=none outputs/PhotoSync.app
-codesign --verify --deep --strict --all-architectures outputs/PhotoSync.app
-scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
+ditto work/Release/Build/Products/Release/PhotosYNC.app outputs/PhotosYNC.app
+codesign --force --sign - --timestamp=none outputs/PhotosYNC.app/Contents/Frameworks/PhotoSyncCore.framework
+codesign --force --sign - --timestamp=none outputs/PhotosYNC.app
+codesign --verify --deep --strict --all-architectures outputs/PhotosYNC.app
+scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
 ```
 
-这些是本地 ad-hoc 签名产物，不等于 Developer ID 签名、公证或 Gatekeeper 验收通过。正式签名/公证需真实凭据和授权，不购买、上传或公开发布来“顺便完成”。重建后更新 `outputs/PhotoSync.provenance` 的确切源码提交、脚本版本及校验值；旧包不是修改后代码的验证证据。
+这些是本地 ad-hoc 签名产物，不等于 Developer ID 签名、公证或 Gatekeeper 验收通过。正式签名/公证需真实凭据和授权，不购买、上传或公开发布来“顺便完成”。重建后更新 `outputs/PhotosYNC.provenance` 的确切源码提交、脚本版本及校验值；旧包不是修改后代码的验证证据。
 
 `work/`、`.worktrees/`、应用/DMG/provenance 已被忽略。不要强制提交 scratch、DerivedData、个人数据库或媒体。`outputs/PhotoSync-implementation-report.md` 和 execution-ledger 是交付记录，可能未被 Git 跟踪；保留，不误作待删垃圾。
 
@@ -143,3 +143,6 @@ scripts/build-dmg.sh "$PWD/outputs/PhotoSync.app" "$PWD/outputs/PhotoSync.dmg"
 报告必须分开列出：构建、自动测试、GUI 演示、真实 Photos、平台兼容、签名分发；未运行写清楚，不能互相替代。记录实际 commit、命令、结果和残余风险。合并/推送/发布遵守用户已授权的范围，不自行发布远端。
 
 兼容范围变更（2026-09-14，用户批准）：最低系统版本由 macOS 14 扩展为 macOS 13。macOS 13 设置入口使用受 AppModel 持有的原生 NSWindow；14+ 保留 SettingsLink。构建成功不等于 macOS 13 实机/真实 Photos 验收通过，结果需单独记录。
+
+
+2026-09-15 发布改名：用户可见名称/产品为 PhotosYNC；Xcode project、scheme、模块、bundle ID 和 Application Support/PhotoSync 数据目录保持不变。macOS默认文件系统不区分大小写，PhotoSync.app与PhotosYNC.app不能作为独立路径；更新产物应使用干净暂存目录，不能用ditto叠加旧包。网络恢复方案在docs/release/2026-09-15-network-recovery-plan.md，尚未实现。最近删除中的用户授权测试图按用户要求不再清理。

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  print -u2 "Usage: $0 /absolute/path/to/PhotoSync.app /absolute/path/to/PhotoSync.dmg"
+  print -u2 "Usage: $0 /absolute/path/to/PhotosYNC.app /absolute/path/to/PhotosYNC.dmg"
   exit 64
 }
 
@@ -66,5 +66,5 @@ trap cleanup EXIT HUP INT TERM
 ditto "$app_path" "$stage_dir/${app_path:t}"
 ln -s /Applications "$stage_dir/Applications"
 
-hdiutil create -volname "PhotoSync" -srcfolder "$stage_dir" -ov -format UDZO "$dmg_path"
+hdiutil create -volname "PhotosYNC" -srcfolder "$stage_dir" -ov -format UDZO "$dmg_path"
 print "Created $dmg_path"
