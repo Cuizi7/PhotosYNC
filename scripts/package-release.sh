@@ -2,7 +2,7 @@
 # Package a clean source snapshot without launching the app or touching user data.
 set -euo pipefail
 cd "${0:A:h:h}"
-release_name=0.1.0-beta
+release_name=0.1.0-beta2
 release_dir="$PWD/outputs/releases/$release_name"
 [[ ! -e "$release_dir" ]] || { print -u2 "Release already exists: $release_dir"; exit 73; }
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || { print -u2 'Commit tracked changes before packaging.'; exit 65; }
@@ -27,16 +27,16 @@ codesign --force --sign - --timestamp=none "$app_path"
 codesign --verify --deep --strict --all-architectures "$app_path"
 [[ -s "$app_path/Contents/Resources/Assets.car" && -s "$app_path/Contents/Resources/PhotosYNC.icns" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.1.0' ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '1' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '2' ]]
 lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch arm64 x86_64
 lipo "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore" -verify_arch arm64 x86_64
 scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg"
 hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg"
-cp docs/release/0.1.0-beta.md "$release_dir/RELEASE-NOTES.md"
+cp docs/release/0.1.0-beta2.md "$release_dir/RELEASE-NOTES.md"
 {
   print "release=$release_name"
   print "source_commit=$source_commit"
-  print "build_number=1"
+  print "build_number=2"
   print "signing=ad-hoc; notarized=no"
   print "architectures=arm64 x86_64"
   print "minimum_macos=13.0"

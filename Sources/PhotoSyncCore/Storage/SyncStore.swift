@@ -12,6 +12,22 @@ public struct StoredFile: Sendable {
     public let nextRetryAt: Date?
 }
 
+/// Current terminal and queue states for enabled, configured sources.
+/// A record has exactly one state, so a source-changed successful import is counted as skipped once.
+public struct SyncStatusSummary: Equatable, Sendable {
+    public var imported: Int
+    public var skipped: Int
+    public var pending: Int
+    public var importing: Int
+
+    public init(imported: Int = 0, skipped: Int = 0, pending: Int = 0, importing: Int = 0) {
+        self.imported = imported
+        self.skipped = skipped
+        self.pending = pending
+        self.importing = importing
+    }
+}
+
 public struct RegisteredSource: Sendable {
     public let id: UUID
     public let url: URL
@@ -124,14 +140,6 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    /// Attribute-only terminal dispositions never enter media matching or the import queue.
-    public func saveNonMedia(sourceID: UUID, relativePath: String, stamp: FileStamp, disposition: String) async throws {
-        try await perform {
-            try self.execute("INSERT INTO non_media_skip (source_id, relative_path, size, modified_ns, disposition, state, skip_reason) VALUES (?, ?, ?, ?, ?, 'skipped', 'unsupportedFormat') ON CONFLICT(source_id, relative_path) DO UPDATE SET size = excluded.size, modified_ns = excluded.modified_ns, disposition = excluded.disposition",
-                [.text(sourceID.uuidString), .text(relativePath), .int64(stamp.size), .int64(stamp.modifiedNanoseconds), .text(disposition)])
-        }
-    }
-
     public func file(sourceID: UUID, relativePath: String) async throws -> StoredFile? {
         try await perform { try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.source_id = ? AND relative_path = ?", [.text(sourceID.uuidString), .text(relativePath)]) }
     }
@@ -185,6 +193,31 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             guard let row = try self.one("SELECT COUNT(*) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.state = ? AND source.enabled = 1 AND source.removed = 0", [.text(state.rawValue)]) else { return 0 }
             return Int(try self.int64(row[0]))
+        }
+    }
+
+    /// Returns all visible state counters from one SQLite statement, so callers do not combine
+    /// independently observed queue states while a submission is changing a record.
+    public func activeSourceSummary() async throws -> SyncStatusSummary {
+        try await perform {
+            guard let row = try self.one("""
+                SELECT
+                    COALESCE(SUM(CASE WHEN file_record.state = 'imported' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN file_record.state = 'skipped' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN file_record.state = 'pending' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN file_record.state = 'importing' THEN 1 ELSE 0 END), 0)
+                FROM file_record
+                JOIN source ON source.id = file_record.source_id
+                WHERE source.enabled = 1 AND source.removed = 0
+                """, []) else {
+                return SyncStatusSummary()
+            }
+            return SyncStatusSummary(
+                imported: Int(try self.int64(row[0])),
+                skipped: Int(try self.int64(row[1])),
+                pending: Int(try self.int64(row[2])),
+                importing: Int(try self.int64(row[3]))
+            )
         }
     }
 

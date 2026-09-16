@@ -2,13 +2,17 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class PhotoKitContractTests: XCTestCase {
-    func testGatewayErrorsKeepCommittedOutcomeUnknownSeparateFromDefiniteFailure() {
+    func testGatewayErrorsKeepCheckpointFailureAndUnknownOutcomeSeparateFromDefiniteFailure() {
         XCTAssertEqual(
             PhotoKitGatewayError.definitelyNotCommitted("validation failed").recoveryEvidence,
             .definitelyNotCommitted
         )
         XCTAssertEqual(
             PhotoKitGatewayError.resultUnknown("checkpoint persistence failed").recoveryEvidence,
+            .unknown
+        )
+        XCTAssertEqual(
+            PhotoKitGatewayError.checkpointFailed("checkpoint persistence failed").recoveryEvidence,
             .unknown
         )
     }
@@ -86,7 +90,7 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.events, ["beforeMutation", "placeholder", "completion", "fetch"])
     }
 
-    func testCheckpointFailureRemainsUnknownAndBlocksAnotherCreate() async throws {
+    func testCheckpointFailureRemainsTypedAfterReindexingAndBlocksAnotherCreate() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         let gateway = PhotoKitGateway(lifecycle: lifecycle)
         _ = try await gateway.loadCandidates()
@@ -95,9 +99,16 @@ final class PhotoKitContractTests: XCTestCase {
         await assertThrows({ try await gateway.create(fileURL: source, kind: .image) { _ in
             throw CheckpointError.failed
         } }, verify: { error in
-            XCTAssertEqual(error as? PhotoKitGatewayError, .resultUnknown("The placeholder checkpoint failed."))
+            XCTAssertEqual(error as? PhotoKitGatewayError, .checkpointFailed("The placeholder checkpoint failed."))
         })
-        await assertThrows { try await gateway.create(fileURL: source, kind: .image) { _ in } }
+        _ = try await gateway.loadCandidates()
+        await assertThrows({ try await gateway.create(fileURL: source, kind: .image) { _ in } }, verify: { error in
+            XCTAssertEqual(
+                error as? PhotoKitGatewayError,
+                .checkpointFailed("New imports are blocked until the gateway is recreated after reconciliation.")
+            )
+        })
+        XCTAssertEqual(lifecycle.commands.count, 1)
     }
 
     func testSystemFailedCompletionIsDefinitelyNotCommitted() async throws {
@@ -120,7 +131,7 @@ final class PhotoKitContractTests: XCTestCase {
         await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in
             throw CheckpointError.failed
         } }, verify: { error in
-            XCTAssertEqual(error as? PhotoKitGatewayError, .resultUnknown("The placeholder checkpoint failed."))
+            XCTAssertEqual(error as? PhotoKitGatewayError, .checkpointFailed("The placeholder checkpoint failed."))
         })
         await assertThrows { try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }
     }

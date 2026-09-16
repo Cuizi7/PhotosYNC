@@ -365,30 +365,59 @@ extension SourceReaderTests {
         })
         await engine.scan(sourceIDs: fixture.sourceIDs)
         let snapshot = await engine.snapshot()
-        XCTAssertEqual(snapshot.imported, 1)
-        XCTAssertEqual(snapshot.failed, 1)
+        XCTAssertEqual(snapshot.summary?.imported, 1)
+        XCTAssertEqual(snapshot.latestScan.failed, 1)
         XCTAssertNotNil(snapshot.waitingSources[fixture.sourceIDs[0]])
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT complete FROM scan_run", at: fixture.databaseURL), 0)
     }
 
-    func testAuxiliaryFilesAreAttributeOnlySkipsWithoutRecovery() async throws {
+    func testUnreadableUnknownChildDirectoryIsAnErrorWithoutBecomingACandidate() async throws {
         let fixture = try await makeEngineFixture(sourceCount: 1)
-        for name in ["same.xmp", "notes.txt", "capture.CR3"] {
+        let unreadableDirectory = fixture.directories[0].appendingPathComponent("unreadable-child")
+        try FileManager.default.createDirectory(at: unreadableDirectory, withIntermediateDirectories: true)
+        let engine = SyncEngine(store: fixture.store, photos: fixture.photos, directory: { id in
+            DirectoryReader(sourceID: id, attributes: { url, keys in
+                if url.lastPathComponent == "unreadable-child" {
+                    throw FixtureError.unavailable("child attributes denied")
+                }
+                return try url.resourceValues(forKeys: keys)
+            })
+        })
+
+        await engine.scan(sourceIDs: fixture.sourceIDs)
+
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.summary?.imported, 1)
+        XCTAssertEqual(snapshot.latestScan.checkedCandidates, 1)
+        XCTAssertEqual(snapshot.latestScan.failed, 1)
+        XCTAssertEqual(snapshot.latestScan.state, .interrupted)
+        XCTAssertNotNil(snapshot.waitingSources[fixture.sourceIDs[0]])
+        XCTAssertEqual(try engineSQLInteger("SELECT checked FROM scan_run", at: fixture.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 1)
+    }
+
+    func testAuxiliaryFilesDoNotBecomeCandidatesOrSkippedRecords() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        for name in ["same.xmp", "capture.ARW", "notes.txt", "capture.CR3"] {
             try Data("auxiliary".utf8).write(to: fixture.directories[0].appendingPathComponent(name))
         }
         await fixture.engine.scan(sourceIDs: fixture.sourceIDs)
         let snapshot = await fixture.engine.snapshot()
-        XCTAssertEqual(snapshot.imported, 1)
-        XCTAssertEqual(snapshot.skipped, 3)
-        XCTAssertEqual(snapshot.failed, 0)
+        XCTAssertEqual(snapshot.summary, SyncStatusSummary(imported: 1, skipped: 0, pending: 0, importing: 0))
+        XCTAssertEqual(snapshot.latestScan.state, .completed)
+        XCTAssertEqual(snapshot.latestScan.checkedCandidates, 1)
+        XCTAssertEqual(snapshot.latestScan.newlyImported, 1)
+        XCTAssertEqual(snapshot.latestScan.failed, 0)
         XCTAssertTrue(snapshot.waitingSources.isEmpty)
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip WHERE state = 'skipped' AND skip_reason = 'unsupportedFormat'", at: fixture.databaseURL), 3)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 0)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 1)
         await fixture.engine.scan(sourceIDs: fixture.sourceIDs)
         let again = await fixture.engine.snapshot()
         XCTAssertTrue(again.waitingSources.isEmpty)
-        XCTAssertEqual(again.imported, 0)
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 3)
+        XCTAssertEqual(again.summary, SyncStatusSummary(imported: 1, skipped: 0, pending: 0, importing: 0))
+        XCTAssertEqual(again.latestScan.checkedCandidates, 1)
+        XCTAssertEqual(again.latestScan.newlyImported, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 0)
     }
 }

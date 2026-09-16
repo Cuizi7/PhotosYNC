@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     @Published var loginNeedsApproval = false
     @Published var changingLogin = false
     @Published var notificationsEnabled = false
+    @Published private(set) var notificationIssue: NotificationPermissionWarning?
     @Published var ready = false
     @Published var demoStatus: GlobalStatus = .unconfigured
     @Published private(set) var qaMode: GUIQAMode?
@@ -23,7 +24,24 @@ final class AppModel: ObservableObject {
     private var settingsWindow: NSWindow?
     private var runtime: SyncRuntime?
     private var polling: Task<Void, Never>?
+    private var notificationPolling: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
+    private var activationObserver: NSObjectProtocol?
+    private lazy var notificationPermissions: NotificationPermissionController = {
+        NotificationPermissionController(
+            preferenceEnabled: UserDefaults.standard.bool(forKey: "sourceNotifications"),
+            readAuthorization: {
+                let settings = await UNUserNotificationCenter.current().notificationSettings()
+                return settings.authorizationStatus == .authorized
+            },
+            requestAuthorization: {
+                try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+            },
+            persistPreference: { enabled in
+                UserDefaults.standard.set(enabled, forKey: "sourceNotifications")
+            }
+        )
+    }()
 
     init(demo: Bool = ProcessInfo.processInfo.arguments.contains("--demo")) {
         self.demo = demo
@@ -90,7 +108,7 @@ final class AppModel: ObservableObject {
             return
         }
         refreshLogin()
-        notificationsEnabled = UserDefaults.standard.bool(forKey: "sourceNotifications")
+        applyNotificationState(notificationPermissions.state)
         polling = Task { [weak self] in
             let runtime = SyncRuntime()
             self?.runtime = runtime
@@ -106,15 +124,21 @@ final class AppModel: ObservableObject {
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in Task { @MainActor in await self?.runtime?.tick(force: true) } }
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.refreshNotificationPermissionState() }
+        }
+        startNotificationPolling()
     }
 
     var status: GlobalStatus {
         if qaBlockedReason != nil { return .error }
         if demo { return demoStatus }
         return .resolve(configured: state.sources.contains(where: \.enabled),
-                        error: error != nil || state.message != nil || state.snapshot.blockingError != nil,
+                        error: error != nil || state.message != nil || state.snapshot.blockingError != nil || state.snapshot.summaryError != nil,
                         paused: state.snapshot.isPaused,
-                        waiting: !state.authorized || !enabledWaiting.isEmpty || state.snapshot.pending > 0 && !state.snapshot.activeWork,
+                        waiting: !state.authorized || !enabledWaiting.isEmpty || ((state.snapshot.summary?.pending ?? 0) > 0 || (state.snapshot.summary?.importing ?? 0) > 0) && !state.snapshot.activeWork,
                         running: state.snapshot.activeWork)
     }
     var enabledWaiting: [UUID: String] {
@@ -126,11 +150,23 @@ final class AppModel: ObservableObject {
         if !ready { return "正在读取配置" }
         return status.description
     }
-    var detail: String? { error ?? state.message ?? state.snapshot.blockingError }
-    var counters: String {
-        let s = state.snapshot
-        return "检查 \(s.checked) · 导入 \(s.imported) · 跳过 \(s.skipped) · 失败 \(s.failed) · 待处理 \(s.pending)"
+    var syncDetail: String? {
+        state.snapshot.blockingError ?? state.snapshot.summaryError ?? state.message ?? error
     }
+    var notificationWarning: String? {
+        guard let notificationIssue else { return nil }
+        switch notificationIssue {
+        case .authorizationDenied:
+            return "通知未获授权；可在系统设置中允许 PhotosYNC 通知。"
+        case .authorizationStatusUnavailable(let message):
+            return "无法读取通知权限：\(message)。请稍后重试或在系统设置中检查 PhotosYNC 通知。"
+        case .authorizationRequestFailed(let message):
+            return "无法请求通知权限：\(message)。请稍后重试或在系统设置中检查 PhotosYNC 通知。"
+        }
+    }
+    var counters: String { SyncStatusPresentation(snapshot: state.snapshot).summary }
+    var scanDescription: String { SyncStatusPresentation(snapshot: state.snapshot).scan }
+    var recoveryAdvice: String? { SyncStatusPresentation(snapshot: state.snapshot).recoveryAdvice }
     var hasEnabledSources: Bool { state.sources.contains(where: \.enabled) }
     var canTogglePause: Bool { ready && !demo && hasEnabledSources }
     var isGUIQA: Bool {
@@ -248,25 +284,49 @@ final class AppModel: ObservableObject {
             } catch { self.error = "登录启动设置失败：\(error.localizedDescription)" }
         }
     }
+    func refreshNotificationPermission() {
+        guard allowsSystemIntegrations else { return }
+        Task { [weak self] in
+            await self?.refreshNotificationPermissionState()
+        }
+    }
     func setNotifications(_ enabled: Bool) {
         guard allowsSystemIntegrations else { return }
-        if !enabled {
-            notificationsEnabled = false
-            UserDefaults.standard.set(false, forKey: "sourceNotifications")
-            return
-        }
+        applyNotificationState(notificationPermissions.setPreferenceEnabled(enabled))
+        guard enabled else { return }
         Task {
-            do {
-                let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
-                notificationsEnabled = granted
-                UserDefaults.standard.set(granted, forKey: "sourceNotifications")
-                if !granted { error = "通知未获授权；可在系统设置中允许 PhotosYNC 通知。" }
-            } catch { self.error = error.localizedDescription }
+            let state = await notificationPermissions.requestAuthorization()
+            applyNotificationState(state)
         }
+    }
+
+    private func startNotificationPolling() {
+        notificationPolling = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshNotificationPermissionState()
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func refreshNotificationPermissionState() async {
+        guard allowsSystemIntegrations else { return }
+        let state = await notificationPermissions.refreshAuthorizationIfNeeded()
+        applyNotificationState(state)
+    }
+
+    private func applyNotificationState(_ state: NotificationPermissionState) {
+        notificationsEnabled = state.preferenceEnabled
+        notificationIssue = state.warning
     }
 
     func quit() {
         polling?.cancel()
+        notificationPolling?.cancel()
         Task { await runtime?.stop(); NSApplication.shared.terminate(nil) }
     }
 }

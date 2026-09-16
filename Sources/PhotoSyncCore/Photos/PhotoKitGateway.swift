@@ -109,8 +109,8 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
             )
         } catch {
             if case .checkpointFailed = error as? PhotoKitSubmissionError {
-                state.blockAdditions()
-                throw PhotoKitGatewayError.resultUnknown("The placeholder checkpoint failed.")
+                state.blockAdditions(.checkpointFailed)
+                throw PhotoKitGatewayError.checkpointFailed("The placeholder checkpoint failed.")
             }
             throw classifyChangeFailure(error)
         }
@@ -119,8 +119,8 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
         case .preventedBeforeMutation:
             throw PhotoKitGatewayError.definitelyNotCommitted("The Photos submission was prevented before mutation.")
         case .checkpointFailed:
-            state.blockAdditions()
-            throw PhotoKitGatewayError.resultUnknown("The placeholder checkpoint failed.")
+            state.blockAdditions(.checkpointFailed)
+            throw PhotoKitGatewayError.checkpointFailed("The placeholder checkpoint failed.")
         case .committed(let identifier):
             // A successful PhotoKit completion is the durable success signal. Later
             // fetch or permission loss is health evidence that blocks additions only.
@@ -161,7 +161,9 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
         switch state.admission(generation: generation) {
         case .ready: return
         case .libraryChanged: throw PhotoKitGatewayError.libraryChanged
-        case .blockedAfterUnknown:
+        case .blockedAfterCheckpointFailure:
+            throw PhotoKitGatewayError.checkpointFailed("New imports are blocked until the gateway is recreated after reconciliation.")
+        case .blockedAfterUnknownOutcome:
             throw PhotoKitGatewayError.resultUnknown("New imports are blocked until the gateway is recreated after reconciliation.")
         }
     }
@@ -171,11 +173,11 @@ public final class PhotoKitGateway: NSObject, PhotosGateway, @unchecked Sendable
             guard lifecycle.currentAccess() == .authorized,
                   lifecycle.isAvailable(),
                   try lifecycle.fetch(identifier: identifier) else {
-                state.blockAdditions()
+                state.blockAdditions(.unknownOutcome)
                 return
             }
         } catch {
-            state.blockAdditions()
+            state.blockAdditions(.unknownOutcome)
         }
     }
 
@@ -264,13 +266,21 @@ private final class SubmissionState: @unchecked Sendable {
 }
 
 private final class PhotoKitState: @unchecked Sendable {
-    private let lock = NSLock(); private var available = true; private var generation = 0; private var indexedGeneration: Int?; private var additionsBlocked = false
+    enum AdditionBlockReason { case checkpointFailed, unknownOutcome }
+    private let lock = NSLock(); private var available = true; private var generation = 0; private var indexedGeneration: Int?; private var additionsBlocked: AdditionBlockReason?
     func snapshot() -> (available: Bool, generation: Int) { lock.lock(); defer { lock.unlock() }; return (available, generation) }
     func recordChange() { lock.lock(); generation += 1; lock.unlock() }
     func recordUnavailable() { lock.lock(); available = false; generation += 1; lock.unlock() }
     func markIndexed(generation expected: Int) -> Bool { lock.lock(); defer { lock.unlock() }; guard available, generation == expected else { return false }; indexedGeneration = expected; return true }
-    enum Admission { case ready, libraryChanged, blockedAfterUnknown }
-    func admission(generation expected: Int) -> Admission { lock.lock(); defer { lock.unlock() }; if additionsBlocked { return .blockedAfterUnknown }; return available && generation == expected && indexedGeneration == expected ? .ready : .libraryChanged }
+    enum Admission { case ready, libraryChanged, blockedAfterCheckpointFailure, blockedAfterUnknownOutcome }
+    func admission(generation expected: Int) -> Admission {
+        lock.lock(); defer { lock.unlock() }
+        switch additionsBlocked {
+        case .checkpointFailed: return .blockedAfterCheckpointFailure
+        case .unknownOutcome: return .blockedAfterUnknownOutcome
+        case nil: return available && generation == expected && indexedGeneration == expected ? .ready : .libraryChanged
+        }
+    }
     func isReady(generation expected: Int) -> Bool { admission(generation: expected) == .ready }
-    func blockAdditions() { lock.lock(); additionsBlocked = true; lock.unlock() }
+    func blockAdditions(_ reason: AdditionBlockReason) { lock.lock(); additionsBlocked = reason; lock.unlock() }
 }

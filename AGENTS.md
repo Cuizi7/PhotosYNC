@@ -151,3 +151,5 @@ scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
 2026-09-15 beta 冻结：版本 0.1.0 beta（build 1），Release 使用 scripts/package-release.sh 从已提交 git archive 快照构建 Universal 包，输出 outputs/releases/0.1.0-beta/，不覆盖旧包也不启动应用。图标源 Design/Icons/PhotosYNC.icon 已进入 app 资源阶段；Xcode 编译 Assets.car 和旧系统 ICNS。详情 docs/release/0.1.0-beta.md。历史未跟踪报告、候选图标及 remote-macos13 原始证据已归档 work/Archive/2026-09-15-beta-freeze/；旧 DerivedData 的 Build/模块缓存/索引已清理，日志和数据库备份保留。
 
 用户正在使用本机时，不通过全局模拟按键（尤其 ⌘W / ⌘Q）或抢占前台焦点控制工具；本次发布收尾仅用无界面命令行，不关闭用户窗口，不启动会自动扫描的生产 PhotosYNC。
+
+2026-09-16 beta2：统计拆分为 EngineSnapshot.summary（活动来源持久化互斥状态，首次未知为 nil）与 latestScan（本次扫描）。非候选 ARW/XMP 不写跳过记录、不计检查/跳过；旧 non_media_skip 表可存在但应用不读写；离线清理工具 scripts/cleanup-non-candidate-records.py 默认 dry-run，--apply 必须指定备份，对实际生产库取得相同 instance.lock，不能在生产应用运行时清理。生产数据库副本只能用于隔离测试，不得根据副本中的 source.path 扫描实际媒体。通知警告独立于同步错误；checkpointFailed 仍是 unknown 恢复证据，不能据此允许重试。beta2 build 2，tag/产物独立于 beta1。部署或清理生产数据仍需新的明确授权。

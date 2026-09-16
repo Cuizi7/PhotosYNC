@@ -24,6 +24,7 @@ struct SourceSettings: View {
         .frame(width: Self.preferredWidth, height: contentHeight)
         .onAppear {
             model.refreshLogin()
+            model.refreshNotificationPermission()
         }
         .onPreferenceChange(SourceSettingsContentHeightKey.self) { height in
             guard height > 0 else { return }
@@ -56,7 +57,7 @@ struct SourceSettings: View {
 
     private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("PhotosYNC \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0") beta")
+            Text(releaseDescription)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Label(model.statusDescription, systemImage: model.status.symbol)
@@ -128,6 +129,12 @@ struct SourceSettings: View {
             Text("同步选项").font(.headline)
             Toggle("来源首次失败和恢复时通知", isOn: Binding(get: { model.notificationsEnabled }, set: model.setNotifications))
                 .disabled(!model.allowsSystemIntegrations)
+            if let warning = model.notificationWarning {
+                Label(warning, systemImage: "bell.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Toggle("登录时启动", isOn: Binding(get: { model.loginEnabled }, set: model.setLogin))
                 .disabled(!model.allowsSystemIntegrations || model.changingLogin)
             if model.loginNeedsApproval {
@@ -145,12 +152,18 @@ struct SourceSettings: View {
                     .buttonStyle(.bordered)
                     .disabled(model.demo)
             }
-            if let error = model.detail {
-                Text(error).foregroundStyle(.red).textSelection(.enabled).lineLimit(5)
+            if let detail = model.syncDetail {
+                Text(detail).foregroundStyle(.red).textSelection(.enabled).lineLimit(5)
                 if model.error != nil { Button("关闭提示") { model.error = nil } }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var releaseDescription: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        let channel = Bundle.main.object(forInfoDictionaryKey: "PhotoSyncReleaseChannel") as? String ?? "beta"
+        return "PhotosYNC \(version) \(channel)"
     }
 
     private var demoSourceRow: some View {

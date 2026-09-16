@@ -165,7 +165,7 @@ final class EngineTests: XCTestCase {
         let heldCount = await f.photos.createCount
         XCTAssertEqual(heldCount, 1)
         let heldSnapshot = await f.engine.snapshot()
-        XCTAssertEqual(heldSnapshot.pending, 1)
+        XCTAssertEqual(heldSnapshot.summary?.pending, 1)
         await f.engine.pause()
         await gate.release()
         await first.value; await second.value
@@ -199,6 +199,7 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(count, 1)
         let snapshot = await f.engine.snapshot()
         XCTAssertNotNil(snapshot.blockingError)
+        XCTAssertNotNil(snapshot.summaryError)
         let uncertain = try await f.store.listFiles(state: .importing, afterID: nil, limit: 10)
         XCTAssertEqual(uncertain.count, 1)
         await f.engine.scan(sourceIDs: f.sourceIDs)
@@ -214,7 +215,7 @@ final class EngineTests: XCTestCase {
         await f.engine.scan(sourceIDs: f.sourceIDs)
         let missing = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
         XCTAssertNil(missing)
-        let failed = await f.engine.snapshot().failed
+        let failed = (await f.engine.snapshot()).latestScan.failed
         XCTAssertEqual(failed, 1)
         try bytes.write(to: url)
         await f.engine.scan(sourceIDs: f.sourceIDs)
@@ -358,14 +359,119 @@ final class EngineTests: XCTestCase {
     func testUnknownReturnedResultBlocksLaterSubmissionsAcrossRounds() async throws {
         let f = try await makeEngineFixture()
         try FileManager.default.moveItem(at: f.directories[1].appendingPathComponent("same.jpg"), to: f.directories[1].appendingPathComponent("different.jpg"))
-        await f.photos.setCreationError(.resultUnknown("callback uncertain"))
+        let unknown = PhotoKitGatewayError.resultUnknown("callback uncertain")
+        await f.photos.setCreationError(unknown)
         await f.engine.scan(sourceIDs: f.sourceIDs)
         await f.photos.setCreationError(nil)
         await f.engine.scan(sourceIDs: f.sourceIDs)
         let count = await f.photos.createCount
         XCTAssertEqual(count, 1, "Do not reuse submission slot while this process has an unresolved result")
         let status = await f.engine.snapshot()
-        XCTAssertNotNil(status.blockingError)
+        XCTAssertEqual(status.blockingError, unknown.localizedDescription)
+        guard case .uncertainSubmission(let message)? = status.recoveryHint else {
+            return XCTFail("An unknown Photos submission needs a typed recovery hint")
+        }
+        XCTAssertEqual(message, "callback uncertain")
+    }
+
+    func testCheckpointFailurePreservesRawBlockAndUsesDedicatedHint() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let checkpoint = PhotoKitGatewayError.checkpointFailed("placeholder checkpoint failed")
+        await f.photos.setCreationError(checkpoint)
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await f.engine.snapshot()
+        XCTAssertEqual(snapshot.blockingError, checkpoint.localizedDescription)
+        XCTAssertEqual(snapshot.recoveryHint, .checkpointFailure(message: "placeholder checkpoint failed"))
+    }
+
+    func testLatestRoundDoesNotCountACompletionFromAnEarlierHeldSubmission() async throws {
+        let f = try await makeEngineFixture()
+        try FileManager.default.moveItem(at: f.directories[1].appendingPathComponent("same.jpg"), to: f.directories[1].appendingPathComponent("different.jpg"))
+        let gate = EngineTestGate()
+        await f.photos.setCreationGate(gate)
+
+        let first = Task { await f.engine.scan(sourceIDs: [f.sourceIDs[0]]) }
+        let firstSubmissionEntered = await engineEventually { await gate.entered }
+        XCTAssertTrue(firstSubmissionEntered)
+        let second = Task { await f.engine.scan(sourceIDs: [f.sourceIDs[1]]) }
+        let secondSourceScanned = try await engineEventually {
+            try await f.store.file(sourceID: f.sourceIDs[1], relativePath: "different.jpg") != nil
+        }
+        XCTAssertTrue(secondSourceScanned)
+        await gate.release()
+        await first.value
+        await second.value
+
+        let snapshot = await f.engine.snapshot()
+        XCTAssertEqual(snapshot.latestScan.state, .completed)
+        XCTAssertEqual(snapshot.latestScan.checkedCandidates, 1)
+        XCTAssertEqual(snapshot.latestScan.newlyImported, 1)
+        XCTAssertEqual(snapshot.summary, SyncStatusSummary(imported: 2, skipped: 0, pending: 0, importing: 0))
+    }
+
+    func testCurrentRoundCountsOnlySupportedCandidatesAndKeepsPriorStateSummary() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        try FileManager.default.removeItem(at: f.directories[0].appendingPathComponent("same.jpg"))
+        let reader = DirectoryReader(sourceID: f.sourceIDs[0])
+
+        for index in 0..<116 {
+            let name = "photo-\(index).jpg"
+            let url = f.directories[0].appendingPathComponent(name)
+            try Data("fixture-\(index)".utf8).write(to: url)
+            let file = SourceFile(
+                sourceID: f.sourceIDs[0],
+                relativePath: name,
+                url: url,
+                stamp: try await reader.stamp(of: url),
+                metadata: media(name)
+            )
+            let id = try await f.store.save(file, decision: .importNew)
+            if index < 115 {
+                let attempt = UUID()
+                try await f.store.beginAttempt(fileID: id, attemptID: attempt)
+                try await f.store.markImported(fileID: id, attemptID: attempt, identifier: "asset-\(index)")
+            } else {
+                try await f.store.markSkipped(fileID: id, reason: .suspectedDuplicate, candidates: [])
+            }
+        }
+        for index in 0..<114 {
+            try Data("raw".utf8).write(to: f.directories[0].appendingPathComponent("raw-\(index).ARW"))
+        }
+        for index in 0..<26 {
+            try Data("sidecar".utf8).write(to: f.directories[0].appendingPathComponent("sidecar-\(index).xmp"))
+        }
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let first = await f.engine.snapshot()
+        XCTAssertEqual(first.summary, SyncStatusSummary(imported: 115, skipped: 1, pending: 0, importing: 0))
+        XCTAssertEqual(first.latestScan.state, .completed)
+        XCTAssertEqual(first.latestScan.checkedCandidates, 116)
+        XCTAssertEqual(first.latestScan.newlyImported, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: f.databaseURL), 0)
+
+        let reopenedStore = try SyncStore(url: f.databaseURL)
+        let restarted = SyncEngine(store: reopenedStore, photos: f.photos)
+        await restarted.scan(sourceIDs: f.sourceIDs)
+        let again = await restarted.snapshot()
+        XCTAssertEqual(again.summary, SyncStatusSummary(imported: 115, skipped: 1, pending: 0, importing: 0))
+        XCTAssertEqual(again.latestScan.checkedCandidates, 116)
+        XCTAssertEqual(again.latestScan.newlyImported, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: f.databaseURL), 0)
+    }
+
+    func testSummaryFailureKeepsLastKnownValuesAndMarksTheSnapshotUnavailable() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let beforeFailure = await f.engine.snapshot()
+        let known = try XCTUnwrap(beforeFailure.summary)
+
+        try injectEngineSQL("ALTER TABLE source DROP COLUMN removed", at: f.databaseURL)
+        let failed = await f.engine.snapshot()
+
+        XCTAssertEqual(failed.summary, known)
+        XCTAssertNotNil(failed.summaryError)
     }
 
     func testOrderedPendingReservationsHaveOneWinnerAndExcludeSelf() async throws {
@@ -434,7 +540,7 @@ final class EngineTests: XCTestCase {
         let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
         XCTAssertEqual(record?.state, .pending)
         XCTAssertNotNil(record?.nextRetryAt)
-        let failed = await engine.snapshot().failed
+        let failed = (await engine.snapshot()).latestScan.failed
         XCTAssertEqual(failed, 1)
         XCTAssertEqual(try engineSQLInteger("SELECT SUM(failed) FROM scan_run", at: f.databaseURL), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run WHERE complete = 0 AND last_error IS NOT NULL", at: f.databaseURL), 1)

@@ -22,12 +22,13 @@ public enum PhotoKitGatewayError: Error, Equatable, LocalizedError, Sendable {
     case libraryChanged
     case definitelyNotCommitted(String)
     case resultUnknown(String)
+    case checkpointFailed(String)
 
     public var recoveryEvidence: ImportEvidence {
         switch self {
         case .definitelyNotCommitted:
             return .definitelyNotCommitted
-        case .authorizationRequired, .libraryUnavailable, .libraryChanged, .resultUnknown:
+        case .authorizationRequired, .libraryUnavailable, .libraryChanged, .resultUnknown, .checkpointFailed:
             return .unknown
         }
     }
@@ -42,7 +43,7 @@ public enum PhotoKitGatewayError: Error, Equatable, LocalizedError, Sendable {
             return "The system Photos library changed while it was being queried."
         case .definitelyNotCommitted(let detail):
             return "The Photos change was not committed: \(detail)"
-        case .resultUnknown(let detail):
+        case .resultUnknown(let detail), .checkpointFailed(let detail):
             return "The Photos import outcome is unknown: \(detail)"
         }
     }

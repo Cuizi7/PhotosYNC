@@ -14,8 +14,8 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Current frozen release: **0.1.0 beta (build 1)**. Artifacts are under
-`outputs/releases/0.1.0-beta/`; see [release notes](docs/release/0.1.0-beta.md).
+Current frozen release: **0.1.0 beta2 (build 2)**. Artifacts are under
+`outputs/releases/0.1.0-beta2/`; see [release notes](docs/release/0.1.0-beta2.md).
 The package includes Apple Silicon and Intel code, the compiled layered icon and
 an ICNS fallback for older macOS.
 

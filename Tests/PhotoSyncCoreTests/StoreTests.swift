@@ -46,6 +46,46 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(history, "asset-1")
     }
 
+    func testActiveSourceSummaryCountsCurrentStatesOnceAndExcludesInactiveSources() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let active = root.appendingPathComponent("active")
+        let disabled = root.appendingPathComponent("disabled")
+        let removed = root.appendingPathComponent("removed")
+        for directory in [active, disabled, removed] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let activeID = try await store.registerSource(url: active)
+        let disabledID = try await store.registerSource(url: disabled)
+        let removedID = try await store.registerSource(url: removed)
+
+        let imported = try await store.save(source(sourceID: activeID, root: active, relativePath: "imported.jpg"), decision: .importNew)
+        let importedAttempt = UUID()
+        try await store.beginAttempt(fileID: imported, attemptID: importedAttempt)
+        try await store.markImported(fileID: imported, attemptID: importedAttempt, identifier: "asset-imported")
+
+        let changed = try await store.save(source(sourceID: activeID, root: active, relativePath: "changed.jpg"), decision: .importNew)
+        let changedAttempt = UUID()
+        try await store.beginAttempt(fileID: changed, attemptID: changedAttempt)
+        try await store.markImported(fileID: changed, attemptID: changedAttempt, identifier: "asset-changed")
+        try await store.recordSourceChange(fileID: changed, stamp: FileStamp(size: 13, modifiedNanoseconds: 11))
+
+        let duplicate = try await store.save(source(sourceID: activeID, root: active, relativePath: "duplicate.jpg"), decision: .importNew)
+        try await store.markSkipped(fileID: duplicate, reason: .suspectedDuplicate, candidates: [])
+        _ = try await store.save(source(sourceID: activeID, root: active, relativePath: "pending.jpg"), decision: .importNew)
+        let importing = try await store.save(source(sourceID: activeID, root: active, relativePath: "importing.jpg"), decision: .importNew)
+        try await store.beginAttempt(fileID: importing, attemptID: UUID())
+
+        _ = try await store.save(source(sourceID: disabledID, root: disabled, relativePath: "ignored-pending.jpg"), decision: .importNew)
+        try await store.disableSource(id: disabledID)
+        _ = try await store.save(source(sourceID: removedID, root: removed, relativePath: "ignored-pending.jpg"), decision: .importNew)
+        try await store.removeSource(id: removedID)
+
+        let summary = try await store.activeSourceSummary()
+
+        XCTAssertEqual(summary, SyncStatusSummary(imported: 1, skipped: 2, pending: 1, importing: 1))
+    }
+
     func testReopenPreservesSuccessHistory() async throws {
         let root = try makeRoot()
         let database = root.appendingPathComponent("state.sqlite")
@@ -386,17 +426,16 @@ extension StoreTests {
 }
 
 extension StoreTests {
-    func testSchemaOneMigrationRetainsMediaAndAddsAttributeOnlyDispositions() async throws {
+    func testSchemaOneMigrationRetainsMediaAndOpensLegacyAttributeTable() async throws {
         let fixture = try await makeEngineFixture(sourceCount: 1)
         let file = try await engineSourceFile(sourceID: fixture.sourceIDs[0], directory: fixture.directories[0])
         _ = try await fixture.store.save(file, decision: .importNew)
         try injectEngineSQL("DROP TABLE non_media_skip; ALTER TABLE source DROP COLUMN removed; PRAGMA user_version = 1", at: fixture.databaseURL)
         let migrated = try SyncStore(url: fixture.databaseURL)
-        try await migrated.saveNonMedia(sourceID: fixture.sourceIDs[0], relativePath: "photo.xmp", stamp: FileStamp(size: 2, modifiedNanoseconds: 3), disposition: "sidecar")
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: fixture.databaseURL), 3)
         let pending = try await migrated.countFiles(state: .pending)
         XCTAssertEqual(pending, 1)
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 0)
     }
 
     func testSchemaTwoMigrationAddsRemovedFlagAndRetainsSource() async throws {
@@ -414,21 +453,15 @@ extension StoreTests {
         XCTAssertEqual(sources.map(\.id), [sourceID])
     }
 
-    func testFreshSchemaSupportsAttributeOnlyDispositions() async throws {
+    func testFreshSchemaLeavesLegacyAttributeTableEmpty() async throws {
         let root = try makeRoot()
         let sourceDirectory = root.appendingPathComponent("photos")
         try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
         let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
-        let sourceID = try await store.registerSource(url: sourceDirectory)
-
-        try await store.saveNonMedia(
-            sourceID: sourceID,
-            relativePath: "photo.xmp",
-            stamp: FileStamp(size: 2, modifiedNanoseconds: 3),
-            disposition: "sidecar"
-        )
+        _ = try await store.registerSource(url: sourceDirectory)
 
         let pending = try await store.countFiles(state: .pending)
         XCTAssertEqual(pending, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: root.appendingPathComponent("state.sqlite")), 0)
     }
 }

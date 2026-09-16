@@ -89,6 +89,14 @@ actor SyncRuntime {
     func current() async -> RuntimeState {
         state.authorized = authorized()
         if let engine { state.snapshot = await engine.snapshot() }
+        else if let store {
+            do {
+                state.snapshot.summary = try await store.activeSourceSummary()
+                state.snapshot.summaryError = nil
+            } catch {
+                state.snapshot.summaryError = error.localizedDescription
+            }
+        }
         state.nextScan = schedule.nextScanAt
         var result = state
         if let loggingError { result.message = loggingError }

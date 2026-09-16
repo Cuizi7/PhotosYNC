@@ -78,7 +78,7 @@ final class RuntimeIntegrationTests: XCTestCase {
         await runtime.tick(force: true)
         await runtime.waitForRound()
         let state = await runtime.current()
-        XCTAssertEqual(state.snapshot.pending, 0)
+        XCTAssertEqual(state.snapshot.summary?.pending, 0)
         let historical = try await store.countFiles(state: .pending)
         XCTAssertEqual(historical, 1)
         XCTAssertFalse(state.snapshot.activeWork)
@@ -127,8 +127,9 @@ extension RuntimeIntegrationTests {
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: fixture.databaseURL), 1)
         let state = await runtime.current()
         XCTAssertTrue(state.snapshot.waitingSources.isEmpty)
-        XCTAssertEqual(state.snapshot.skipped, 1)
-        XCTAssertEqual(state.snapshot.imported, 1)
+        XCTAssertEqual(state.snapshot.summary?.skipped, 0)
+        XCTAssertEqual(state.snapshot.latestScan.checkedCandidates, 1)
+        XCTAssertEqual(state.snapshot.summary?.imported, 1)
     }
 
     func testFailureAndRecoveryNotificationTransitionsAreDeduplicated() async throws {

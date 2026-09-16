@@ -24,10 +24,16 @@ struct StatusMenu: View {
                 }
             }
             Text(model.counters).font(.caption).foregroundStyle(.secondary)
-            if let detail = model.detail {
-                Text(detail).font(.caption).lineLimit(3)
-                Text("若 Photos 提交结果不确定，请等待确认；检查点失败后需退出并重新启动。")
+            Text(model.scanDescription).font(.caption).foregroundStyle(.secondary)
+            if let warning = model.notificationWarning {
+                Label(warning, systemImage: "bell.slash")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if let detail = model.syncDetail {
+                Text(detail).font(.caption).lineLimit(3)
+            }
+            if let hint = model.recoveryAdvice {
+                Text(hint).font(.caption).foregroundStyle(.secondary)
             }
             if let next = model.state.nextScan {
                 Text("下次扫描：\(next.formatted(date: .omitted, time: .shortened))").font(.caption)
