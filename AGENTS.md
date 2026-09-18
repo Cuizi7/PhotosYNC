@@ -7,10 +7,11 @@
 1. `git status --short`、`git log -5 --oneline`；检查当前目录及父目录的 `CLAUDE.md` / `claude.md`。
 2. `outputs/2026-09-13-photo-sync-v1-design.md`：已批准的产品规则。
 3. `README.md`：构建、运行和当前限制。
-4. `Design/Validation.md`：真实 Photos 验收程序及已验证/未验证的区别。
-5. 需要回溯任务时读 `docs/superpowers/plans/2026-09-13-photo-sync-v1.md`；计划含示意接口，以批准设计和实际代码为准。
+4. `docs/specs/2026-09-18-runtime-state-and-recovery.md`：扫描/恢复/计数/文案的权威运行时契约。
+5. `Design/Validation.md`：真实 Photos 验收程序及已验证/未验证的区别。
+6. 需要回溯任务时读 `docs/superpowers/plans/2026-09-13-photo-sync-v1.md`；计划含示意接口，以批准设计和实际代码为准。
 
-v1 已实现并合并到 `main`，代码基线 `5666851`；2026-09-14 合并后重新构建和执行 94 项测试通过。不要重新执行整套已完成实施计划。后续变更仍需在当前 HEAD 验证。
+v1 已实现并合并到 `main`。当前 `main` 基线为 `259d990`，包含 beta2 统计/通知修复、来源错误文案、读取 deferred 与来源恢复隔离；合并后核心测试为 167 项通过。不要重新执行整套已完成实施计划；后续变更仍需在当前 HEAD 验证。
 
 ## 不可突破的第一版边界
 
@@ -164,3 +165,4 @@ scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
 
 2026-09-17 统计口径补注（同一分支）：`activeSourceSummary` 改为一条带 CTE 的语句，除原有活动来源计数外新增 `retainedImported`（停用或移除来源的成功导入数）；活动计数显式带 `source.enabled = 1 AND source.removed = 0` 条件，退役历史不再混入 `imported`。`SyncStatusPresentation.summary` 在 `retainedImported > 0` 时附注“另有 N 条历史属已停用或移除的来源”。动机：把子目录换成其父目录、或停用来源时，历史仍在库中但会退出统计，原实现会让“已导入”看起来凭空归零。已在生产库只读副本上核对：212 活动导入 + 2 条退役历史（已移除的 PhotosYNC-QA），与原 214 条一致。构建与 161 项测试通过。
 
+2026-09-18 当前基线：上述 2026-09-17 修复已在本地 `main` squash 为 `259d990`，远端尚未推送。运行时状态、读取 deferred、来源/文件错误隔离、退避和文案以 `docs/specs/2026-09-18-runtime-state-and-recovery.md` 为权威；核心测试基线为 167 项。历史分支名称和旧测试数量只用于追溯，不作为当前状态。
