@@ -194,8 +194,10 @@ struct SourceSettings: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(source.url.path).lineLimit(2).truncationMode(.middle).help(source.url.path)
                     .accessibilityLabel(source.url.path)
-                Text(source.enabled ? (model.enabledWaiting[source.id] ?? "已启用") : "已停用 · 记录保留")
+                // Same rule as the menu: the summary is shown, the raw system text is the tooltip.
+                Text(source.enabled ? (model.enabledWaiting[source.id]?.summary ?? "已启用") : "已停用 · 记录保留")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    .help(model.enabledWaiting[source.id]?.detail ?? source.url.path)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 6) {

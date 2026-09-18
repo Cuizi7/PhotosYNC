@@ -14,17 +14,28 @@ public struct StoredFile: Sendable {
 
 /// Current terminal and queue states for enabled, configured sources.
 /// A record has exactly one state, so a source-changed successful import is counted as skipped once.
+/// `pending` and `retryPending` partition the `pending` state without adding a fifth state:
+/// `pending` has never recorded an error, `retryPending` holds a definite not-committed failure
+/// in `last_error` and waits for its next attempt. Their sum is every pending record.
 public struct SyncStatusSummary: Equatable, Sendable {
     public var imported: Int
     public var skipped: Int
     public var pending: Int
     public var importing: Int
+    public var retryPending: Int
+    /// Successful imports kept in the database whose source is disabled or removed. They are not
+    /// part of the counters above; the menu mentions them so retiring a source is not mistaken
+    /// for losing its history.
+    public var retainedImported: Int
 
-    public init(imported: Int = 0, skipped: Int = 0, pending: Int = 0, importing: Int = 0) {
+    public init(imported: Int = 0, skipped: Int = 0, pending: Int = 0, importing: Int = 0,
+                retryPending: Int = 0, retainedImported: Int = 0) {
         self.imported = imported
         self.skipped = skipped
         self.pending = pending
         self.importing = importing
+        self.retryPending = retryPending
+        self.retainedImported = retainedImported
     }
 }
 
@@ -198,17 +209,28 @@ public final class SyncStore: @unchecked Sendable {
 
     /// Returns all visible state counters from one SQLite statement, so callers do not combine
     /// independently observed queue states while a submission is changing a record.
+    /// `retainedImported` counts successful imports whose source is disabled or removed: they stay
+    /// in the database as history but are deliberately outside the counters above, so a person who
+    /// retires a source (for example to configure its parent directory instead) is told where the
+    /// numbers went instead of seeing the totals silently reset.
     public func activeSourceSummary() async throws -> SyncStatusSummary {
         try await perform {
             guard let row = try self.one("""
+                WITH scoped AS (
+                    SELECT file_record.state AS state,
+                           file_record.last_error AS last_error,
+                           CASE WHEN source.enabled = 1 AND source.removed = 0 THEN 1 ELSE 0 END AS active
+                    FROM file_record
+                    JOIN source ON source.id = file_record.source_id
+                )
                 SELECT
-                    COALESCE(SUM(CASE WHEN file_record.state = 'imported' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN file_record.state = 'skipped' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN file_record.state = 'pending' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN file_record.state = 'importing' THEN 1 ELSE 0 END), 0)
-                FROM file_record
-                JOIN source ON source.id = file_record.source_id
-                WHERE source.enabled = 1 AND source.removed = 0
+                    COALESCE(SUM(CASE WHEN active = 1 AND state = 'imported' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN active = 1 AND state = 'skipped' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN active = 1 AND state = 'pending' AND last_error IS NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN active = 1 AND state = 'importing' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN active = 1 AND state = 'pending' AND last_error IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN active = 0 AND state = 'imported' THEN 1 ELSE 0 END), 0)
+                FROM scoped
                 """, []) else {
                 return SyncStatusSummary()
             }
@@ -216,7 +238,9 @@ public final class SyncStore: @unchecked Sendable {
                 imported: Int(try self.int64(row[0])),
                 skipped: Int(try self.int64(row[1])),
                 pending: Int(try self.int64(row[2])),
-                importing: Int(try self.int64(row[3]))
+                importing: Int(try self.int64(row[3])),
+                retryPending: Int(try self.int64(row[4])),
+                retainedImported: Int(try self.int64(row[5]))
             )
         }
     }

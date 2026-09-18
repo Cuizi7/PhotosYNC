@@ -8,7 +8,13 @@ struct RuntimeState: Sendable {
     var sources: [RegisteredSource] = []
     var authorized = false
     var nextScan: Date?
+    /// Blocking initialization/operation headline, with its raw detail kept separately.
     var message: String?
+    var messageDetail: String?
+    /// Logging is best-effort. A logger outage is visible as a warning but must not make the
+    /// global sync status an error or stop the engine.
+    var warning: String?
+    var warningDetail: String?
 }
 
 /// Owns one engine and gateway for the entire process. A poisoned gateway is never replaced.
@@ -22,8 +28,10 @@ actor SyncRuntime {
     private var state = RuntimeState()
     private var started = false
     private var stopped = false
-    private var loggingError: String?
+    private var loggingWarning: String?
+    private var loggingWarningDetail: String?
     private var registeredFailures = Set<UUID>()
+    private var lastKnownAuthorization: Bool?
     let logsURL: URL
     private let databaseURL: URL
     private let now: @Sendable () -> Date
@@ -78,16 +86,37 @@ actor SyncRuntime {
                 Task { await self?.logFailed(message) }
             })
             self.logger = logger
+        } catch {
+            // Logging is intentionally non-blocking: continue opening the store and syncing.
+            logFailed(error.localizedDescription)
+        }
+        do {
             store = try SyncStore(url: databaseURL, readExecutor: executor)
+        } catch {
+            setBootstrapFailure(summary: "无法打开本地同步数据库，同步尚未启动。", error: error)
+            return
+        }
+        do {
             try await refreshSources()
-            await tick(force: true)
-        } catch { state.message = error.localizedDescription }
+        } catch {
+            setBootstrapFailure(summary: "无法读取来源配置，同步尚未启动。", error: error)
+            return
+        }
+        await tick(force: true)
     }
 
-    private func logFailed(_ message: String) { loggingError = "日志写入失败：\(message)" }
+    private func logFailed(_ message: String) {
+        loggingWarning = "日志文件写入失败，同步仍在继续，但排查信息可能不完整。"
+        loggingWarningDetail = message
+    }
+
+    private func setBootstrapFailure(summary: String, error: Error) {
+        state.message = summary
+        state.messageDetail = error.localizedDescription
+    }
 
     func current() async -> RuntimeState {
-        state.authorized = authorized()
+        refreshAuthorization()
         if let engine { state.snapshot = await engine.snapshot() }
         else if let store {
             do {
@@ -99,8 +128,33 @@ actor SyncRuntime {
         }
         state.nextScan = schedule.nextScanAt
         var result = state
-        if let loggingError { result.message = loggingError }
+        result.warning = loggingWarning
+        result.warningDetail = loggingWarningDetail
         return result
+    }
+
+    /// Losing the Photos permission needs a person, so it is announced on the transition instead
+    /// of every poll. The first read only records the state; launch is not a revocation.
+    private func refreshAuthorization() {
+        let granted = authorized()
+        if let previous = lastKnownAuthorization, previous, !granted {
+            postNotification(title: "PhotosYNC 需要处理",
+                             body: "失去“照片”读写权限，同步已暂停。请在设置中重新授权。")
+        }
+        lastKnownAuthorization = granted
+        state.authorized = granted
+    }
+
+    private func postNotification(title: String, body: String) {
+        guard notificationsEnabled() else { return }
+        Task {
+            let center = UNUserNotificationCenter.current()
+            guard await center.notificationSettings().authorizationStatus == .authorized else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
     }
 
     func requestAuthorization() async {
@@ -163,22 +217,27 @@ actor SyncRuntime {
 
     func tick(force: Bool = false) async {
         guard !stopped else { return }
-        state.authorized = authorized()
+        refreshAuthorization()
         guard state.authorized, state.sources.contains(where: \.enabled), !state.snapshot.isPaused else { return }
         if engine == nil, let store {
             let executor = self.executor
             engine = SyncEngine(store: store, photos: PhotoKitGateway(),
                                 directory: { DirectoryReader(sourceID: $0, executor: executor) },
                                 metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger,
-                                notify: { _, recovered in
-                                    guard self.notificationsEnabled() else { return }
+                                // Keep the old transition hook available to injected clients, but
+                                // let the summary-carrying hook below drive user notifications.
+                                notify: { _, _ in },
+                                notifyIssue: { summary in
                                     Task {
-                                        let center = UNUserNotificationCenter.current()
-                                        guard await center.notificationSettings().authorizationStatus == .authorized else { return }
-                                        let content = UNMutableNotificationContent()
-                                        content.title = recovered ? "PhotosYNC 来源已恢复" : "PhotosYNC 来源等待恢复"
-                                        content.body = recovered ? "来源已恢复正常同步。" : "同步遇到错误，将自动重试。请在设置中查看详情。"
-                                        try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+                                        await self.postNotification(title: "PhotosYNC 需要处理", body: summary)
+                                    }
+                                },
+                                notifySourceIssue: { _, recovered, issue in
+                                    Task {
+                                        await self.postNotification(
+                                            title: recovered ? "PhotosYNC 来源已恢复" : "PhotosYNC 来源等待恢复",
+                                            body: recovered ? "来源已恢复正常同步。" : (issue?.summary ?? "来源暂时不可用，将自动重试。恢复后不再提示。")
+                                        )
                                     }
                                 })
         }
@@ -211,12 +270,21 @@ actor SyncRuntime {
         let enabled = Set(state.sources.filter(\.enabled).map(\.id))
         // Count failures once per attempted round, never once per UI polling tick.
         for id in ids where enabled.contains(id) {
-            if snapshot.waitingSources[id] != nil {
+            let sourceUnavailable = snapshot.waitingSources[id]?.isSourceAvailability == true
+            let deferred = snapshot.deferredSources.contains(id)
+            if sourceUnavailable {
                 schedule.recordSourceFailure(id, now: now())
                 registeredFailures.insert(id)
             } else {
-                schedule.recordSourceRecovered(id)
+                // File and submission issues do not quarantine a healthy source.
+                schedule.recordSourceFailureRecovered(id)
                 registeredFailures.remove(id)
+            }
+            if deferred {
+                // Normal waiting: come back shortly without recording a failure or showing one.
+                schedule.recordSourceDeferral(id, now: now())
+            } else {
+                schedule.recordSourceDeferralRecovered(id)
             }
         }
         schedule.finished(now: now())

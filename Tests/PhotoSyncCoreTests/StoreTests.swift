@@ -73,17 +73,32 @@ final class StoreTests: XCTestCase {
         let duplicate = try await store.save(source(sourceID: activeID, root: active, relativePath: "duplicate.jpg"), decision: .importNew)
         try await store.markSkipped(fileID: duplicate, reason: .suspectedDuplicate, candidates: [])
         _ = try await store.save(source(sourceID: activeID, root: active, relativePath: "pending.jpg"), decision: .importNew)
+        // One pending record with a definite not-committed failure: it stays pending as a state,
+        // but the summary separates it so counters never double count the same record.
+        let retrying = try await store.save(source(sourceID: activeID, root: active, relativePath: "retrying.jpg"), decision: .importNew)
+        try await store.recordRetry(fileID: retrying, attemptID: nil, nextRetry: Date(), error: "definitely not committed", definitelyNotCommitted: true)
         let importing = try await store.save(source(sourceID: activeID, root: active, relativePath: "importing.jpg"), decision: .importNew)
         try await store.beginAttempt(fileID: importing, attemptID: UUID())
 
         _ = try await store.save(source(sourceID: disabledID, root: disabled, relativePath: "ignored-pending.jpg"), decision: .importNew)
+        // History of a retired source stays in the database but leaves the counters, so the
+        // summary reports it separately instead of silently dropping it.
+        let retired = try await store.save(source(sourceID: disabledID, root: disabled, relativePath: "retired.jpg"), decision: .importNew)
+        let retiredAttempt = UUID()
+        try await store.beginAttempt(fileID: retired, attemptID: retiredAttempt)
+        try await store.markImported(fileID: retired, attemptID: retiredAttempt, identifier: "asset-retired")
         try await store.disableSource(id: disabledID)
         _ = try await store.save(source(sourceID: removedID, root: removed, relativePath: "ignored-pending.jpg"), decision: .importNew)
+        let removedFile = try await store.save(source(sourceID: removedID, root: removed, relativePath: "removed.jpg"), decision: .importNew)
+        let removedAttempt = UUID()
+        try await store.beginAttempt(fileID: removedFile, attemptID: removedAttempt)
+        try await store.markImported(fileID: removedFile, attemptID: removedAttempt, identifier: "asset-removed")
         try await store.removeSource(id: removedID)
 
         let summary = try await store.activeSourceSummary()
 
-        XCTAssertEqual(summary, SyncStatusSummary(imported: 1, skipped: 2, pending: 1, importing: 1))
+        XCTAssertEqual(summary, SyncStatusSummary(imported: 1, skipped: 2, pending: 1, importing: 1,
+                                                  retryPending: 1, retainedImported: 2))
     }
 
     func testReopenPreservesSuccessHistory() async throws {

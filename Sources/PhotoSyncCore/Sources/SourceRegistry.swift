@@ -42,12 +42,13 @@ public enum SourceRegistryError: Error, LocalizedError {
     case aliasOrLink(URL)
     case overlappingSource(URL)
 
+    /// These reach the menu directly when a person adds a source, so they are written for people.
     public var errorDescription: String? {
         switch self {
-        case .notFileURL: return "A source must be a file URL."
-        case .notDirectory(let url): return "The source is not a directory: \(url.path)."
-        case .aliasOrLink(let url): return "Aliases and symbolic links cannot be configured as sources: \(url.path)."
-        case .overlappingSource(let url): return "The source overlaps \(url.path)."
+        case .notFileURL: return "来源必须是本机文件夹路径。"
+        case .notDirectory(let url): return "所选路径不是文件夹：\(url.path)"
+        case .aliasOrLink(let url): return "不能把替身或符号链接配置为来源：\(url.path)"
+        case .overlappingSource(let url): return "该来源与已有来源重叠：\(url.path)"
         }
     }
 }

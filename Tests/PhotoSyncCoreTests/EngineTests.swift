@@ -1,4 +1,6 @@
 import XCTest
+import Darwin
+import SQLite3
 @testable import PhotoSyncCore
 
 final class EngineTests: XCTestCase {
@@ -215,12 +217,296 @@ final class EngineTests: XCTestCase {
         await f.engine.scan(sourceIDs: f.sourceIDs)
         let missing = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
         XCTAssertNil(missing)
-        let failed = (await f.engine.snapshot()).latestScan.failed
-        XCTAssertEqual(failed, 1)
+        let progress = (await f.engine.snapshot()).latestScan
+        XCTAssertEqual(progress.failed, 1)
+        // An unreadable file is a file-level failure of this round, not a source outage.
+        XCTAssertEqual(progress.failedFiles, 1)
         try bytes.write(to: url)
         await f.engine.scan(sourceIDs: f.sourceIDs)
         let recovered = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
         XCTAssertEqual(recovered?.state, .imported)
+    }
+
+    func testUnavailableSourceIsReportedPerSourceAndClearsOnRecovery() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let directory = f.directories[0]
+        try FileManager.default.removeItem(at: directory)
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let broken = await f.engine.snapshot()
+        // One source-level failure, and deliberately not a failed file.
+        XCTAssertEqual(broken.latestScan.failed, 1)
+        XCTAssertEqual(broken.latestScan.failedFiles, 0)
+        let issue = broken.waitingSources[f.sourceIDs[0]]
+        // The headline is plain language; the system text survives only in the detail/tooltip.
+        XCTAssertEqual(issue?.summary, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。")
+        XCTAssertTrue(issue?.detail.contains(directory.path) ?? false)
+        XCTAssertNotEqual(issue?.summary, issue?.detail)
+        XCTAssertEqual(broken.sourceFileIssueCounts[f.sourceIDs[0]] ?? 0, 0)
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let recovered = await f.engine.snapshot()
+        XCTAssertNil(recovered.waitingSources[f.sourceIDs[0]])
+        XCTAssertEqual(recovered.latestScan.state, .completed)
+    }
+
+    func testUnreadableFilesAreCountedPerFileAndClearIndividually() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let valid = try Data(contentsOf: f.directories[0].appendingPathComponent("same.jpg"))
+        let first = f.directories[0].appendingPathComponent("bad-1.jpg")
+        let second = f.directories[0].appendingPathComponent("bad-2.jpg")
+        try Data("bad JPEG".utf8).write(to: first)
+        try Data("bad JPEG".utf8).write(to: second)
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let both = await f.engine.snapshot()
+        XCTAssertEqual(both.latestScan.failedFiles, 2)
+        XCTAssertEqual(both.sourceFileIssueCounts[f.sourceIDs[0]], 2)
+        XCTAssertEqual(both.waitingSources[f.sourceIDs[0]]?.summary, "文件无法读取，可能已损坏或没有权限。")
+        XCTAssertTrue(both.waitingSources[f.sourceIDs[0]]?.detail.contains("bad-1.jpg") ?? false)
+
+        // Repairing one file clears only that file's issue; the source keeps waiting for the other.
+        try valid.write(to: first)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let partial = await f.engine.snapshot()
+        XCTAssertEqual(partial.sourceFileIssueCounts[f.sourceIDs[0]], 1)
+        XCTAssertNotNil(partial.waitingSources[f.sourceIDs[0]])
+
+        try valid.write(to: second)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let clean = await f.engine.snapshot()
+        XCTAssertEqual(clean.latestScan.state, .completed)
+        XCTAssertNil(clean.waitingSources[f.sourceIDs[0]])
+        XCTAssertNil(clean.sourceFileIssueCounts[f.sourceIDs[0]])
+    }
+
+    func testUnmountedVolumeIsExplainedInPlainLanguage() {
+        let error = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+                            userInfo: [NSLocalizedDescriptionKey: "The file “home” couldn’t be opened because there is no such file."])
+        let url = URL(fileURLWithPath: "/Volumes/PhotoSyncMissingVolume/Photos/2026")
+        let issue = SourceIssueText.directoryUnavailable(sourceURL: url, failingURL: url, isRoot: true, error: error)
+        XCTAssertTrue(issue.summary.contains("未挂载"))
+        XCTAssertTrue(issue.summary.contains("/Volumes/PhotoSyncMissingVolume"))
+        XCTAssertFalse(issue.summary.contains("couldn’t be opened"))
+        XCTAssertTrue(issue.detail.contains("couldn’t be opened"))
+    }
+
+    func testDeferredReadIsWaitingNotAnError() async throws {
+        // The bounded reader refusing a concurrent read of one source is normal waiting: nothing
+        // is reported to the person, nothing counts as an unreadable file, and it comes back.
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let recorder = IssueRecorder()
+        let reader = ControlledDirectoryReader(sourceID: f.sourceIDs[0], failingDirectory: f.directories[0],
+                                              failure: .sourceBusy)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader },
+                                notifyIssue: { message in Task { await recorder.record(message) } })
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let waiting = await engine.snapshot()
+        XCTAssertNil(waiting.waitingSources[f.sourceIDs[0]])
+        XCTAssertEqual(waiting.sourceFileIssueCounts[f.sourceIDs[0]] ?? 0, 0)
+        XCTAssertTrue(waiting.deferredSources.contains(f.sourceIDs[0]))
+        XCTAssertTrue(waiting.latestScan.deferred)
+        XCTAssertEqual(waiting.latestScan.failedFiles, 0)
+        let announced = await recorder.messages.count
+        XCTAssertEqual(announced, 0)
+
+        await reader.recover()
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let recovered = await engine.snapshot()
+        XCTAssertFalse(recovered.deferredSources.contains(f.sourceIDs[0]))
+        XCTAssertEqual(recovered.latestScan.state, .completed)
+        let imported = await f.photos.createCount
+        XCTAssertEqual(imported, 1)
+    }
+
+    func testDeferredDirectoryReadCompletesScanRunWithoutFailureOrJournal() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let reader = ControlledDirectoryReader(sourceID: f.sourceIDs[0], failingDirectory: f.directories[0], failure: .sourceBusy)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader }, logger: logger)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await engine.snapshot()
+        XCTAssertTrue(snapshot.latestScan.deferred)
+        XCTAssertEqual(snapshot.latestScan.failed, 0)
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+        XCTAssertEqual(
+            try engineSQLInteger("SELECT complete FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL),
+            1
+        )
+        XCTAssertEqual(
+            try engineSQLInteger("SELECT failed FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL),
+            0
+        )
+        XCTAssertNil(try engineSQLString("SELECT last_error FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL))
+
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let text = try? String(contentsOf: logURL)
+        XCTAssertFalse(text?.contains("\"result\":\"failed\"") == true)
+    }
+
+    func testDeferredMetadataReadCompletesScanRunWithoutFailureOrJournal() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let engine = SyncEngine(
+            store: f.store,
+            photos: f.photos,
+            metadata: { _ in DeferredMetadataReader() },
+            logger: logger
+        )
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await engine.snapshot()
+        XCTAssertTrue(snapshot.latestScan.deferred)
+        XCTAssertEqual(snapshot.latestScan.failed, 0)
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+        XCTAssertEqual(
+            try engineSQLInteger("SELECT complete FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL),
+            1
+        )
+        XCTAssertEqual(
+            try engineSQLInteger("SELECT failed FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL),
+            0
+        )
+        XCTAssertNil(try engineSQLString("SELECT last_error FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL))
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let text = try? String(contentsOf: logURL)
+        XCTAssertFalse(text?.contains("\"result\":\"failed\"") == true)
+    }
+
+    func testDeferredStampReadKeepsTheFilePendingWithoutAnIssue() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let reader = ContendedSubmissionStampReader(sourceID: f.sourceIDs[0])
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let waiting = await engine.snapshot()
+        XCTAssertNil(waiting.waitingSources[f.sourceIDs[0]])
+        XCTAssertTrue(waiting.deferredSources.contains(f.sourceIDs[0]))
+        XCTAssertTrue(waiting.latestScan.deferred)
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .pending)
+        XCTAssertEqual(record?.retryCount, 0)
+        XCTAssertNil(record?.nextRetryAt)
+        XCTAssertEqual(try engineSQLString("SELECT last_error FROM file_record WHERE source_id = '\(f.sourceIDs[0].uuidString)' AND relative_path = 'same.jpg'", at: f.databaseURL), nil)
+        let summary = try await f.store.activeSourceSummary()
+        XCTAssertEqual(summary.retryPending, 0)
+        let created = await f.photos.createCount
+        XCTAssertEqual(created, 0)
+        // The deferred read never marks the source's scan run as failed.
+        XCTAssertEqual(try engineSQLInteger("SELECT COALESCE(SUM(failed), 0) FROM scan_run", at: f.databaseURL), 0)
+
+        await reader.recover()
+        try injectEngineSQL("UPDATE file_record SET next_retry_at = 0", at: f.databaseURL)
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let recovered = await engine.snapshot()
+        XCTAssertFalse(recovered.deferredSources.contains(f.sourceIDs[0]))
+        let imported = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(imported?.state, .imported)
+    }
+
+    func testRepeatedUnavailableSourceIsJournaledOnce() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let engine = SyncEngine(store: f.store, photos: f.photos, logger: logger)
+        try FileManager.default.removeItem(at: f.directories[0])
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        // A recovered source starts a new condition: a later outage is journaled again.
+        try FileManager.default.createDirectory(at: f.directories[0], withIntermediateDirectories: true)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        try FileManager.default.removeItem(at: f.directories[0])
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let lines = try String(contentsOf: logURL).split(separator: "\n")
+        let directoryFailures = try lines.filter { line in
+            let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+            return object?["phase"] == "directory" && object?["result"] == "failed"
+        }
+        // Each attempt persists its own scan_run row; the journal keeps the transitions only.
+        XCTAssertEqual(directoryFailures.count, 2)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: f.databaseURL), 5)
+    }
+
+    func testBlockingIssueIsAnnouncedOncePerDistinctMessage() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let recorder = IssueRecorder()
+        let engine = SyncEngine(store: f.store, photos: f.photos,
+                                notifyIssue: { message in Task { await recorder.record(message) } })
+        await f.photos.setLoadFailure(true)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let first = await engineEventually { await recorder.messages.count >= 1 }
+        XCTAssertTrue(first)
+        let blocked = await engine.snapshot()
+        XCTAssertNotNil(blocked.blockingError)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let settled = await engineEventually { await recorder.messages.count > 1 }
+        XCTAssertFalse(settled)
+        let announced = await recorder.messages.count
+        XCTAssertEqual(announced, 1)
+    }
+
+    func testAuthorizationRequiredCandidateLoadUsesPermissionHeadline() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let engine = SyncEngine(store: f.store, photos: AuthorizationRequiredPhotosGateway())
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.blockingSummary, "未获“照片”读写权限，同步已暂停。请在设置中点“授权访问照片”。")
+        XCTAssertEqual(snapshot.blockingError, PhotoKitGatewayError.authorizationRequired.localizedDescription)
+    }
+
+    func testSourceIssueNotificationCarriesFriendlySummaryAndRetainsRawDetailSeparately() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let recorder = SourceIssueNotificationRecorder()
+        let reader = ControlledDirectoryReader(
+            sourceID: f.sourceIDs[0],
+            failingDirectory: f.directories[0],
+            failure: .permissionDenied
+        )
+        let engine = SyncEngine(
+            store: f.store,
+            photos: f.photos,
+            directory: { _ in reader },
+            notifySourceIssue: { _, recovered, issue in
+                recorder.record(recovered: recovered, issue: issue)
+            }
+        )
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let event = recorder.events.first
+        XCTAssertEqual(event?.recovered, false)
+        XCTAssertEqual(event?.issue?.summary, "来源目录无法访问，请检查访问权限；恢复后会自动继续。")
+        XCTAssertTrue(event?.issue?.detail.contains("permission denied") ?? false)
+        XCTAssertNotEqual(event?.issue?.summary, event?.issue?.detail)
+    }
+
+    func testWaitingSourceSummaryCompatibilityAccessorMapsTheHumanHeadline() {
+        let sourceID = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.waitingSources[sourceID] = SourceIssue(summary: "目录暂时不可用。", detail: "raw detail")
+        XCTAssertEqual(snapshot.waitingSourceSummaries[sourceID], "目录暂时不可用。")
     }
 
     func testMultipleCandidatesSkipAndDisabledSourceRetainsHistory() async throws {
@@ -598,6 +884,119 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("SELECT failed FROM scan_run WHERE source_id = '\(pendingID.uuidString)'", at: f.databaseURL), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run WHERE source_id = '\(pendingID.uuidString)' AND complete = 0 AND last_error IS NOT NULL AND ended_at IS NOT NULL", at: f.databaseURL), 1)
     }
+
+    func testRootDirectoryUnavailableMessageRetainsTechnicalErrorAndRecovers() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let reader = ControlledDirectoryReader(
+            sourceID: f.sourceIDs[0],
+            failingDirectory: f.directories[0],
+            failure: .cocoaMissing
+        )
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader }, logger: logger)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.waitingSources[f.sourceIDs[0]]?.summary, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。")
+        XCTAssertEqual(snapshot.latestScan.failed, 1)
+        XCTAssertEqual(
+            try engineSQLString("SELECT last_error FROM scan_run WHERE source_id = '\(f.sourceIDs[0].uuidString)' ORDER BY started_at DESC LIMIT 1", at: f.databaseURL),
+            "file home no such directory"
+        )
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        let logged = await engineEventually { loggedEvent(at: logURL, phase: "directory", result: "failed")?["error"] == "file home no such directory" }
+        XCTAssertTrue(logged)
+
+        await reader.recover()
+        await engine.scan(sourceIDs: f.sourceIDs)
+
+        let recoveredSnapshot = await engine.snapshot()
+        let importedCount = await f.photos.createCount
+        XCTAssertNil(recoveredSnapshot.waitingSources[f.sourceIDs[0]])
+        XCTAssertEqual(importedCount, 1)
+    }
+
+    func testRootDirectoryFailuresUseFriendlyMessages() async throws {
+        // Read contention is deliberately absent here: it is waiting, not a reported problem.
+        let cases: [(String, DirectoryFailure, String)] = [
+            ("Cocoa missing", .cocoaMissing, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。"),
+            ("Cocoa read missing", .cocoaReadMissing, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。"),
+            ("POSIX missing", .posixMissing, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。"),
+            ("POSIX not directory", .posixNotDirectory, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。"),
+            ("nested no device", .nestedNoDevice, "来源目录不可用，正在等待恢复。请检查磁盘或网络连接。"),
+            ("permission", .permissionDenied, "来源目录无法访问，请检查访问权限；恢复后会自动继续。"),
+            ("Cocoa permission", .cocoaReadPermission, "来源目录无法访问，请检查访问权限；恢复后会自动继续。"),
+            ("operation not permitted", .operationNotPermitted, "来源目录无法访问，请检查访问权限；恢复后会自动继续。"),
+            ("alias", .aliasOrLink, "来源配置无效：不支持别名或符号链接，请重新选择实际文件夹。"),
+            ("not directory", .notDirectory, "来源配置无效：所选路径不是文件夹，请重新选择来源目录。"),
+            ("unknown", .unknown, "来源目录暂时无法读取，正在等待恢复。")
+        ]
+
+        for (name, failure, expected) in cases {
+            let f = try await makeEngineFixture(sourceCount: 1)
+            let reader = ControlledDirectoryReader(
+                sourceID: f.sourceIDs[0],
+                failingDirectory: f.directories[0],
+                failure: failure
+            )
+            let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+            await engine.scan(sourceIDs: f.sourceIDs)
+
+            let snapshot = await engine.snapshot()
+            XCTAssertEqual(snapshot.waitingSources[f.sourceIDs[0]]?.summary, expected, name)
+            // No reported problem for a deferred read: it must not reach the waiting list at all.
+            XCTAssertFalse(snapshot.deferredSources.contains(f.sourceIDs[0]), name)
+        }
+    }
+
+    func testEachContentionReasonIsDeferredInsteadOfReported() async throws {
+        for failure in [DirectoryFailure.timedOut, .sourceBusy, .resourceExhausted] {
+            let f = try await makeEngineFixture(sourceCount: 1)
+            let reader = ControlledDirectoryReader(
+                sourceID: f.sourceIDs[0],
+                failingDirectory: f.directories[0],
+                failure: failure
+            )
+            let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+            await engine.scan(sourceIDs: f.sourceIDs)
+
+            let snapshot = await engine.snapshot()
+            XCTAssertNil(snapshot.waitingSources[f.sourceIDs[0]])
+            XCTAssertTrue(snapshot.deferredSources.contains(f.sourceIDs[0]))
+            XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+        }
+    }
+
+    func testChildDirectoryFailuresUsePartialMessagesAndScanHealthySibling() async throws {
+        let cases: [(DirectoryFailure, String)] = [
+            (.cocoaReadMissing, "部分子目录不可用，正在等待恢复。请检查磁盘或网络连接。"),
+            (.permissionDenied, "部分子目录无法访问，请检查访问权限；恢复后会自动继续。")
+        ]
+
+        for (failure, expected) in cases {
+            let f = try await makeEngineFixture(sourceCount: 1)
+            let unavailable = f.directories[0].appendingPathComponent("unavailable", isDirectory: true)
+            let healthy = f.directories[0].appendingPathComponent("healthy", isDirectory: true)
+            try FileManager.default.createDirectory(at: unavailable, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: healthy, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: f.directories[0].appendingPathComponent("same.jpg"), to: healthy.appendingPathComponent("healthy.jpg"))
+            let reader = ControlledDirectoryReader(sourceID: f.sourceIDs[0], failingDirectory: unavailable, failure: failure)
+            let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+            await engine.scan(sourceIDs: f.sourceIDs)
+
+            let snapshot = await engine.snapshot()
+            XCTAssertEqual(snapshot.waitingSources[f.sourceIDs[0]]?.summary, expected)
+            XCTAssertEqual(snapshot.latestScan.failed, 1)
+            XCTAssertEqual(snapshot.summary?.imported, 1)
+            let healthyFile = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "healthy/healthy.jpg")
+            XCTAssertEqual(healthyFile?.state, .imported)
+        }
+    }
 }
 
 private func loggedEvent(at url: URL, phase: String, result: String) -> [String: String]? {
@@ -646,4 +1045,152 @@ private final class NotificationRecorder: @unchecked Sendable {
         recordedEvents.append((sourceID, recovered))
         lock.unlock()
     }
+}
+
+private final class SourceIssueNotificationRecorder: @unchecked Sendable {
+    struct Event {
+        let recovered: Bool
+        let issue: SourceIssue?
+    }
+
+    private let lock = NSLock()
+    private var recorded: [Event] = []
+
+    var events: [Event] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded
+    }
+
+    func record(recovered: Bool, issue: SourceIssue?) {
+        lock.lock(); defer { lock.unlock() }
+        recorded.append(Event(recovered: recovered, issue: issue))
+    }
+}
+
+private func engineSQLString(_ sql: String, at url: URL) throws -> String? {
+    var db: OpaquePointer?, statement: OpaquePointer?
+    guard sqlite3_open(url.path, &db) == SQLITE_OK else { throw FixtureError.unavailable("sqlite open") }
+    defer { sqlite3_finalize(statement); sqlite3_close(db) }
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, sqlite3_step(statement) == SQLITE_ROW else {
+        throw FixtureError.unavailable("sqlite query")
+    }
+    guard let value = sqlite3_column_text(statement, 0) else { return nil }
+    return String(cString: value)
+}
+
+private enum DirectoryFailure: Sendable {
+    case cocoaMissing
+    case cocoaReadMissing
+    case posixMissing
+    case posixNotDirectory
+    case nestedNoDevice
+    case permissionDenied
+    case cocoaReadPermission
+    case operationNotPermitted
+    case timedOut
+    case sourceBusy
+    case resourceExhausted
+    case aliasOrLink
+    case notDirectory
+    case unknown
+
+    func error(for directory: URL) -> Error {
+        switch self {
+        case .cocoaMissing:
+            return NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError,
+                           userInfo: [NSLocalizedDescriptionKey: "file home no such directory"])
+        case .cocoaReadMissing:
+            return NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+                           userInfo: [NSLocalizedDescriptionKey: "file read no such directory"])
+        case .posixMissing:
+            return NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT), userInfo: [NSLocalizedDescriptionKey: "directory not found"])
+        case .posixNotDirectory:
+            return NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR), userInfo: [NSLocalizedDescriptionKey: "not a directory"])
+        case .nestedNoDevice:
+            // The outer error says nothing useful; the cause is one level down.
+            return NSError(domain: NSURLErrorDomain, code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "directory transport failed",
+                NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENODEV))
+            ])
+        case .permissionDenied:
+            return NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: "permission denied"])
+        case .cocoaReadPermission:
+            return NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError, userInfo: [NSLocalizedDescriptionKey: "Cocoa permission denied"])
+        case .operationNotPermitted:
+            return NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM), userInfo: [NSLocalizedDescriptionKey: "operation not permitted"])
+        case .timedOut:
+            return ReadExecutorError.timedOut
+        case .sourceBusy:
+            return ReadExecutorError.sourceBusy
+        case .resourceExhausted:
+            return ReadExecutorError.resourceExhausted
+        case .aliasOrLink:
+            return SourceRegistryError.aliasOrLink(directory)
+        case .notDirectory:
+            return SourceRegistryError.notDirectory(directory)
+        case .unknown:
+            return NSError(domain: "PhotoSyncTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "do not display this technical error"])
+        }
+    }
+}
+
+private actor ControlledDirectoryReader: DirectoryReading {
+    private let reader: DirectoryReader
+    private let failingDirectory: URL
+    private var failure: DirectoryFailure?
+
+    init(sourceID: UUID, failingDirectory: URL, failure: DirectoryFailure) {
+        reader = DirectoryReader(sourceID: sourceID)
+        self.failingDirectory = failingDirectory
+        self.failure = failure
+    }
+
+    func recover() { failure = nil }
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        if directory.resolvingSymlinksInPath().path == failingDirectory.resolvingSymlinksInPath().path, let failure {
+            throw failure.error(for: directory)
+        }
+        return try await reader.entries(in: directory)
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp { try await reader.stamp(of: file) }
+}
+
+/// Refuses the submission-time stamp read while the scan's own stamp read succeeds, which is the
+/// same-source contention the bounded reader produces when imports and scans overlap.
+private actor ContendedSubmissionStampReader: DirectoryReading {
+    private let reader: DirectoryReader
+    private var stamps = 0
+    private var contended = true
+
+    init(sourceID: UUID) { reader = DirectoryReader(sourceID: sourceID) }
+
+    func recover() { contended = false }
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] { try await reader.entries(in: directory) }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        stamps += 1
+        if stamps > 1, contended { throw ReadExecutorError.sourceBusy }
+        return try await reader.stamp(of: file)
+    }
+}
+
+private struct DeferredMetadataReader: MetadataReading {
+    func read(url: URL, filename: String) async throws -> MediaMetadata {
+        throw ReadExecutorError.sourceBusy
+    }
+}
+
+private struct AuthorizationRequiredPhotosGateway: PhotosGateway {
+    func loadCandidates() async throws -> [MatchCandidate] {
+        throw PhotoKitGatewayError.authorizationRequired
+    }
+
+    func create(fileURL: URL, kind: MediaKind, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+        throw PhotoKitGatewayError.authorizationRequired
+    }
+
+    func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
 }

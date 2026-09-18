@@ -9,6 +9,8 @@ import UserNotifications
 final class AppModel: ObservableObject {
     @Published var state = RuntimeState()
     @Published var error: String?
+    /// Raw system text behind `error`, offered only as a tooltip.
+    private var errorDetail: String?
     @Published var loginEnabled = false
     @Published var loginNeedsApproval = false
     @Published var changingLogin = false
@@ -138,20 +140,50 @@ final class AppModel: ObservableObject {
         return .resolve(configured: state.sources.contains(where: \.enabled),
                         error: error != nil || state.message != nil || state.snapshot.blockingError != nil || state.snapshot.summaryError != nil,
                         paused: state.snapshot.isPaused,
-                        waiting: !state.authorized || !enabledWaiting.isEmpty || ((state.snapshot.summary?.pending ?? 0) > 0 || (state.snapshot.summary?.importing ?? 0) > 0) && !state.snapshot.activeWork,
-                        running: state.snapshot.activeWork)
+                        waiting: !enabledWaiting.isEmpty || ((state.snapshot.summary?.pending ?? 0) > 0 || (state.snapshot.summary?.retryPending ?? 0) > 0 || (state.snapshot.summary?.importing ?? 0) > 0) && !state.snapshot.activeWork,
+                        running: state.snapshot.activeWork,
+                        authorized: !needsPhotosAuthorization)
     }
-    var enabledWaiting: [UUID: String] {
+    /// Only a completed bootstrap can tell "not authorized" from "not read yet"; before that the
+    /// icon must not claim the user has to act.
+    var needsPhotosAuthorization: Bool { ready && !state.authorized }
+    var authorizationIssue: String? {
+        guard needsPhotosAuthorization else { return nil }
+        return "未获“照片”读写权限，同步已暂停。请在设置中点“授权访问照片”。"
+    }
+    var enabledWaiting: [UUID: SourceIssue] {
         let ids = Set(state.sources.filter(\.enabled).map(\.id))
         return state.snapshot.waitingSources.filter { ids.contains($0.key) }
+    }
+    func fileIssueCount(for sourceID: UUID) -> Int {
+        state.snapshot.sourceFileIssueCounts[sourceID] ?? 0
     }
     var statusDescription: String {
         if state.snapshot.isPaused && state.snapshot.activeWork { return "正在暂停，等待当前操作返回" }
         if !ready { return "正在读取配置" }
         return status.description
     }
+    /// Headline text only: it must read as plain language, never as a system error message.
     var syncDetail: String? {
-        state.snapshot.blockingError ?? state.snapshot.summaryError ?? state.message ?? error
+        authorizationIssue ?? state.snapshot.blockingSummary ?? summaryFailureNotice ?? state.message ?? state.warning ?? error
+    }
+    /// Raw system text behind the headline, offered as a tooltip for diagnosis and support.
+    var syncDetailHelp: String? {
+        state.snapshot.blockingError ?? state.snapshot.summaryError ?? state.messageDetail ?? state.warningDetail ?? errorDetail
+    }
+    private var summaryFailureNotice: String? {
+        state.snapshot.summaryError == nil ? nil : "同步统计暂时读不到，稍后会自动重试。"
+    }
+    /// Keeps raw system text out of the headline: a validation error already reads like a
+    /// sentence for people, anything else shows a plain summary and keeps the detail for support.
+    private func reportOperationFailure(_ summary: String, _ failure: Error) {
+        if let registry = failure as? SourceRegistryError, let description = registry.errorDescription {
+            error = description
+            errorDetail = nil
+        } else {
+            error = summary
+            errorDetail = failure.localizedDescription
+        }
     }
     var notificationWarning: String? {
         guard let notificationIssue else { return nil }
@@ -238,7 +270,7 @@ final class AppModel: ObservableObject {
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in
                 do { try await self?.runtime?.add(url); await self?.refresh() }
-                catch { self?.error = error.localizedDescription }
+                catch { self?.reportOperationFailure("添加来源失败，请确认该文件夹可以访问。", error) }
             }
         }
     }
@@ -246,14 +278,14 @@ final class AppModel: ObservableObject {
         guard !demo else { return }
         Task {
             do { try await runtime?.disable(id); await refresh() }
-            catch { self.error = error.localizedDescription }
+            catch { self.reportOperationFailure("停用来源失败，请稍后重试。", error) }
         }
     }
     func remove(_ id: UUID) {
         guard !demo else { return }
         Task {
             do { try await runtime?.removeSource(id); await refresh() }
-            catch { self.error = error.localizedDescription }
+            catch { self.reportOperationFailure("移除来源失败，请稍后重试。", error) }
         }
     }
     func settingsContentHeightDidChange(_ height: CGFloat) {
@@ -281,7 +313,7 @@ final class AppModel: ObservableObject {
             do {
                 if enabled { try SMAppService.mainApp.register() }
                 else { try await SMAppService.mainApp.unregister() }
-            } catch { self.error = "登录启动设置失败：\(error.localizedDescription)" }
+            } catch { self.reportOperationFailure("登录启动设置失败，请稍后重试或在系统设置中检查。", error) }
         }
     }
     func refreshNotificationPermission() {

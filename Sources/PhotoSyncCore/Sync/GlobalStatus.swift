@@ -1,8 +1,13 @@
 public enum GlobalStatus: String, CaseIterable, Sendable {
     case unconfigured, error, paused, waiting, running, completed
 
-    public static func resolve(configured: Bool, error: Bool, paused: Bool, waiting: Bool, running: Bool) -> Self {
+    /// Priority is fixed: unconfigured, then anything a person must handle (missing Photos
+    /// authorization and engine-level errors), then pause, then waiting for a source, then work.
+    /// A missing Photos permission is not a wait for a directory to come back: only the user can
+    /// grant it, so it must not hide behind the waiting symbol.
+    public static func resolve(configured: Bool, error: Bool, paused: Bool, waiting: Bool, running: Bool, authorized: Bool = true) -> Self {
         guard configured else { return .unconfigured }
+        if !authorized { return .error }
         if error { return .error }
         if paused { return .paused }
         if waiting { return .waiting }

@@ -12,6 +12,12 @@ public struct ScanProgress: Equatable, Sendable {
     public var checkedCandidates: Int
     public var newlyImported: Int
     public var failed: Int
+    /// File-level failures in this round: unreadable entries and failed metadata reads.
+    /// An unavailable source directory is not a file failure and is reported per source instead.
+    public var failedFiles: Int
+    /// Some work was left for a later attempt because a bounded read was refused or timed out.
+    /// A deferred round is normal waiting, not a failure, so the menu says "稍后继续".
+    public var deferred: Bool
     public var startedAt: Date?
     public var endedAt: Date?
 
@@ -20,6 +26,8 @@ public struct ScanProgress: Equatable, Sendable {
         checkedCandidates: Int = 0,
         newlyImported: Int = 0,
         failed: Int = 0,
+        failedFiles: Int = 0,
+        deferred: Bool = false,
         startedAt: Date? = nil,
         endedAt: Date? = nil
     ) {
@@ -27,6 +35,8 @@ public struct ScanProgress: Equatable, Sendable {
         self.checkedCandidates = checkedCandidates
         self.newlyImported = newlyImported
         self.failed = failed
+        self.failedFiles = failedFiles
+        self.deferred = deferred
         self.startedAt = startedAt
         self.endedAt = endedAt
     }
@@ -35,6 +45,154 @@ public struct ScanProgress: Equatable, Sendable {
 public enum EngineRecoveryHint: Equatable, Sendable {
     case uncertainSubmission(message: String)
     case checkpointFailure(message: String)
+}
+
+/// The operation that produced a source issue. Runtime scheduling uses this explicit distinction
+/// so a bad file or an uncertain submission cannot quarantine an otherwise healthy source.
+public enum SourceIssueKind: String, Equatable, Sendable {
+    case sourceAvailability
+    case file
+    case submission
+}
+
+/// One problem worth telling a person about. `summary` is what the menu and notifications show —
+/// plain language, no system error text. `detail` keeps the raw message for the journal, the scan
+/// batch row and the menu tooltip, so nothing needed for support is lost.
+public struct SourceIssue: Equatable, Sendable {
+    public var summary: String
+    public var detail: String
+    public var kind: SourceIssueKind
+
+    public init(summary: String, detail: String, kind: SourceIssueKind = .sourceAvailability) {
+        self.summary = summary; self.detail = detail; self.kind = kind
+    }
+
+    public var isSourceAvailability: Bool { kind == .sourceAvailability }
+}
+
+/// Wording for failures the engine can classify from the operation that failed. A missing volume
+/// is not a mysterious file error to the person reading the menu: it is an unmounted disk or share.
+enum SourceIssueText {
+    static func directoryUnavailable(sourceURL: URL, failingURL: URL, isRoot: Bool, error: Error) -> SourceIssue {
+        SourceIssue(summary: directorySummary(sourceURL: sourceURL, isRoot: isRoot, error: error),
+                    detail: "\(failingURL.path): \(error.localizedDescription)",
+                    kind: .sourceAvailability)
+    }
+
+    static func fileUnreadable(relativePath: String, url: URL, error: Error) -> SourceIssue {
+        SourceIssue(summary: "文件无法读取，可能已损坏或没有权限。",
+                    detail: "\(url.path): \(error.localizedDescription)", kind: .file)
+    }
+
+    /// A stamp read happens before any Photos submission, so a failed one never leaves the import
+    /// in doubt: the record stays pending and is attempted again.
+    static func submissionStampFailed(error: Error) -> SourceIssue {
+        SourceIssue(summary: "读取来源文件失败，尚未提交，稍后会自动重试。",
+                    detail: error.localizedDescription, kind: .submission)
+    }
+
+    static let uncertainImport = "上次导入的结果尚未确认，已暂停新的导入。"
+    static let checkpointFailure = "导入检查点保存失败，已暂停新的导入。"
+    static let authorizationRequired = "未获“照片”读写权限，同步已暂停。请在设置中点“授权访问照片”。"
+    static let libraryUnavailable = "无法读取系统照片图库，已暂停导入。"
+    static let storageStopped = "本地数据库不可用，同步已停止。"
+
+    static func blockingSummary(for error: Error) -> String {
+        if let error = error as? PhotoKitGatewayError {
+            switch error {
+            case .authorizationRequired:
+                return authorizationRequired
+            case .libraryUnavailable, .libraryChanged:
+                return libraryUnavailable
+            case .checkpointFailed:
+                return checkpointFailure
+            case .resultUnknown:
+                return uncertainImport
+            case .definitelyNotCommitted:
+                return "有文件导入失败，稍后会自动重试。"
+            }
+        }
+        return libraryUnavailable
+    }
+
+    /// The bounded reader refuses a second concurrent read of one source, ends its own logical
+    /// wait, or has no free slot. None of that found a problem: the work stays queued and comes
+    /// back shortly, so these are the only read results the app treats as normal waiting instead
+    /// of reporting them.
+    static func isReadContention(_ error: Error) -> Bool {
+        error is ReadExecutorError
+    }
+
+    private static func directorySummary(sourceURL: URL, isRoot: Bool, error: Error) -> String {
+        let subject = isRoot ? "来源目录" : "部分子目录"
+        if let configurationError = error as? SourceRegistryError {
+            switch configurationError {
+            case .aliasOrLink:
+                return isRoot
+                    ? "来源配置无效：不支持别名或符号链接，请重新选择实际文件夹。"
+                    : "部分子目录包含不支持的别名或符号链接，已停止读取该目录。"
+            case .notDirectory:
+                return isRoot
+                    ? "来源配置无效：所选路径不是文件夹，请重新选择来源目录。"
+                    : "部分子目录不是有效文件夹，已停止读取该目录。"
+            case .notFileURL:
+                return isRoot
+                    ? "来源配置无效：所选来源不是本地文件夹，请重新选择来源目录。"
+                    : "部分子目录配置无效，已停止读取该目录。"
+            case .overlappingSource:
+                return isRoot
+                    ? "来源配置无效：来源目录与已有目录重叠，请调整来源配置。"
+                    : "部分子目录配置无效，已停止读取该目录。"
+            }
+        }
+        // A network share that is not mounted is the most specific thing we can say about a root.
+        if isRoot, let mount = missingMount(for: sourceURL) {
+            return "所在磁盘或网络共享 \(mount) 未挂载；挂载后会自动继续同步。"
+        }
+        for nsError in underlyingNSErrorChain(error) {
+            if nsError.domain == NSCocoaErrorDomain,
+               nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError {
+                return "\(subject)不可用，正在等待恢复。请检查磁盘或网络连接。"
+            }
+            if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileReadNoPermissionError {
+                return "\(subject)无法访问，请检查访问权限；恢复后会自动继续。"
+            }
+            if nsError.domain == NSPOSIXErrorDomain,
+               [Int(ENOENT), Int(ENOTDIR), Int(ENODEV)].contains(nsError.code) {
+                return "\(subject)不可用，正在等待恢复。请检查磁盘或网络连接。"
+            }
+            if nsError.domain == NSPOSIXErrorDomain,
+               [Int(EACCES), Int(EPERM)].contains(nsError.code) {
+                return "\(subject)无法访问，请检查访问权限；恢复后会自动继续。"
+            }
+            if nsError.domain == NSPOSIXErrorDomain,
+               [Int(ENETDOWN), Int(ENETUNREACH), Int(ENOTCONN), Int(ECONNRESET), Int(ETIMEDOUT), Int(EPIPE), Int(EHOSTDOWN)].contains(nsError.code) {
+                return "\(subject)所在的网络共享连接已中断；恢复后会自动继续。"
+            }
+        }
+        return "\(subject)暂时无法读取，正在等待恢复。"
+    }
+
+    /// Wrapped failures keep their cause in `NSUnderlyingErrorKey`; the outer error is often a
+    /// generic transport error, so classification has to look a few levels down.
+    private static func underlyingNSErrorChain(_ error: Error) -> [NSError] {
+        var errors: [NSError] = []
+        var current: NSError? = error as NSError
+        for _ in 0..<4 {
+            guard let nsError = current else { break }
+            errors.append(nsError)
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return errors
+    }
+
+    /// `/Volumes/<name>` that the source path depends on but that does not exist right now.
+    private static func missingMount(for url: URL) -> String? {
+        let components = url.pathComponents
+        guard components.count >= 3, components[1] == "Volumes" else { return nil }
+        let mount = "/" + components[1] + "/" + components[2]
+        return FileManager.default.fileExists(atPath: mount) ? nil : mount
+    }
 }
 
 public struct EngineSnapshot: Sendable {
@@ -46,8 +204,23 @@ public struct EngineSnapshot: Sendable {
     public var latestScan = ScanProgress()
     public var activeWork = false
     public var sourcePhases: [UUID: String] = [:]
-    public var waitingSources: [UUID: String] = [:]
+    public var waitingSources: [UUID: SourceIssue] = [:]
+    /// Migration aid for clients that consumed the pre-SourceIssue `[UUID: String]` view.
+    /// New code should read `waitingSources[id]?.summary` and, when needed, `.detail`/`.kind`.
+    @available(*, deprecated, message: "Use waitingSources and read SourceIssue.summary")
+    public var waitingSourceSummaries: [UUID: String] {
+        waitingSources.mapValues(\.summary)
+    }
+    /// Unresolved file-level scan issues per source. They are reported next to that source's
+    /// primary message and disappear when the file is readable again or a clean scan completes.
+    public var sourceFileIssueCounts: [UUID: Int] = [:]
+    /// Sources whose last round left work for a later attempt because a read was deferred. They
+    /// are waiting, not failing: nothing is reported for them and they are retried within seconds.
+    public var deferredSources: Set<UUID> = []
+    /// Raw engine-level failure, kept for the journal and the menu tooltip.
     public var blockingError: String?
+    /// Plain-language headline for `blockingError`, and the text a notification carries.
+    public var blockingSummary: String?
     public var recoveryHint: EngineRecoveryHint?
     public var isPaused = false
 }
@@ -62,6 +235,11 @@ public actor SyncEngine {
     private let policy: DuplicatePolicy
     private let logger: RunLogger?
     private let notify: @Sendable (UUID, Bool) -> Void
+    /// Source transition notifications retain the compatibility callback above while this
+    /// callback carries the classified human summary. `detail` is intentionally not sent here.
+    private let notifySourceIssue: @Sendable (UUID, Bool, SourceIssue?) -> Void
+    /// Announces a blocking problem that needs a person. Unlike `notify`, it carries the message.
+    private let notifyIssue: @Sendable (String) -> Void
     private var status = EngineSnapshot()
     private var scanning = false
     private var recovering = false
@@ -78,7 +256,11 @@ public actor SyncEngine {
     private var rounds: [UUID: ScanRound] = [:]
     private var latestRoundID: UUID?
     private var reportedWaitingSources: Set<UUID> = []
-    private var sourceIssues: [UUID: [String: String]] = [:]
+    private var sourceIssues: [UUID: [String: SourceIssue]] = [:]
+    /// One signature per source/phase/path so an unchanged failure is not journaled every round.
+    private var lastFailureLogSignatures: [String: String] = [:]
+    /// The blocking message already announced, so one unresolved block notifies once.
+    private var lastNotifiedIssue: String?
 
     private struct ScanRound {
         var sources: Set<UUID>
@@ -96,9 +278,12 @@ public actor SyncEngine {
                 directory: @escaping DirectoryFactory = { DirectoryReader(sourceID: $0) },
                 metadata: @escaping MetadataFactory = { MetadataReader(sourceID: $0) },
                 policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
-                notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in }) {
+                notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in },
+                notifyIssue: @escaping @Sendable (String) -> Void = { _ in },
+                notifySourceIssue: @escaping @Sendable (UUID, Bool, SourceIssue?) -> Void = { _, _, _ in }) {
         self.store = store; self.photos = photos; self.directory = directory
         self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
+        self.notifyIssue = notifyIssue; self.notifySourceIssue = notifySourceIssue
     }
 
     public func sources() async throws -> [RegisteredSource] { try await store.sources() }
@@ -112,6 +297,8 @@ public actor SyncEngine {
         // Admission closes before the durable update suspends this actor.
         disabledSources.insert(id)
         try await store.disableSource(id: id)
+        // A disabled source is not waiting for anything; its issues are re-detected if it returns.
+        clearRemovedSourceStatus(id)
     }
     public func removeSource(id: UUID) async throws {
         // Removal must close both scan and Photos admission before the database update awaits.
@@ -158,12 +345,16 @@ public actor SyncEngine {
         }
         scanning = true
         let roundID = beginRound(sources: sources)
+        // A round that starts with nothing blocking is a clean slate: the same problem is
+        // announced again only after it has actually gone away. `clearBlockingError` re-reads the
+        // conditions every round, so clearing the message alone must not clear the announcement.
+        if status.blockingError == nil { lastNotifiedIssue = nil }
         clearBlockingError()
         await recoverImports()
         if !uncertainSubmissions.isEmpty {
             setUncertainSubmissionBlock()
         }
-        guard !storageFailed else {
+        guard !storageFailed, status.blockingError == nil else {
             scanning = false
             await refreshSummary()
             finishRound(roundID)
@@ -171,7 +362,7 @@ public actor SyncEngine {
         }
         do { indexed = try await photos.loadCandidates() }
         catch {
-            setBlockingError(error.localizedDescription)
+            setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
             interruptRound(roundID)
             scanning = false
             await refreshSummary()
@@ -217,11 +408,21 @@ public actor SyncEngine {
                         clearUncertainSubmissionBlockIfResolved()
                         resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id))
                     case .unknown:
-                        setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: "An earlier Photos import is awaiting confirmation.", fileID: record.id, attemptID: attempt, error: nil)
+                        setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
+                                       issue: SourceIssue(summary: SourceIssueText.uncertainImport,
+                                                          detail: "An earlier Photos import is awaiting confirmation.", kind: .submission),
+                                       fileID: record.id, attemptID: attempt, error: nil)
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
-                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: error.localizedDescription, fileID: record.id, attemptID: attempt, error: error)
+                    if let gatewayError = error as? PhotoKitGatewayError,
+                       gatewayError == .authorizationRequired {
+                        setBlockingError(error.localizedDescription, summary: SourceIssueText.authorizationRequired)
+                    } else {
+                        setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
+                                       issue: SourceIssue(summary: SourceIssueText.uncertainImport, detail: error.localizedDescription, kind: .submission),
+                                       fileID: record.id, attemptID: attempt, error: error)
+                    }
                 }
             }
         } catch { stopStorage(error) }
@@ -229,6 +430,7 @@ public actor SyncEngine {
 
     private func scanSource(_ sourceID: UUID, roundID: UUID) async {
         status.sourcePhases[sourceID] = "扫描目录与元数据"
+        status.deferredSources.remove(sourceID)
         defer { status.sourcePhases.removeValue(forKey: sourceID) }
         var checked = 0, failed = 0
         var run: UUID?
@@ -248,6 +450,7 @@ public actor SyncEngine {
                     for entry in try await reader.entries(in: folder.url) {
                         guard canScan(sourceID: sourceID) else { break scanLoop }
                         if entry.isDirectory { directories.append((entry.url, folder.relative + entry.url.lastPathComponent + "/")); continue }
+                        let relative = folder.relative + entry.url.lastPathComponent
                         let classification = MetadataReader.classification(entry.url)
                         if let failure = entry.failure {
                             if classification == "image" || classification == "video" {
@@ -255,11 +458,13 @@ public actor SyncEngine {
                                 recordCandidateChecked(roundID)
                             }
                             failed += 1
-                            recordRoundFailure(roundID)
+                            recordRoundFailure(roundID, fileLevel: true)
                             lastFailure = failure
-                            let error = NSError(domain: "PhotoSync.DirectoryEntry", code: 1, userInfo: [NSLocalizedDescriptionKey: failure])
-                            setSourceIssue(sourceID, key: "scan", message: failure, runID: run, error: error)
-                            logEvent(phase: "metadata", result: "failed", sourceID: sourceID, runID: run, path: entry.url.path, error: error)
+                            let entryError = NSError(domain: "PhotoSync.DirectoryEntry", code: 1, userInfo: [NSLocalizedDescriptionKey: failure])
+                            setSourceIssue(sourceID, key: fileScanIssueKey(relative),
+                                           issue: SourceIssueText.fileUnreadable(relativePath: relative, url: entry.url, error: entryError),
+                                           runID: run, error: entryError)
+                            logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, error: entryError)
                             continue
                         }
                         guard classification == "image" || classification == "video" else {
@@ -271,7 +476,6 @@ public actor SyncEngine {
                         do {
                             let stamp = try await reader.stamp(of: entry.url)
                             guard canScan(sourceID: sourceID) else { break scanLoop }
-                            let relative = folder.relative + entry.url.lastPathComponent
                             if let old = try await store.file(sourceID: sourceID, relativePath: relative) {
                                 guard canScan(sourceID: sourceID) else { break scanLoop }
                                 // Never discard the identity of an unresolved actual import.
@@ -279,6 +483,7 @@ public actor SyncEngine {
                                     try await store.recordSourceChange(fileID: old.id, stamp: stamp)
                                     resolveSourceIssue(sourceID, key: issueKey(for: old.id), runID: run, fileID: old.id)
                                 }
+                                resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run, fileID: old.id)
                                 continue
                             }
                             let info = try await metadataReader.read(url: entry.url, filename: entry.url.lastPathComponent)
@@ -287,32 +492,54 @@ public actor SyncEngine {
                             let decision = policy.evaluate(info, candidates: indexed)
                             let evidence = matchingCandidates(decision, candidates: indexed)
                             _ = try await store.save(file, decision: decision, candidates: evidence)
+                            resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run)
                         } catch let error as SyncStoreError { throw error }
                         catch {
-                            failed += 1
-                            recordRoundFailure(roundID)
-                            lastFailure = error.localizedDescription
-                            setSourceIssue(sourceID, key: "scan", message: error.localizedDescription, runID: run, error: error)
-                            logEvent(phase: "metadata", result: "failed", sourceID: sourceID, runID: run, path: entry.url.path, error: error)
+                            if SourceIssueText.isReadContention(error) {
+                                // Bounded-reader contention is queue pressure, not a bad file.
+                                // Leave all persisted scan-run failure fields untouched.
+                                recordDeferral(roundID, sourceID: sourceID)
+                            } else {
+                                failed += 1
+                                lastFailure = error.localizedDescription
+                                recordRoundFailure(roundID, fileLevel: true)
+                                setSourceIssue(sourceID, key: fileScanIssueKey(relative),
+                                               issue: SourceIssueText.fileUnreadable(relativePath: relative, url: entry.url, error: error),
+                                               runID: run, error: error)
+                                logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, error: error)
+                            }
                         }
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
-                    failed += 1
-                    recordRoundFailure(roundID)
-                    lastFailure = error.localizedDescription
-                    setSourceIssue(sourceID, key: "scan", message: error.localizedDescription, runID: run, error: error)
-                    logEvent(phase: "directory", result: "failed", sourceID: sourceID, runID: run, error: error)
+                    if SourceIssueText.isReadContention(error) {
+                        recordDeferral(roundID, sourceID: sourceID)
+                    } else {
+                        failed += 1
+                        lastFailure = error.localizedDescription
+                        recordRoundFailure(roundID)
+                        setSourceIssue(sourceID, key: Self.directoryScanIssueKey,
+                                       issue: SourceIssueText.directoryUnavailable(sourceURL: source.url, failingURL: folder.url,
+                                                                                   isRoot: folder.relative.isEmpty, error: error),
+                                       runID: run, error: error)
+                        logFailureOnce(phase: "directory", sourceID: sourceID, runID: run, path: folder.url.path, error: error)
+                    }
                 }
             }
             if let run {
+                let deferred = status.deferredSources.contains(sourceID)
                 let complete = failed == 0 && canScan(sourceID: sourceID)
                 try await store.finishScan(runID: run, now: Date(), complete: complete, checked: checked, failed: failed, error: lastFailure)
                 if !complete { interruptRound(roundID) }
-                if complete { resolveSourceIssue(sourceID, key: "scan", runID: run) }
+                if complete && !deferred {
+                    resolveScanIssues(sourceID, runID: run)
+                    status.deferredSources.remove(sourceID)
+                }
                 let result: String
                 if status.isPaused {
                     result = "paused"
+                } else if deferred {
+                    result = "deferred"
                 } else if complete {
                     result = "completed"
                 } else if disabledSources.contains(sourceID) {
@@ -320,7 +547,11 @@ public actor SyncEngine {
                 } else {
                     result = "failed"
                 }
-                logEvent(phase: "scan", result: result, sourceID: sourceID, runID: run)
+                if result == "failed" {
+                    logFailureOnce(phase: "scan", sourceID: sourceID, runID: run)
+                } else {
+                    logEvent(phase: "scan", result: result, sourceID: sourceID, runID: run)
+                }
             }
             startDrain(roundID: roundID)
         } catch {
@@ -355,19 +586,30 @@ public actor SyncEngine {
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
-                    let message = error.localizedDescription
-                    recordRoundFailure(context.roundID)
-                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: message, runID: context.runID, fileID: record.id, error: error)
-                    logEvent(phase: "submission-stamp", result: "failed", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, error: error)
-                    try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)
-                    if let run = context.runID { try await store.recordScanFailure(runID: run, error: message) }
+                    if SourceIssueText.isReadContention(error) {
+                        // The stamp is read before any Photos request. A contention result is
+                        // ordinary queueing: keep the pending row byte-for-byte equivalent and
+                        // let the independent source deferral schedule bring it back.
+                        recordDeferral(context.roundID, sourceID: record.file.sourceID)
+                    } else {
+                        let message = error.localizedDescription
+                        recordRoundFailure(context.roundID)
+                        // Nothing was submitted: the read failed before dispatch, so this is a
+                        // retry, not an uncertain import.
+                        setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
+                                       issue: SourceIssueText.submissionStampFailed(error: error),
+                                       runID: context.runID, fileID: record.id, error: error)
+                        logFailureOnce(phase: "submission-stamp", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, error: error)
+                        try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)
+                        if let run = context.runID { try await store.recordScanFailure(runID: run, error: message) }
+                    }
                     continue
                 }
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
                 do { indexed = try await photos.loadCandidates() }
                 catch {
                     recordRoundFailure(context.roundID)
-                    setBlockingError(error.localizedDescription)
+                    setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
                     break
                 }
                 let local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
@@ -410,7 +652,10 @@ public actor SyncEngine {
                     let definite = (error as? PhotoKitGatewayError)?.recoveryEvidence == .definitelyNotCommitted
                     try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: nextRetry(for: record), error: error.localizedDescription, definitelyNotCommitted: definite)
                     recordRoundFailure(context.roundID)
-                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id), message: error.localizedDescription, runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
+                    setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
+                                   issue: SourceIssue(summary: definite ? "有文件导入失败，稍后会自动重试。" : SourceIssueText.uncertainImport,
+                                                      detail: error.localizedDescription, kind: .submission),
+                                   runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
                     logEvent(phase: "submission", result: "failed", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
                     // A gateway reporting unknown may still own a physical request. Keep this
                     // instance and stop submissions until its own lifecycle permits recovery.
@@ -456,9 +701,15 @@ public actor SyncEngine {
 
     private func issueKey(for fileID: UUID) -> String { "file:\(fileID.uuidString)" }
 
-    private func setSourceIssue(_ sourceID: UUID, key: String, message: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
-        guard !removedSources.contains(sourceID) else { return }
-        sourceIssues[sourceID, default: [:]][key] = message
+    /// Source directories and individual files are tracked separately so an unavailable volume
+    /// and unreadable files can be reported at the same time instead of overwriting each other.
+    private static let directoryScanIssueKey = "scan:directory"
+    private func fileScanIssueKey(_ relativePath: String) -> String { "scan:file:\(relativePath)" }
+
+    private func setSourceIssue(_ sourceID: UUID, key: String, issue: SourceIssue, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+        // A source that was disabled or removed mid-scan must not reappear as waiting afterwards.
+        guard !removedSources.contains(sourceID), !disabledSources.contains(sourceID) else { return }
+        sourceIssues[sourceID, default: [:]][key] = issue
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
     }
 
@@ -466,40 +717,94 @@ public actor SyncEngine {
         guard !removedSources.contains(sourceID) else { return }
         sourceIssues[sourceID]?.removeValue(forKey: key)
         if sourceIssues[sourceID]?.isEmpty == true { sourceIssues.removeValue(forKey: sourceID) }
+        // A readable file is a new condition: if it breaks again, that failure is journaled again.
+        if key.hasPrefix("scan:file:") {
+            lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|metadata|\(key.dropFirst("scan:file:".count))")
+        }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: nil)
+    }
+
+    /// A clean scan means the source answered for every entry it enumerated, so no scan-stage
+    /// issue from an earlier round survives it. Submission issues keep their own lifetime.
+    private func resolveScanIssues(_ sourceID: UUID, runID: UUID? = nil) {
+        guard let keys = sourceIssues[sourceID]?.keys.filter({ $0.hasPrefix("scan:") }), !keys.isEmpty else { return }
+        for key in keys { sourceIssues[sourceID]?.removeValue(forKey: key) }
+        if sourceIssues[sourceID]?.isEmpty == true { sourceIssues.removeValue(forKey: sourceID) }
+        syncSourceIssueStatus(sourceID, runID: runID, error: nil)
+    }
+
+    /// The source line shows the most explanatory unresolved problem: a missing directory first,
+    /// then a blocked import, then unreadable files.
+    private func primaryIssue(_ issues: [String: SourceIssue]) -> SourceIssue? {
+        if let issue = issues[Self.directoryScanIssueKey] { return issue }
+        if let key = issues.keys.filter({ $0.hasPrefix("file:") }).sorted().first { return issues[key] }
+        if let key = issues.keys.filter({ $0.hasPrefix("scan:file:") }).sorted().first { return issues[key] }
+        return issues.keys.sorted().first.flatMap { issues[$0] }
     }
 
     private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
         guard !removedSources.contains(sourceID) else { return }
-        if let message = sourceIssues[sourceID]?.values.sorted().first {
-            status.waitingSources[sourceID] = message
-            logSourceWaiting(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
+        let issues = sourceIssues[sourceID] ?? [:]
+        if let issue = primaryIssue(issues) {
+            status.waitingSources[sourceID] = issue
+            let fileIssues = issues.keys.filter { $0.hasPrefix("scan:file:") }.count
+            if fileIssues > 0 {
+                status.sourceFileIssueCounts[sourceID] = fileIssues
+            } else {
+                status.sourceFileIssueCounts.removeValue(forKey: sourceID)
+            }
+            logSourceWaiting(sourceID, issue: issue, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
         } else {
             status.waitingSources.removeValue(forKey: sourceID)
+            status.sourceFileIssueCounts.removeValue(forKey: sourceID)
+            clearFailureLogSignatures(sourceID)
             logSourceRecovered(sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
         }
     }
 
-    private func logSourceWaiting(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+    private func logSourceWaiting(_ sourceID: UUID, issue: SourceIssue, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
         guard reportedWaitingSources.insert(sourceID).inserted else { return }
         notify(sourceID, false)
-        logEvent(phase: "recovery", result: "waiting", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
+        notifySourceIssue(sourceID, false, issue)
+        logEvent(phase: "recovery", result: "waiting", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error, detail: issue.detail)
     }
 
     private func logSourceRecovered(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
         guard reportedWaitingSources.remove(sourceID) != nil else { return }
         notify(sourceID, true)
+        notifySourceIssue(sourceID, true, nil)
         logEvent(phase: "recovery", result: "recovered", sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
     }
 
     private func clearRemovedSourceStatus(_ sourceID: UUID) {
         status.sourcePhases.removeValue(forKey: sourceID)
         status.waitingSources.removeValue(forKey: sourceID)
+        status.sourceFileIssueCounts.removeValue(forKey: sourceID)
+        status.deferredSources.remove(sourceID)
         sourceIssues.removeValue(forKey: sourceID)
         reportedWaitingSources.remove(sourceID)
+        clearFailureLogSignatures(sourceID)
     }
 
-    private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, error: Error? = nil) {
+    private func clearFailureLogSignatures(_ sourceID: UUID) {
+        let prefix = "\(sourceID.uuidString)|"
+        lastFailureLogSignatures = lastFailureLogSignatures.filter { !$0.key.hasPrefix(prefix) }
+    }
+
+    /// Journals a failure only while its signature changes. Every attempt still persists its own
+    /// `scan_run` row, so an unchanged failure repeating on each recovery round adds no evidence.
+    /// `keyPath` names the failing item (a relative path) while `path` stays the logged location.
+    private func logFailureOnce(phase: String, sourceID: UUID, keyPath: String? = nil, runID: UUID? = nil,
+                                fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil,
+                                result: String = "failed", error: Error? = nil) {
+        let key = "\(sourceID.uuidString)|\(phase)|\(keyPath ?? path ?? "")"
+        let signature = "\(result)|\(error?.localizedDescription ?? "")"
+        guard lastFailureLogSignatures[key] != signature else { return }
+        lastFailureLogSignatures[key] = signature
+        logEvent(phase: phase, result: result, sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, path: path, error: error)
+    }
+
+    private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, error: Error? = nil, detail: String? = nil) {
         var fields = ["phase": phase, "result": result]
         if let sourceID { fields["source"] = sourceID.uuidString }
         if let runID { fields["run"] = runID.uuidString }
@@ -507,6 +812,7 @@ public actor SyncEngine {
         if let attemptID { fields["attempt"] = attemptID.uuidString }
         if let path { fields["path"] = path }
         if let error { fields["error"] = error.localizedDescription }
+        if let detail { fields["detail"] = detail }
         logger?.log(fields)
     }
 
@@ -551,9 +857,21 @@ public actor SyncEngine {
         updateRound(roundID) { $0.progress.newlyImported += 1 }
     }
 
-    private func recordRoundFailure(_ roundID: UUID) {
+    /// A deferred read is waiting, not failing: it never creates an issue, never counts as an
+    /// unreadable file, and never notifies. It only marks the round so the UI can say "稍后继续"
+    /// and so the source is retried shortly.
+    private func recordDeferral(_ roundID: UUID, sourceID: UUID) {
+        status.deferredSources.insert(sourceID)
+        updateRound(roundID) {
+            $0.progress.deferred = true
+            $0.interrupted = true
+        }
+    }
+
+    private func recordRoundFailure(_ roundID: UUID, fileLevel: Bool = false) {
         updateRound(roundID) {
             $0.progress.failed += 1
+            if fileLevel { $0.progress.failedFiles += 1 }
             $0.interrupted = true
         }
     }
@@ -597,22 +915,42 @@ public actor SyncEngine {
 
     private func clearBlockingError() {
         status.blockingError = nil
+        status.blockingSummary = nil
         status.recoveryHint = nil
         hasUncertainSubmissionBlock = false
     }
 
-    private func setBlockingError(_ message: String) {
+    private func setBlockingError(_ message: String, summary: String) {
         status.blockingError = message
+        status.blockingSummary = summary
         status.recoveryHint = nil
         hasUncertainSubmissionBlock = false
+        publishIssueNotification(summary)
     }
 
     private func setUncertainSubmissionBlock() {
         hasUncertainSubmissionBlock = true
         let fileID = uncertainSubmissions.min { $0.uuidString < $1.uuidString }
-        status.blockingError = fileID.flatMap { uncertainSubmissionErrors[$0] }
+        let message = fileID.flatMap { uncertainSubmissionErrors[$0] }
             ?? "A Photos submission from this session remains uncertain. Waiting for confirmation."
-        status.recoveryHint = fileID.flatMap { uncertainSubmissionHints[$0] }
+        let hint = fileID.flatMap { uncertainSubmissionHints[$0] }
+        let summary: String
+        if case .checkpointFailure? = hint {
+            summary = SourceIssueText.checkpointFailure
+        } else {
+            summary = SourceIssueText.uncertainImport
+        }
+        status.blockingError = message
+        status.recoveryHint = hint
+        status.blockingSummary = summary
+        publishIssueNotification(summary)
+    }
+
+    /// Blocks that need a person are announced once per distinct headline instead of once per round.
+    private func publishIssueNotification(_ summary: String) {
+        guard lastNotifiedIssue != summary else { return }
+        lastNotifiedIssue = summary
+        notifyIssue(summary)
     }
 
     private func clearUncertainSubmissionBlockIfResolved() {
@@ -624,11 +962,14 @@ public actor SyncEngine {
     }
 
     private func stopStorage(_ error: Error) {
+        let firstStop = !storageFailed
         storageFailed = true
         status.blockingError = "Storage stopped: \(error.localizedDescription)"
+        status.blockingSummary = SourceIssueText.storageStopped
         status.summaryError = error.localizedDescription
         status.recoveryHint = nil
         hasUncertainSubmissionBlock = false
         logger?.log(["error": error.localizedDescription, "scope": "storage"])
+        if firstStop { publishIssueNotification(SourceIssueText.storageStopped) }
     }
 }

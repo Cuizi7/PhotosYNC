@@ -15,7 +15,21 @@ struct StatusMenu: View {
                 ProgressView().controlSize(.small)
             }
             ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
-                if let phase = model.enabledWaiting[source.id] ?? model.state.snapshot.sourcePhases[source.id] {
+                // The line is plain language; the raw system text stays in the tooltip so the
+                // menu never greets a person with "The file “home” couldn’t be opened…".
+                if let issue = model.enabledWaiting[source.id] {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(source.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
+                        Text(issue.summary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        // Unreadable files keep no record, so this count is the only standing trace
+                        // of them beyond the journal; it disappears with the next clean scan.
+                        if model.fileIssueCount(for: source.id) > 0 {
+                            Text("另有 \(model.fileIssueCount(for: source.id)) 个文件读取失败")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    .help("\(source.url.path)\n\(issue.detail)\n\(issue.summary)")
+                } else if let phase = model.state.snapshot.sourcePhases[source.id] {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(source.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
                         Text(phase).font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -30,7 +44,16 @@ struct StatusMenu: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let detail = model.syncDetail {
-                Text(detail).font(.caption).lineLimit(3)
+                Group {
+                    if model.status == .error {
+                        Label(detail, systemImage: "exclamationmark.triangle")
+                    } else {
+                        Text(detail)
+                    }
+                }
+                .font(.caption).lineLimit(3)
+                // Diagnosis stays one hover away instead of occupying the headline.
+                .help(model.syncDetailHelp ?? detail)
             }
             if let hint = model.recoveryAdvice {
                 Text(hint).font(.caption).foregroundStyle(.secondary)

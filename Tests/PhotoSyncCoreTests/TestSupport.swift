@@ -163,6 +163,12 @@ actor EngineTestGate {
     func release() { released = true; waiters.forEach { $0.resume() }; waiters = [] }
 }
 
+/// Records blocking-issue announcements so a test can assert what a person would be told.
+actor IssueRecorder {
+    private(set) var messages: [String] = []
+    func record(_ message: String) { messages.append(message) }
+}
+
 struct GatedDirectoryReader: DirectoryReading {
     let reader: DirectoryReader
     let gate: EngineTestGate
