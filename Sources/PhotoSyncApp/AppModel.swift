@@ -14,6 +14,7 @@ final class AppModel: ObservableObject {
     @Published var loginEnabled = false
     @Published var loginNeedsApproval = false
     @Published var changingLogin = false
+    @Published private(set) var changingSources: Set<UUID> = []
     @Published var notificationsEnabled = false
     @Published private(set) var notificationIssue: NotificationPermissionWarning?
     @Published var ready = false
@@ -22,6 +23,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var qaRoot: URL?
     @Published private(set) var qaBlockedReason: String?
     let demo: Bool
+    /// The production initializer owns system observers, permission polling, and window setup.
+    /// An injected runtime is used by isolated hosts and must never acquire those integrations.
+    private let ownsSystemLifecycle: Bool
     private var demoWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var runtime: SyncRuntime?
@@ -47,6 +51,7 @@ final class AppModel: ObservableObject {
 
     init(demo: Bool = ProcessInfo.processInfo.arguments.contains("--demo")) {
         self.demo = demo
+        ownsSystemLifecycle = true
 #if GUI_QA
         let arguments = ProcessInfo.processInfo.arguments
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -134,15 +139,33 @@ final class AppModel: ObservableObject {
         startNotificationPolling()
     }
 
+    /// Uses an already prepared runtime without starting production polling, observers, windows,
+    /// login-item checks, or notification permission requests. This keeps isolated hosts on the
+    /// same runtime/store path as the app while leaving system integrations with the caller.
+    init(runtime: SyncRuntime, initialState: RuntimeState) {
+        demo = false
+        ownsSystemLifecycle = false
+        self.runtime = runtime
+        state = initialState
+        ready = true
+    }
+
     var status: GlobalStatus {
         if qaBlockedReason != nil { return .error }
         if demo { return demoStatus }
-        return .resolve(configured: state.sources.contains(where: \.enabled),
-                        error: error != nil || state.message != nil || state.snapshot.blockingError != nil || state.snapshot.summaryError != nil,
-                        paused: state.snapshot.isPaused,
-                        waiting: !enabledWaiting.isEmpty || ((state.snapshot.summary?.pending ?? 0) > 0 || (state.snapshot.summary?.retryPending ?? 0) > 0 || (state.snapshot.summary?.importing ?? 0) > 0) && !state.snapshot.activeWork,
-                        running: state.snapshot.activeWork,
-                        authorized: !needsPhotosAuthorization)
+        let presentation = SyncStatusPresentation(snapshot: state.snapshot)
+        return presentation.globalStatus(
+            enabledSourceIDs: enabledSourceIDs,
+            authorized: !needsPhotosAuthorization,
+            hasBlockingError: hasBlockingStatusError
+        )
+    }
+    private var enabledSourceIDs: Set<UUID> {
+        Set(state.sources.filter(\.enabled).map(\.id))
+    }
+    private var hasBlockingStatusError: Bool {
+        error != nil || state.message != nil || state.snapshot.blockingError != nil ||
+            state.snapshot.summaryError != nil
     }
     /// Only a completed bootstrap can tell "not authorized" from "not read yet"; before that the
     /// icon must not claim the user has to act.
@@ -152,16 +175,22 @@ final class AppModel: ObservableObject {
         return "未获“照片”读写权限，同步已暂停。请在设置中点“授权访问照片”。"
     }
     var enabledWaiting: [UUID: SourceIssue] {
-        let ids = Set(state.sources.filter(\.enabled).map(\.id))
-        return state.snapshot.waitingSources.filter { ids.contains($0.key) }
+        state.snapshot.waitingSources.filter { enabledSourceIDs.contains($0.key) }
     }
     func fileIssueCount(for sourceID: UUID) -> Int {
         state.snapshot.sourceFileIssueCounts[sourceID] ?? 0
     }
     var statusDescription: String {
-        if state.snapshot.isPaused && state.snapshot.activeWork { return "正在暂停，等待当前操作返回" }
         if !ready { return "正在读取配置" }
-        return status.description
+        if qaBlockedReason != nil || demo { return status.description }
+        let currentStatus = status
+        // A global failure or missing Photos access must keep its generic error heading even if
+        // the same snapshot also contains a paused or file-level state.
+        if hasBlockingStatusError || needsPhotosAuthorization { return currentStatus.description }
+        return SyncStatusPresentation(snapshot: state.snapshot).statusDescription(
+            for: currentStatus,
+            enabledSourceIDs: enabledSourceIDs
+        )
     }
     /// Headline text only: it must read as plain language, never as a system error message.
     var syncDetail: String? {
@@ -209,7 +238,7 @@ final class AppModel: ObservableObject {
 #endif
     }
     var isReadOnlyGUIQA: Bool { isGUIQA && qaMode == .readonly }
-    var allowsSystemIntegrations: Bool { !demo && !isGUIQA }
+    var allowsSystemIntegrations: Bool { ownsSystemLifecycle && !demo && !isGUIQA }
     var qaModeDescription: String {
         switch qaMode {
         case .fake:
@@ -269,21 +298,47 @@ final class AppModel: ObservableObject {
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in
-                do { try await self?.runtime?.add(url); await self?.refresh() }
-                catch { self?.reportOperationFailure("添加来源失败，请确认该文件夹可以访问。", error) }
+                guard let self else { return }
+                // Selecting an existing directory is also an enable operation; share its guard.
+                let existingID = self.state.sources.first {
+                    $0.url.standardizedFileURL == url.standardizedFileURL
+                }?.id
+                if let existingID {
+                    guard !self.changingSources.contains(existingID) else { return }
+                    self.changingSources.insert(existingID)
+                }
+                defer { if let existingID { self.changingSources.remove(existingID) } }
+                do { try await self.runtime?.add(url); await self.refresh() }
+                catch { self.reportOperationFailure("添加来源失败，请确认该文件夹可以访问。", error) }
             }
         }
     }
-    func disable(_ id: UUID) {
-        guard !demo else { return }
+    func enable(_ id: UUID) {
+        guard !demo, ready, !changingSources.contains(id) else { return }
+        changingSources.insert(id)
         Task {
+            defer { changingSources.remove(id) }
+            do { try await runtime?.enable(id); await refresh() }
+            catch let failure as RuntimeSourceOperationError {
+                error = failure.localizedDescription
+                errorDetail = nil
+            } catch { self.reportOperationFailure("启用来源失败，请确认该文件夹可以访问。", error) }
+        }
+    }
+    func disable(_ id: UUID) {
+        guard !demo, ready, !changingSources.contains(id) else { return }
+        changingSources.insert(id)
+        Task {
+            defer { changingSources.remove(id) }
             do { try await runtime?.disable(id); await refresh() }
             catch { self.reportOperationFailure("停用来源失败，请稍后重试。", error) }
         }
     }
     func remove(_ id: UUID) {
-        guard !demo else { return }
+        guard !demo, ready, !changingSources.contains(id) else { return }
+        changingSources.insert(id)
         Task {
+            defer { changingSources.remove(id) }
             do { try await runtime?.removeSource(id); await refresh() }
             catch { self.reportOperationFailure("移除来源失败，请稍后重试。", error) }
         }

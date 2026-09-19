@@ -8,6 +8,72 @@ import PhotoSyncCore
 struct SyncStatusPresentation {
     let snapshot: EngineSnapshot
 
+    /// Maps only enabled sources to the global icon state, so a stale snapshot for a disabled
+    /// source cannot hide work that is still progressing elsewhere.
+    func globalStatus(
+        enabledSourceIDs: Set<UUID>,
+        authorized: Bool,
+        hasBlockingError: Bool
+    ) -> GlobalStatus {
+        guard !enabledSourceIDs.isEmpty else { return .unconfigured }
+        guard authorized, !hasBlockingError else { return .error }
+        if snapshot.isPaused { return .paused }
+
+        let issues = enabledIssues(for: enabledSourceIDs)
+        if issues.contains(where: \.isSourceAvailability) { return .waiting }
+        if snapshot.activeWork { return .running }
+        if hasDeferredWork(for: enabledSourceIDs) { return .waiting }
+
+        let summary = snapshot.summary
+        if (summary?.importing ?? 0) > 0 { return .waiting }
+        if (summary?.pending ?? 0) > 0 || (summary?.retryPending ?? 0) > 0 { return .waiting }
+        if hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs) { return .error }
+        return snapshot.latestScan.state == .completed ? .completed : .waiting
+    }
+
+    func statusDescription(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String {
+        let issues = enabledIssues(for: enabledSourceIDs)
+        let summary = snapshot.summary
+        switch status {
+        case .error:
+            return hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs)
+                ? "部分文件需要处理"
+                : status.description
+        case .paused:
+            return snapshot.activeWork ? "正在暂停，等待当前操作返回" : status.description
+        case .waiting:
+            if issues.contains(where: \.isSourceAvailability) { return "等待恢复" }
+            if hasDeferredWork(for: enabledSourceIDs) { return "稍后继续" }
+            if (summary?.importing ?? 0) > 0 { return "等待核对" }
+            let pending = summary?.pending ?? 0
+            let retryPending = summary?.retryPending ?? 0
+            if pending > 0 || retryPending > 0 {
+                return pending == 0 ? "等待重试" : "等待处理"
+            }
+            return "等待扫描"
+        default:
+            return status.description
+        }
+    }
+
+    private func enabledIssues(for enabledSourceIDs: Set<UUID>) -> [SourceIssue] {
+        snapshot.waitingSources.compactMap { enabledSourceIDs.contains($0.key) ? $0.value : nil }
+    }
+
+    private func hasDeferredWork(for enabledSourceIDs: Set<UUID>) -> Bool {
+        !snapshot.deferredSources.intersection(enabledSourceIDs).isEmpty
+    }
+
+    private func hasFileOrSubmissionIssue(
+        _ issues: [SourceIssue],
+        enabledSourceIDs: Set<UUID>
+    ) -> Bool {
+        issues.contains { $0.kind == .file || $0.kind == .submission } ||
+            snapshot.sourceFileIssueCounts.contains {
+                enabledSourceIDs.contains($0.key) && $0.value > 0
+            }
+    }
+
     var summary: String {
         guard let summary = snapshot.summary else {
             return snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用"

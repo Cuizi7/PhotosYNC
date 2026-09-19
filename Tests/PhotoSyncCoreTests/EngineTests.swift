@@ -122,6 +122,146 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+    func testSourceChangeDuringCheckpointedCreatePreservesImportedResult() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let gate = EngineTestGate()
+        await f.photos.setCreationGate(gate)
+
+        let scan = Task { await f.engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let checkpointed = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let record = try XCTUnwrap(checkpointed)
+        XCTAssertEqual(record.state, .importing)
+        XCTAssertEqual(record.placeholderID, "fake-1")
+
+        let changed = try await f.store.recordSourceChange(fileID: record.id, stamp: .init(size: 99, modifiedNanoseconds: 99))
+        XCTAssertFalse(changed)
+        await gate.release()
+        await scan.value
+
+        let imported = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let snapshot = await f.engine.snapshot()
+        XCTAssertEqual(imported?.state, .imported)
+        XCTAssertNotNil(imported?.successID)
+        XCTAssertNil(snapshot.blockingError)
+    }
+
+    func testStalePendingAdmissionAfterSourceChangeDoesNotBlockEngine() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let gate = EngineTestGate()
+        let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], gate: gate)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let pending = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let record = try XCTUnwrap(pending)
+        let changed = try await f.store.recordSourceChange(fileID: record.id, stamp: .init(size: 99, modifiedNanoseconds: 99))
+        XCTAssertTrue(changed)
+        await gate.release()
+        await scan.value
+
+        let state = try await f.store.state(of: record.id)
+        let snapshot = await engine.snapshot()
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(state, .skipped)
+        XCTAssertEqual(createCount, 0)
+        XCTAssertNil(snapshot.blockingError)
+    }
+
+    func testLateStampFailureAfterSourceChangeKeepsHealthyWorkMoving() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let gate = EngineTestGate()
+        let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], gate: gate,
+                                           failSubmissionStamp: true, failSubmissionStampOnce: true)
+        let notifications = NotificationRecorder()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader },
+                                notify: { notifications.record(sourceID: $0, recovered: $1) })
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let pending = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let record = try XCTUnwrap(pending)
+        let changed = try await f.store.recordSourceChange(fileID: record.id, stamp: .init(size: 99, modifiedNanoseconds: 99))
+        XCTAssertTrue(changed)
+
+        // Queue a distinct healthy sibling while the stale stamp is held, so continuing the
+        // same drain (rather than restarting the engine) must admit this work.
+        let healthyURL = f.directories[0].appendingPathComponent("healthy.jpg")
+        try FileManager.default.copyItem(at: record.file.url, to: healthyURL)
+        let healthy = SourceFile(sourceID: f.sourceIDs[0], relativePath: "healthy.jpg", url: healthyURL,
+                                 stamp: try await DirectoryReader(sourceID: f.sourceIDs[0]).stamp(of: healthyURL),
+                                 metadata: try await MetadataReader(sourceID: f.sourceIDs[0]).read(url: healthyURL, filename: "healthy.jpg"))
+        let healthyID = try await f.store.save(healthy, decision: .importNew)
+        await gate.release()
+        await scan.value
+
+        let skipped = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let healthyState = try await f.store.state(of: healthyID)
+        let snapshot = await engine.snapshot()
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(skipped?.state, .skipped)
+        XCTAssertEqual(skipped?.file.stamp, FileStamp(size: 99, modifiedNanoseconds: 99))
+        XCTAssertEqual(skipped?.retryCount, 0)
+        XCTAssertNil(skipped?.nextRetryAt)
+        XCTAssertNil(skipped?.successID)
+        XCTAssertEqual(healthyState, .imported)
+        XCTAssertEqual(createCount, 1)
+        XCTAssertNil(snapshot.blockingError)
+        XCTAssertTrue(snapshot.waitingSources.isEmpty)
+        XCTAssertEqual(snapshot.latestScan.failed, 0)
+        XCTAssertTrue(notifications.events.isEmpty)
+        XCTAssertEqual(try engineSQLInteger("SELECT COALESCE(SUM(failed), 0) FROM scan_run", at: f.databaseURL), 0)
+        XCTAssertNil(try engineSQLString("SELECT last_error FROM file_record WHERE id = '\(record.id.uuidString)'", at: f.databaseURL))
+    }
+
+    func testStampRetryWriteFailuresStillStopStorageForPendingRecords() async throws {
+        for action in ["IGNORE", "FAIL, 'injected retry write failure'"] {
+            let f = try await makeEngineFixture(sourceCount: 1)
+            let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], failSubmissionStamp: true)
+            try injectEngineSQL("CREATE TRIGGER fail_retry BEFORE UPDATE OF retry_count ON file_record BEGIN SELECT RAISE(\(action)); END", at: f.databaseURL)
+            let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+
+            await engine.scan(sourceIDs: f.sourceIDs)
+
+            let snapshot = await engine.snapshot()
+            let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+            let createCount = await f.photos.createCount
+            XCTAssertNotNil(snapshot.blockingError, action)
+            XCTAssertEqual(record?.state, .pending, action)
+            XCTAssertEqual(record?.retryCount, 0, action)
+            XCTAssertEqual(createCount, 0, action)
+        }
+    }
+
+    func testLateStampFailureDoesNotTreatImportingAsTerminal() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let gate = EngineTestGate()
+        let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], gate: gate, failSubmissionStamp: true)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let pending = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let record = try XCTUnwrap(pending)
+        let attemptID = UUID()
+        try await f.store.beginAttempt(fileID: record.id, attemptID: attemptID)
+        try f.store.checkpointPlaceholder(fileID: record.id, attemptID: attemptID, identifier: "unresolved")
+        await gate.release()
+        await scan.value
+
+        let unresolved = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let snapshot = await engine.snapshot()
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(unresolved?.state, .importing)
+        XCTAssertEqual(unresolved?.attemptID, attemptID)
+        XCTAssertEqual(unresolved?.placeholderID, "unresolved")
+        XCTAssertNotNil(snapshot.blockingError)
+        XCTAssertEqual(createCount, 0)
+    }
+
     func testIndexFailureNeverSubmits() async throws {
         let f = try await makeEngineFixture()
         await f.photos.setLoadFailure(true)
@@ -251,6 +391,71 @@ final class EngineTests: XCTestCase {
         let recovered = await f.engine.snapshot()
         XCTAssertNil(recovered.waitingSources[f.sourceIDs[0]])
         XCTAssertEqual(recovered.latestScan.state, .completed)
+    }
+
+    func testRecoveredDirectoryKeepsOnlyFileIssue() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let reader = Beta3RecoveryDirectory()
+        let engine = SyncEngine(
+            store: f.store,
+            photos: f.photos,
+            directory: { _ in reader },
+            metadata: { _ in Beta3BrokenMetadata() }
+        )
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let offline = await engine.snapshot()
+        XCTAssertEqual(offline.waitingSources[f.sourceIDs[0]]?.kind, .sourceAvailability)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let recovered = await engine.snapshot()
+        XCTAssertEqual(recovered.waitingSources[f.sourceIDs[0]]?.kind, .file)
+        XCTAssertEqual(recovered.sourceFileIssueCounts[f.sourceIDs[0]], 1)
+        XCTAssertEqual(recovered.latestScan.failedFiles, 1)
+    }
+
+    func testDirectoryFailureIsJournaledAgainAfterRecoveryWithFileIssuesRemaining() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let reader = ControlledDirectoryReader(sourceID: f.sourceIDs[0], failingDirectory: f.directories[0], failure: .cocoaReadMissing)
+        let notifications = NotificationRecorder()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader },
+                                metadata: { _ in Beta3BrokenMetadata() }, logger: logger,
+                                notify: { notifications.record(sourceID: $0, recovered: $1) })
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+        func failureCount(_ phase: String) throws -> Int {
+            logger.flushForTesting()
+            return try String(contentsOf: logURL).split(separator: "\n").filter { line in
+                let row = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+                return row?["phase"] == phase && row?["result"] == "failed"
+            }.count
+        }
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        XCTAssertEqual(try failureCount("directory"), 1)
+        await reader.recover()
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let fileOnly = await engine.snapshot()
+        XCTAssertEqual(fileOnly.waitingSources[f.sourceIDs[0]]?.kind, .file)
+        XCTAssertEqual(try failureCount("directory"), 1)
+        XCTAssertEqual(try failureCount("metadata"), 1)
+
+        await reader.failAgain(.cocoaReadMissing)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let offlineAgain = await engine.snapshot()
+        XCTAssertEqual(offlineAgain.waitingSources[f.sourceIDs[0]]?.kind, .sourceAvailability)
+        XCTAssertEqual(try failureCount("directory"), 2)
+
+        // Directory recovery must not retire the ongoing file failure's signature or unlatch
+        // the aggregate notification while that file is still unreadable.
+        await reader.recover()
+        await engine.scan(sourceIDs: f.sourceIDs)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        XCTAssertEqual(try failureCount("directory"), 2)
+        XCTAssertEqual(try failureCount("metadata"), 1)
+        XCTAssertEqual(notifications.events.count, 1)
+        XCTAssertEqual(notifications.events.first?.1, false)
     }
 
     func testUnreadableFilesAreCountedPerFileAndClearIndividually() async throws {
@@ -835,6 +1040,62 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    func testSubmissionStampFailuresKeepSeparateFileIdentitiesAndResetAfterRecovery() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let secondURL = f.directories[0].appendingPathComponent("second.jpg")
+        try FileManager.default.copyItem(at: f.directories[0].appendingPathComponent("same.jpg"), to: secondURL)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let reader = Beta3SubmissionStampDirectory(sourceID: f.sourceIDs[0])
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader }, logger: logger)
+        let logURL = logDirectory.appendingPathComponent("photo-sync.jsonl")
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        logger.flushForTesting()
+
+        let sameRecord = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let secondRecord = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "second.jpg")
+        let same = try XCTUnwrap(sameRecord)
+        let second = try XCTUnwrap(secondRecord)
+        let expectedIDs = Set([same.id.uuidString, second.id.uuidString])
+        let initialRows = try submissionStampFailureRows(at: logURL)
+        XCTAssertEqual(Set(initialRows.compactMap { $0["file"] }), expectedIDs)
+        XCTAssertEqual(initialRows.count, 2)
+
+        try injectEngineSQL("UPDATE file_record SET next_retry_at = 0", at: f.databaseURL)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        logger.flushForTesting()
+        XCTAssertEqual(try submissionStampFailureRows(at: logURL).count, 2)
+
+        await reader.recover()
+        try injectEngineSQL("UPDATE file_record SET next_retry_at = 0", at: f.databaseURL)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        logger.flushForTesting()
+        let sameState = try await f.store.state(of: same.id)
+        let secondState = try await f.store.state(of: second.id)
+        XCTAssertEqual(sameState, .imported)
+        XCTAssertEqual(secondState, .imported)
+
+        // The isolated row is made retryable again solely to exercise a later failure of the
+        // same persisted identity after its successful recovery cleared the journal signature.
+        try injectEngineSQL(
+            "UPDATE file_record SET state = 'pending', success_id = NULL, success_metadata_json = NULL, retry_count = 0, next_retry_at = 0, last_error = NULL, definitely_not_committed = 0 WHERE id = '\(same.id.uuidString)'",
+            at: f.databaseURL
+        )
+        await reader.failAgain()
+        await engine.scan(sourceIDs: f.sourceIDs)
+        logger.flushForTesting()
+        let recoveredThenFailedRows = try submissionStampFailureRows(at: logURL)
+        XCTAssertEqual(recoveredThenFailedRows.count, 3)
+        XCTAssertEqual(recoveredThenFailedRows.filter { $0["file"] == same.id.uuidString }.count, 2)
+        XCTAssertEqual(recoveredThenFailedRows.filter { $0["file"] == second.id.uuidString }.count, 1)
+
+        try injectEngineSQL("UPDATE file_record SET next_retry_at = 0 WHERE id = '\(same.id.uuidString)'", at: f.databaseURL)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        logger.flushForTesting()
+        XCTAssertEqual(try submissionStampFailureRows(at: logURL).count, 3)
+    }
+
     func testTerminalDuplicateSkipClearsOnlyItsRetryIssue() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         let reader = SubmissionStampReader(sourceID: f.sourceIDs[0], failSubmissionStamp: true, failSubmissionStampOnce: true)
@@ -1007,6 +1268,14 @@ private func loggedEvent(at url: URL, phase: String, result: String) -> [String:
     }.first
 }
 
+private func submissionStampFailureRows(at url: URL) throws -> [[String: String]] {
+    let text = try String(contentsOf: url)
+    return try text.split(separator: "\n").compactMap { line in
+        let object = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+        return object?["phase"] == "submission-stamp" && object?["result"] == "failed" ? object : nil
+    }
+}
+
 private actor PreAdmissionFailurePhotosGateway: PhotosGateway {
     private(set) var createCallCount = 0
     private(set) var actualSubmissionCount = 0
@@ -1146,6 +1415,7 @@ private actor ControlledDirectoryReader: DirectoryReading {
     }
 
     func recover() { failure = nil }
+    func failAgain(_ failure: DirectoryFailure) { self.failure = failure }
 
     func entries(in directory: URL) async throws -> [DirectoryEntry] {
         if directory.resolvingSymlinksInPath().path == failingDirectory.resolvingSymlinksInPath().path, let failure {
@@ -1173,6 +1443,56 @@ private actor ContendedSubmissionStampReader: DirectoryReading {
     func stamp(of file: URL) async throws -> FileStamp {
         stamps += 1
         if stamps > 1, contended { throw ReadExecutorError.sourceBusy }
+        return try await reader.stamp(of: file)
+    }
+}
+
+private actor Beta3RecoveryDirectory: DirectoryReading {
+    private var calls = 0
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        calls += 1
+        if calls == 1 { throw CocoaError(.fileReadNoSuchFile) }
+        return [DirectoryEntry(url: directory.appendingPathComponent("broken.jpg"), isDirectory: false, stamp: nil)]
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        FileStamp(size: 12, modifiedNanoseconds: 1)
+    }
+}
+
+private struct Beta3BrokenMetadata: MetadataReading {
+    func read(url: URL, filename: String) async throws -> MediaMetadata {
+        throw MetadataError.unreadable
+    }
+}
+
+private actor Beta3SubmissionStampDirectory: DirectoryReading {
+    private let reader: DirectoryReader
+    private var scanStampsRemaining = 0
+    private var failingSubmissionStamps = true
+
+    init(sourceID: UUID) {
+        reader = DirectoryReader(sourceID: sourceID)
+    }
+
+    func recover() { failingSubmissionStamps = false }
+    func failAgain() { failingSubmissionStamps = true }
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        let entries = try await reader.entries(in: directory)
+        scanStampsRemaining += entries.filter { !$0.isDirectory && $0.failure == nil }.count
+        return entries
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        if scanStampsRemaining > 0 {
+            scanStampsRemaining -= 1
+            return try await reader.stamp(of: file)
+        }
+        if failingSubmissionStamps {
+            throw FixtureError.unavailable("submission stat unavailable")
+        }
         return try await reader.stamp(of: file)
     }
 }

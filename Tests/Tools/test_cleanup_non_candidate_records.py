@@ -11,7 +11,6 @@ import unittest
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = WORKTREE_ROOT / "scripts" / "cleanup-non-candidate-records.py"
-PRODUCTION_SNAPSHOT = WORKTREE_ROOT.parent.parent / "work" / "Beta2" / "production-snapshot.sqlite"
 
 
 class CleanupNonCandidateRecordsTests(unittest.TestCase):
@@ -160,19 +159,21 @@ class CleanupNonCandidateRecordsTests(unittest.TestCase):
         self.assertEqual(self.count_candidates(live_database), 2)
         self.assertFalse((self.root / "must-not-exist.sqlite").exists())
 
-    def test_production_snapshot_is_only_used_after_copying_to_a_temporary_database(self) -> None:
-        if not PRODUCTION_SNAPSHOT.is_file():
-            self.skipTest("The permitted production snapshot is not present.")
-        source_stat = PRODUCTION_SNAPSHOT.stat()
-        copied_database = self.root / "production-snapshot-copy.sqlite"
-        shutil.copyfile(PRODUCTION_SNAPSHOT, copied_database)
-        backup = self.root / "production-snapshot-copy-before.sqlite"
+    def test_synthetic_database_copy_can_be_cleaned_without_changing_its_source(self) -> None:
+        synthetic_source = self.root / "synthetic-source.sqlite"
+        self.create_database(synthetic_source)
+        source_stat = synthetic_source.stat()
+        source_snapshot = self.snapshots(synthetic_source)
+        copied_database = self.root / "synthetic-copy.sqlite"
+        shutil.copyfile(synthetic_source, copied_database)
+        backup = self.root / "synthetic-copy-before.sqlite"
 
         result = self.run_script("--database", str(copied_database), "--apply", "--backup", str(backup))
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(backup.is_file())
-        self.assertEqual(PRODUCTION_SNAPSHOT.stat(), source_stat)
+        self.assertEqual(synthetic_source.stat(), source_stat)
+        self.assertEqual(self.snapshots(synthetic_source), source_snapshot)
         self.assertEqual(self.integrity_check(copied_database), "ok")
         self.assertEqual(self.integrity_check(backup), "ok")
 

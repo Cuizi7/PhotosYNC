@@ -240,6 +240,7 @@ public actor SyncEngine {
     private let notifySourceIssue: @Sendable (UUID, Bool, SourceIssue?) -> Void
     /// Announces a blocking problem that needs a person. Unlike `notify`, it carries the message.
     private let notifyIssue: @Sendable (String) -> Void
+    private let now: @Sendable () -> Date
     private var status = EngineSnapshot()
     private var scanning = false
     private var recovering = false
@@ -257,8 +258,10 @@ public actor SyncEngine {
     private var latestRoundID: UUID?
     private var reportedWaitingSources: Set<UUID> = []
     private var sourceIssues: [UUID: [String: SourceIssue]] = [:]
-    /// One signature per source/phase/path so an unchanged failure is not journaled every round.
+    /// One signature per source, phase, and file identity so an unchanged failure is not journaled every round.
     private var lastFailureLogSignatures: [String: String] = [:]
+    // The single drain may await retry persistence while a scan resolves the same file.
+    private var pendingStampFailureID: UUID?
     /// The blocking message already announced, so one unresolved block notifies once.
     private var lastNotifiedIssue: String?
 
@@ -280,10 +283,12 @@ public actor SyncEngine {
                 policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
                 notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in },
                 notifyIssue: @escaping @Sendable (String) -> Void = { _ in },
-                notifySourceIssue: @escaping @Sendable (UUID, Bool, SourceIssue?) -> Void = { _, _, _ in }) {
+                notifySourceIssue: @escaping @Sendable (UUID, Bool, SourceIssue?) -> Void = { _, _, _ in },
+                now: @escaping @Sendable () -> Date = { Date() }) {
         self.store = store; self.photos = photos; self.directory = directory
         self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
         self.notifyIssue = notifyIssue; self.notifySourceIssue = notifySourceIssue
+        self.now = now
     }
 
     public func sources() async throws -> [RegisteredSource] { try await store.sources() }
@@ -399,14 +404,14 @@ public actor SyncEngine {
                         uncertainSubmissionHints.removeValue(forKey: record.id)
                         uncertainSubmissionErrors.removeValue(forKey: record.id)
                         clearUncertainSubmissionBlockIfResolved()
-                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id))
+                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), fileID: record.id)
                     case .definitelyNotCommitted:
-                        try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: Date(), error: "Confirmed not committed", definitelyNotCommitted: true)
+                        try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: now(), error: "Confirmed not committed", definitelyNotCommitted: true)
                         uncertainSubmissions.remove(record.id)
                         uncertainSubmissionHints.removeValue(forKey: record.id)
                         uncertainSubmissionErrors.removeValue(forKey: record.id)
                         clearUncertainSubmissionBlockIfResolved()
-                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id))
+                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), fileID: record.id)
                     case .unknown:
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                                        issue: SourceIssue(summary: SourceIssueText.uncertainImport,
@@ -437,18 +442,22 @@ public actor SyncEngine {
         do {
             let source = try await store.source(id: sourceID)
             guard source.enabled, canScan(sourceID: sourceID) else { return }
-            run = try await store.beginScan(sourceID: sourceID, now: Date())
+            run = try await store.beginScan(sourceID: sourceID, now: now())
             setRun(run, sourceID: sourceID, roundID: roundID)
             logEvent(phase: "scan", result: "started", sourceID: sourceID, runID: run)
             let reader = directory(sourceID)
             let metadataReader = metadata(sourceID)
             var directories: [(url: URL, relative: String)] = [(source.url, "")]
+            var directoryTraversalComplete = true
             var lastFailure: String?
             scanLoop: while !directories.isEmpty, canScan(sourceID: sourceID) {
                 let folder = directories.removeFirst()
                 do {
                     for entry in try await reader.entries(in: folder.url) {
-                        guard canScan(sourceID: sourceID) else { break scanLoop }
+                        guard canScan(sourceID: sourceID) else {
+                            directoryTraversalComplete = false
+                            break scanLoop
+                        }
                         if entry.isDirectory { directories.append((entry.url, folder.relative + entry.url.lastPathComponent + "/")); continue }
                         let relative = folder.relative + entry.url.lastPathComponent
                         let classification = MetadataReader.classification(entry.url)
@@ -475,19 +484,31 @@ public actor SyncEngine {
                         recordCandidateChecked(roundID)
                         do {
                             let stamp = try await reader.stamp(of: entry.url)
-                            guard canScan(sourceID: sourceID) else { break scanLoop }
+                            guard canScan(sourceID: sourceID) else {
+                                directoryTraversalComplete = false
+                                break scanLoop
+                            }
                             if let old = try await store.file(sourceID: sourceID, relativePath: relative) {
-                                guard canScan(sourceID: sourceID) else { break scanLoop }
-                                // Never discard the identity of an unresolved actual import.
-                                if old.state != .importing, old.file.stamp != stamp {
-                                    try await store.recordSourceChange(fileID: old.id, stamp: stamp)
-                                    resolveSourceIssue(sourceID, key: issueKey(for: old.id), runID: run, fileID: old.id)
+                                guard canScan(sourceID: sourceID) else {
+                                    directoryTraversalComplete = false
+                                    break scanLoop
+                                }
+                                // The store reads and updates under one transaction, so a
+                                // submission that began after this snapshot keeps its identity.
+                                if old.file.stamp != stamp {
+                                    let changed = try await store.recordSourceChange(fileID: old.id, stamp: stamp)
+                                    if changed {
+                                        resolveSourceIssue(sourceID, key: issueKey(for: old.id), runID: run, fileID: old.id)
+                                    }
                                 }
                                 resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run, fileID: old.id)
                                 continue
                             }
                             let info = try await metadataReader.read(url: entry.url, filename: entry.url.lastPathComponent)
-                            guard canScan(sourceID: sourceID) else { break scanLoop }
+                            guard canScan(sourceID: sourceID) else {
+                                directoryTraversalComplete = false
+                                break scanLoop
+                            }
                             let file = SourceFile(sourceID: sourceID, relativePath: relative, url: entry.url, stamp: stamp, metadata: info)
                             let decision = policy.evaluate(info, candidates: indexed)
                             let evidence = matchingCandidates(decision, candidates: indexed)
@@ -512,6 +533,7 @@ public actor SyncEngine {
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
+                    directoryTraversalComplete = false
                     if SourceIssueText.isReadContention(error) {
                         recordDeferral(roundID, sourceID: sourceID)
                     } else {
@@ -526,10 +548,16 @@ public actor SyncEngine {
                     }
                 }
             }
+            if !directories.isEmpty || !canScan(sourceID: sourceID) {
+                directoryTraversalComplete = false
+            }
+            if directoryTraversalComplete && directories.isEmpty && canScan(sourceID: sourceID) {
+                resolveSourceIssue(sourceID, key: Self.directoryScanIssueKey, runID: run)
+            }
             if let run {
                 let deferred = status.deferredSources.contains(sourceID)
                 let complete = failed == 0 && canScan(sourceID: sourceID)
-                try await store.finishScan(runID: run, now: Date(), complete: complete, checked: checked, failed: failed, error: lastFailure)
+                try await store.finishScan(runID: run, now: now(), complete: complete, checked: checked, failed: failed, error: lastFailure)
                 if !complete { interruptRound(roundID) }
                 if complete && !deferred {
                     resolveScanIssues(sourceID, runID: run)
@@ -576,12 +604,14 @@ public actor SyncEngine {
                 let context = SubmissionContext(roundID: roundID, runID: runID(for: record.file.sourceID, roundID: roundID))
                 guard canSubmit(sourceID: record.file.sourceID) else { continue }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
-                if let retry = record.nextRetryAt, retry > Date() { continue }
+                if let retry = record.nextRetryAt, retry > now() { continue }
                 do {
                     let stamp = try await directory(record.file.sourceID).stamp(of: record.file.url)
                     guard stamp == record.file.stamp else {
-                        try await store.recordSourceChange(fileID: record.id, stamp: stamp)
-                        resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                        let changed = try await store.recordSourceChange(fileID: record.id, stamp: stamp)
+                        if changed {
+                            resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                        }
                         continue
                     }
                 } catch let error as SyncStoreError { throw error }
@@ -593,14 +623,29 @@ public actor SyncEngine {
                         recordDeferral(context.roundID, sourceID: record.file.sourceID)
                     } else {
                         let message = error.localizedDescription
+                        // Nothing was submitted. A concurrent scan may supersede this file
+                        // during either the stamp read or retry write. Reserve publication
+                        // before awaiting, so a matching resolution can cancel the late issue.
+                        pendingStampFailureID = record.id
+                        defer { pendingStampFailureID = nil }
+                        do {
+                            try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)
+                        } catch let error as SyncStoreError {
+                            guard case .invalidTransition = error else { throw error }
+                            let current = try await store.file(sourceID: record.file.sourceID, relativePath: record.file.relativePath)
+                            guard let current, current.id == record.id,
+                                  current.state == .skipped || current.state == .imported else { throw error }
+                            resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                            continue
+                        }
+                        guard pendingStampFailureID == record.id else { continue }
                         recordRoundFailure(context.roundID)
-                        // Nothing was submitted: the read failed before dispatch, so this is a
-                        // retry, not an uncertain import.
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                                        issue: SourceIssueText.submissionStampFailed(error: error),
                                        runID: context.runID, fileID: record.id, error: error)
-                        logFailureOnce(phase: "submission-stamp", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, error: error)
-                        try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)
+                        logFailureOnce(phase: "submission-stamp", sourceID: record.file.sourceID,
+                                       keyPath: record.file.relativePath, runID: context.runID,
+                                       fileID: record.id, path: record.file.url.path, error: error)
                         if let run = context.runID { try await store.recordScanFailure(runID: run, error: message) }
                     }
                     continue
@@ -626,11 +671,19 @@ public actor SyncEngine {
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
                 let attempt = UUID()
                 activeAttempt = attempt
-                try await store.beginAttempt(fileID: record.id, attemptID: attempt)
+                do {
+                    try await store.beginAttempt(fileID: record.id, attemptID: attempt)
+                } catch let error as SyncStoreError {
+                    guard case .invalidTransition = error else { throw error }
+                    let current = try await store.file(sourceID: record.file.sourceID, relativePath: record.file.relativePath)
+                    guard let current, current.state != .pending else { throw error }
+                    activeAttempt = nil
+                    continue
+                }
                 let enabled = try await store.source(id: record.file.sourceID).enabled
                 guard enabled, canSubmit(sourceID: record.file.sourceID) else {
                     // A durable attempt exists, but no Photos request has been dispatched.
-                    try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: Date(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
+                    try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: now(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
                     activeAttempt = nil
                     break
                 }
@@ -695,8 +748,8 @@ public actor SyncEngine {
         !status.isPaused && !storageFailed && !disabledSources.contains(sourceID)
     }
 
-    private func nextRetry(for record: StoredFile, now: Date = Date()) -> Date {
-        now.addingTimeInterval(retryDelay(failureCount: record.retryCount + 1))
+    private func nextRetry(for record: StoredFile) -> Date {
+        now().addingTimeInterval(retryDelay(failureCount: record.retryCount + 1))
     }
 
     private func issueKey(for fileID: UUID) -> String { "file:\(fileID.uuidString)" }
@@ -714,12 +767,26 @@ public actor SyncEngine {
     }
 
     private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
+        if let fileID, key == issueKey(for: fileID), pendingStampFailureID == fileID {
+            pendingStampFailureID = nil
+        }
         guard !removedSources.contains(sourceID) else { return }
         sourceIssues[sourceID]?.removeValue(forKey: key)
         if sourceIssues[sourceID]?.isEmpty == true { sourceIssues.removeValue(forKey: sourceID) }
+        // Complete traversal ends this directory outage even when file issues remain.
+        // A later outage must be journaled without resetting those files' signatures.
+        if key == Self.directoryScanIssueKey {
+            let prefix = "\(sourceID.uuidString)|directory|"
+            lastFailureLogSignatures = lastFailureLogSignatures.filter { !$0.key.hasPrefix(prefix) }
+        }
         // A readable file is a new condition: if it breaks again, that failure is journaled again.
         if key.hasPrefix("scan:file:") {
             lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|metadata|\(key.dropFirst("scan:file:".count))")
+        }
+        // Submission-stamp issues already carry their persisted file ID. Resetting one read
+        // failure must not re-enable identical log rows for any other file in this source.
+        if key.hasPrefix("file:"), let fileID {
+            lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|submission-stamp|\(fileID.uuidString)")
         }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: nil)
     }
@@ -793,11 +860,13 @@ public actor SyncEngine {
 
     /// Journals a failure only while its signature changes. Every attempt still persists its own
     /// `scan_run` row, so an unchanged failure repeating on each recovery round adds no evidence.
-    /// `keyPath` names the failing item (a relative path) while `path` stays the logged location.
+    /// fileID is the preferred dedupe identity; keyPath is its fallback while path stays the
+    /// logged physical location.
     private func logFailureOnce(phase: String, sourceID: UUID, keyPath: String? = nil, runID: UUID? = nil,
                                 fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil,
                                 result: String = "failed", error: Error? = nil) {
-        let key = "\(sourceID.uuidString)|\(phase)|\(keyPath ?? path ?? "")"
+        let identity = fileID?.uuidString ?? keyPath ?? path ?? ""
+        let key = "\(sourceID.uuidString)|\(phase)|\(identity)"
         let signature = "\(result)|\(error?.localizedDescription ?? "")"
         guard lastFailureLogSignatures[key] != signature else { return }
         lastFailureLogSignatures[key] = signature
@@ -832,7 +901,7 @@ public actor SyncEngine {
 
     private func beginRound(sources: Set<UUID>) -> UUID {
         let id = UUID()
-        let progress = ScanProgress(state: .running, startedAt: Date())
+        let progress = ScanProgress(state: .running, startedAt: now())
         rounds[id] = ScanRound(sources: sources, progress: progress)
         latestRoundID = id
         status.latestScan = progress
@@ -884,7 +953,7 @@ public actor SyncEngine {
         guard var round = rounds[roundID] else { return }
         let stoppedSource = round.sources.contains { disabledSources.contains($0) }
         round.progress.state = round.interrupted || stoppedSource || status.isPaused || storageFailed ? .interrupted : .completed
-        round.progress.endedAt = Date()
+        round.progress.endedAt = now()
         rounds[roundID] = round
         publish(round: round, id: roundID)
         rounds.removeValue(forKey: roundID)

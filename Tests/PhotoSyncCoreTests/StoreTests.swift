@@ -3,6 +3,55 @@ import PhotoSyncCore
 import SQLite3
 
 final class StoreTests: XCTestCase {
+    func testDueRetrySourceIDsIncludesOnlyActiveDefinitePendingFailuresAtDeadline() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let active = root.appendingPathComponent("active")
+        let disabled = root.appendingPathComponent("disabled")
+        let removed = root.appendingPathComponent("removed")
+        for directory in [active, disabled, removed] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let activeID = try await store.registerSource(url: active)
+        let disabledID = try await store.registerSource(url: disabled)
+        let removedID = try await store.registerSource(url: removed)
+        let deadline = Date(timeIntervalSince1970: 5)
+
+        for relativePath in ["due-one.jpg", "due-two.jpg"] {
+            let id = try await store.save(source(sourceID: activeID, root: active, relativePath: relativePath), decision: .importNew)
+            try await store.recordRetry(fileID: id, attemptID: nil, nextRetry: deadline,
+                                        error: "temporary", definitelyNotCommitted: true)
+        }
+        let future = try await store.save(source(sourceID: activeID, root: active, relativePath: "future.jpg"), decision: .importNew)
+        try await store.recordRetry(fileID: future, attemptID: nil, nextRetry: deadline.addingTimeInterval(1),
+                                    error: "temporary", definitelyNotCommitted: true)
+        _ = try await store.save(source(sourceID: activeID, root: active, relativePath: "clean-pending.jpg"), decision: .importNew)
+        let importing = try await store.save(source(sourceID: activeID, root: active, relativePath: "importing.jpg"), decision: .importNew)
+        let importingAttempt = UUID()
+        try await store.beginAttempt(fileID: importing, attemptID: importingAttempt)
+        try await store.recordRetry(fileID: importing, attemptID: importingAttempt, nextRetry: deadline,
+                                    error: "unknown", definitelyNotCommitted: false)
+
+        let disabledFile = try await store.save(source(sourceID: disabledID, root: disabled, relativePath: "disabled.jpg"), decision: .importNew)
+        try await store.recordRetry(fileID: disabledFile, attemptID: nil, nextRetry: deadline,
+                                    error: "temporary", definitelyNotCommitted: true)
+        try await store.disableSource(id: disabledID)
+
+        let removedFile = try await store.save(source(sourceID: removedID, root: removed, relativePath: "removed.jpg"), decision: .importNew)
+        try await store.recordRetry(fileID: removedFile, attemptID: nil, nextRetry: deadline,
+                                    error: "temporary", definitelyNotCommitted: true)
+        try await store.removeSource(id: removedID)
+
+        let beforeDeadline = try await store.dueRetrySourceIDs(at: deadline.addingTimeInterval(-1))
+        let atDeadline = try await store.dueRetrySourceIDs(at: deadline)
+        let reopened = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let afterReopen = try await reopened.dueRetrySourceIDs(at: deadline)
+
+        XCTAssertEqual(beforeDeadline, [])
+        XCTAssertEqual(atDeadline, [activeID])
+        XCTAssertEqual(afterReopen, [activeID])
+    }
+
     func testSuccessfulRetryResetsFailureCount() async throws {
         let root = try makeRoot()
         let store = try SyncStore(url: root.appendingPathComponent("store.sqlite"))
@@ -38,12 +87,95 @@ final class StoreTests: XCTestCase {
 
         try await store.beginAttempt(fileID: id, attemptID: attempt)
         try await store.markImported(fileID: id, attemptID: attempt, identifier: "asset-1")
-        try await store.recordSourceChange(fileID: id, stamp: FileStamp(size: 15, modifiedNanoseconds: 20))
+        let changed = try await store.recordSourceChange(fileID: id, stamp: FileStamp(size: 15, modifiedNanoseconds: 20))
 
         let state = try await store.state(of: id)
         let history = try await store.successIdentifier(of: id)
+        XCTAssertTrue(changed)
         XCTAssertEqual(state, .skipped)
         XCTAssertEqual(history, "asset-1")
+    }
+
+    func testSourceChangeSkipsPendingRecord() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let file = source(sourceID: sourceID, root: root)
+        let fileID = try await store.save(file, decision: .importNew)
+        let replacement = FileStamp(size: 99, modifiedNanoseconds: 99)
+
+        let changed = try await store.recordSourceChange(fileID: fileID, stamp: replacement)
+        let stored = try await store.file(sourceID: sourceID, relativePath: "a.jpg")
+
+        XCTAssertTrue(changed)
+        XCTAssertEqual(stored?.state, .skipped)
+        XCTAssertEqual(stored?.file.stamp, replacement)
+    }
+
+    func testSourceChangePreservesUnconfirmedAttempt() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let file = source(sourceID: sourceID, root: root)
+        let fileID = try await store.save(file, decision: .importNew)
+        let before = try await store.file(sourceID: sourceID, relativePath: "a.jpg")
+        let stale = try XCTUnwrap(before)
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: fileID, attemptID: attempt)
+        try store.checkpointPlaceholder(fileID: fileID, attemptID: attempt, identifier: "asset")
+
+        let changed = try await store.recordSourceChange(fileID: fileID, stamp: .init(size: 99, modifiedNanoseconds: 99))
+        let during = try await store.file(sourceID: sourceID, relativePath: "a.jpg")
+
+        XCTAssertFalse(changed)
+        XCTAssertEqual(during?.state, .importing)
+        XCTAssertEqual(during?.attemptID, attempt)
+        XCTAssertEqual(during?.placeholderID, "asset")
+        XCTAssertEqual(during?.file.stamp, stale.file.stamp)
+        try await store.markImported(fileID: fileID, attemptID: attempt, identifier: "asset")
+        let success = try await store.successIdentifier(of: fileID)
+        XCTAssertEqual(success, "asset")
+    }
+
+    func testSourceChangeMissingRecordThrowsNotFound() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let missing = UUID()
+
+        do {
+            _ = try await store.recordSourceChange(fileID: missing, stamp: .init(size: 99, modifiedNanoseconds: 99))
+            XCTFail("Expected a missing record to throw")
+        } catch let error as SyncStoreError {
+            guard case .notFound(let id) = error else {
+                return XCTFail("Expected notFound, got \(error)")
+            }
+            XCTAssertEqual(id, missing)
+        }
+    }
+
+    func testReopenPreservesProtectedUnconfirmedAttempt() async throws {
+        let root = try makeRoot()
+        let database = root.appendingPathComponent("state.sqlite")
+        let sourceID: UUID
+        let fileID: UUID
+        let attempt: UUID
+        do {
+            let store = try SyncStore(url: database)
+            sourceID = try await store.registerSource(url: root)
+            fileID = try await store.save(source(sourceID: sourceID, root: root), decision: .importNew)
+            attempt = UUID()
+            try await store.beginAttempt(fileID: fileID, attemptID: attempt)
+            try store.checkpointPlaceholder(fileID: fileID, attemptID: attempt, identifier: "asset")
+            let changed = try await store.recordSourceChange(fileID: fileID, stamp: .init(size: 99, modifiedNanoseconds: 99))
+            XCTAssertFalse(changed)
+        }
+
+        let reopened = try SyncStore(url: database)
+        let stored = try await reopened.file(sourceID: sourceID, relativePath: "a.jpg")
+        XCTAssertEqual(stored?.id, fileID)
+        XCTAssertEqual(stored?.state, .importing)
+        XCTAssertEqual(stored?.attemptID, attempt)
+        XCTAssertEqual(stored?.placeholderID, "asset")
     }
 
     func testActiveSourceSummaryCountsCurrentStatesOnceAndExcludesInactiveSources() async throws {

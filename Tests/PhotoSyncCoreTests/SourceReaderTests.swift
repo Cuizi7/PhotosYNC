@@ -81,6 +81,10 @@ final class SourceReaderTests: XCTestCase {
             MetadataReader.captureSecond(rawCaptureTime: "1969:12:31 23:59:59.900", offsetTimeOriginal: "+00:00"),
             -1
         )
+        XCTAssertEqual(
+            MetadataReader.captureSecond(rawCaptureTime: "2026:09:13 10:15:30.999999999", offsetTimeOriginal: "+08:00"),
+            1_789_265_730
+        )
         XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2026:09:13 10:15:30", offsetTimeOriginal: nil))
     }
 
@@ -98,6 +102,46 @@ final class SourceReaderTests: XCTestCase {
             1_789_265_730
         )
         XCTAssertNil(MetadataReader.videoCaptureSecond(rawCaptureTime: "2026-09-13T10:15:30"))
+    }
+
+    func testInvalidCalendarDatesStayUncertain() {
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2024:02:30 03:04:05", offsetTimeOriginal: "+00:00"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2023:02:29 03:04:05", offsetTimeOriginal: "+00:00"))
+        XCTAssertNotNil(MetadataReader.captureSecond(rawCaptureTime: "2024:02:29 03:04:05", offsetTimeOriginal: "+00:00"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2024:01:02 03:04", offsetTimeOriginal: "+00:00"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2024:01:02 24:00:00", offsetTimeOriginal: "+00:00"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2024:01:02 03:04:60", offsetTimeOriginal: "+00:00"))
+        XCTAssertNil(MetadataReader.captureSecond(rawCaptureTime: "2024:01:02 03:04:05.123junk", offsetTimeOriginal: "+00:00"))
+    }
+
+    func testVideoFractionalSecondsPreserveReliableSecond() {
+        XCTAssertEqual(MetadataReader.videoCaptureSecond(rawCaptureTime: "1970-01-01T00:00:00.123Z"), 0)
+        XCTAssertEqual(MetadataReader.videoCaptureSecond(rawCaptureTime: "1970-01-01T08:00:00.999+08:00"), 0)
+        XCTAssertEqual(MetadataReader.videoCaptureSecond(rawCaptureTime: "1969-12-31T23:59:59.900Z"), -1)
+        XCTAssertEqual(MetadataReader.videoCaptureSecond(rawCaptureTime: "2026-09-13T10:15:30.999999999+08:00"), 1_789_265_730)
+        XCTAssertNil(MetadataReader.videoCaptureSecond(rawCaptureTime: "1970-01-01T00:00:00.123"))
+    }
+
+    func testVideoCaptureSecondAcceptsFractionalPrecisionAndRejectsMalformedTimestamps() {
+        for timestamp in [
+            "1970-01-01T00:00:00.1Z",
+            "1970-01-01T00:00:00.123Z",
+            "1970-01-01T00:00:00.123456Z",
+            "1970-01-01T00:00:00.123456789Z",
+            "2024-02-29T23:59:59Z",
+        ] {
+            XCTAssertNotNil(MetadataReader.videoCaptureSecond(rawCaptureTime: timestamp), timestamp)
+        }
+
+        for timestamp in [
+            "2023-02-29T00:00:00Z",
+            "2024-01-02T24:00:00Z",
+            "2024-01-02T03:04:60Z",
+            "2024-01-02T03:04:05Zjunk",
+            "2024-01-02T03:04:05+00:60",
+        ] {
+            XCTAssertNil(MetadataReader.videoCaptureSecond(rawCaptureTime: timestamp), timestamp)
+        }
     }
 
     func testReadExecutorKeepsTimedOutSlotOccupiedUntilBlockingWorkReturns() async throws {

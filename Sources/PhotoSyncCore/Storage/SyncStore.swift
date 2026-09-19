@@ -180,9 +180,19 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    public func recordSourceChange(fileID: UUID, stamp: FileStamp) async throws {
+    @discardableResult
+    public func recordSourceChange(fileID: UUID, stamp: FileStamp) async throws -> Bool {
         try await perform {
-            try self.requireChange("UPDATE file_record SET size = ?, modified_ns = ?, state = 'skipped', skip_reason = ?, attempt_id = NULL, placeholder_id = NULL WHERE id = ?", [.int64(stamp.size), .int64(stamp.modifiedNanoseconds), .text(SkipReason.sourceChanged.rawValue), .text(fileID.uuidString)])
+            try self.transaction {
+                guard let row = try self.one("SELECT state FROM file_record WHERE id = ?", [.text(fileID.uuidString)]) else {
+                    throw SyncStoreError.notFound(fileID)
+                }
+                if try self.fileState(row[0]) == .importing {
+                    return false
+                }
+                try self.requireChange("UPDATE file_record SET size = ?, modified_ns = ?, state = 'skipped', skip_reason = ?, attempt_id = NULL, placeholder_id = NULL WHERE id = ? AND state <> 'importing'", [.int64(stamp.size), .int64(stamp.modifiedNanoseconds), .text(SkipReason.sourceChanged.rawValue), .text(fileID.uuidString)])
+                return true
+            }
         }
     }
 
@@ -204,6 +214,26 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             guard let row = try self.one("SELECT COUNT(*) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.state = ? AND source.enabled = 1 AND source.removed = 0", [.text(state.rawValue)]) else { return 0 }
             return Int(try self.int64(row[0]))
+        }
+    }
+
+    /// Sources with a persisted, explicitly retryable file failure whose deadline has arrived.
+    /// An uncertain importing record never appears here: seeing no callback cannot prove that the
+    /// earlier Photos request did not commit.
+    public func dueRetrySourceIDs(at now: Date) async throws -> [UUID] {
+        try await perform {
+            try self.rows("""
+                SELECT DISTINCT source.id
+                FROM file_record
+                JOIN source ON source.id = file_record.source_id
+                WHERE source.enabled = 1 AND source.removed = 0
+                  AND file_record.state = 'pending'
+                  AND file_record.last_error IS NOT NULL
+                  AND file_record.definitely_not_committed = 1
+                  AND file_record.next_retry_at IS NOT NULL
+                  AND file_record.next_retry_at <= ?
+                ORDER BY source.id
+                """, [.double(now.timeIntervalSince1970)]).map { try self.uuid($0[0]) }
         }
     }
 

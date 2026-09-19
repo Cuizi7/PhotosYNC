@@ -18,6 +18,11 @@ public final class RunLogger: @unchecked Sendable {
         queue.async { [weak self] in self?.append(fields, at: date) }
     }
 
+    /// Lets XCTest wait for already-enqueued journal writes without guessing a delay.
+    func flushForTesting() {
+        queue.sync {}
+    }
+
     private func append(_ fields: [String: String], at date: Date) {
         do {
             let url = directory.appendingPathComponent("photo-sync.jsonl")

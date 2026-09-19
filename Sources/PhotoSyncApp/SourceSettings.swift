@@ -45,6 +45,7 @@ struct SourceSettings: View {
                 model.remove(source.id)
                 pendingRemoval = nil
             }
+            .disabled(model.demo || !model.ready || model.changingSources.contains(source.id))
             Button("取消", role: .cancel) {}
         } message: { source in
             Text("这只会移除“\(source.url.lastPathComponent)”的同步配置；不会删除来源文件、Photos 中的照片或既有同步记录。")
@@ -201,15 +202,17 @@ struct SourceSettings: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 6) {
-                if source.enabled {
-                    Button("停用") { model.disable(source.id) }
-                        .buttonStyle(.bordered)
-                        .disabled(model.demo)
+                Button(source.enabled ? "停用" : "启用") {
+                    if source.enabled { model.disable(source.id) }
+                    else { model.enable(source.id) }
                 }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("\(source.enabled ? "disable" : "enable")-source-\(source.id.uuidString)")
+                .disabled(model.demo || !model.ready || model.changingSources.contains(source.id))
                 Button("移除") { pendingRemoval = source }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("remove-source-\(source.id.uuidString)")
-                    .disabled(model.demo || !model.ready)
+                    .disabled(model.demo || !model.ready || model.changingSources.contains(source.id))
             }
         }
     }

@@ -109,16 +109,14 @@ private func readImage(url: URL, filename: String) throws -> MediaMetadata {
 }
 
 private func parseDate(_ raw: String, offsetTimeOriginal: String) -> Date? {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.calendar = Calendar(identifier: .gregorian)
-    formatter.dateFormat = "yyyy:MM:dd HH:mm:ss.SSSSSS"
-    guard let timeZone = timeZone(offsetTimeOriginal) else { return nil }
-    formatter.timeZone = timeZone
-    return formatter.date(from: raw) ?? {
-        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-        return formatter.date(from: raw)
-    }()
+    guard matches(raw, pattern: "^[0-9]{4}:[0-9]{2}:[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?$"),
+          let timeZone = timeZone(offsetTimeOriginal) else { return nil }
+
+    let base = String(raw.prefix(19))
+    guard let date = validatedCalendarSecond(base, format: "yyyy:MM:dd HH:mm:ss", timeZone: timeZone) else {
+        return nil
+    }
+    return date
 }
 
 private func timeZone(_ offset: String) -> TimeZone? {
@@ -142,9 +140,43 @@ private func isASCIIDigit(_ byte: UInt8) -> Bool {
 
 private func parsedVideoCaptureSecond(_ rawCaptureTime: String?) -> Int64? {
     guard let rawCaptureTime,
-          let date = ISO8601DateFormatter().date(from: rawCaptureTime),
-          videoOffset(rawCaptureTime) != nil else { return nil }
-    return Int64(date.timeIntervalSince1970.rounded(.down))
+          matches(rawCaptureTime, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"),
+          let offset = videoOffset(rawCaptureTime),
+          let timeZone = timeZone(offset) else { return nil }
+
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let integral = ISO8601DateFormatter()
+    integral.formatOptions = [.withInternetDateTime]
+    guard (fractional.date(from: rawCaptureTime) ?? integral.date(from: rawCaptureTime)) != nil else {
+        return nil
+    }
+
+    let base = String(rawCaptureTime.prefix(19))
+    guard let integralDate = validatedCalendarSecond(base, format: "yyyy-MM-dd'T'HH:mm:ss", timeZone: timeZone) else {
+        return nil
+    }
+    return Int64(integralDate.timeIntervalSince1970)
+}
+
+private func validatedCalendarSecond(_ value: String, format: String, timeZone: TimeZone) -> Date? {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = timeZone
+    formatter.calendar = calendar
+    formatter.timeZone = timeZone
+    formatter.dateFormat = format
+    formatter.isLenient = false
+    guard let date = formatter.date(from: value), formatter.string(from: date) == value else {
+        return nil
+    }
+    return date
+}
+
+private func matches(_ value: String, pattern: String) -> Bool {
+    guard let range = value.range(of: pattern, options: .regularExpression) else { return false }
+    return range == value.startIndex..<value.endIndex
 }
 
 private func videoOffset(_ rawCaptureTime: String?) -> String? {

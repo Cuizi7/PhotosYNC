@@ -1,9 +1,40 @@
+import AppKit
 import SwiftUI
 import PhotoSyncCore
 
 struct StatusMenu: View {
     @ObservedObject var model: AppModel
+    @State private var measuredStatusHeight: CGFloat = 1
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                statusContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: StatusMenuContentHeightKey.self, value: proxy.size.height)
+                        }
+                    }
+            }
+            .frame(height: min(measuredStatusHeight, maximumStatusHeight))
+            Divider().padding(.vertical, 8)
+            actions
+        }
+        .padding(14).frame(width: 320)
+        .onPreferenceChange(StatusMenuContentHeightKey.self) { height in
+            guard height > 0, abs(measuredStatusHeight - height) > 0.5 else { return }
+            measuredStatusHeight = height
+        }
+    }
+
+    private var maximumStatusHeight: CGFloat {
+        let visibleScreenHeight = NSScreen.screens.map { $0.visibleFrame.height }.min() ?? 660
+        return min(440, max(160, visibleScreenHeight - 220))
+    }
+
+    private var statusContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(model.statusDescription, systemImage: model.status.symbol)
                 .font(.headline).accessibilityLabel(model.statusDescription)
@@ -61,7 +92,11 @@ struct StatusMenu: View {
             if let next = model.state.nextScan {
                 Text("下次扫描：\(next.formatted(date: .omitted, time: .shortened))").font(.caption)
             }
-            Divider().padding(.vertical, 2)
+        }
+    }
+
+    private var actions: some View {
+        VStack(alignment: .leading, spacing: 10) {
             Button("立即扫描", action: model.scan)
                 .accessibilityIdentifier("scan-now")
                 .disabled(!model.ready || model.state.snapshot.activeWork || model.state.snapshot.isPaused || !model.state.authorized || model.demo)
@@ -79,6 +114,13 @@ struct StatusMenu: View {
             Divider().padding(.vertical, 2)
             Button("退出 PhotosYNC", action: model.quit).keyboardShortcut("q")
         }
-        .padding(14).frame(width: 320)
+    }
+}
+
+private struct StatusMenuContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

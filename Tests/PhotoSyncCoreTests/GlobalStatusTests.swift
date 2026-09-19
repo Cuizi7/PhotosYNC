@@ -39,6 +39,229 @@ final class GlobalStatusTests: XCTestCase {
 }
 
 final class RuntimeIntegrationTests: XCTestCase {
+    func testEnableSourceReusesIdentityAndSuccessfulHistory() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let runtime = SyncRuntime(store: fixture.store, engine: fixture.engine,
+                                  now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        let countBefore = await fixture.photos.createCount
+        XCTAssertEqual(countBefore, 1)
+        try await runtime.disable(fixture.sourceIDs[0])
+        for _ in 0..<2 {
+            try await runtime.enable(fixture.sourceIDs[0])
+            await runtime.waitForRound()
+        }
+        let state = await runtime.current()
+        let countAfter = await fixture.photos.createCount
+        XCTAssertEqual(state.sources.map(\.id), fixture.sourceIDs)
+        XCTAssertTrue(state.sources[0].enabled)
+        XCTAssertEqual(state.snapshot.summary?.imported, 1)
+        XCTAssertEqual(countAfter, countBefore)
+    }
+
+    func testEnableUnavailableSourceKeepsItDisabledAndCanRecover() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let runtime = SyncRuntime(store: fixture.store, engine: fixture.engine,
+                                  now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        try await runtime.disable(fixture.sourceIDs[0])
+        let directory = fixture.directories[0]
+        let offline = directory.appendingPathExtension("offline")
+        try FileManager.default.moveItem(at: directory, to: offline)
+        do {
+            try await runtime.enable(fixture.sourceIDs[0])
+            XCTFail("An unavailable source must fail validation")
+        } catch {}
+        let failedState = await runtime.current()
+        XCTAssertFalse(failedState.sources[0].enabled)
+        let createsWhileUnavailable = await fixture.photos.createCount
+        XCTAssertEqual(createsWhileUnavailable, 0)
+        try FileManager.default.moveItem(at: offline, to: directory)
+        try await runtime.enable(fixture.sourceIDs[0])
+        await runtime.waitForRound()
+        let recovered = await runtime.current()
+        XCTAssertTrue(recovered.sources[0].enabled)
+        XCTAssertEqual(recovered.snapshot.summary?.imported, 1)
+    }
+
+    func testEnableRemovedSourceDoesNotRestoreConfiguration() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let runtime = SyncRuntime(store: fixture.store, engine: fixture.engine,
+                                  now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        try await runtime.removeSource(fixture.sourceIDs[0])
+        do {
+            try await runtime.enable(fixture.sourceIDs[0])
+            XCTFail("Enable must not re-add a removed source")
+        } catch RuntimeSourceOperationError.sourceRemoved {
+        }
+        let state = await runtime.current()
+        XCTAssertTrue(state.sources.isEmpty)
+        let removed = try await fixture.store.isSourceRemoved(id: fixture.sourceIDs[0])
+        XCTAssertTrue(removed)
+        let creates = await fixture.photos.createCount
+        XCTAssertEqual(creates, 0)
+    }
+
+    func testEnableWhilePausedWaitsUntilResumeBeforeSubmitting() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let runtime = SyncRuntime(store: fixture.store, engine: fixture.engine,
+                                  now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        try await runtime.disable(fixture.sourceIDs[0])
+        await runtime.pause()
+        try await runtime.enable(fixture.sourceIDs[0])
+        await runtime.waitForRound()
+        let paused = await runtime.current()
+        XCTAssertTrue(paused.sources[0].enabled)
+        XCTAssertTrue(paused.snapshot.isPaused)
+        let whilePaused = await fixture.photos.createCount
+        XCTAssertEqual(whilePaused, 0)
+        await runtime.resume()
+        await runtime.waitForRound()
+        let resumed = await runtime.current()
+        XCTAssertEqual(resumed.snapshot.summary?.imported, 1)
+    }
+
+    func testDueFileRetryRunsAtFiveSeconds() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let clock = RuntimeClock()
+        let engine = SyncEngine(store: fixture.store, photos: fixture.photos, now: { clock.read() })
+        let runtime = SyncRuntime(store: fixture.store, engine: engine,
+                                  now: { clock.read() }, authorized: { true })
+        await fixture.photos.setCreationError(.definitelyNotCommitted("temporary"))
+        try await runtime.prepareInjectedRuntime()
+
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+
+        await fixture.photos.setCreationError(nil)
+        clock.set(4)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let beforeDue = await fixture.photos.createCount
+        XCTAssertEqual(beforeDue, 1)
+
+        clock.set(5)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let afterDue = await fixture.photos.createCount
+        XCTAssertEqual(afterDue, 2)
+        let state = await runtime.current()
+        XCTAssertEqual(state.snapshot.summary?.imported, 1)
+        XCTAssertEqual(state.nextScan, Date(timeIntervalSince1970: 1_800))
+    }
+
+    func testDueFileRetryUsesPersistedBackoffWithoutOverlappingAtTheSameDeadline() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let clock = RuntimeClock()
+        let engine = SyncEngine(store: fixture.store, photos: fixture.photos, now: { clock.read() })
+        let runtime = SyncRuntime(store: fixture.store, engine: engine,
+                                  now: { clock.read() }, authorized: { true })
+        await fixture.photos.setCreationError(.definitelyNotCommitted("temporary"))
+        try await runtime.prepareInjectedRuntime()
+
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        for (time, expectedCreates) in [(4.0, 1), (5.0, 2), (5.0, 2), (19.0, 2),
+                                        (20.0, 3), (49.0, 3), (50.0, 4), (109.0, 4), (110.0, 5)] {
+            clock.set(time)
+            await runtime.tick()
+            await runtime.waitForRound()
+            let creates = await fixture.photos.createCount
+            XCTAssertEqual(creates, expectedCreates, "unexpected create count at t=\(time)")
+        }
+    }
+
+    func testPausedDueFileRetryWaitsUntilResume() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let clock = RuntimeClock()
+        let engine = SyncEngine(store: fixture.store, photos: fixture.photos, now: { clock.read() })
+        let runtime = SyncRuntime(store: fixture.store, engine: engine,
+                                  now: { clock.read() }, authorized: { true })
+        await fixture.photos.setCreationError(.definitelyNotCommitted("temporary"))
+        try await runtime.prepareInjectedRuntime()
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+
+        await fixture.photos.setCreationError(nil)
+        await runtime.pause()
+        clock.set(5)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let whilePaused = await fixture.photos.createCount
+        XCTAssertEqual(whilePaused, 1)
+
+        await runtime.resume()
+        await runtime.waitForRound()
+        let afterResume = await fixture.photos.createCount
+        XCTAssertEqual(afterResume, 2)
+    }
+
+    func testDueFileRetryWaitsForFutureUnavailableSourceRecovery() async throws {
+        let root = try temporaryDirectory()
+        let directory = root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: directory)
+        let reader = RuntimeBlockedRetryDirectory(mode: .unavailable)
+        let clock = RuntimeClock()
+        let engine = SyncEngine(store: store, photos: RuntimePhotos(), directory: { _ in reader }, now: { clock.read() })
+        let runtime = SyncRuntime(store: store, engine: engine, now: { clock.read() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        let retry = try await store.save(runtimeRetryFile(sourceID: sourceID, directory: directory), decision: .importNew)
+        try await store.recordRetry(fileID: retry, attemptID: nil, nextRetry: clock.read(),
+                                    error: "temporary", definitelyNotCommitted: true)
+
+        clock.set(1)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let beforeSourceRecovery = await reader.calls
+        XCTAssertEqual(beforeSourceRecovery, 1)
+
+        clock.set(5)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let atSourceRecovery = await reader.calls
+        XCTAssertEqual(atSourceRecovery, 2)
+    }
+
+    func testDueFileRetryWaitsForFutureDeferredReadRecovery() async throws {
+        let root = try temporaryDirectory()
+        let directory = root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: directory)
+        let reader = RuntimeBlockedRetryDirectory(mode: .deferred)
+        let clock = RuntimeClock()
+        let engine = SyncEngine(store: store, photos: RuntimePhotos(), directory: { _ in reader }, now: { clock.read() })
+        let runtime = SyncRuntime(store: store, engine: engine, now: { clock.read() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        let retry = try await store.save(runtimeRetryFile(sourceID: sourceID, directory: directory), decision: .importNew)
+        try await store.recordRetry(fileID: retry, attemptID: nil, nextRetry: clock.read(),
+                                    error: "temporary", definitelyNotCommitted: true)
+
+        clock.set(1)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let beforeDeferredRecovery = await reader.calls
+        XCTAssertEqual(beforeDeferredRecovery, 1)
+
+        clock.set(5)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let atDeferredRecovery = await reader.calls
+        XCTAssertEqual(atDeferredRecovery, 2)
+    }
+
     func testLongRoundDropsScheduledTickWithoutCatchup() async throws {
         let root = try temporaryDirectory()
         let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
@@ -98,6 +321,42 @@ private final class RuntimeClock: @unchecked Sendable {
     func read() -> Date { lock.lock(); defer { lock.unlock() }; return Date(timeIntervalSince1970: seconds) }
     func set(_ value: TimeInterval) { lock.lock(); defer { lock.unlock() }; seconds = value }
 }
+
+private func runtimeRetryFile(sourceID: UUID, directory: URL) -> SourceFile {
+    let url = directory.appendingPathComponent("retry.jpg")
+    return SourceFile(
+        sourceID: sourceID,
+        relativePath: "retry.jpg",
+        url: url,
+        stamp: FileStamp(size: 1, modifiedNanoseconds: 1),
+        metadata: media("retry.jpg")
+    )
+}
+
+private enum RuntimeRetryBlock: Sendable {
+    case unavailable
+    case deferred
+}
+
+private actor RuntimeBlockedRetryDirectory: DirectoryReading {
+    let mode: RuntimeRetryBlock
+    private(set) var calls = 0
+
+    init(mode: RuntimeRetryBlock) { self.mode = mode }
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        calls += 1
+        switch mode {
+        case .unavailable: throw CocoaError(.fileReadNoSuchFile)
+        case .deferred: throw ReadExecutorError.sourceBusy
+        }
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        FileStamp(size: 1, modifiedNanoseconds: 1)
+    }
+}
+
 private actor HeldRuntimeDirectory: DirectoryReading {
     var calls = 0
     var continuation: CheckedContinuation<Void, Never>?
@@ -192,6 +451,56 @@ extension RuntimeIntegrationTests {
         XCTAssertEqual(afterRegularTick, 2)
     }
 
+    func testDirectoryRecoveryToFileIssueClearsSourceBackoffWithoutPrematureRecoveryNotification() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = fixture.sourceIDs[0]
+        let brokenURL = fixture.directories[0].appendingPathComponent("broken.jpg")
+        try FileManager.default.copyItem(at: fixture.directories[0].appendingPathComponent("same.jpg"), to: brokenURL)
+        let reader = RuntimeRecoveryThenBrokenDirectory(fileURL: brokenURL)
+        let metadata = RuntimeRecoveringMetadata()
+        let transitions = NotificationTransitions()
+        let clock = RuntimeClock()
+        let engine = SyncEngine(
+            store: fixture.store,
+            photos: fixture.photos,
+            directory: { _ in reader },
+            metadata: { _ in metadata },
+            notify: { _, recovered in transitions.append(recovered) },
+            now: { clock.read() }
+        )
+        let runtime = SyncRuntime(store: fixture.store, engine: engine, now: { clock.read() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+
+        await runtime.tick(force: true)
+        await runtime.waitForRound()
+        let unavailable = await runtime.current()
+        XCTAssertEqual(unavailable.snapshot.waitingSources[sourceID]?.kind, .sourceAvailability)
+        XCTAssertEqual(transitions.read(), [false])
+
+        clock.set(5)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let fileFailure = await runtime.current()
+        XCTAssertEqual(fileFailure.snapshot.waitingSources[sourceID]?.kind, .file)
+        XCTAssertEqual(fileFailure.snapshot.sourceFileIssueCounts[sourceID], 1)
+        XCTAssertEqual(transitions.read(), [false])
+
+        clock.set(10)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let callsAfterBackoffClears = await reader.calls
+        XCTAssertEqual(callsAfterBackoffClears, 2)
+
+        await metadata.recover()
+        clock.set(1_800)
+        await runtime.tick()
+        await runtime.waitForRound()
+        let recovered = await runtime.current()
+        XCTAssertNil(recovered.snapshot.waitingSources[sourceID])
+        XCTAssertNil(recovered.snapshot.sourceFileIssueCounts[sourceID])
+        XCTAssertEqual(transitions.read(), [false, true])
+    }
+
     func testLoggerBootstrapFailureIsNonBlockingAndDoesNotBecomeGlobalError() async throws {
         let fixture = try await makeEngineFixture(sourceCount: 1)
         let logPath = fixture.directories[0].appendingPathComponent("logger-file")
@@ -222,6 +531,16 @@ extension RuntimeIntegrationTests {
             ),
             .completed
         )
+        // A logger warning remains visible in the detail area but is not a global blocker. Before
+        // any scan has completed, the pure projection therefore waits for a scan instead of
+        // showing either an error or completion.
+        let projection = SyncStatusPresentation(snapshot: state.snapshot).globalStatus(
+            enabledSourceIDs: Set(fixture.sourceIDs),
+            authorized: true,
+            hasBlockingError: state.message != nil || state.snapshot.blockingError != nil ||
+                state.snapshot.summaryError != nil
+        )
+        XCTAssertEqual(projection, .waiting)
     }
 }
 
@@ -260,5 +579,33 @@ private actor RuntimeFileIssueDirectory: DirectoryReading {
 private struct RuntimeUnreadableMetadata: MetadataReading {
     func read(url: URL, filename: String) async throws -> MediaMetadata {
         throw MetadataError.unreadable
+    }
+}
+
+private actor RuntimeRecoveryThenBrokenDirectory: DirectoryReading {
+    let fileURL: URL
+    private(set) var calls = 0
+
+    init(fileURL: URL) { self.fileURL = fileURL }
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        calls += 1
+        if calls == 1 { throw CocoaError(.fileReadNoSuchFile) }
+        return [DirectoryEntry(url: fileURL, isDirectory: false, stamp: nil)]
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        FileStamp(size: 12, modifiedNanoseconds: 1)
+    }
+}
+
+private actor RuntimeRecoveringMetadata: MetadataReading {
+    private var unreadable = true
+
+    func recover() { unreadable = false }
+
+    func read(url: URL, filename: String) async throws -> MediaMetadata {
+        if unreadable { throw MetadataError.unreadable }
+        return try await MetadataReader().read(url: url, filename: filename)
     }
 }

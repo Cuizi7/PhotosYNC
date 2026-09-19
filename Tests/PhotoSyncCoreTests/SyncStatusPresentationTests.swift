@@ -101,4 +101,191 @@ final class SyncStatusPresentationTests: XCTestCase {
         XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).recoveryAdvice!.contains("重新启动"))
     }
 
+    func testDeferredRoundIsNotCompleted() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary()
+        snapshot.latestScan = ScanProgress(state: .interrupted, deferred: true)
+        snapshot.deferredSources = [id]
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .waiting)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "稍后继续")
+    }
+
+    func testFileIssueDoesNotHideHealthyWork() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.activeWork = true
+        snapshot.waitingSources[id] = SourceIssue(summary: "文件无法读取。", detail: "fixture", kind: .file)
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false), .running)
+    }
+
+    func testNoEnabledSourcesIsUnconfigured() {
+        let view = SyncStatusPresentation(snapshot: EngineSnapshot())
+        let status = view.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .unconfigured)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: []), "未配置来源")
+    }
+
+    func testBlockingErrorsOutrankPauseAndDoNotUsePauseDescription() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.isPaused = true
+        snapshot.activeWork = true
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let blocked = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: true)
+        let unauthorized = view.globalStatus(enabledSourceIDs: [id], authorized: false, hasBlockingError: false)
+
+        XCTAssertEqual(blocked, .error)
+        XCTAssertEqual(unauthorized, .error)
+        XCTAssertEqual(view.statusDescription(for: blocked, enabledSourceIDs: [id]), "需要处理错误")
+    }
+
+    func testPausedWorkDescribesPendingStop() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.isPaused = true
+        snapshot.activeWork = true
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .paused)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "正在暂停，等待当前操作返回")
+    }
+
+    func testEnabledSourceAvailabilityPrecedesRunningWork() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.activeWork = true
+        snapshot.waitingSources[id] = SourceIssue(summary: "来源目录不可用。", detail: "fixture")
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .waiting)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "等待恢复")
+    }
+
+    func testDisabledSourceIssueDoesNotAffectCompletedStatus() {
+        let enabledID = UUID()
+        let disabledID = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary()
+        snapshot.latestScan = ScanProgress(state: .completed)
+        snapshot.waitingSources[disabledID] = SourceIssue(summary: "来源目录不可用。", detail: "fixture")
+        snapshot.sourceFileIssueCounts[disabledID] = 1
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [enabledID], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .completed)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [enabledID]), "已完成")
+    }
+
+    func testDisabledDeferredSourceDoesNotHideHealthyWork() {
+        let enabledID = UUID()
+        let disabledID = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.activeWork = true
+        snapshot.latestScan = ScanProgress(state: .interrupted, deferred: true)
+        snapshot.deferredSources = [disabledID]
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [enabledID], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .running)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [enabledID]), "正在同步")
+    }
+
+    func testUnknownAndInterruptedRoundsWaitForScan() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let unknown = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(unknown, .waiting)
+        XCTAssertEqual(view.statusDescription(for: unknown, enabledSourceIDs: [id]), "等待扫描")
+
+        snapshot.latestScan = ScanProgress(state: .interrupted)
+        let interrupted = SyncStatusPresentation(snapshot: snapshot)
+        let status = interrupted.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .waiting)
+        XCTAssertEqual(interrupted.statusDescription(for: status, enabledSourceIDs: [id]), "等待扫描")
+    }
+
+    func testQueuedWorkUsesSpecificWaitingDescription() {
+        let id = UUID()
+        let cases: [(name: String, summary: SyncStatusSummary, description: String)] = [
+            ("importing", SyncStatusSummary(importing: 1), "等待核对"),
+            ("retry only", SyncStatusSummary(retryPending: 1), "等待重试"),
+            ("new pending", SyncStatusSummary(pending: 1), "等待处理"),
+            ("mixed pending", SyncStatusSummary(pending: 1, retryPending: 1), "等待处理")
+        ]
+
+        for item in cases {
+            var snapshot = EngineSnapshot()
+            snapshot.summary = item.summary
+            let view = SyncStatusPresentation(snapshot: snapshot)
+            let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+            XCTAssertEqual(status, .waiting, item.name)
+            XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), item.description, item.name)
+        }
+    }
+
+    func testIdleFileAndSubmissionIssuesNeedAttention() {
+        let id = UUID()
+        let cases: [(name: String, kind: SourceIssueKind)] = [
+            ("file", .file),
+            ("submission", .submission)
+        ]
+
+        for item in cases {
+            var snapshot = EngineSnapshot()
+            snapshot.summary = SyncStatusSummary()
+            snapshot.waitingSources[id] = SourceIssue(summary: "需要处理。", detail: "fixture", kind: item.kind)
+            let view = SyncStatusPresentation(snapshot: snapshot)
+            let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+            XCTAssertEqual(status, .error, item.name)
+            XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "部分文件需要处理", item.name)
+        }
+    }
+
+    func testEnabledFileIssueCountNeedsAttention() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary()
+        snapshot.sourceFileIssueCounts[id] = 1
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .error)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "部分文件需要处理")
+    }
+
+    func testCompletedRoundWithoutOutstandingWorkIsCompleted() {
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(imported: 1)
+        snapshot.latestScan = ScanProgress(state: .completed)
+        let view = SyncStatusPresentation(snapshot: snapshot)
+
+        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+
+        XCTAssertEqual(status, .completed)
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "已完成")
+    }
+
 }

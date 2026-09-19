@@ -3,6 +3,11 @@ import Photos
 import UserNotifications
 import PhotoSyncCore
 
+enum RuntimeSourceOperationError: Error, LocalizedError {
+    case sourceRemoved
+    var errorDescription: String? { "该来源已移除，请重新添加来源目录。" }
+}
+
 struct RuntimeState: Sendable {
     var snapshot = EngineSnapshot()
     var sources: [RegisteredSource] = []
@@ -38,6 +43,7 @@ actor SyncRuntime {
     private let authorized: @Sendable () -> Bool
     private let requestAuthorizationAction: @Sendable () async -> Bool
     private let notificationsEnabled: @Sendable () -> Bool
+    private let dueRetryQueryFailureSummary = "无法读取本地同步数据库，稍后会自动重试。"
 
     init(
         store: SyncStore,
@@ -170,6 +176,16 @@ actor SyncRuntime {
         await tick(force: true)
     }
 
+    func enable(_ id: UUID) async throws {
+        guard let store else { throw CocoaError(.fileReadUnknown) }
+        // Visible sources exclude removed configurations. Reuse registration so path validation,
+        // source identity, and successful history follow the same rules as adding a directory.
+        guard let source = try await store.sources().first(where: { $0.id == id }) else {
+            throw RuntimeSourceOperationError.sourceRemoved
+        }
+        try await add(source.url)
+    }
+
     func disable(_ id: UUID) async throws {
         if let engine { try await engine.disableSource(id: id) }
         else { try await store?.disableSource(id: id) }
@@ -239,7 +255,8 @@ actor SyncRuntime {
                                             body: recovered ? "来源已恢复正常同步。" : (issue?.summary ?? "来源暂时不可用，将自动重试。恢复后不再提示。")
                                         )
                                     }
-                                })
+                                },
+                                now: now)
         }
         guard let engine else { return }
         let now = now()
@@ -249,16 +266,53 @@ actor SyncRuntime {
             return
         }
         let enabled = Set(state.sources.filter(\.enabled).map(\.id))
-        let due = Set(schedule.dueRecoverySources(now: now)).intersection(enabled)
         let ids: [UUID]
         if force {
             guard schedule.requestNow(now: now) else { return }
             ids = Array(enabled)
         } else if schedule.request(now: now) {
+            let due = Set(schedule.dueRecoverySources(now: now)).intersection(enabled)
             ids = Array(enabled.subtracting(registeredFailures).union(due))
-        } else if (!due.isEmpty || state.snapshot.blockingError != nil), schedule.requestRecovery(now: now) {
-            ids = state.snapshot.blockingError != nil ? Array(enabled.subtracting(registeredFailures).union(due)) : Array(due)
-        } else { return }
+        } else {
+            guard let store else { return }
+            let dueFiles: Set<UUID>
+            do {
+                dueFiles = Set(try await store.dueRetrySourceIDs(at: now))
+                if state.message == dueRetryQueryFailureSummary {
+                    state.message = nil
+                    state.messageDetail = nil
+                }
+            } catch {
+                guard !stopped else { return }
+                state.message = dueRetryQueryFailureSummary
+                state.messageDetail = error.localizedDescription
+                return
+            }
+
+            // The store query suspends this actor. Permission, pause, source configuration, and
+            // an existing round can all change while it is in flight, so do not reuse the earlier
+            // admission decision.
+            refreshAuthorization()
+            guard !stopped, state.authorized, !state.snapshot.isPaused, round == nil else { return }
+            let refreshedEnabled = Set(state.sources.filter(\.enabled).map(\.id))
+            guard !refreshedEnabled.isEmpty else { return }
+            let dueSourceRecovery = Set(schedule.dueRecoverySources(now: now)).intersection(refreshedEnabled)
+            let heldSources = registeredFailures.union(state.snapshot.deferredSources)
+            let eligibleFiles = dueFiles.intersection(refreshedEnabled).subtracting(heldSources)
+                .union(dueFiles.intersection(dueSourceRecovery))
+
+            if !eligibleFiles.isEmpty {
+                // File retry deadlines are independent from the 60-second source-recovery poll.
+                guard schedule.requestNow(now: now) else { return }
+                ids = Array(eligibleFiles.union(dueSourceRecovery))
+            } else if (!dueSourceRecovery.isEmpty || state.snapshot.blockingError != nil), schedule.requestRecovery(now: now) {
+                ids = state.snapshot.blockingError != nil
+                    ? Array(refreshedEnabled.subtracting(registeredFailures).union(dueSourceRecovery))
+                    : Array(dueSourceRecovery)
+            } else {
+                return
+            }
+        }
         round = Task {
             await engine.scan(sourceIDs: ids)
             self.finishedRound(ids: ids, snapshot: await engine.snapshot())

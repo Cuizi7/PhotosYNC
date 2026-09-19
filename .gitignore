@@ -11,3 +11,6 @@
 
 # Versioned local distribution artifacts; source artwork stays in Design/Icons.
 /outputs/releases/
+
+# Cache created by Python validation and tool-test imports.
+__pycache__/

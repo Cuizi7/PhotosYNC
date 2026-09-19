@@ -14,8 +14,8 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Current frozen release: **0.1.0 beta2 (build 2)**. Artifacts are under
-`outputs/releases/0.1.0-beta2/`; see [release notes](docs/release/0.1.0-beta2.md).
+Current frozen release: **0.1.0 beta3 (build 3)**. Artifacts are under
+`outputs/releases/0.1.0-beta3/`; see [release notes](docs/release/0.1.0-beta3.md).
 The package includes Apple Silicon and Intel code, the compiled layered icon and
 an ICNS fallback for older macOS.
 
@@ -44,3 +44,12 @@ If an import result is uncertain after an interruption, PhotosYNC keeps it in an
 Do not use a personal Photos library as a test fixture. Real Photos-write validation requires a separate macOS test account, its System Photo Library, disabled iCloud Photos, and user authorization for that isolated environment. See `Design/Validation.md` for the procedure and current validation status.
 
 PhotosYNC v1 does not synchronize deletions, re-import assets removed from Photos, manage Photos libraries, auto-mount network storage, or provide a media browser. A slow or disconnected network mount is treated as a source error or waiting condition, not as a reason to alter the mount or the source contents.
+
+
+## Automated acceptance and local release
+
+Run `python3 scripts/validate.py --output-dir "$PWD/work/validation-check" --derived-data "$PWD/work/validation-check-derived"` with a fresh evidence path for development acceptance. It runs the complete hostless XCTest bundle, synthetic tool tests and the version-controlled continuation-race regression. Failed, empty or timed-out runs do not produce a successful acceptance record.
+
+`scripts/package-release.sh` performs this validation inside a clean committed `git archive`, then builds the normal Universal Release app from the same source. Only validated and verified bundles are published into a new release directory; old releases and concurrent publication locks are not overwritten. Validation evidence accompanies the package and is tied to its source provenance. There is no test-skip or cached-success release path.
+
+Routine beta iterations reuse established real-Photos integration evidence and require the automated gates. Changes to actual PhotoKit/authorization/media/platform boundaries need targeted system acceptance. The automation does not use personal Photos, production database snapshots or system-permission changes. See [agent acceptance rules](AGENTS.md) and [validation history](Design/Validation.md) for the distinction between automated, historical and current system evidence.

@@ -11,7 +11,7 @@
 5. `Design/Validation.md`：真实 Photos 验收程序及已验证/未验证的区别。
 6. 需要回溯任务时读 `docs/superpowers/plans/2026-09-13-photo-sync-v1.md`；计划含示意接口，以批准设计和实际代码为准。
 
-v1 已实现并合并到 `main`。当前 `main` 基线为 `259d990`，包含 beta2 统计/通知修复、来源错误文案、读取 deferred 与来源恢复隔离；合并后核心测试为 167 项通过。不要重新执行整套已完成实施计划；后续变更仍需在当前 HEAD 验证。
+v1 已实现并合并到 `main`。`4adc1e0` 是本轮修复前的 main 基线。beta3 修复、App 自动测试及发布门槛的当前源码以本 checkout 的 `git rev-parse HEAD` 为准；下方日期记录保留历史验证事实，不能代替当前发布结果。不要重新执行整套已完成实施计划；后续变更仍需在当前 HEAD 验证。
 
 ## 不可突破的第一版边界
 
@@ -65,6 +65,8 @@ SQLite 常规调用通过串行队列；placeholder 用同步检查点入口。�
 
 ## 构建和自动测试
 
+完整验收和发布以文末“Agent 自主验收与本地发布契约”的统一入口为准。下方原生构建/XCTest命令用于分层诊断，不单独构成发布验收。
+
 最低 macOS 13；历史验证环境为 Xcode 26.6 / Swift 6.3.3。执行前用 `xcodebuild -version`、`xcrun swift --version` 复核。
 
 从仓库根目录执行，产物及日志放到被忽略的 `work/`：
@@ -103,6 +105,8 @@ open -n work/Validation/Build/Products/Debug/PhotosYNC.app --args --demo --statu
 代码允许不代表已经获准执行：不得通过脚本调用绕过 UI 提示来扩大测试范围。测试用哈希可以核对自制 fixture 的前后字节，但不能带入产品的同步逻辑。
 
 ## 运行数据与打包
+
+发布统一使用 `scripts/package-release.sh`，它从归档源码强制执行完整验收。下方手动 Release/签名命令仅保留为历史诊断参考，不得用来绕过发布门槛。
 
 真实运行数据：`~/Library/Application Support/PhotoSync/sync.sqlite`，日志在同目录 `Logs/`。排查时先只读；不要删除数据库“重置测试”，这会丢失防重复导入的历史。源码/构建目录不是运行数据目录。
 
@@ -166,3 +170,42 @@ scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
 2026-09-17 统计口径补注（同一分支）：`activeSourceSummary` 改为一条带 CTE 的语句，除原有活动来源计数外新增 `retainedImported`（停用或移除来源的成功导入数）；活动计数显式带 `source.enabled = 1 AND source.removed = 0` 条件，退役历史不再混入 `imported`。`SyncStatusPresentation.summary` 在 `retainedImported > 0` 时附注“另有 N 条历史属已停用或移除的来源”。动机：把子目录换成其父目录、或停用来源时，历史仍在库中但会退出统计，原实现会让“已导入”看起来凭空归零。已在生产库只读副本上核对：212 活动导入 + 2 条退役历史（已移除的 PhotosYNC-QA），与原 214 条一致。构建与 161 项测试通过。
 
 2026-09-18 当前基线：上述 2026-09-17 修复已在本地 `main` squash 为 `259d990`，远端尚未推送。运行时状态、读取 deferred、来源/文件错误隔离、退避和文案以 `docs/specs/2026-09-18-runtime-state-and-recovery.md` 为权威；核心测试基线为 167 项。历史分支名称和旧测试数量只用于追溯，不作为当前状态。
+
+
+## 2026-09-19 beta3 修复与本地发布
+
+以下记录对应 `codex/photosync-beta3-fixes` 的历史行为冻结阶段；当前分支与合并状态须以 Git 为准。行为冻结提交 `5420dce992d2fcb58a5d0a8bd57b5c55dc31af3f` 已通过干净 build-for-testing 和完整 209 项 XCTest（0 失败，2.909 秒）；集成深度评审及修复复核 SPEC/QUALITY 均通过，范围内问题均已解决。恢复后旧错误发布交错另有受控 RED/GREEN 探针与 84 项受影响测试证据。最终日志为 `work/beta3-frozen-build.log`、`work/beta3-frozen-tests.log`；打包提交由发布产物 provenance 记录。
+
+- `recordSourceChange` 在同一事务内拒绝覆盖 `importing`；晚到的成功回调仍保留成功证据，提交前的正常并发状态变化不会停止整个 engine。
+- runtime tick 独立消费明确未提交文件的重试期限；目录恢复、文件重试和读取 deferred 使用独立口径，unknown 提交不因到期进入重试。
+- 完整目录遍历恢复后清除目录问题，即使另有坏文件；文件日志独立去重，目录恢复后相同故障再次出现会重新记录。恢复已经清除的问题不会被早先异步读取失败重新发布。
+- UI 从问题类别和未完成工作推导状态；真实来源不可用保持优先于运行中，deferred 不再虚报完成。设置支持原位置启用来源并保留身份/历史，操作进行中防重复；菜单信息区有界滚动，操作区固定。
+- 日期解析拒绝日历无效日期；带明确时区的合法视频小数秒使用基础整数秒，避免浮点舍入进位。判重仍无时间容差，不猜测时区。
+
+版本配置为 0.1.0 / beta3 / build 3；独立打包路径 `outputs/releases/0.1.0-beta3/`。使用 `scripts/package-release.sh` 从干净已提交的 git archive 构建 Universal arm64/x86_64，并记录实际源码提交。包是否已构建、签名/DMG/校验是否通过以本轮发布证据为准，不能凭版本配置推断。
+
+保持 schema v3，不重判历史 skipped，不修补过去可能丢失的成功历史，不清理或迁移生产数据库。UI 证据来自 `005bfd7` 的离屏 NSHostingView/临时 fixture：0/1/16/30 来源菜单高 248/299/626/626pt；这不是原生菜单、点击、键盘/VoiceOver 或 macOS 13/14 实机验收。该历史阶段未启动生产应用、访问真实 Photos、更改系统权限、安装、合并或推送；后续合并与发布以 Git 和产物 provenance 为准。本地 ad-hoc 签名不等于 Developer ID、公证或 Gatekeeper 验收。完整边界见 `docs/release/0.1.0-beta3.md` 与 `Design/Validation.md`。
+
+
+## Agent 自主验收与本地发布契约（2026-09-19）
+
+普通 beta 的默认发布门槛是自动回归和产物核验，不要求每次重复真实 Photos 验收。此前的基础系统验收可复用于没有改变的系统集成边界；不得把历史记录写成当前包的新实测。
+
+### 强制入口与失败处理
+
+- 开发验收使用 `python3 scripts/validate.py --output-dir "$PWD/work/validation-<唯一名称>" --derived-data "$PWD/work/validation-<唯一名称>-derived"`。不要用仅 `xcodebuild build`、几项 selected tests 或旧日志宣告完整验收。
+- 发布使用 `scripts/package-release.sh`。它要求干净的已提交源码（非 ignored 的未跟踪文件也须处理），先归档该提交，再在同一归档中完整验证和正常 Universal Release 构建。不允许先在旧工作树测试，再包装不同源码。
+- 验收包含完整无过滤 XCTest、`Tests/Tools` 合成数据测试和受控续体竞态回归。XCTest 退出码、完整结束标志、实际数量大于零及失败数为零须同时满足；任何失败、超时、缺失工具/报告或零测试都不能绕过。
+- `scripts/test-continuation-race.py` 从当前 Core 创建隔离副本并插入唯一 await 门闩，执行版本控制的 `Tests/Regression/ContinuationRace.swift`。锚点改变须失败并修复 harness，不能跳过；门闩及测试代码不得进入发行 App。它补的是 retry 写入成功之后、失败提示发布之前的竞争，不得以较早的 retry 写入前竞争测试替代。
+- 发布包必须通过版本/channel/build、Universal app/Core 架构、图标资源、逐层签名、DMG 和校验值检查。provenance 必须绑定实际源码提交与本次验证证据；不得复用旧的成功标记。
+- 已有发布路径（目录、文件或符号链接）不得覆盖。发布锁冲突须停止；不能删除他人锁或在旧发布目录内嵌套新 package 来规避拒绝。失败保留独立 work 证据，不留下被宣称成功的发布目录。
+- 独立 review 按本文件风险等级执行；等价只读 review 不使既有测试失效，修复后仅重审新差异。最终完整验收必须覆盖最后一次行为/测试变更。用户明确授权的本地 squash merge 不重复询问；合并后核对源码树，并从 main 的确切提交执行发布入口。
+
+### 何时需要针对性系统验证
+
+- 普通状态机修复、调度、统计、日志、纯解析逻辑及已有契约内的来源操作，可用完整自动验证验收。UI 改动补常规离屏/GUIQA 行为测试；无需为 UI 测试导入真实照片。
+- 真实 PhotoKit 提交/恢复语义、系统授权调用、entitlements/bundle identity、真实媒体读取方式、新媒体类型、最低系统版本或平台兼容假设改变时，评估并补改变边界的针对性系统验证。不是对同一旧路径反复重跑整套手工验证。
+- 新的系统验收需要超出已有用户授权的图库、来源或系统设置时，先说明确切范围与缺口；不得通过测试脚本绕过授权。没有执行的边界如实标为未验证，不能伪称通过。
+- 常规自动验收只用自制媒体、UUID 临时数据库和 fake Photos；不得自动读取生产数据库或历史生产快照。`Tests/Tools` 也遵循这一规则。
+
+本契约中的“发布”默认是本地 ad-hoc app/DMG 交付。远端推送、公开发布、安装/启动生产 App、Developer ID/公证、生产数据维护均遵守用户实际授权；不能由“验收通过”自行推导授权。全局 Codex 配置及插件技能无需为本项目改写。
