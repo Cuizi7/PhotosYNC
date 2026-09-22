@@ -147,11 +147,15 @@ private actor ProbePhotos: PhotosGateway {
     private(set) var createCount = 0
 
     func loadCandidates() async throws -> [MatchCandidate] { [] }
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        PhotosCandidateSnapshot(generation: 0, candidates: [])
+    }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
 
     func create(
         fileURL: URL,
         kind: MediaKind,
+        expectedGeneration: Int,
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> String {
         createCount += 1

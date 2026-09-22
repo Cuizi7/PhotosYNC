@@ -94,10 +94,49 @@ enum FixtureError: Error {
     case unavailable(String)
 }
 
+private final class TestCandidateValidityState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = 0
+
+    func setGeneration(_ value: Int) {
+        lock.lock(); generation = value; lock.unlock()
+    }
+
+    func commitIfCurrent(
+        generation expected: Int,
+        _ commit: @escaping @Sendable () throws -> Void
+    ) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expected else { return false }
+        try commit()
+        return true
+    }
+}
+
+private final class TestCandidateValidity: PhotosCandidateValidity, @unchecked Sendable {
+    private let state: TestCandidateValidityState
+    private let generation: Int
+
+    init(state: TestCandidateValidityState, generation: Int) {
+        self.state = state
+        self.generation = generation
+    }
+
+    func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
+        try state.commitIfCurrent(generation: generation, commit)
+    }
+}
+
 // Test-only Photos implementation. Never asks for system authorization.
 actor FakePhotosGateway: PhotosGateway {
     private(set) var createCount = 0
     private var candidates: [MatchCandidate] = []
+    private var candidateGeneration = 0
+    private var candidateSnapshotCalls = 0
+    private var candidateSnapshotErrorAfterFirst: PhotoKitGatewayError?
+    private var candidateSnapshotMutationAfterCall: Int?
+    private let candidateValidityState = TestCandidateValidityState()
     private var loadFailure = false
     var evidence: ImportEvidence = .unknown
     private var creationGate: EngineTestGate?
@@ -107,14 +146,37 @@ actor FakePhotosGateway: PhotosGateway {
     func setCreationError(_ error: PhotoKitGatewayError?) { creationError = error }
     func setFailIndexAfterCreate() { failIndexAfterCreate = true }
     func setCandidates(_ values: [MatchCandidate]) { candidates = values }
+    func bumpCandidateGeneration() {
+        candidateGeneration += 1
+        candidateValidityState.setGeneration(candidateGeneration)
+    }
+    func setCandidateSnapshotErrorAfterFirst(_ error: PhotoKitGatewayError?) { candidateSnapshotErrorAfterFirst = error }
+    func setCandidateSnapshotMutationAfterCall(_ call: Int?) { candidateSnapshotMutationAfterCall = call }
     func setLoadFailure(_ value: Bool) { loadFailure = value }
     func setEvidence(_ value: ImportEvidence) { evidence = value }
     func loadCandidates() async throws -> [MatchCandidate] {
         if loadFailure { throw PhotoKitGatewayError.libraryUnavailable }
         return candidates
     }
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        candidateSnapshotCalls += 1
+        if candidateSnapshotCalls > 1, let error = candidateSnapshotErrorAfterFirst { throw error }
+        if loadFailure { throw PhotoKitGatewayError.libraryUnavailable }
+        let snapshot = PhotosCandidateSnapshot(
+            generation: candidateGeneration,
+            candidates: candidates,
+            validity: TestCandidateValidity(state: candidateValidityState, generation: candidateGeneration)
+        )
+        if candidateSnapshotCalls == candidateSnapshotMutationAfterCall {
+            candidates = []
+            candidateGeneration += 1
+            candidateValidityState.setGeneration(candidateGeneration)
+            candidateSnapshotMutationAfterCall = nil
+        }
+        return snapshot
+    }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { evidence }
-    func create(fileURL: URL, kind: MediaKind, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+    func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
         createCount += 1
         let id = "fake-\(createCount)"
         try onPlaceholder(id)

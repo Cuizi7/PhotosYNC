@@ -251,7 +251,6 @@ public actor SyncEngine {
     private var uncertainSubmissionHints: [UUID: EngineRecoveryHint] = [:]
     private var uncertainSubmissionErrors: [UUID: String] = [:]
     private var hasUncertainSubmissionBlock = false
-    private var indexed: [MatchCandidate] = []
     private var disabledSources: Set<UUID> = []
     private var removedSources: Set<UUID> = []
     private var rounds: [UUID: ScanRound] = [:]
@@ -365,7 +364,8 @@ public actor SyncEngine {
             finishRound(roundID)
             return
         }
-        do { indexed = try await photos.loadCandidates() }
+        let photoSnapshot: PhotosCandidateSnapshot
+        do { photoSnapshot = try await photos.candidateSnapshot() }
         catch {
             setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
             interruptRound(roundID)
@@ -375,7 +375,11 @@ public actor SyncEngine {
             return
         }
         await withTaskGroup(of: Void.self) { group in
-            for sourceID in sources { group.addTask { await self.scanSource(sourceID, roundID: roundID) } }
+            for sourceID in sources {
+                group.addTask {
+                    await self.scanSource(sourceID, roundID: roundID, photosSnapshot: photoSnapshot)
+                }
+            }
         }
         scanning = false
         // Existing physical Photos work owns the one drain task. New rounds may still scan.
@@ -433,7 +437,7 @@ public actor SyncEngine {
         } catch { stopStorage(error) }
     }
 
-    private func scanSource(_ sourceID: UUID, roundID: UUID) async {
+    private func scanSource(_ sourceID: UUID, roundID: UUID, photosSnapshot: PhotosCandidateSnapshot) async {
         status.sourcePhases[sourceID] = "扫描目录与元数据"
         status.deferredSources.remove(sourceID)
         defer { status.sourcePhases.removeValue(forKey: sourceID) }
@@ -510,11 +514,16 @@ public actor SyncEngine {
                                 break scanLoop
                             }
                             let file = SourceFile(sourceID: sourceID, relativePath: relative, url: entry.url, stamp: stamp, metadata: info)
-                            let decision = policy.evaluate(info, candidates: indexed)
-                            let evidence = matchingCandidates(decision, candidates: indexed)
-                            _ = try await store.save(file, decision: decision, candidates: evidence)
+                            try await saveScannedFile(file, initialSnapshot: photosSnapshot)
                             resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run)
                         } catch let error as SyncStoreError { throw error }
+                        catch let error as PhotoKitGatewayError {
+                            lastFailure = error.localizedDescription
+                            recordRoundFailure(roundID)
+                            setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
+                            directoryTraversalComplete = false
+                            break scanLoop
+                        }
                         catch {
                             if SourceIssueText.isReadContention(error) {
                                 // Bounded-reader contention is queue pressure, not a bad file.
@@ -588,6 +597,59 @@ public actor SyncEngine {
         }
     }
 
+    private static let snapshotCommitAttempts = 3
+
+    private func saveScannedFile(_ file: SourceFile, initialSnapshot: PhotosCandidateSnapshot) async throws {
+        var photoSnapshot = initialSnapshot
+        var localCandidates = try await store.candidates(filename: file.metadata.filename, excludingID: nil)
+        var candidates = photoSnapshot.candidates(named: file.metadata.filename) + localCandidates
+        var decision = policy.evaluate(file.metadata, candidates: candidates)
+        var evidence = matchingCandidates(decision, candidates: candidates)
+        var latestSnapshotChecked = false
+        var refreshLocalCandidates = false
+        var staleAttempts = 0
+
+        while true {
+            if case .skip = decision {
+                if !latestSnapshotChecked {
+                    let latestSnapshot = try await photos.candidateSnapshot()
+                    let generationChanged = latestSnapshot.generation != photoSnapshot.generation
+                    photoSnapshot = latestSnapshot
+                    if generationChanged || refreshLocalCandidates {
+                        localCandidates = try await store.candidates(filename: file.metadata.filename, excludingID: nil)
+                        candidates = photoSnapshot.candidates(named: file.metadata.filename) + localCandidates
+                        decision = policy.evaluate(file.metadata, candidates: candidates)
+                        evidence = matchingCandidates(decision, candidates: candidates)
+                    }
+                    latestSnapshotChecked = true
+                    refreshLocalCandidates = false
+                    if case .importNew = decision { continue }
+                }
+
+                switch try await store.saveWithSnapshotValidity(
+                    file,
+                    decision: decision,
+                    candidates: evidence,
+                    validity: photoSnapshot.candidateValidity
+                ) {
+                case .committed:
+                    return
+                case .staleSnapshot:
+                    staleAttempts += 1
+                    guard staleAttempts < Self.snapshotCommitAttempts else {
+                        throw PhotoKitGatewayError.libraryChanged
+                    }
+                    latestSnapshotChecked = false
+                    refreshLocalCandidates = true
+                    continue
+                }
+            } else {
+                _ = try await store.save(file, decision: decision, candidates: evidence)
+                return
+            }
+        }
+    }
+
     private func startDrain(roundID: UUID) {
         guard drainTask == nil, !status.isPaused, !storageFailed, status.blockingError == nil else { return }
         guard let sources = rounds[roundID]?.sources, !sources.isEmpty else { return }
@@ -596,11 +658,12 @@ public actor SyncEngine {
 
     private func drain(roundID: UUID, sources: Set<UUID>) async {
         do {
-            var visited: Set<UUID> = []
-            while !status.isPaused, !storageFailed, status.blockingError == nil {
-                let records = try await allFiles(.pending)
-                guard let record = records.first(where: { !visited.contains($0.id) && sources.contains($0.file.sourceID) }) else { break }
-                visited.insert(record.id)
+            var cursor: UUID?
+            drainLoop: while !status.isPaused, !storageFailed, status.blockingError == nil {
+                guard let record = try await store.nextPendingFile(sourceIDs: sources, afterID: cursor) else { break }
+                // Advance before any await so one round cannot revisit a future-retry or
+                // temporarily blocked row. The next nil-cursor drain handles recovered rows.
+                cursor = record.id
                 let context = SubmissionContext(roundID: roundID, runID: runID(for: record.file.sourceID, roundID: roundID))
                 guard canSubmit(sourceID: record.file.sourceID) else { continue }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
@@ -651,20 +714,52 @@ public actor SyncEngine {
                     continue
                 }
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
-                do { indexed = try await photos.loadCandidates() }
+                var photoSnapshot: PhotosCandidateSnapshot
+                do { photoSnapshot = try await photos.candidateSnapshot() }
                 catch {
                     recordRoundFailure(context.roundID)
                     setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
                     break
                 }
-                let local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
+                var local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
-                let candidates = indexed + local
-                let decision = policy.evaluate(record.file.metadata, candidates: candidates)
-                if case .skip = decision {
-                    try await store.markSkipped(fileID: record.id, reason: .suspectedDuplicate, candidates: matchingCandidates(decision, candidates: candidates))
-                    resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
-                    continue
+                var candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
+                var decision = policy.evaluate(record.file.metadata, candidates: candidates)
+                var evidence = matchingCandidates(decision, candidates: candidates)
+                var staleAttempts = 0
+                while true {
+                    if case .skip = decision {
+                        switch try await store.markSkippedWithSnapshotValidity(
+                            fileID: record.id,
+                            reason: .suspectedDuplicate,
+                            candidates: evidence,
+                            validity: photoSnapshot.candidateValidity
+                        ) {
+                        case .committed:
+                            resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                            continue drainLoop
+                        case .staleSnapshot:
+                            staleAttempts += 1
+                            guard staleAttempts < Self.snapshotCommitAttempts else {
+                                recordRoundFailure(context.roundID)
+                                setBlockingError(PhotoKitGatewayError.libraryChanged.localizedDescription,
+                                                 summary: SourceIssueText.blockingSummary(for: PhotoKitGatewayError.libraryChanged))
+                                break drainLoop
+                            }
+                            do { photoSnapshot = try await photos.candidateSnapshot() }
+                            catch {
+                                recordRoundFailure(context.roundID)
+                                setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
+                                break drainLoop
+                            }
+                            local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
+                            candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
+                            decision = policy.evaluate(record.file.metadata, candidates: candidates)
+                            evidence = matchingCandidates(decision, candidates: candidates)
+                            continue
+                        }
+                    }
+                    break
                 }
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
@@ -691,12 +786,11 @@ public actor SyncEngine {
                     let store = self.store
                     status.sourcePhases[record.file.sourceID] = "新增到照片"
                     defer { status.sourcePhases.removeValue(forKey: record.file.sourceID) }
-                    let id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind) { identifier in
+                    let id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind, expectedGeneration: photoSnapshot.generation) { identifier in
                         try store.checkpointPlaceholder(fileID: record.id, attemptID: attempt, identifier: identifier)
                     }
                     // Even pause or loss of library health cannot erase a committed callback.
                     try await store.markImported(fileID: record.id, attemptID: attempt, identifier: id)
-                    indexed.append(MatchCandidate(key: id, metadata: record.file.metadata))
                     recordRoundImport(context.roundID)
                     resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id, attemptID: attempt)
                     logEvent(phase: "submission", result: "imported", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, attemptID: attempt)
@@ -745,7 +839,7 @@ public actor SyncEngine {
     }
 
     private func canScan(sourceID: UUID) -> Bool {
-        !status.isPaused && !storageFailed && !disabledSources.contains(sourceID)
+        !status.isPaused && !storageFailed && status.blockingError == nil && !disabledSources.contains(sourceID)
     }
 
     private func nextRetry(for record: StoredFile) -> Date {

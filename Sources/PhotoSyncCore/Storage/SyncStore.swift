@@ -12,6 +12,11 @@ public struct StoredFile: Sendable {
     public let nextRetryAt: Date?
 }
 
+enum SnapshotCommitResult: Sendable {
+    case committed(UUID)
+    case staleSnapshot
+}
+
 /// Current terminal and queue states for enabled, configured sources.
 /// A record has exactly one state, so a source-changed successful import is counted as skipped once.
 /// `pending` and `retryPending` partition the `pending` state without adding a fifth state:
@@ -69,11 +74,14 @@ public final class SyncStore: @unchecked Sendable {
     private let ruleVersion = 1
     private let readExecutor: ReadExecutor
     private let validateSource: @Sendable (URL) throws -> URL
+    private let decodeObserver: @Sendable () -> Void
 
     public init(url: URL, readExecutor: ReadExecutor = .shared,
-                validateSource: @escaping @Sendable (URL) throws -> URL = { try SourceRegistry.normalizedURL($0) }) throws {
+                validateSource: @escaping @Sendable (URL) throws -> URL = { try SourceRegistry.normalizedURL($0) },
+                decodeObserver: @escaping @Sendable () -> Void = {}) throws {
         self.readExecutor = readExecutor
         self.validateSource = validateSource
+        self.decodeObserver = decodeObserver
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK, let handle else {
@@ -85,6 +93,7 @@ public final class SyncStore: @unchecked Sendable {
         do {
             try execute("PRAGMA foreign_keys = ON")
             try migrate()
+            try ensureIndexes()
         } catch {
             sqlite3_close(handle)
             throw error
@@ -147,6 +156,39 @@ public final class SyncStore: @unchecked Sendable {
                     try self.markSkippedSync(fileID: id, reason: .suspectedDuplicate, candidates: candidates)
                 }
                 return id
+            }
+        }
+    }
+
+    func saveWithSnapshotValidity(
+        _ file: SourceFile,
+        decision: MatchDecision,
+        candidates: [MatchCandidate],
+        validity: any PhotosCandidateValidity
+    ) async throws -> SnapshotCommitResult {
+        try await perform {
+            try self.execute("BEGIN IMMEDIATE")
+            do {
+                let id = UUID()
+                let metadata = try self.encode(file.metadata)
+                try self.requireChange("""
+                    INSERT INTO file_record (id, created_order, source_id, relative_path, filename, size, modified_ns, metadata_json, state, rule_version)
+                    VALUES (?, (SELECT COALESCE(MAX(created_order), 0) + 1 FROM file_record), ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """, [.text(id.uuidString), .text(file.sourceID.uuidString), .text(file.relativePath), .text(file.metadata.filename), .int64(file.stamp.size), .int64(file.stamp.modifiedNanoseconds), .text(metadata), .int64(Int64(self.ruleVersion))])
+                if case .skip(let keys) = decision {
+                    guard Set(keys) == Set(candidates.map(\.key)), keys.count == candidates.count else {
+                        throw SyncStoreError.invalidTransition("Skipped files require the complete compared candidate snapshots.")
+                    }
+                    try self.markSkippedSync(fileID: id, reason: .suspectedDuplicate, candidates: candidates)
+                }
+                guard try validity.commitIfCurrent({ try self.execute("COMMIT") }) else {
+                    try self.execute("ROLLBACK")
+                    return .staleSnapshot
+                }
+                return .committed(id)
+            } catch {
+                try? self.execute("ROLLBACK")
+                throw error
             }
         }
     }
@@ -287,6 +329,39 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// Selects one active pending record after a stable created-order cursor.
+    /// The caller owns retry-deadline checks so future retries remain visible to the current
+    /// round without being silently filtered out of the queue.
+    public func nextPendingFile(sourceIDs: Set<UUID>, afterID: UUID?) async throws -> StoredFile? {
+        try await perform {
+            guard !sourceIDs.isEmpty else { return nil }
+            let afterOrder: Int64
+            if let afterID {
+                guard let row = try self.one("SELECT created_order FROM file_record WHERE id = ?", [.text(afterID.uuidString)]) else {
+                    throw SyncStoreError.notFound(afterID)
+                }
+                afterOrder = try self.int64(row[0])
+            } else {
+                afterOrder = 0
+            }
+            let orderedSources = sourceIDs.sorted { $0.uuidString < $1.uuidString }
+            let placeholders = Array(repeating: "?", count: orderedSources.count).joined(separator: ", ")
+            var bindings: [Binding] = [.int64(afterOrder)]
+            bindings.append(contentsOf: orderedSources.map { .text($0.uuidString) })
+            return try self.storedFile("""
+                SELECT \(Self.fileColumns)
+                FROM file_record
+                JOIN source ON source.id = file_record.source_id
+                WHERE file_record.state = 'pending'
+                  AND file_record.created_order > ?
+                  AND file_record.source_id IN (\(placeholders))
+                  AND source.enabled = 1 AND source.removed = 0
+                ORDER BY file_record.created_order
+                LIMIT 1
+                """, bindings)
+        }
+    }
+
     public func candidates(filename: String, excludingID: UUID?, olderPendingOnly: Bool = false) async throws -> [MatchCandidate] {
         try await perform {
             var sql = "SELECT id, state, metadata_json, success_id, success_metadata_json FROM file_record WHERE filename = ?"
@@ -307,6 +382,28 @@ public final class SyncStore: @unchecked Sendable {
 
     public func markSkipped(fileID: UUID, reason: SkipReason, candidates: [MatchCandidate]) async throws {
         try await perform { try self.transaction { try self.markSkippedSync(fileID: fileID, reason: reason, candidates: candidates) } }
+    }
+
+    func markSkippedWithSnapshotValidity(
+        fileID: UUID,
+        reason: SkipReason,
+        candidates: [MatchCandidate],
+        validity: any PhotosCandidateValidity
+    ) async throws -> SnapshotCommitResult {
+        try await perform {
+            try self.execute("BEGIN IMMEDIATE")
+            do {
+                try self.markSkippedSync(fileID: fileID, reason: reason, candidates: candidates)
+                guard try validity.commitIfCurrent({ try self.execute("COMMIT") }) else {
+                    try self.execute("ROLLBACK")
+                    return .staleSnapshot
+                }
+                return .committed(fileID)
+            } catch {
+                try? self.execute("ROLLBACK")
+                throw error
+            }
+        }
     }
 
     public func recordRetry(fileID: UUID, attemptID: UUID?, nextRetry: Date, error: String, definitelyNotCommitted: Bool) async throws {
@@ -408,6 +505,13 @@ public final class SyncStore: @unchecked Sendable {
         try rows("PRAGMA table_info(source)", []).contains { try text($0[1]) == name }
     }
 
+    private func ensureIndexes() throws {
+        guard try one("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_record'", []) != nil else { return }
+        try transaction {
+            try execute("CREATE INDEX IF NOT EXISTS file_state_created_order ON file_record(state, created_order)")
+        }
+    }
+
     private func perform<T>(_ operation: @escaping () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
@@ -494,6 +598,7 @@ public final class SyncStore: @unchecked Sendable {
     private static let fileColumns = "file_record.id, file_record.source_id, relative_path, source.path, size, modified_ns, metadata_json, state, attempt_id, placeholder_id, success_id, retry_count, next_retry_at"
     private func storedFile(_ sql: String, _ bindings: [Binding]) throws -> StoredFile? { try one(sql, bindings).map(decodeStoredFile) }
     private func decodeStoredFile(_ row: [Value]) throws -> StoredFile {
+        decodeObserver()
         let metadata = try decode(MediaMetadata.self, from: try text(row[6]))
         return StoredFile(id: try uuid(row[0]), file: SourceFile(sourceID: try uuid(row[1]), relativePath: try text(row[2]), url: URL(fileURLWithPath: try text(row[3])).appendingPathComponent(try text(row[2])), stamp: FileStamp(size: try int64(row[4]), modifiedNanoseconds: try int64(row[5])), metadata: metadata), state: try fileState(row[7]), attemptID: optionalUUID(row[8]), placeholderID: optionalText(row[9]), successID: optionalText(row[10]), retryCount: Int(try int64(row[11])), nextRetryAt: optionalDouble(row[12]).map(Date.init(timeIntervalSince1970:)))
     }
@@ -513,7 +618,7 @@ public final class SyncStore: @unchecked Sendable {
     CREATE TABLE file_record (id TEXT PRIMARY KEY, created_order INTEGER NOT NULL UNIQUE, source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, metadata_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','importing','imported','skipped')), skip_reason TEXT, rule_version INTEGER NOT NULL, attempt_id TEXT, placeholder_id TEXT, submitted_at REAL, definitely_not_committed INTEGER NOT NULL DEFAULT 0, success_id TEXT, success_metadata_json TEXT, succeeded_at REAL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT, UNIQUE(source_id, relative_path));
     CREATE TABLE match_evidence (file_id TEXT NOT NULL REFERENCES file_record(id), candidate_key TEXT NOT NULL, candidate_json TEXT NOT NULL, rule_version INTEGER NOT NULL, compared_at REAL NOT NULL, PRIMARY KEY(file_id, candidate_key));
     CREATE TABLE scan_run (id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source(id), started_at REAL NOT NULL, ended_at REAL, complete INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, last_error TEXT);
-    CREATE INDEX file_state_retry ON file_record(state, next_retry_at); CREATE INDEX file_name ON file_record(filename);
+    CREATE INDEX file_state_retry ON file_record(state, next_retry_at); CREATE INDEX file_name ON file_record(filename); CREATE INDEX file_state_created_order ON file_record(state, created_order);
     CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path));
     """
 }

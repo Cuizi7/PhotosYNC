@@ -370,7 +370,10 @@ private actor HeldRuntimeDirectory: DirectoryReading {
 }
 private struct RuntimePhotos: PhotosGateway {
     func loadCandidates() async throws -> [MatchCandidate] { [] }
-    func create(fileURL: URL, kind: MediaKind, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        PhotosCandidateSnapshot(generation: 0, candidates: [])
+    }
+    func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
         throw PhotoKitGatewayError.definitelyNotCommitted("Test never imports")
     }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }

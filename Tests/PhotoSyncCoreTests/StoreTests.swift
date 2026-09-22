@@ -1,8 +1,125 @@
 import XCTest
-import PhotoSyncCore
+@testable import PhotoSyncCore
 import SQLite3
 
 final class StoreTests: XCTestCase {
+    func testNextPendingFileUsesStableCursorAndActiveSourceScope() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let activeRoot = root.appendingPathComponent("active")
+        let disabledRoot = root.appendingPathComponent("disabled")
+        try FileManager.default.createDirectory(at: activeRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: disabledRoot, withIntermediateDirectories: true)
+        let activeID = try await store.registerSource(url: activeRoot)
+        let disabledID = try await store.registerSource(url: disabledRoot)
+
+        let first = try await store.save(source(sourceID: activeID, root: activeRoot, relativePath: "first.jpg"), decision: .importNew)
+        let second = try await store.save(source(sourceID: activeID, root: activeRoot, relativePath: "second.jpg"), decision: .importNew)
+        _ = try await store.save(source(sourceID: disabledID, root: disabledRoot, relativePath: "disabled.jpg"), decision: .importNew)
+        try await store.disableSource(id: disabledID)
+
+        let selectedFirst = try await store.nextPendingFile(sourceIDs: [activeID, disabledID], afterID: nil)
+        XCTAssertEqual(selectedFirst?.id, first)
+
+        try await store.markSkipped(fileID: first, reason: .sourceChanged, candidates: [])
+        let selectedSecond = try await store.nextPendingFile(sourceIDs: [activeID, disabledID], afterID: first)
+        XCTAssertEqual(selectedSecond?.id, second)
+
+        let empty = try await store.nextPendingFile(sourceIDs: [], afterID: nil)
+        XCTAssertNil(empty)
+        await XCTAssertThrowsErrorAsync(
+            try await store.nextPendingFile(sourceIDs: [activeID], afterID: UUID())
+        )
+    }
+
+    func testNextPendingFileDecodesOnlyTheProcessedPrefixAcrossLargeQueue() async throws {
+        let root = try makeRoot()
+        let counter = DecodeCounter()
+        let database = root.appendingPathComponent("state.sqlite")
+        let store = try SyncStore(url: database, decodeObserver: { counter.increment() })
+        let sourceID = try await store.registerSource(url: root)
+        let metadata = "{\"filename\":\"synthetic.jpg\",\"kind\":\"image\",\"captureSecond\":null,\"rawCaptureTime\":null,\"rawCaptureOffset\":null,\"make\":null,\"model\":null,\"width\":1,\"height\":1,\"duration\":null}"
+        try injectEngineSQL("""
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
+            INSERT INTO file_record (id, created_order, source_id, relative_path, filename, size, modified_ns, metadata_json, state, rule_version)
+            SELECT printf('00000000-0000-0000-0000-%012d', i), i, '\(sourceID.uuidString)', printf('synthetic-%05d.jpg', i), 'synthetic.jpg', 1, 1, '\(metadata)', 'pending', 1 FROM n
+            """, at: database)
+
+        var cursor: UUID?
+        for _ in 0..<16 {
+            let selected = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: cursor)
+            cursor = try XCTUnwrap(selected?.id)
+        }
+        XCTAssertEqual(counter.value, 16)
+    }
+
+    func testNextPendingFileKeepsLateAppendsAndFutureRetriesVisibleAfterCursor() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let firstID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "first.jpg"), decision: .importNew)
+        let secondID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "second.jpg"), decision: .importNew)
+
+        let firstOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: nil)
+        let first = try XCTUnwrap(firstOptional)
+        XCTAssertEqual(first.id, firstID)
+        try await store.markSkipped(fileID: firstID, reason: .sourceChanged, candidates: [])
+
+        let secondOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: firstID)
+        let second = try XCTUnwrap(secondOptional)
+        XCTAssertEqual(second.id, secondID)
+
+        let lateID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "late.jpg"), decision: .importNew)
+        let lateOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: secondID)
+        let late = try XCTUnwrap(lateOptional)
+        XCTAssertEqual(late.id, lateID)
+
+        let future = Date(timeIntervalSince1970: 10_000)
+        try await store.recordRetry(fileID: lateID, attemptID: nil, nextRetry: future,
+                                    error: "wait for retry", definitelyNotCommitted: true)
+        let futureRetryOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: secondID)
+        let futureRetry = try XCTUnwrap(futureRetryOptional)
+        XCTAssertEqual(futureRetry.id, lateID)
+        XCTAssertEqual(futureRetry.nextRetryAt, future)
+    }
+
+    func testFreshReopenedAndMigratedV3DatabasesKeepKeysetIndexAndHistory() async throws {
+        let fixture = try await makeEngineFixture(sourceCount: 1)
+        let file = try await engineSourceFile(sourceID: fixture.sourceIDs[0], directory: fixture.directories[0])
+        let fileID = try await fixture.store.save(file, decision: .importNew)
+        let database = fixture.databaseURL
+        let indexCount = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'file_state_created_order'"
+        XCTAssertEqual(try engineSQLInteger(indexCount, at: database), 1)
+
+        try injectEngineSQL("DROP INDEX file_state_created_order; PRAGMA user_version = 2", at: database)
+        let reopened = try SyncStore(url: database)
+        XCTAssertEqual(try engineSQLInteger(indexCount, at: database), 1)
+        let reopenedState = try await reopened.state(of: fileID)
+        XCTAssertEqual(reopenedState, .pending)
+
+        let reopenedAgain = try SyncStore(url: database)
+        XCTAssertEqual(try engineSQLInteger(indexCount, at: database), 1)
+        let reopenedAgainState = try await reopenedAgain.state(of: fileID)
+        XCTAssertEqual(reopenedAgainState, .pending)
+    }
+
+    func testFailedKeysetIndexCreationDoesNotReplaceExistingDatabase() async throws {
+        let root = try makeRoot()
+        let database = root.appendingPathComponent("state.sqlite")
+        let fileID: UUID
+        do {
+            let store = try SyncStore(url: database)
+            let sourceID = try await store.registerSource(url: root)
+            fileID = try await store.save(source(sourceID: sourceID, root: root), decision: .importNew)
+        }
+
+        try injectEngineSQL("DROP INDEX file_state_created_order; CREATE TABLE file_state_created_order (marker INTEGER)", at: database)
+        XCTAssertThrowsError(try SyncStore(url: database))
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 3)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record WHERE id = '\(fileID.uuidString)'", at: database), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_state_created_order'", at: database), 1)
+    }
+
     func testDueRetrySourceIDsIncludesOnlyActiveDefinitePendingFailuresAtDeadline() async throws {
         let root = try makeRoot()
         let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
@@ -401,6 +518,32 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(state, .pending)
     }
 
+    func testSnapshotValidityRollbackLeavesNoSkipOrEvidence() async throws {
+        let root = try makeRoot()
+        let database = root.appendingPathComponent("state.sqlite")
+        let store = try SyncStore(url: database)
+        let sourceID = try await store.registerSource(url: root)
+        let file = source(sourceID: sourceID, root: root)
+        let candidate = MatchCandidate(key: "photos:1", metadata: media("a.jpg"))
+
+        let result = try await store.saveWithSnapshotValidity(
+            file,
+            decision: .skip(candidateKeys: [candidate.key]),
+            candidates: [candidate],
+            validity: RejectingSnapshotValidity()
+        )
+
+        guard case .staleSnapshot = result else {
+            return XCTFail("Expected a stale snapshot result")
+        }
+        let pendingCount = try await store.countFiles(state: .pending)
+        let skippedCount = try await store.countFiles(state: .skipped)
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(skippedCount, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: database), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM match_evidence", at: database), 0)
+    }
+
     func testSaveSkipPersistsActualCandidateSnapshots() async throws {
         let root = try makeRoot()
         let database = root.appendingPathComponent("state.sqlite")
@@ -524,6 +667,29 @@ final class StoreTests: XCTestCase {
             stamp: FileStamp(size: size, modifiedNanoseconds: modified),
             metadata: media(relativePath)
         )
+    }
+}
+
+private final class DecodeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var countStorage = 0
+
+    func increment() {
+        lock.lock()
+        countStorage += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return countStorage
+    }
+}
+
+private final class RejectingSnapshotValidity: PhotosCandidateValidity, @unchecked Sendable {
+    func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
+        false
     }
 }
 

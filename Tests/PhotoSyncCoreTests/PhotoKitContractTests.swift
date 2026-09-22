@@ -1,7 +1,111 @@
 import XCTest
+import Photos
 @testable import PhotoSyncCore
 
 final class PhotoKitContractTests: XCTestCase {
+    func testIncrementalChangePayloadContainsOnlyTheChangedAssets() {
+        let change = PhotoKitCandidateIndexChange.incremental(
+            removedAssetIDs: ["removed"],
+            insertedAssets: [PhotoKitCandidateAsset(identifier: "inserted", candidates: [candidate(key: "inserted")])],
+            changedAssets: [PhotoKitCandidateAsset(identifier: "changed", candidates: [candidate(key: "changed")])]
+        )
+        guard case let .incremental(removed, inserted, changed) = change else {
+            return XCTFail("expected an incremental change")
+        }
+        XCTAssertEqual(removed, ["removed"])
+        XCTAssertEqual(inserted.map(\.identifier), ["inserted"])
+        XCTAssertEqual(changed.map(\.identifier), ["changed"])
+    }
+
+    func testCandidateSnapshotGroupsByFilenameAndReusesUnchangedIndex() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "fixture-1"), candidate(key: "fixture-2")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+
+        let first = try await gateway.candidateSnapshot()
+        let second = try await gateway.candidateSnapshot()
+
+        XCTAssertEqual(first.candidates(named: "fixture.jpg").count, 2)
+        XCTAssertEqual(second.candidates(named: "missing.jpg"), [])
+        XCTAssertEqual(first.generation, second.generation)
+        XCTAssertEqual(lifecycle.loadCount, 1)
+    }
+
+    func testIncrementalCandidateChangeUpdatesFilenameBucketsWithoutFullReload() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let old = candidate(key: "asset-old")
+        let replacement = candidate(key: "asset-new")
+        lifecycle.candidates = [old]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.candidateSnapshot()
+        lifecycle.nextChange = .incremental(
+            removedAssetIDs: ["asset-old"],
+            insertedAssets: [PhotoKitCandidateAsset(identifier: "asset-new", candidates: [replacement])],
+            changedAssets: [],
+        )
+        gateway.recordLibraryChangeForTesting()
+
+        let snapshot = try await gateway.candidateSnapshot()
+        XCTAssertTrue(snapshot.candidates(named: "fixture.jpg").contains(replacement))
+        XCTAssertFalse(snapshot.candidates(named: "fixture.jpg").contains(old))
+        XCTAssertEqual(lifecycle.loadCount, 1)
+    }
+
+    func testNonincrementalCandidateChangeRebuildsBeforeReturningSnapshot() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "before")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.candidateSnapshot()
+        lifecycle.candidates = [candidate(key: "after")]
+        lifecycle.nextChange = .reload
+        gateway.recordLibraryChangeForTesting()
+
+        let snapshot = try await gateway.candidateSnapshot()
+        XCTAssertEqual(snapshot.candidates(named: "fixture.jpg").map(\.key), ["after"])
+        XCTAssertEqual(lifecycle.loadCount, 2)
+    }
+
+    func testOneHundredIncrementalOwnAssetChangesDoNotReloadTheLibrary() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        var currentID = "asset-0"
+        lifecycle.candidates = [candidate(key: currentID)]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.candidateSnapshot()
+
+        for index in 1...100 {
+            let nextID = "asset-\(index)"
+            lifecycle.nextChange = .incremental(
+                removedAssetIDs: [currentID],
+                insertedAssets: [PhotoKitCandidateAsset(identifier: nextID, candidates: [candidate(key: nextID)])],
+                changedAssets: [],
+            )
+            gateway.recordLibraryChangeForTesting()
+            let snapshot = try await gateway.candidateSnapshot()
+            XCTAssertEqual(snapshot.candidates(named: "fixture.jpg").map(\.key), [nextID])
+            currentID = nextID
+        }
+        XCTAssertEqual(lifecycle.loadCount, 1)
+    }
+
+    func testOverlappingIncrementalIDsForceACompleteRebuild() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "asset-1")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        _ = try await gateway.candidateSnapshot()
+
+        lifecycle.candidates = [candidate(key: "reloaded")]
+        lifecycle.nextChange = .incremental(
+            removedAssetIDs: ["asset-1"],
+            insertedAssets: [],
+            changedAssets: [PhotoKitCandidateAsset(identifier: "asset-1", candidates: [candidate(key: "changed")])]
+        )
+        gateway.recordLibraryChangeForTesting()
+
+        let snapshot = try await gateway.candidateSnapshot()
+        XCTAssertEqual(snapshot.candidates(named: "fixture.jpg").map(\.key), ["reloaded"])
+        XCTAssertEqual(lifecycle.loadCount, 2)
+    }
+
     func testGatewayErrorsKeepCheckpointFailureAndUnknownOutcomeSeparateFromDefiniteFailure() {
         XCTAssertEqual(
             PhotoKitGatewayError.definitelyNotCommitted("validation failed").recoveryEvidence,
@@ -180,10 +284,10 @@ final class PhotoKitContractTests: XCTestCase {
     func testCreateRejectsAStaleCandidateIndexBeforePhotoKitSubmission() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         let gateway = PhotoKitGateway(lifecycle: lifecycle)
-        _ = try await gateway.loadCandidates()
+        let snapshot = try await gateway.candidateSnapshot()
         gateway.recordLibraryChangeForTesting()
 
-        await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }, verify: { error in
+        await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image, expectedGeneration: snapshot.generation) { _ in } }, verify: { error in
             XCTAssertEqual(
                 error as? PhotoKitGatewayError,
                 .definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
@@ -191,6 +295,19 @@ final class PhotoKitContractTests: XCTestCase {
         })
         XCTAssertTrue(lifecycle.commands.isEmpty)
         XCTAssertTrue(lifecycle.events.isEmpty)
+    }
+
+    func testPhotosGatewayProtocolDispatchesGenerationBoundCreate() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let concrete = PhotoKitGateway(lifecycle: lifecycle)
+        let gateway: any PhotosGateway = concrete
+        let snapshot = try await gateway.candidateSnapshot()
+        concrete.recordLibraryChangeForTesting()
+
+        await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image, expectedGeneration: snapshot.generation) { _ in } }, verify: { error in
+            XCTAssertEqual(error as? PhotoKitGatewayError, .definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission."))
+        })
+        XCTAssertTrue(lifecycle.commands.isEmpty)
     }
 
     func testEventBeforeChangeBlockPreventsSubmissionAndEventDuringReconcileDoesNotReturnFound() async throws {
@@ -247,6 +364,7 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
     var beforeMutation: (() -> Void)?
     var loadHook: (() -> Void)?
     var fetchHook: (() -> Void)?
+    var nextChange: PhotoKitCandidateIndexChange = .reload
     var loseAccessAfterCompletion = false
     var commands: [PhotoKitCreateCommand] = []
     var events: [String] = []
@@ -255,11 +373,15 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
     func currentAccess() -> PhotoKitAccess { access }
     func requestReadWriteAuthorization() async -> PhotoKitAccess { access }
     func isAvailable() -> Bool { available }
-    func loadCandidates() throws -> [MatchCandidate] {
+    func loadCandidateAssets() throws -> [PhotoKitCandidateAsset] {
         loadCount += 1
         let snapshot = candidates
         loadHook?()
-        return snapshot
+        let grouped = Dictionary(grouping: snapshot, by: { $0.key })
+        return grouped.map { PhotoKitCandidateAsset(identifier: $0.key, candidates: $0.value) }
+    }
+    func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange {
+        nextChange
     }
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         self.beforeMutation?()

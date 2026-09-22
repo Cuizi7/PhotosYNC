@@ -95,6 +95,120 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(createCallCount, 2)
     }
 
+    func testScanRechecksDuplicateDecisionAfterPhotosGenerationChanges() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceFile = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        await f.photos.setCandidates([MatchCandidate(key: "photos-duplicate", metadata: sourceFile.metadata)])
+        let gate = EngineTestGate()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { sourceID in
+            GatedDirectoryReader(reader: DirectoryReader(sourceID: sourceID), gate: gate)
+        })
+
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        await f.photos.setCandidates([])
+        await f.photos.bumpCandidateGeneration()
+        await gate.release()
+        await scan.value
+
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .imported)
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(createCount, 1)
+    }
+
+    func testPhotosErrorDuringDuplicateRecheckBlocksSyncInsteadOfReportingUnreadableFile() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceFile = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        await f.photos.setCandidates([MatchCandidate(key: "photos-duplicate", metadata: sourceFile.metadata)])
+        let gate = EngineTestGate()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { sourceID in
+            GatedDirectoryReader(reader: DirectoryReader(sourceID: sourceID), gate: gate)
+        })
+
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        await f.photos.setCandidateSnapshotErrorAfterFirst(.authorizationRequired)
+        await gate.release()
+        await scan.value
+
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.blockingError, PhotoKitGatewayError.authorizationRequired.localizedDescription)
+        XCTAssertEqual(snapshot.blockingSummary, SourceIssueText.authorizationRequired)
+        XCTAssertEqual(snapshot.latestScan.failed, 1)
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+        XCTAssertTrue(snapshot.waitingSources.isEmpty)
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertNil(record)
+    }
+
+    func testScanDoesNotPersistSkipWhenPhotosChangesAfterLatestSnapshot() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceFile = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        await f.photos.setCandidates([MatchCandidate(key: "photos-duplicate", metadata: sourceFile.metadata)])
+        await f.photos.setCandidateSnapshotMutationAfterCall(2)
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .imported)
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(createCount, 1)
+    }
+
+    func testDrainDoesNotPersistSkipWhenPhotosChangesAfterLatestSnapshot() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceFile = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        _ = try await f.store.save(sourceFile, decision: .importNew)
+        await f.photos.setCandidates([MatchCandidate(key: "photos-duplicate", metadata: sourceFile.metadata)])
+        await f.photos.setCandidateSnapshotMutationAfterCall(2)
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .imported)
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(createCount, 1)
+    }
+
+    func testRecoveredOlderPendingRowIsFoundAfterCursorAdvanceAndImportedOnce() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let laterURL = f.directories[0].appendingPathComponent("later.jpg")
+        try FileManager.default.copyItem(at: f.directories[0].appendingPathComponent("same.jpg"), to: laterURL)
+        let older = try await engineSourceFile(sourceID: sourceID, directory: f.directories[0])
+        let later = SourceFile(
+            sourceID: sourceID,
+            relativePath: "later.jpg",
+            url: laterURL,
+            stamp: try await DirectoryReader(sourceID: sourceID).stamp(of: laterURL),
+            metadata: try await MetadataReader(sourceID: sourceID).read(url: laterURL, filename: "later.jpg")
+        )
+        let olderID = try await f.store.save(older, decision: .importNew)
+        let laterID = try await f.store.save(later, decision: .importNew)
+        try await f.store.beginAttempt(fileID: olderID, attemptID: UUID())
+        await f.photos.setEvidence(.definitelyNotCommitted)
+
+        let cursorAdvance = try await f.store.nextPendingFile(sourceIDs: [sourceID], afterID: nil)
+        XCTAssertEqual(cursorAdvance?.id, laterID)
+        let afterCursor = try await f.store.nextPendingFile(sourceIDs: [sourceID], afterID: laterID)
+        XCTAssertNil(afterCursor)
+
+        await f.engine.recoverImports()
+        let recovered = try await f.store.file(sourceID: sourceID, relativePath: "same.jpg")
+        XCTAssertEqual(recovered?.state, .pending)
+
+        await f.engine.scan(sourceIDs: [sourceID])
+        let olderAfter = try await f.store.file(sourceID: sourceID, relativePath: "same.jpg")
+        let laterAfter = try await f.store.file(sourceID: sourceID, relativePath: "later.jpg")
+        XCTAssertEqual(olderAfter?.state, .imported)
+        XCTAssertEqual(laterAfter?.state, .imported)
+        let createCount = await f.photos.createCount
+        XCTAssertEqual(createCount, 2)
+    }
+
     func testTwoSourcesSubmitOnlyOnce() async throws {
         let f = try await makeEngineFixture()
         await f.engine.scan(sourceIDs: f.sourceIDs)
@@ -1281,12 +1395,16 @@ private actor PreAdmissionFailurePhotosGateway: PhotosGateway {
     private(set) var actualSubmissionCount = 0
 
     func loadCandidates() async throws -> [MatchCandidate] { [] }
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        PhotosCandidateSnapshot(generation: 0, candidates: [])
+    }
 
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
 
     func create(
         fileURL: URL,
         kind: MediaKind,
+        expectedGeneration: Int,
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> String {
         createCallCount += 1
@@ -1508,7 +1626,11 @@ private struct AuthorizationRequiredPhotosGateway: PhotosGateway {
         throw PhotoKitGatewayError.authorizationRequired
     }
 
-    func create(fileURL: URL, kind: MediaKind, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        throw PhotoKitGatewayError.authorizationRequired
+    }
+
+    func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
         throw PhotoKitGatewayError.authorizationRequired
     }
 
