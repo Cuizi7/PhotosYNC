@@ -8,7 +8,7 @@ fail() {
 }
 
 cd "${0:A:h:h}"
-release_name=0.1.0-beta4
+release_name=0.1.0-beta5
 release_root="$PWD/outputs/releases"
 final_release_dir="$release_root/$release_name"
 
@@ -119,14 +119,14 @@ codesign --force --sign - --timestamp=none "$app_path"
 codesign --verify --deep --strict --all-architectures "$app_path"
 [[ -s "$app_path/Contents/Resources/Assets.car" && -s "$app_path/Contents/Resources/PhotosYNC.icns" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.1.0' ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '4' ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :PhotoSyncReleaseChannel' "$app_path/Contents/Info.plist")" == 'beta4' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '5' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :PhotoSyncReleaseChannel' "$app_path/Contents/Info.plist")" == 'beta5' ]]
 lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch arm64 x86_64
 lipo "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore" -verify_arch arm64 x86_64
 scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg"
 hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg"
 
-cp docs/release/0.1.0-beta4.md "$release_dir/RELEASE-NOTES.md"
+cp docs/release/0.1.0-beta5.md "$release_dir/RELEASE-NOTES.md"
 ditto "$validation_dir" "$release_dir/validation"
 cp "$build_dir/validate.log" "$release_dir/validate.log"
 cp "$build_dir/release-build.log" "$release_dir/release-build.log"
@@ -137,7 +137,7 @@ continuation_result_hash=$(shasum -a 256 "$release_dir/validation/continuation-r
 {
   print "release=$release_name"
   print "source_commit=$source_commit"
-  print 'build_number=4'
+  print 'build_number=5'
   print 'signing=ad-hoc; notarized=no'
   print 'architectures=arm64 x86_64'
   print 'minimum_macos=13.0'
