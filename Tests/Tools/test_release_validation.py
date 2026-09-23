@@ -79,7 +79,7 @@ class ReleaseFixture:
         return self.events.read_text().splitlines()
 
     def release_path(self) -> Path:
-        return self.root / "outputs" / "releases" / "0.1.0-beta5"
+        return self.root / "outputs" / "releases" / "0.1.0"
 
     def _write_repository(self) -> None:
         for relative in ("scripts", "Tests/Tools", "docs/release", "PhotoSync.xcodeproj"):
@@ -91,7 +91,8 @@ class ReleaseFixture:
         (self.root / "PhotoSync.xcodeproj" / "project.pbxproj").write_text("fixture project\n")
         (self.root / "Sources").mkdir()
         (self.root / "Sources" / "fixture.swift").write_text("let fixture = true\n")
-        (self.root / "docs/release/0.1.0-beta5.md").write_text("fixture release notes\n")
+        (self.root / "docs/release/0.1.0.md").write_text("fixture release notes\n")
+        (self.root / "CHANGELOG.md").write_text("fixture changelog\n")
         (self.root / "Tests/Tools/test_fixture.py").write_text(
             "import unittest\n\n"
             "class FixtureTests(unittest.TestCase):\n"
@@ -244,6 +245,7 @@ class ReleaseValidationTests(unittest.TestCase):
         release = self.fixture.release_path()
         self.assertTrue((release / "validation" / "validation.json").is_file())
         self.assertTrue((release / "validation" / "validation-report.md").is_file())
+        self.assertEqual((release / "CHANGELOG.md").read_text(), "fixture changelog\n")
         self.assertTrue((release / "SHA256SUMS").is_file())
         self.assertIn(
             "./validation/continuation-race/probe evidence with spaces.txt",
@@ -285,7 +287,7 @@ class ReleaseValidationTests(unittest.TestCase):
                 try:
                     release = fixture.release_path()
                     if case == "dirty":
-                        (fixture.root / "docs/release/0.1.0-beta5.md").write_text("changed\n")
+                        (fixture.root / "docs/release/0.1.0.md").write_text("changed\n")
                     elif case == "untracked":
                         (fixture.root / "untracked.txt").write_text("untracked\n")
                     elif case == "file":
@@ -298,7 +300,7 @@ class ReleaseValidationTests(unittest.TestCase):
                         release.parent.mkdir(parents=True, exist_ok=True)
                         release.symlink_to(fixture.root / "missing-release-target")
                     else:
-                        lock = release.parent / ".0.1.0-beta5.lock"
+                        lock = release.parent / ".0.1.0.lock"
                         lock.mkdir(parents=True)
                     result = fixture.run_packager()
                     self.assertNotEqual(result.returncode, 0)
@@ -323,8 +325,8 @@ class ReleaseValidationTests(unittest.TestCase):
 
     def assert_no_transient_release_paths(self, fixture: ReleaseFixture) -> None:
         release_root = fixture.release_path().parent
-        self.assertFalse((release_root / ".0.1.0-beta5.lock").exists())
-        self.assertEqual(list(release_root.glob(".0.1.0-beta5.staging.*")), [])
+        self.assertFalse((release_root / ".0.1.0.lock").exists())
+        self.assertEqual(list(release_root.glob(".0.1.0.staging.*")), [])
 
 
 _FAKE_XCODEBUILD = """#!/bin/sh
@@ -364,8 +366,8 @@ case " $* " in
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleExecutable</key><string>PhotosYNC</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>5</string>
-<key>PhotoSyncReleaseChannel</key><string>beta5</string>
+<key>CFBundleVersion</key><string>6</string>
+<key>PhotoSyncReleaseChannel</key><string>stable</string>
 </dict></plist>
 PLIST
       printf '#!/bin/sh\\nexit 0\\n' > "$app/Contents/MacOS/PhotosYNC"
