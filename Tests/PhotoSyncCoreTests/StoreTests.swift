@@ -3,6 +3,111 @@ import XCTest
 import SQLite3
 
 final class StoreTests: XCTestCase {
+    func testDeletedLocalCandidateCannotBecomeNewSkipEvidence() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let firstRoot = root.appendingPathComponent("first")
+        let secondRoot = root.appendingPathComponent("second")
+        try FileManager.default.createDirectory(at: firstRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+        let firstSource = try await store.registerSource(url: firstRoot)
+        let secondSource = try await store.registerSource(url: secondRoot)
+        let first = source(sourceID: firstSource, root: firstRoot, relativePath: "same.jpg")
+        let firstID = try await store.save(first, decision: .importNew)
+        let candidate = MatchCandidate(key: "file:\(firstID.uuidString)", metadata: first.metadata)
+        let second = source(sourceID: secondSource, root: secondRoot, relativePath: "same.jpg")
+        let validity = PhotosCandidateSnapshot(generation: 0, candidates: []).candidateValidity
+        let removed = try await store.removeConfirmedAbsentPending(fileID: firstID)
+        XCTAssertTrue(removed)
+
+        let result = try await store.saveWithSnapshotValidity(second,
+            decision: .skip(candidateKeys: [candidate.key]), candidates: [candidate], validity: validity)
+
+        guard case .staleSnapshot = result else { return XCTFail("Deleted local candidate must invalidate the skip") }
+        let secondRecord = try await store.file(sourceID: secondSource, relativePath: "same.jpg")
+        XCTAssertNil(secondRecord)
+    }
+
+    func testDeletedLocalCandidateCannotSkipExistingPendingFile() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let first = source(sourceID: sourceID, root: root, relativePath: "first.jpg")
+        let firstID = try await store.save(first, decision: .importNew)
+        let secondID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "second.jpg"), decision: .importNew)
+        let candidate = MatchCandidate(key: "file:\(firstID.uuidString)", metadata: first.metadata)
+        let removed = try await store.removeConfirmedAbsentPending(fileID: firstID)
+        XCTAssertTrue(removed)
+
+        let result = try await store.markSkippedWithSnapshotValidity(fileID: secondID,
+            reason: .suspectedDuplicate, candidates: [candidate],
+            validity: PhotosCandidateSnapshot(generation: 0, candidates: []).candidateValidity)
+
+        guard case .staleSnapshot = result else { return XCTFail("Deleted local candidate must invalidate the skip") }
+        let state = try await store.state(of: secondID)
+        XCTAssertEqual(state, .pending)
+    }
+
+    func testPendingQueueCanAdvanceAfterCursorRecordWasDeleted() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let firstID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "first.jpg"), decision: .importNew)
+        let secondID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "second.jpg"), decision: .importNew)
+        let firstOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: nil)
+        let first = try XCTUnwrap(firstOptional)
+        XCTAssertEqual(first.id, firstID)
+        let removed = try await store.removeConfirmedAbsentPending(fileID: firstID)
+        XCTAssertTrue(removed)
+
+        let next = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: first.createdOrder)
+        XCTAssertEqual(next?.id, secondID)
+    }
+
+    func testConfirmedAbsentPendingRemovesRetryAndReopensDependentDuplicate() async throws {
+        let root = try makeRoot()
+        let database = root.appendingPathComponent("state.sqlite")
+        let store = try SyncStore(url: database)
+        let sourceID = try await store.registerSource(url: root)
+        let missing = source(sourceID: sourceID, root: root, relativePath: "missing.jpg")
+        let missingID = try await store.save(missing, decision: .importNew)
+        try await store.recordRetry(fileID: missingID, attemptID: nil, nextRetry: Date(timeIntervalSince1970: 0),
+                                    error: "missing before submission", definitelyNotCommitted: true)
+        let candidate = MatchCandidate(key: "file:\(missingID.uuidString)", metadata: missing.metadata)
+        let duplicate = source(sourceID: sourceID, root: root, relativePath: "elsewhere/missing.jpg")
+        let duplicateID = try await store.save(duplicate, decision: .skip(candidateKeys: [candidate.key]), candidates: [candidate])
+
+        let before = try await store.pendingPaths(sourceID: sourceID)
+        XCTAssertEqual(before["missing.jpg"], missingID)
+        let removed = try await store.removeConfirmedAbsentPending(fileID: missingID)
+
+        XCTAssertTrue(removed)
+        let deletedRecord = try await store.file(sourceID: sourceID, relativePath: "missing.jpg")
+        let reopenedState = try await store.state(of: duplicateID)
+        let dueSources = try await store.dueRetrySourceIDs(at: Date())
+        let removedAgain = try await store.removeConfirmedAbsentPending(fileID: missingID)
+        XCTAssertNil(deletedRecord)
+        XCTAssertEqual(reopenedState, .pending)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM match_evidence WHERE file_id = '\(duplicateID.uuidString)'", at: database), 0)
+        XCTAssertEqual(dueSources, [])
+        XCTAssertFalse(removedAgain)
+    }
+
+    func testConfirmedAbsentPendingPreservesSubmittedAndImportedRecords() async throws {
+        let root = try makeRoot()
+        let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
+        let sourceID = try await store.registerSource(url: root)
+        let importingID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "in-flight.jpg"), decision: .importNew)
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: importingID, attemptID: attempt)
+        let removedImporting = try await store.removeConfirmedAbsentPending(fileID: importingID)
+        try await store.markImported(fileID: importingID, attemptID: attempt, identifier: "photos-success")
+        let removedImported = try await store.removeConfirmedAbsentPending(fileID: importingID)
+        let successID = try await store.successIdentifier(of: importingID)
+        XCTAssertFalse(removedImporting)
+        XCTAssertFalse(removedImported)
+        XCTAssertEqual(successID, "photos-success")
+    }
     func testNextPendingFileUsesStableCursorAndActiveSourceScope() async throws {
         let root = try makeRoot()
         let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))
@@ -18,18 +123,17 @@ final class StoreTests: XCTestCase {
         _ = try await store.save(source(sourceID: disabledID, root: disabledRoot, relativePath: "disabled.jpg"), decision: .importNew)
         try await store.disableSource(id: disabledID)
 
-        let selectedFirst = try await store.nextPendingFile(sourceIDs: [activeID, disabledID], afterID: nil)
+        let selectedFirst = try await store.nextPendingFile(sourceIDs: [activeID, disabledID], afterOrder: nil)
         XCTAssertEqual(selectedFirst?.id, first)
 
         try await store.markSkipped(fileID: first, reason: .sourceChanged, candidates: [])
-        let selectedSecond = try await store.nextPendingFile(sourceIDs: [activeID, disabledID], afterID: first)
+        let selectedSecond = try await store.nextPendingFile(sourceIDs: [activeID, disabledID], afterOrder: selectedFirst?.createdOrder)
         XCTAssertEqual(selectedSecond?.id, second)
 
-        let empty = try await store.nextPendingFile(sourceIDs: [], afterID: nil)
+        let empty = try await store.nextPendingFile(sourceIDs: [], afterOrder: nil)
         XCTAssertNil(empty)
-        await XCTAssertThrowsErrorAsync(
-            try await store.nextPendingFile(sourceIDs: [activeID], afterID: UUID())
-        )
+        let pastEnd = try await store.nextPendingFile(sourceIDs: [activeID], afterOrder: Int64.max)
+        XCTAssertNil(pastEnd)
     }
 
     func testNextPendingFileDecodesOnlyTheProcessedPrefixAcrossLargeQueue() async throws {
@@ -45,10 +149,10 @@ final class StoreTests: XCTestCase {
             SELECT printf('00000000-0000-0000-0000-%012d', i), i, '\(sourceID.uuidString)', printf('synthetic-%05d.jpg', i), 'synthetic.jpg', 1, 1, '\(metadata)', 'pending', 1 FROM n
             """, at: database)
 
-        var cursor: UUID?
+        var cursor: Int64?
         for _ in 0..<16 {
-            let selected = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: cursor)
-            cursor = try XCTUnwrap(selected?.id)
+            let selected = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: cursor)
+            cursor = try XCTUnwrap(selected?.createdOrder)
         }
         XCTAssertEqual(counter.value, 16)
     }
@@ -60,24 +164,24 @@ final class StoreTests: XCTestCase {
         let firstID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "first.jpg"), decision: .importNew)
         let secondID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "second.jpg"), decision: .importNew)
 
-        let firstOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: nil)
+        let firstOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: nil)
         let first = try XCTUnwrap(firstOptional)
         XCTAssertEqual(first.id, firstID)
         try await store.markSkipped(fileID: firstID, reason: .sourceChanged, candidates: [])
 
-        let secondOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: firstID)
+        let secondOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: first.createdOrder)
         let second = try XCTUnwrap(secondOptional)
         XCTAssertEqual(second.id, secondID)
 
         let lateID = try await store.save(source(sourceID: sourceID, root: root, relativePath: "late.jpg"), decision: .importNew)
-        let lateOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: secondID)
+        let lateOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: second.createdOrder)
         let late = try XCTUnwrap(lateOptional)
         XCTAssertEqual(late.id, lateID)
 
         let future = Date(timeIntervalSince1970: 10_000)
         try await store.recordRetry(fileID: lateID, attemptID: nil, nextRetry: future,
                                     error: "wait for retry", definitelyNotCommitted: true)
-        let futureRetryOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterID: secondID)
+        let futureRetryOptional = try await store.nextPendingFile(sourceIDs: [sourceID], afterOrder: second.createdOrder)
         let futureRetry = try XCTUnwrap(futureRetryOptional)
         XCTAssertEqual(futureRetry.id, lateID)
         XCTAssertEqual(futureRetry.nextRetryAt, future)

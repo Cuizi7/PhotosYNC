@@ -62,25 +62,45 @@ public struct MetadataReader: MetadataReading {
     }
 
     private func readVideo(url: URL, filename: String) async throws -> MediaMetadata {
-        let asset = AVURLAsset(url: url)
-        let duration = try await asset.load(.duration)
-        let creationDate = try await asset.load(.creationDate)
-        let metadata = try await asset.load(.commonMetadata)
-        let creationItem = creationDate ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })
-        let rawCaptureTime = try await creationItem?.load(.stringValue)
-        let dimensions = try? await asset.load(.tracks).first(where: { $0.mediaType == .video })?.load(.naturalSize)
-        return MediaMetadata(
-            filename: filename,
-            kind: .video,
-            captureSecond: MetadataReader.videoCaptureSecond(rawCaptureTime: rawCaptureTime),
-            rawCaptureTime: rawCaptureTime,
-            rawCaptureOffset: videoOffset(rawCaptureTime),
-            make: nil,
-            model: nil,
-            width: dimensions.map { Int(abs($0.width)) },
-            height: dimensions.map { Int(abs($0.height)) },
-            duration: duration.seconds.isFinite ? duration.seconds : nil
-        )
+        do {
+            let asset = AVURLAsset(url: url)
+            let duration = try await asset.load(.duration)
+            let creationDate = try await asset.load(.creationDate)
+            let metadata = try await asset.load(.commonMetadata)
+            let creationItem = creationDate ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })
+            let rawCaptureTime = try await creationItem?.load(.stringValue)
+            let dimensions = try? await asset.load(.tracks).first(where: { $0.mediaType == .video })?.load(.naturalSize)
+            return MediaMetadata(
+                filename: filename,
+                kind: .video,
+                captureSecond: MetadataReader.videoCaptureSecond(rawCaptureTime: rawCaptureTime),
+                rawCaptureTime: rawCaptureTime,
+                rawCaptureOffset: videoOffset(rawCaptureTime),
+                make: nil,
+                model: nil,
+                width: dimensions.map { Int(abs($0.width)) },
+                height: dimensions.map { Int(abs($0.height)) },
+                duration: duration.seconds.isFinite ? duration.seconds : nil
+            )
+        } catch {
+            throw Self.videoMetadataError(error)
+        }
+    }
+
+    /// Keep the underlying AVFoundation and OSStatus codes in diagnostics. The localized system
+    /// sentence can be generic even when the nested error identifies a repeatable file failure.
+    static func videoMetadataError(_ error: Error) -> NSError {
+        var codes: [String] = []
+        var current: NSError? = error as NSError
+        for _ in 0..<3 {
+            guard let failure = current else { break }
+            codes.append("\(failure.domain) \(failure.code)")
+            current = failure.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return NSError(domain: "PhotoSync.VideoMetadata", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Video metadata could not be read (\(codes.joined(separator: " <- "))).",
+            NSUnderlyingErrorKey: error
+        ])
     }
 }
 

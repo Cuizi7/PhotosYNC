@@ -452,6 +452,8 @@ public actor SyncEngine {
             let reader = directory(sourceID)
             let metadataReader = metadata(sourceID)
             var directories: [(url: URL, relative: String)] = [(source.url, "")]
+            // Only an exhaustive traversal may retire pending files absent from the source.
+            var unseenPending = try await store.pendingPaths(sourceID: sourceID)
             var directoryTraversalComplete = true
             var lastFailure: String?
             scanLoop: while !directories.isEmpty, canScan(sourceID: sourceID) {
@@ -464,8 +466,12 @@ public actor SyncEngine {
                         }
                         if entry.isDirectory { directories.append((entry.url, folder.relative + entry.url.lastPathComponent + "/")); continue }
                         let relative = folder.relative + entry.url.lastPathComponent
+                        unseenPending.removeValue(forKey: relative)
                         let classification = MetadataReader.classification(entry.url)
                         if let failure = entry.failure {
+                            // Resource attributes failed before the reader knew whether this
+                            // entry was a file or a directory. Its descendants may be unvisited.
+                            directoryTraversalComplete = false
                             if classification == "image" || classification == "video" {
                                 checked += 1
                                 recordCandidateChecked(roundID)
@@ -561,7 +567,22 @@ public actor SyncEngine {
                 directoryTraversalComplete = false
             }
             if directoryTraversalComplete && directories.isEmpty && canScan(sourceID: sourceID) {
-                resolveSourceIssue(sourceID, key: Self.directoryScanIssueKey, runID: run)
+                // File metadata failures do not make directory enumeration incomplete. A missing
+                // pending file is normal source deletion only after every directory answered.
+                for (relative, fileID) in unseenPending.sorted(by: { $0.key < $1.key }) {
+                    guard canScan(sourceID: sourceID) else { break }
+                    if try await store.removeConfirmedAbsentPending(fileID: fileID) {
+                        resolveSourceIssue(sourceID, key: issueKey(for: fileID), runID: run,
+                                           fileID: fileID, announceRecovery: false)
+                        resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run,
+                                           announceRecovery: false)
+                        logEvent(phase: "source-file", result: "deleted", sourceID: sourceID, runID: run,
+                                 fileID: fileID, path: source.url.appendingPathComponent(relative).path)
+                    }
+                }
+                if canScan(sourceID: sourceID) {
+                    resolveSourceIssue(sourceID, key: Self.directoryScanIssueKey, runID: run)
+                }
             }
             if let run {
                 let deferred = status.deferredSources.contains(sourceID)
@@ -658,12 +679,12 @@ public actor SyncEngine {
 
     private func drain(roundID: UUID, sources: Set<UUID>) async {
         do {
-            var cursor: UUID?
+            var cursor: Int64?
             drainLoop: while !status.isPaused, !storageFailed, status.blockingError == nil {
-                guard let record = try await store.nextPendingFile(sourceIDs: sources, afterID: cursor) else { break }
+                guard let record = try await store.nextPendingFile(sourceIDs: sources, afterOrder: cursor) else { break }
                 // Advance before any await so one round cannot revisit a future-retry or
                 // temporarily blocked row. The next nil-cursor drain handles recovered rows.
-                cursor = record.id
+                cursor = record.createdOrder
                 let context = SubmissionContext(roundID: roundID, runID: runID(for: record.file.sourceID, roundID: roundID))
                 guard canSubmit(sourceID: record.file.sourceID) else { continue }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
@@ -671,7 +692,16 @@ public actor SyncEngine {
                 do {
                     let stamp = try await directory(record.file.sourceID).stamp(of: record.file.url)
                     guard stamp == record.file.stamp else {
-                        let changed = try await store.recordSourceChange(fileID: record.id, stamp: stamp)
+                        let changed: Bool
+                        do { changed = try await store.recordSourceChange(fileID: record.id, stamp: stamp) }
+                        catch let error as SyncStoreError {
+                            switch error {
+                            case .notFound, .invalidTransition:
+                                guard try await pendingRecordWasSuperseded(record) else { throw error }
+                                continue drainLoop
+                            default: throw error
+                            }
+                        }
                         if changed {
                             resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
                         }
@@ -695,10 +725,9 @@ public actor SyncEngine {
                             try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)
                         } catch let error as SyncStoreError {
                             guard case .invalidTransition = error else { throw error }
-                            let current = try await store.file(sourceID: record.file.sourceID, relativePath: record.file.relativePath)
-                            guard let current, current.id == record.id,
-                                  current.state == .skipped || current.state == .imported else { throw error }
-                            resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                            guard try await pendingRecordWasSuperseded(record) else { throw error }
+                            // A completed or deleted row needs no further submission from this
+                            // stale drain cursor. Deletion already clears its in-memory issue.
                             continue
                         }
                         guard pendingStampFailureID == record.id else { continue }
@@ -729,12 +758,20 @@ public actor SyncEngine {
                 var staleAttempts = 0
                 while true {
                     if case .skip = decision {
-                        switch try await store.markSkippedWithSnapshotValidity(
-                            fileID: record.id,
-                            reason: .suspectedDuplicate,
-                            candidates: evidence,
-                            validity: photoSnapshot.candidateValidity
-                        ) {
+                        let skipResult: SnapshotCommitResult
+                        do {
+                            skipResult = try await store.markSkippedWithSnapshotValidity(
+                                fileID: record.id,
+                                reason: .suspectedDuplicate,
+                                candidates: evidence,
+                                validity: photoSnapshot.candidateValidity
+                            )
+                        } catch let error as SyncStoreError {
+                            guard case .invalidTransition = error,
+                                  try await pendingRecordWasSuperseded(record) else { throw error }
+                            continue drainLoop
+                        }
+                        switch skipResult {
                         case .committed:
                             resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
                             continue drainLoop
@@ -770,8 +807,7 @@ public actor SyncEngine {
                     try await store.beginAttempt(fileID: record.id, attemptID: attempt)
                 } catch let error as SyncStoreError {
                     guard case .invalidTransition = error else { throw error }
-                    let current = try await store.file(sourceID: record.file.sourceID, relativePath: record.file.relativePath)
-                    guard let current, current.state != .pending else { throw error }
+                    guard try await pendingRecordWasSuperseded(record) else { throw error }
                     activeAttempt = nil
                     continue
                 }
@@ -834,6 +870,15 @@ public actor SyncEngine {
         await refreshSummary()
     }
 
+    private func pendingRecordWasSuperseded(_ record: StoredFile) async throws -> Bool {
+        let current = try await store.file(sourceID: record.file.sourceID,
+                                           relativePath: record.file.relativePath)
+        // An importing row may own an unknown Photos result and must remain blocking.
+        // Only deletion, replacement, or an already terminal row supersedes this cursor.
+        return current == nil || current?.id != record.id ||
+            current?.state == .skipped || current?.state == .imported
+    }
+
     private func canSubmit(sourceID: UUID) -> Bool {
         !status.isPaused && !storageFailed && status.blockingError == nil && uncertainSubmissions.isEmpty && !disabledSources.contains(sourceID)
     }
@@ -860,7 +905,8 @@ public actor SyncEngine {
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
     }
 
-    private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
+    private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil,
+                                    attemptID: UUID? = nil, announceRecovery: Bool = true) {
         if let fileID, key == issueKey(for: fileID), pendingStampFailureID == fileID {
             pendingStampFailureID = nil
         }
@@ -882,7 +928,8 @@ public actor SyncEngine {
         if key.hasPrefix("file:"), let fileID {
             lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|submission-stamp|\(fileID.uuidString)")
         }
-        syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: nil)
+        syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID,
+                              error: nil, announceRecovery: announceRecovery)
     }
 
     /// A clean scan means the source answered for every entry it enumerated, so no scan-stage
@@ -903,7 +950,8 @@ public actor SyncEngine {
         return issues.keys.sorted().first.flatMap { issues[$0] }
     }
 
-    private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
+    private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil,
+                                       attemptID: UUID? = nil, error: Error?, announceRecovery: Bool = true) {
         guard !removedSources.contains(sourceID) else { return }
         let issues = sourceIssues[sourceID] ?? [:]
         if let issue = primaryIssue(issues) {
@@ -919,7 +967,12 @@ public actor SyncEngine {
             status.waitingSources.removeValue(forKey: sourceID)
             status.sourceFileIssueCounts.removeValue(forKey: sourceID)
             clearFailureLogSignatures(sourceID)
-            logSourceRecovered(sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
+            if announceRecovery {
+                logSourceRecovered(sourceID, runID: runID, fileID: fileID, attemptID: attemptID)
+            } else {
+                // Normal deletion closes a stale retry, not a recovered source failure.
+                reportedWaitingSources.remove(sourceID)
+            }
         }
     }
 

@@ -4,6 +4,235 @@ import SQLite3
 @testable import PhotoSyncCore
 
 final class EngineTests: XCTestCase {
+    func testCompleteTraversalTreatsDeletedPendingFileAsNormalSourceChange() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let directory = f.directories[0]
+        let sourceID = f.sourceIDs[0]
+        let gone = directory.appendingPathComponent("gone.jpg")
+        try FileManager.default.copyItem(at: directory.appendingPathComponent("same.jpg"), to: gone)
+        let stored = SourceFile(sourceID: sourceID, relativePath: "gone.jpg", url: gone,
+                                stamp: try await DirectoryReader(sourceID: sourceID).stamp(of: gone),
+                                metadata: try await MetadataReader(sourceID: sourceID).read(url: gone, filename: "gone.jpg"))
+        let deletedID = try await f.store.save(stored, decision: .importNew)
+        try await f.store.recordRetry(fileID: deletedID, attemptID: nil, nextRetry: Date(timeIntervalSince1970: 0),
+                                      error: "missing before submission", definitelyNotCommitted: true)
+        try FileManager.default.removeItem(at: gone)
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let removed = try await f.store.file(sourceID: sourceID, relativePath: "gone.jpg")
+        let due = try await f.store.dueRetrySourceIDs(at: Date())
+        let summary = try await f.store.activeSourceSummary()
+        let scan = await f.engine.snapshot().latestScan
+        XCTAssertNil(removed)
+        XCTAssertEqual(due, [])
+        XCTAssertEqual(summary.retryPending, 0)
+        XCTAssertEqual(scan.failed, 0)
+        XCTAssertEqual(scan.failedFiles, 0)
+        XCTAssertEqual(scan.state, .completed)
+        let initialCreates = await f.photos.createCount
+        XCTAssertEqual(initialCreates, 1)
+
+        try FileManager.default.copyItem(at: directory.appendingPathComponent("same.jpg"), to: gone)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let rediscovered = try await f.store.file(sourceID: sourceID, relativePath: "gone.jpg")
+        XCTAssertEqual(rediscovered?.state, .imported)
+        let finalCreates = await f.photos.createCount
+        XCTAssertEqual(finalCreates, 2)
+    }
+
+    func testBadMediaDoesNotBlockNormalDeletionReconciliation() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let directory = f.directories[0]
+        let gone = directory.appendingPathComponent("gone.jpg")
+        try FileManager.default.copyItem(at: directory.appendingPathComponent("same.jpg"), to: gone)
+        let stored = SourceFile(sourceID: sourceID, relativePath: "gone.jpg", url: gone,
+                                stamp: try await DirectoryReader(sourceID: sourceID).stamp(of: gone),
+                                metadata: try await MetadataReader(sourceID: sourceID).read(url: gone, filename: "gone.jpg"))
+        _ = try await f.store.save(stored, decision: .importNew)
+        try FileManager.default.removeItem(at: gone)
+        try Data("bad JPEG".utf8).write(to: directory.appendingPathComponent("bad.jpg"))
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let removed = try await f.store.file(sourceID: sourceID, relativePath: "gone.jpg")
+        let snapshot = await f.engine.snapshot()
+        XCTAssertNil(removed)
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 1)
+        XCTAssertEqual(snapshot.latestScan.failed, 1)
+        let creates = await f.photos.createCount
+        XCTAssertEqual(creates, 1)
+    }
+
+    func testDeletedPendingFileClearsItsScanIssueWhileAnotherFileStillFails() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let file = try await engineSourceFile(sourceID: sourceID, directory: f.directories[0])
+        _ = try await f.store.save(file, decision: .importNew)
+        try Data("bad JPEG".utf8).write(to: f.directories[0].appendingPathComponent("bad.jpg"))
+        let reader = FailingScanStampReader(reader: DirectoryReader(sourceID: sourceID))
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: [sourceID])
+        let before = await engine.snapshot()
+        XCTAssertEqual(before.sourceFileIssueCounts[sourceID], 2)
+        try FileManager.default.removeItem(at: file.url)
+
+        await engine.scan(sourceIDs: [sourceID])
+
+        let snapshot = await engine.snapshot()
+        let deleted = try await f.store.file(sourceID: sourceID, relativePath: "same.jpg")
+        XCTAssertNil(deleted)
+        XCTAssertEqual(snapshot.sourceFileIssueCounts[sourceID], 1)
+        XCTAssertTrue(snapshot.waitingSources[sourceID]?.detail.contains("bad.jpg") == true)
+    }
+
+    func testDeletionDuringHeldDrainDoesNotStopStorageOrHealthySource() async throws {
+        let f = try await makeEngineFixture(sourceCount: 2)
+        let missingSource = f.sourceIDs[0]
+        let missing = try await engineSourceFile(sourceID: missingSource, directory: f.directories[0])
+        _ = try await f.store.save(missing, decision: .importNew)
+        try FileManager.default.removeItem(at: missing.url)
+        let scanGate = EngineTestGate()
+        let stampGate = EngineTestGate()
+        let heldReader = GatedMissingFileReader(reader: DirectoryReader(sourceID: missingSource),
+                                                scanGate: scanGate, stampGate: stampGate)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { id -> any DirectoryReading in
+            if id == missingSource { return heldReader }
+            return DirectoryReader(sourceID: id)
+        })
+
+        let round = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let scanHeld = await engineEventually { await scanGate.entered }
+        let drainHeld = await engineEventually { await stampGate.entered }
+        XCTAssertTrue(scanHeld)
+        XCTAssertTrue(drainHeld)
+        await scanGate.release()
+        let removed = try await engineEventually {
+            try await f.store.file(sourceID: missingSource, relativePath: "same.jpg") == nil
+        }
+        XCTAssertTrue(removed)
+        await stampGate.release()
+        await round.value
+
+        let snapshot = await engine.snapshot()
+        let healthy = try await f.store.file(sourceID: f.sourceIDs[1], relativePath: "same.jpg")
+        XCTAssertNil(snapshot.blockingError)
+        XCTAssertEqual(healthy?.state, .imported)
+    }
+
+    func testUnknownChildDirectoryTypeDoesNotConfirmDescendantDeletion() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let child = f.directories[0].appendingPathComponent("unreadable-child")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        let nested = child.appendingPathComponent("nested.jpg")
+        try FileManager.default.copyItem(at: f.directories[0].appendingPathComponent("same.jpg"), to: nested)
+        let stored = SourceFile(sourceID: sourceID, relativePath: "unreadable-child/nested.jpg", url: nested,
+                                stamp: try await DirectoryReader(sourceID: sourceID).stamp(of: nested),
+                                metadata: try await MetadataReader(sourceID: sourceID).read(url: nested, filename: "nested.jpg"))
+        let fileID = try await f.store.save(stored, decision: .importNew)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { id in
+            DirectoryReader(sourceID: id, attributes: { url, keys in
+                if url.lastPathComponent == "unreadable-child" {
+                    throw FixtureError.unavailable("child attributes unavailable")
+                }
+                return try url.resourceValues(forKeys: keys)
+            })
+        })
+
+        await engine.scan(sourceIDs: [sourceID])
+
+        let retained = try await f.store.file(sourceID: sourceID, relativePath: "unreadable-child/nested.jpg")
+        XCTAssertEqual(retained?.id, fileID)
+        let issue = await engine.snapshot().waitingSources[sourceID]
+        XCTAssertNotNil(issue)
+    }
+
+    func testNormalSourceDeletionClearsRetryWithoutRecoveryNotification() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let reader = SubmissionStampReader(sourceID: sourceID, failSubmissionStamp: true)
+        let notifications = SourceIssueNotificationRecorder()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader },
+                                notifySourceIssue: { _, recovered, issue in
+                                    notifications.record(recovered: recovered, issue: issue)
+                                })
+
+        await engine.scan(sourceIDs: [sourceID])
+        XCTAssertEqual(notifications.events.filter { !$0.recovered }.count, 1)
+        try FileManager.default.removeItem(at: f.directories[0].appendingPathComponent("same.jpg"))
+        await engine.scan(sourceIDs: [sourceID])
+
+        let record = try await f.store.file(sourceID: sourceID, relativePath: "same.jpg")
+        XCTAssertNil(record)
+        XCTAssertEqual(notifications.events.filter { $0.recovered }.count, 0)
+    }
+
+    func testDeletionReconciliationDoesNotDiscardConcurrentImportingEvidence() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let file = try await engineSourceFile(sourceID: sourceID, directory: f.directories[0])
+        let fileID = try await f.store.save(file, decision: .importNew)
+        try FileManager.default.removeItem(at: file.url)
+        let gate = EngineTestGate()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { id in
+            GatedDirectoryReader(reader: DirectoryReader(sourceID: id), gate: gate)
+        })
+
+        let scanning = Task { await engine.scan(sourceIDs: [sourceID]) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let attempt = UUID()
+        try await f.store.beginAttempt(fileID: fileID, attemptID: attempt)
+        await gate.release()
+        await scanning.value
+
+        let retained = try await f.store.file(sourceID: sourceID, relativePath: "same.jpg")
+        XCTAssertEqual(retained?.state, .importing)
+        try await f.store.markImported(fileID: fileID, attemptID: attempt, identifier: "late-success")
+        let success = try await f.store.successIdentifier(of: fileID)
+        XCTAssertEqual(success, "late-success")
+    }
+
+    func testUnreadableVideoKeepsFileFailureWhileHealthySiblingImports() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let video = f.directories[0].appendingPathComponent("unreadable.mpg")
+        try Data("not an MPEG program stream".utf8).write(to: video)
+        let logDirectory = try temporaryDirectory()
+        let logger = try RunLogger(directory: logDirectory)
+        let engine = SyncEngine(store: f.store, photos: f.photos, logger: logger)
+
+        await engine.scan(sourceIDs: f.sourceIDs)
+        logger.flushForTesting()
+
+        let failedVideo = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "unreadable.mpg")
+        let snapshot = await engine.snapshot()
+        let creates = await f.photos.createCount
+        XCTAssertNil(failedVideo)
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 1)
+        XCTAssertEqual(snapshot.sourceFileIssueCounts[f.sourceIDs[0]], 1)
+        XCTAssertEqual(snapshot.waitingSources[f.sourceIDs[0]]?.kind, .file)
+        XCTAssertEqual(creates, 1)
+        let journal = try XCTUnwrap(loggedEvent(at: logDirectory.appendingPathComponent("photo-sync.jsonl"), phase: "metadata", result: "failed"))
+        XCTAssertTrue(journal["error"]?.contains("AVFoundationErrorDomain") == true)
+    }
+
+    func testUnavailableDirectoryDoesNotDeletePendingFile() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0]
+        let stored = try await engineSourceFile(sourceID: sourceID, directory: f.directories[0])
+        let id = try await f.store.save(stored, decision: .importNew)
+        try FileManager.default.removeItem(at: f.directories[0])
+
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+
+        let surviving = try await f.store.file(sourceID: sourceID, relativePath: "same.jpg")
+        XCTAssertEqual(surviving?.id, id)
+        XCTAssertEqual(surviving?.state, .pending)
+        let issue = await f.engine.snapshot().waitingSources[sourceID]
+        XCTAssertEqual(issue?.kind, .sourceAvailability)
+    }
     func testUnknownImportDoesNotEmitRecoveredAfterSuccessfulTraversal() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         let logDirectory = try temporaryDirectory()
@@ -191,9 +420,9 @@ final class EngineTests: XCTestCase {
         try await f.store.beginAttempt(fileID: olderID, attemptID: UUID())
         await f.photos.setEvidence(.definitelyNotCommitted)
 
-        let cursorAdvance = try await f.store.nextPendingFile(sourceIDs: [sourceID], afterID: nil)
+        let cursorAdvance = try await f.store.nextPendingFile(sourceIDs: [sourceID], afterOrder: nil)
         XCTAssertEqual(cursorAdvance?.id, laterID)
-        let afterCursor = try await f.store.nextPendingFile(sourceIDs: [sourceID], afterID: laterID)
+        let afterCursor = try await f.store.nextPendingFile(sourceIDs: [sourceID], afterOrder: cursorAdvance?.createdOrder)
         XCTAssertNil(afterCursor)
 
         await f.engine.recoverImports()
@@ -1414,6 +1643,37 @@ private actor PreAdmissionFailurePhotosGateway: PhotosGateway {
         actualSubmissionCount += 1
         try onPlaceholder("submitted-1")
         return "submitted-1"
+    }
+}
+
+private struct FailingScanStampReader: DirectoryReading {
+    let reader: DirectoryReader
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        try await reader.entries(in: directory)
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        if file.lastPathComponent == "same.jpg" {
+            throw FixtureError.unavailable("scan stamp unavailable")
+        }
+        return try await reader.stamp(of: file)
+    }
+}
+
+private struct GatedMissingFileReader: DirectoryReading {
+    let reader: DirectoryReader
+    let scanGate: EngineTestGate
+    let stampGate: EngineTestGate
+
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        await scanGate.wait()
+        return try await reader.entries(in: directory)
+    }
+
+    func stamp(of file: URL) async throws -> FileStamp {
+        await stampGate.wait()
+        return try await reader.stamp(of: file)
     }
 }
 

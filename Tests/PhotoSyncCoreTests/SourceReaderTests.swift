@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 @testable import PhotoSyncCore
 
 final class SourceReaderTests: XCTestCase {
@@ -41,6 +42,33 @@ final class SourceReaderTests: XCTestCase {
         XCTAssertEqual(metadata.make, "Fixture Make")
         XCTAssertEqual(metadata.model, "Fixture Model")
         XCTAssertNotNil(metadata.captureSecond)
+    }
+
+    func testVideoMetadataErrorKeepsNestedSystemCodes() {
+        let underlying = NSError(domain: NSOSStatusErrorDomain, code: -12979)
+        let failure = NSError(domain: AVFoundationErrorDomain, code: -11800,
+                              userInfo: [NSUnderlyingErrorKey: underlying])
+
+        let wrapped = MetadataReader.videoMetadataError(failure)
+
+        XCTAssertTrue(wrapped.localizedDescription.contains("AVFoundationErrorDomain -11800"))
+        XCTAssertTrue(wrapped.localizedDescription.contains("NSOSStatusErrorDomain -12979"))
+        XCTAssertEqual((wrapped.userInfo[NSUnderlyingErrorKey] as? NSError)?.domain, AVFoundationErrorDomain)
+    }
+
+    func testUnreadableMPGRemainsAMediaReadFailure() async throws {
+        let directory = try temporaryDirectory()
+        let video = directory.appendingPathComponent("unreadable.mpg")
+        try Data("not an MPEG program stream".utf8).write(to: video)
+
+        do {
+            _ = try await MetadataReader(sourceID: UUID()).read(url: video, filename: "unreadable.mpg")
+            XCTFail("Unreadable video should not produce guessed metadata")
+        } catch {
+            let failure = error as NSError
+            XCTAssertEqual(failure.domain, "PhotoSync.VideoMetadata")
+            XCTAssertNotNil(failure.userInfo[NSUnderlyingErrorKey])
+        }
     }
 
     func testCorruptImageThrows() async throws {

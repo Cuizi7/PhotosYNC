@@ -3,6 +3,7 @@ import SQLite3
 
 public struct StoredFile: Sendable {
     public let id: UUID
+    public let createdOrder: Int64
     public let file: SourceFile
     public let state: FileState
     public let attemptID: UUID?
@@ -169,6 +170,10 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             try self.execute("BEGIN IMMEDIATE")
             do {
+                if case .skip = decision, !(try self.localCandidateEvidenceValid(candidates)) {
+                    try self.execute("ROLLBACK")
+                    return .staleSnapshot
+                }
                 let id = UUID()
                 let metadata = try self.encode(file.metadata)
                 try self.requireChange("""
@@ -195,6 +200,56 @@ public final class SyncStore: @unchecked Sendable {
 
     public func file(sourceID: UUID, relativePath: String) async throws -> StoredFile? {
         try await perform { try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.source_id = ? AND relative_path = ?", [.text(sourceID.uuidString), .text(relativePath)]) }
+    }
+
+    /// Pending records observed at the beginning of one source traversal. The caller removes
+    /// paths seen by the directory reader and reconciles only after a complete traversal.
+    public func pendingPaths(sourceID: UUID) async throws -> [String: UUID] {
+        try await perform {
+            let rows = try self.rows("SELECT relative_path, id FROM file_record WHERE source_id = ? AND state = 'pending'",
+                                     [.text(sourceID.uuidString)])
+            var paths: [String: UUID] = [:]
+            paths.reserveCapacity(rows.count)
+            for row in rows { paths[try self.text(row[0])] = try self.uuid(row[1]) }
+            return paths
+        }
+    }
+
+    /// Retire a source file confirmed absent by a complete directory traversal. A queued row
+    /// is safe to remove only when no Photos request was sent or a failure proved non-commit.
+    /// Duplicate skips that named this row as a candidate must be reconsidered by normal drain.
+    public func removeConfirmedAbsentPending(fileID: UUID) async throws -> Bool {
+        try await perform {
+            try self.transaction {
+                guard let row = try self.one("SELECT state, submitted_at, definitely_not_committed FROM file_record WHERE id = ?",
+                                             [.text(fileID.uuidString)]),
+                      try self.fileState(row[0]) == .pending else {
+                    return false
+                }
+                let definitelyNotCommitted = try self.int64(row[2]) == 1
+                guard self.optionalDouble(row[1]) == nil || definitelyNotCommitted else { return false }
+                let dependents = try self.rows("""
+                    SELECT file_record.id FROM match_evidence
+                    JOIN file_record ON file_record.id = match_evidence.file_id
+                    WHERE match_evidence.candidate_key = ? AND file_record.state = 'skipped'
+                      AND file_record.skip_reason = ?
+                    """, [.text("file:\(fileID.uuidString)"), .text(SkipReason.suspectedDuplicate.rawValue)])
+                for dependent in dependents {
+                    let id = try self.text(dependent[0])
+                    try self.requireChange("""
+                        UPDATE file_record SET state = 'pending', skip_reason = NULL,
+                            attempt_id = NULL, placeholder_id = NULL, submitted_at = NULL,
+                            definitely_not_committed = 0, retry_count = 0,
+                            next_retry_at = NULL, last_error = NULL
+                        WHERE id = ? AND state = 'skipped' AND skip_reason = ?
+                        """, [.text(id), .text(SkipReason.suspectedDuplicate.rawValue)])
+                    try self.execute("DELETE FROM match_evidence WHERE file_id = ?", [.text(id)])
+                }
+                try self.execute("DELETE FROM match_evidence WHERE file_id = ?", [.text(fileID.uuidString)])
+                try self.requireChange("DELETE FROM file_record WHERE id = ? AND state = 'pending'", [.text(fileID.uuidString)])
+                return true
+            }
+        }
     }
 
     public func state(of id: UUID) async throws -> FileState {
@@ -329,24 +384,15 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    /// Selects one active pending record after a stable created-order cursor.
-    /// The caller owns retry-deadline checks so future retries remain visible to the current
-    /// round without being silently filtered out of the queue.
-    public func nextPendingFile(sourceIDs: Set<UUID>, afterID: UUID?) async throws -> StoredFile? {
+    /// Selects one active pending record after a stable created-order cursor. The order value
+    /// remains valid even if the previous row was normally deleted during another source scan.
+    /// The caller owns retry-deadline checks so future retries remain visible to the round.
+    public func nextPendingFile(sourceIDs: Set<UUID>, afterOrder: Int64?) async throws -> StoredFile? {
         try await perform {
             guard !sourceIDs.isEmpty else { return nil }
-            let afterOrder: Int64
-            if let afterID {
-                guard let row = try self.one("SELECT created_order FROM file_record WHERE id = ?", [.text(afterID.uuidString)]) else {
-                    throw SyncStoreError.notFound(afterID)
-                }
-                afterOrder = try self.int64(row[0])
-            } else {
-                afterOrder = 0
-            }
             let orderedSources = sourceIDs.sorted { $0.uuidString < $1.uuidString }
             let placeholders = Array(repeating: "?", count: orderedSources.count).joined(separator: ", ")
-            var bindings: [Binding] = [.int64(afterOrder)]
+            var bindings: [Binding] = [.int64(afterOrder ?? 0)]
             bindings.append(contentsOf: orderedSources.map { .text($0.uuidString) })
             return try self.storedFile("""
                 SELECT \(Self.fileColumns)
@@ -393,6 +439,10 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             try self.execute("BEGIN IMMEDIATE")
             do {
+                guard try self.localCandidateEvidenceValid(candidates) else {
+                    try self.execute("ROLLBACK")
+                    return .staleSnapshot
+                }
                 try self.markSkippedSync(fileID: fileID, reason: reason, candidates: candidates)
                 guard try validity.commitIfCurrent({ try self.execute("COMMIT") }) else {
                     try self.execute("ROLLBACK")
@@ -480,6 +530,29 @@ public final class SyncStore: @unchecked Sendable {
         for candidate in candidates {
             try execute("INSERT INTO match_evidence (file_id, candidate_key, candidate_json, rule_version, compared_at) VALUES (?, ?, ?, ?, ?)", [.text(fileID.uuidString), .text(candidate.key), .text(try encode(candidate)), .int64(Int64(ruleVersion)), .double(Date().timeIntervalSince1970)])
         }
+    }
+
+    /// Photos validity covers the system library generation. Local candidate removal and
+    /// source-change transitions are independently serialized by this SQLite transaction.
+    private func localCandidateEvidenceValid(_ candidates: [MatchCandidate]) throws -> Bool {
+        for candidate in candidates where candidate.key.hasPrefix("file:") {
+            guard let id = UUID(uuidString: String(candidate.key.dropFirst("file:".count))),
+                  let row = try one("SELECT state, metadata_json, success_id, success_metadata_json FROM file_record WHERE id = ?",
+                                    [.text(id.uuidString)]) else { return false }
+            let state = try fileState(row[0])
+            let metadataJSON: String
+            switch state {
+            case .pending, .importing, .imported:
+                metadataJSON = try text(row[1])
+            case .skipped:
+                guard optionalText(row[2]) != nil else { return false }
+                metadataJSON = try text(row[3])
+            }
+            guard try decode(MediaMetadata.self, from: metadataJSON) == candidate.metadata else {
+                return false
+            }
+        }
+        return true
     }
 
     private func migrate() throws {
@@ -595,12 +668,12 @@ public final class SyncStore: @unchecked Sendable {
         return sqlite3_errcode(database) == SQLITE_CONSTRAINT ? .constraint(message) : .sqlite(message)
     }
 
-    private static let fileColumns = "file_record.id, file_record.source_id, relative_path, source.path, size, modified_ns, metadata_json, state, attempt_id, placeholder_id, success_id, retry_count, next_retry_at"
+    private static let fileColumns = "file_record.id, file_record.source_id, relative_path, source.path, size, modified_ns, metadata_json, state, attempt_id, placeholder_id, success_id, retry_count, next_retry_at, created_order"
     private func storedFile(_ sql: String, _ bindings: [Binding]) throws -> StoredFile? { try one(sql, bindings).map(decodeStoredFile) }
     private func decodeStoredFile(_ row: [Value]) throws -> StoredFile {
         decodeObserver()
         let metadata = try decode(MediaMetadata.self, from: try text(row[6]))
-        return StoredFile(id: try uuid(row[0]), file: SourceFile(sourceID: try uuid(row[1]), relativePath: try text(row[2]), url: URL(fileURLWithPath: try text(row[3])).appendingPathComponent(try text(row[2])), stamp: FileStamp(size: try int64(row[4]), modifiedNanoseconds: try int64(row[5])), metadata: metadata), state: try fileState(row[7]), attemptID: optionalUUID(row[8]), placeholderID: optionalText(row[9]), successID: optionalText(row[10]), retryCount: Int(try int64(row[11])), nextRetryAt: optionalDouble(row[12]).map(Date.init(timeIntervalSince1970:)))
+        return StoredFile(id: try uuid(row[0]), createdOrder: try int64(row[13]), file: SourceFile(sourceID: try uuid(row[1]), relativePath: try text(row[2]), url: URL(fileURLWithPath: try text(row[3])).appendingPathComponent(try text(row[2])), stamp: FileStamp(size: try int64(row[4]), modifiedNanoseconds: try int64(row[5])), metadata: metadata), state: try fileState(row[7]), attemptID: optionalUUID(row[8]), placeholderID: optionalText(row[9]), successID: optionalText(row[10]), retryCount: Int(try int64(row[11])), nextRetryAt: optionalDouble(row[12]).map(Date.init(timeIntervalSince1970:)))
     }
     private func fileState(_ value: Value) throws -> FileState { guard let state = FileState(rawValue: try text(value)) else { throw SyncStoreError.sqlite("Invalid file state.") }; return state }
     private func encode<T: Encodable>(_ value: T) throws -> String { String(decoding: try encoder.encode(value), as: UTF8.self) }

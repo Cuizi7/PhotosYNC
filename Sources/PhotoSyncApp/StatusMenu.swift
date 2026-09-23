@@ -52,6 +52,8 @@ struct StatusMenu: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(source.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
                         Text(issue.summary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        // TODO: Add a separate bounded file-issue inspection surface. Do not
+                        // expand this menu into one row per failed file; large sources can have many.
                         // Unreadable files keep no record, so this count is the only standing trace
                         // of them beyond the journal; it disappears with the next clean scan.
                         if model.fileIssueCount(for: source.id) > 0 {
