@@ -1,0 +1,209 @@
+{
+  "retrieved_utc": "2026-09-29",
+  "records": [
+    {
+      "source_id": "cc-01-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Fragaria_vesca_close-up_1.jpg",
+      "revision_id": 1259394370,
+      "revision_timestamp": "2026-08-10T17:37:56Z",
+      "license_classification": "Public domain (PD-self)",
+      "license_template_evidence": [
+        "{{PD-self}}"
+      ]
+    },
+    {
+      "source_id": "cc-01-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Fragaria_vesca_close-up_2.jpg",
+      "revision_id": 1259394374,
+      "revision_timestamp": "2026-08-10T17:37:57Z",
+      "license_classification": "Public domain (PD-self)",
+      "license_template_evidence": [
+        "{{PD-self}}"
+      ]
+    },
+    {
+      "source_id": "cc-02-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Fragaria_vesca_close-up_3.jpg",
+      "revision_id": 1259394377,
+      "revision_timestamp": "2026-08-10T17:37:57Z",
+      "license_classification": "Public domain (PD-self)",
+      "license_template_evidence": [
+        "{{PD-self}}"
+      ]
+    },
+    {
+      "source_id": "cc-02-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Fragaria_vesca_close-up_4.jpg",
+      "revision_id": 1028283722,
+      "revision_timestamp": "2025-05-05T09:06:49Z",
+      "license_classification": "Public domain (PD-self)",
+      "license_template_evidence": [
+        "{{PD-self}}"
+      ]
+    },
+    {
+      "source_id": "cc-03-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_mother_cat_of_Meitei_domestic_cat_breed_(Meitei_house_cat_variety)_suckling_her_only_little_newborn_baby_kitten_01.jpg",
+      "revision_id": 1235171670,
+      "revision_timestamp": "2026-06-21T01:08:16Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-03-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_mother_cat_of_Meitei_domestic_cat_breed_(Meitei_house_cat_variety)_suckling_her_only_little_newborn_baby_kitten_02.jpg",
+      "revision_id": 1235171609,
+      "revision_timestamp": "2026-06-21T01:08:09Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-04-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_mother_cat_of_Meitei_domestic_cat_breed_(Meitei_house_cat_variety)_suckling_her_only_little_newborn_baby_kitten_03.jpg",
+      "revision_id": 1235171623,
+      "revision_timestamp": "2026-06-21T01:08:11Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-04-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_mother_cat_of_Meitei_domestic_cat_breed_(Meitei_house_cat_variety)_suckling_her_only_little_newborn_baby_kitten_04.jpg",
+      "revision_id": 1235171633,
+      "revision_timestamp": "2026-06-21T01:08:12Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-05-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_least_tern_at_the_Nantucket_National_Wildlife_Refuge,_MA._Credit-_Amanda_Boyd-USFWS_(5974496795).jpg",
+      "revision_id": 1003274225,
+      "revision_timestamp": "2025-02-27T16:42:31Z",
+      "license_classification": "Public domain (PD-USGov-FWS; imported Flickr metadata also records CC BY 2.0)",
+      "license_template_evidence": [
+        "{{User:FlickreviewR/reviewed-pass|U. S. Fish and Wildlife Service - Northeast Region|https://flickr.com/photos/43322816@N08/5974496795|2016-09-28 20:31:39|cc-by-2.0|}}",
+        "{{PD-USGov-FWS}}"
+      ]
+    },
+    {
+      "source_id": "cc-05-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_least_tern_at_the_Nantucket_National_Wildlife_Refuge,_MA._Credit-_Amanda_Boyd-USFWS_(5974497191).jpg",
+      "revision_id": 969873173,
+      "revision_timestamp": "2024-12-13T21:08:06Z",
+      "license_classification": "Public domain (PD-USGov-FWS; imported Flickr metadata also records CC BY 2.0)",
+      "license_template_evidence": [
+        "{{User:FlickreviewR/reviewed-pass|U. S. Fish and Wildlife Service - Northeast Region|https://flickr.com/photos/43322816@N08/5974497191|2016-09-28 20:14:05|cc-by-2.0|}}",
+        "{{PD-USGov-FWS}}"
+      ]
+    },
+    {
+      "source_id": "cc-06-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_common_tern_at_the_Nantucket_National_Wildlife_Refuge,_MA._Credit-_Amanda_Boyd-USFWS_(5974497409).jpg",
+      "revision_id": 996421974,
+      "revision_timestamp": "2025-02-09T23:26:16Z",
+      "license_classification": "Public domain (PD-USGov-FWS; imported Flickr metadata also records CC BY 2.0)",
+      "license_template_evidence": [
+        "{{User:FlickreviewR/reviewed-pass|U. S. Fish and Wildlife Service - Northeast Region|https://flickr.com/photos/43322816@N08/5974497409|2016-09-28 20:12:02|cc-by-2.0|}}",
+        "{{PD-USGov-FWS}}"
+      ]
+    },
+    {
+      "source_id": "cc-06-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:A_roseate_tern_at_the_Nantucket_National_Wildlife_Refuge,_MA._Credit-_Amanda_Boyd-USFWS_(5975057838).jpg",
+      "revision_id": 1003637893,
+      "revision_timestamp": "2025-02-28T12:36:40Z",
+      "license_classification": "Public domain (PD-USGov-FWS; imported Flickr metadata also records CC BY 2.0)",
+      "license_template_evidence": [
+        "{{User:FlickreviewR/reviewed-pass|U. S. Fish and Wildlife Service - Northeast Region|https://flickr.com/photos/43322816@N08/5975057838|2016-09-28 20:14:57|cc-by-2.0|}}",
+        "{{PD-USGov-FWS}}"
+      ]
+    },
+    {
+      "source_id": "cc-07-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:2866Close-up_photographs_of_wild_flowers_in_the_Philippines_02.jpg",
+      "revision_id": 972255541,
+      "revision_timestamp": "2024-12-19T02:32:11Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-07-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:2866Close-up_photographs_of_wild_flowers_in_the_Philippines_03.jpg",
+      "revision_id": 972255548,
+      "revision_timestamp": "2024-12-19T02:32:12Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-08-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:2866Close-up_photographs_of_wild_flowers_in_the_Philippines_05.jpg",
+      "revision_id": 972255562,
+      "revision_timestamp": "2024-12-19T02:32:14Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-08-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:2866Close-up_photographs_of_wild_flowers_in_the_Philippines_14.jpg",
+      "revision_id": 972255626,
+      "revision_timestamp": "2024-12-19T02:32:23Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-09-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Campbells_Bay_2014-01-18_14-39-06_NZ_Auckland.jpg",
+      "revision_id": 1069884421,
+      "revision_timestamp": "2025-08-11T01:40:05Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{cc-zero}}{{FlickreviewR|status=passed|author=Juhele_CZ|sourceurl=https://flickr.com/photos/96541566@N06/51808583121|archive=|reviewdate=2023-07-13 01:26:34|reviewlicense=cc-zero|reviewer=FlickreviewR 2}}"
+      ]
+    },
+    {
+      "source_id": "cc-09-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Campbells_Bay_cliffs_2014-01-18_14-53-24_NZ_Auckland.jpg",
+      "revision_id": 1069884452,
+      "revision_timestamp": "2025-08-11T01:40:09Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{cc-zero}}{{FlickreviewR|status=passed|author=Juhele_CZ|sourceurl=https://flickr.com/photos/96541566@N06/51807627367|archive=|reviewdate=2023-07-13 01:26:36|reviewlicense=cc-zero|reviewer=FlickreviewR 2}}"
+      ]
+    },
+    {
+      "source_id": "cc-10-1",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Furlong_Gulch.jpg",
+      "revision_id": 1155818068,
+      "revision_timestamp": "2026-01-29T10:56:21Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    },
+    {
+      "source_id": "cc-10-2",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Kortum_Trail_viewed_from_Peaked_Hill.jpg",
+      "revision_id": 954463713,
+      "revision_timestamp": "2024-11-09T01:39:36Z",
+      "license_classification": "CC0",
+      "license_template_evidence": [
+        "{{self|cc-zero}}"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PhotosYNC 照片判重审阅</title>
+  <style>
+    :root { color-scheme: light; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f6f8; color: #202b35; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #7bb8eb; outline-offset: 2px; }
+    .wrap { max-width: 1420px; margin: 0 auto; padding: 22px 22px 60px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; margin-bottom: 16px; }
+    h1 { font-size: 25px; line-height: 1.25; margin: 0 0 6px; }
+    h2 { font-size: 19px; margin: 0; }
+    p { margin: 0; }
+    .muted { color: #5d6b76; }
+    .dataset { font-size: 13px; margin-top: 5px; overflow-wrap: anywhere; }
+    .notice { background: #fff7df; color: #61470a; border: 1px solid #e8cc7b; border-radius: 9px; padding: 10px 13px; margin: 13px 0; }
+    .notice strong { color: #513900; }
+    .toolbar, .summary, .case { background: #fff; border: 1px solid #d9e0e5; border-radius: 12px; box-shadow: 0 2px 8px #172e4408; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px 14px; padding: 13px; margin-bottom: 13px; }
+    .toolbar label, .field { display: flex; flex-direction: column; gap: 4px; font-weight: 600; font-size: 13px; }
+    .toolbar input, .toolbar select, .field select, .field textarea { border: 1px solid #aab9c6; border-radius: 7px; padding: 7px 9px; background: #fff; color: inherit; }
+    .toolbar input { width: min(360px, 70vw); }
+    .summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 11px 14px; margin-bottom: 13px; }
+    .summary strong { font-variant-numeric: tabular-nums; }
+    .summary .spacer { flex: 1; }
+    .primary { border: 1px solid #165f9a; background: #1669ac; color: #fff; border-radius: 7px; padding: 8px 13px; font-weight: 650; }
+    .secondary { border: 1px solid #a8b7c4; background: #f7fafc; color: #223748; border-radius: 7px; padding: 7px 11px; }
+    .danger { border-color: #bc7e72; color: #8d3629; background: #fff8f6; }
+    .primary:disabled { background: #aebac4; border-color: #aebac4; cursor: not-allowed; }
+    .case { margin: 0 0 17px; padding: 17px; }
+    .case.folded .expected { margin-bottom: 0; }
+    .case-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px 14px; margin-bottom: 11px; }
+    .case-head .title { flex: 1; min-width: 230px; }
+    .case-id { font-size: 12px; color: #566c7d; font-weight: 650; overflow-wrap: anywhere; }
+    .badge { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .positive { background: #e6f3ec; color: #246547; }
+    .negative { background: #e8f1fa; color: #255d8b; }
+    .boundary { background: #f6eddf; color: #825824; }
+    .pending { background: #edf0f2; color: #4c5d69; }
+    .approved { background: #ddf3e6; color: #1d7146; }
+    .rejected { background: #fae6e3; color: #9b382d; }
+    .expected { border: 1px solid #c9d9e7; border-radius: 9px; padding: 11px 14px; margin-bottom: 13px; }
+    .expected strong { display: block; font-size: 20px; }
+    .expected .expected-detail { margin-top: 3px; font-size: 14px; }
+    .expected.duplicate { background: #eaf5ee; color: #1b5c3b; }
+    .expected.not-duplicate { background: #edf4fc; color: #244f79; }
+    .reason { margin: 0 0 13px; color: #334956; white-space: pre-wrap; }
+    .comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+    .photo-pane { min-width: 0; border: 1px solid #dce3e8; border-radius: 9px; overflow: hidden; background: #f9fbfc; }
+    .pane-top { padding: 7px 10px; font-weight: 700; background: #eff4f7; border-bottom: 1px solid #dce3e8; }
+    .image-button { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 250px; max-height: 355px; border: 0; padding: 8px; background: #202934; color: white; }
+    .image-button img { display: block; max-width: 100%; max-height: 338px; object-fit: contain; }
+    .image-button .missing { padding: 30px; }
+    .image-button:hover { background: #111b26; }
+    .meta { padding: 8px 10px 10px; font-size: 12px; color: #485f70; overflow-wrap: anywhere; }
+    .meta div + div { margin-top: 3px; }
+    .source-url { word-break: break-all; }
+    .candidate-strip { display: flex; gap: 7px; overflow-x: auto; padding: 8px 0 2px; }
+    .candidate-choice { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; max-width: 230px; border: 1px solid #b6c5d1; background: #fff; border-radius: 7px; padding: 5px 7px; font-size: 12px; }
+    .candidate-choice[aria-pressed="true"] { border-color: #176bae; background: #eaf4fc; box-shadow: inset 0 0 0 1px #176bae; }
+    .candidate-choice img { width: 35px; height: 35px; object-fit: cover; border-radius: 3px; }
+    .candidate-choice span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .review { border-top: 1px solid #e2e8ec; margin-top: 13px; padding-top: 12px; }
+    .review-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 250px)) 1fr; gap: 10px 14px; align-items: end; }
+    .field textarea { min-height: 58px; width: 100%; resize: vertical; }
+    .notes { grid-column: 1 / -1; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; grid-column: 1 / -1; }
+    .hint { font-size: 12px; color: #6c5c2c; }
+    .pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 15px; }
+    .empty { text-align: center; padding: 48px 20px; color: #61717d; }
+    dialog { border: 0; border-radius: 10px; max-width: 99vw; max-height: 99vh; padding: 9px; background: #17212b; color: #fff; box-shadow: 0 15px 60px #0009; }
+    dialog::backdrop { background: #0b1529d9; }
+    .lightbox-top { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 0 3px 7px; }
+    .lightbox-top button { color: #fff; background: transparent; border: 1px solid #a6b1bd; border-radius: 6px; padding: 2px 9px; }
+    dialog img { display: block; max-width: calc(99vw - 20px); max-height: calc(99vh - 65px); object-fit: contain; }
+    @media (max-width: 760px) {
+      .wrap { padding: 14px 11px 45px; }
+      header { display: block; }
+      .comparison { grid-template-columns: 1fr; }
+      .image-button { min-height: 190px; }
+      .review-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 450px) { .review-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <div>
+        <h1>PhotosYNC 照片判重审阅</h1>
+        <p class="muted">逐例查看预期判重结果、对比图片，并确认导入动作。</p>
+        <p id="dataset" class="dataset muted"></p>
+      </div>
+    </header>
+    <p class="notice"><strong>审阅提醒：</strong>预期结果是待确认的用例标签，不是模型实测结果；未审阅的建议不能当作真值。你只需确认图片内容、照片关系和导入动作；来源许可由独立 reviewer 复核。本页只在当前浏览器保存进度；请导出 JSON 留存并交回。</p>
+    <p id="storage-warning" class="notice" hidden></p>
+    <section class="toolbar" aria-label="筛选案例">
+      <label>类别
+        <select id="group-filter">
+          <option value="all">全部类别</option><option value="positive">同图副本</option><option value="negative">不同照片</option><option value="boundary">边界案例</option>
+        </select>
+      </label>
+      <label>审阅状态
+        <select id="status-filter">
+          <option value="all">全部状态</option><option value="pending">待审阅</option><option value="approved">已批准</option><option value="rejected">已拒绝</option>
+        </select>
+      </label>
+      <label>搜索 ID、标题、理由或图片 ID
+        <input id="search" type="search" placeholder="输入关键词" autocomplete="off">
+      </label>
+    </section>
+    <section class="summary" aria-label="审阅进度">
+      <span id="progress" aria-live="polite"></span>
+      <span id="visible-count" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="export" type="button" class="primary">导出审阅 JSON</button>
+    </section>
+    <div id="cases"></div>
+    <nav class="pager" aria-label="分页">
+      <button id="previous" type="button" class="secondary">上一页</button>
+      <span id="page-info"></span>
+      <button id="next" type="button" class="secondary">下一页</button>
+    </nav>
+  </main>
+  <dialog id="lightbox" aria-label="全尺寸照片">
+    <div class="lightbox-top"><span id="lightbox-title"></span><button id="lightbox-close" type="button">关闭 ×</button></div>
+    <img id="lightbox-image" alt="全尺寸照片">
+  </dialog>
+  <script>
+    "use strict";
+    // Generator must JSON-serialize the manifest and escape '<' as '\u003c' before replacing this token.
+    const manifest = __MANIFEST_JSON__;
+    const frozen = __FROZEN_JSON__;
+    const frozenMap = new Map((frozen?.cases || []).map(item => [item.id, item]));
+    const pageSize = 10;
+    const groupName = {positive: "同图副本", negative: "不同照片", boundary: "边界案例"};
+    const relationName = {same_photo: "同一张照片", different_photo: "不同照片", derived_photo: "衍生照片（裁剪／编辑等）"};
+    const actionName = {skip: "跳过导入", import: "导入"};
+    const statusName = {pending: "待审阅", approved: "已批准", rejected: "已拒绝"};
+    const imageMap = new Map((manifest.images || []).map(image => [image.id, image]));
+    const sourceMap = new Map((manifest.sources || []).map(source => [source.id, source]));
+    const storageKey = `photosync-dedup-review:${manifest.dataset_id}:${manifest.version}:${manifest.content_sha256}`;
+    let state = {};
+    let page = 0;
+    const expandedApproved = new Set();
+    let storageAvailable = true;
+
+    function byId(id) { return document.getElementById(id); }
+    function node(tag, className, content) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (content !== undefined) element.textContent = String(content);
+      return element;
+    }
+    function safeImagePath(file) {
+      if (typeof file !== "string" || !file || file.startsWith("/") || file.includes("\\") || /^[a-z][\w+.-]*:/i.test(file) || file.split("/").some(part => part === ".." || part === "")) return null;
+      return file;
+    }
+    function initialReview(item) {
+      const fixed = frozenMap.get(item.id);
+      if (fixed) return {...fixed.expected, review_status: "approved", notes: fixed.notes, reviewed_at: fixed.reviewed_at, updated_at: null};
+      const confirmed = item.review_status === "approved" && item.expected;
+      const label = confirmed ? item.expected : item.proposed;
+      return {relation: label?.relation || "different_photo", action: label?.action || "import", review_status: confirmed ? "approved" : "pending", notes: "", reviewed_at: confirmed ? item.approval.date : null, updated_at: null};
+    }
+    function reviewFor(item) {
+      if (!state[item.id]) state[item.id] = initialReview(item);
+      return state[item.id];
+    }
+    function save() {
+      if (!storageAvailable) return;
+      try { localStorage.setItem(storageKey, JSON.stringify({dataset_id: manifest.dataset_id, version: manifest.version, content_sha256: manifest.content_sha256, cases: state})); }
+      catch (error) { storageAvailable = false; showStorageWarning(); }
+    }
+    function showStorageWarning() {
+      const warning = byId("storage-warning");
+      warning.hidden = false;
+      warning.textContent = "当前浏览器无法保存本地进度。关闭页面前请导出审阅 JSON；重新打开可能无法恢复。";
+    }
+    function restore() {
+      // The accepted export is authoritative for this frozen snapshot. Leave all
+      // older browser keys intact; this snapshot is read-only.
+      if (frozen) return;
+      try {
+        let saved = JSON.parse(localStorage.getItem(storageKey) || "null");
+        let expectedVersion = manifest.version;
+        let expectedHash = manifest.content_sha256;
+        let carriedIds = null;
+        const migration = manifest.review_migration;
+        if (!saved && migration) {
+          for (const predecessor of [migration, ...(migration.fallbacks || [])]) {
+            const oldKey = `photosync-dedup-review:${predecessor.from_dataset_id}:${predecessor.from_version}:${predecessor.from_content_sha256}`;
+            const prior = JSON.parse(localStorage.getItem(oldKey) || "null");
+            if (prior?.dataset_id !== manifest.dataset_id || prior?.version !== predecessor.from_version || prior?.content_sha256 !== predecessor.from_content_sha256 || !prior.cases || typeof prior.cases !== "object") continue;
+            saved = prior;
+            expectedVersion = predecessor.from_version;
+            expectedHash = predecessor.from_content_sha256;
+            carriedIds = new Set(Object.keys(predecessor.unchanged_cases));
+            break;
+          }
+        }
+        if (saved?.dataset_id === manifest.dataset_id && saved?.version === expectedVersion && saved?.content_sha256 === expectedHash && saved.cases && typeof saved.cases === "object") {
+          for (const item of manifest.cases) {
+            if (carriedIds && !carriedIds.has(item.id)) continue;
+            const prior = saved.cases[item.id];
+            if (!prior || typeof prior !== "object") continue;
+            const base = initialReview(item);
+            state[item.id] = {
+              relation: relationName[prior.relation] ? prior.relation : base.relation,
+              action: actionName[prior.action] ? prior.action : base.action,
+              review_status: statusName[prior.review_status] ? prior.review_status : "pending",
+              notes: typeof prior.notes === "string" ? prior.notes.slice(0, 3000) : "",
+              reviewed_at: typeof prior.reviewed_at === "string" ? prior.reviewed_at : null,
+              updated_at: typeof prior.updated_at === "string" ? prior.updated_at : null
+            };
+          }
+          if (carriedIds) save();
+        }
+      } catch (error) { storageAvailable = false; showStorageWarning(); }
+    }
+    function touch(item, labelsChanged = false) {
+      const review = reviewFor(item);
+      review.updated_at = new Date().toISOString();
+      if (labelsChanged) {
+        review.review_status = "pending";
+        review.reviewed_at = null;
+      }
+      save();
+      updateProgress();
+    }
+    function updateProgress() {
+      let approved = 0, rejected = 0;
+      for (const item of manifest.cases) {
+        const status = reviewFor(item).review_status;
+        if (status === "approved") approved++;
+        if (status === "rejected") rejected++;
+      }
+      const pending = manifest.cases.length - approved - rejected;
+      byId("progress").textContent = `共 ${manifest.cases.length} 例 · 已批准 ${approved} · 已拒绝 ${rejected} · 待审阅 ${pending}`;
+    }
+    function filteredCases() {
+      const group = byId("group-filter").value;
+      const status = byId("status-filter").value;
+      const text = byId("search").value.trim().toLocaleLowerCase();
+      return manifest.cases.filter(item => {
+        if (group !== "all" && item.group !== group) return false;
+        if (status !== "all" && reviewFor(item).review_status !== status) return false;
+        if (!text) return true;
+        return [item.id, item.title, item.reason, item.query, ...(item.candidates || [])].join(" ").toLocaleLowerCase().includes(text);
+      });
+    }
+    function sourceDetails(image) {
+      const source = sourceMap.get(image?.source_id);
+      if (!source) return "来源：未注明";
+      return `来源：${source.title || source.id} · 作者：${source.author || "未注明"} · 许可：${source.license || "未注明"}`;
+    }
+    function appendImagePane(parent, label, imageId) {
+      const image = imageMap.get(imageId);
+      const pane = node("section", "photo-pane");
+      pane.append(node("div", "pane-top", label));
+      const button = node("button", "image-button");
+      button.type = "button";
+      const file = safeImagePath(image?.file);
+      if (file) {
+        const picture = node("img");
+        picture.src = file;
+        picture.alt = `${label} ${imageId}`;
+        picture.loading = "lazy";
+        button.append(picture);
+        button.setAttribute("aria-label", `查看 ${imageId} 全尺寸照片`);
+        button.addEventListener("click", () => openLightbox(imageId, file));
+      } else {
+        button.disabled = true;
+        button.append(node("span", "missing", "图片文件缺失或路径无效"));
+      }
+      pane.append(button);
+      const meta = node("div", "meta");
+      meta.append(node("div", "", `图片 ID：${imageId} · ${image?.width ?? "?"} × ${image?.height ?? "?"} px`));
+      meta.append(node("div", "", `文件：${image?.file ?? "?"}`));
+      const source = sourceMap.get(image?.source_id);
+      const provenance = node("details", "");
+      provenance.append(node("summary", "", "来源与许可（由 reviewer 负责）"));
+      provenance.append(node("div", "", sourceDetails(image)));
+      if (source?.source_url && /^https:\/\//.test(source.source_url)) {
+        const link = node("a", "source-url", "查看原始出处与许可");
+        link.href = source.source_url; link.target = "_blank"; link.rel = "noopener noreferrer";
+        provenance.append(link);
+      }
+      if (source?.license_evidence) provenance.append(node("div", "", source.license_evidence));
+      if (source?.license_revision_id) provenance.append(node("div", "", `Commons revision: ${source.license_revision_id}`));
+      meta.append(provenance);
+      if (image?.transform?.kind) meta.append(node("div", "", `处理：${image.transform.kind}`));
+      pane.append(meta);
+      parent.append(pane);
+      return pane;
+    }
+    function openLightbox(imageId, file) {
+      const dialog = byId("lightbox");
+      byId("lightbox-title").textContent = imageId;
+      const picture = byId("lightbox-image");
+      picture.src = file;
+      picture.alt = `全尺寸照片 ${imageId}`;
+      dialog.showModal();
+    }
+    function selectField(label, options, current, onChange) {
+      const wrapper = node("label", "field", label);
+      const select = node("select");
+      for (const [value, text] of Object.entries(options)) {
+        const option = node("option", "", text);
+        option.value = value;
+        select.append(option);
+      }
+      select.value = current;
+      select.addEventListener("change", () => onChange(select.value));
+      wrapper.append(select);
+      return wrapper;
+    }
+    function contentResult(review) {
+      if (review.relation === "same_photo") return "duplicate";
+      if (review.relation === "different_photo") return "not_duplicate";
+      // For edited derivatives, the reviewer chooses whether to keep a separate version.
+      return review.action === "skip" ? "duplicate" : "not_duplicate";
+    }
+    function renderCase(item) {
+      const review = reviewFor(item);
+      const card = node("article", "case");
+      card.id = `case-${item.id}`;
+      const head = node("div", "case-head");
+      const title = node("div", "title");
+      title.append(node("div", "case-id", item.id));
+      title.append(node("h2", "", item.title || item.id));
+      head.append(title);
+      head.append(node("span", `badge ${item.group}`, groupName[item.group] || item.group));
+      const statusBadge = node("span", `badge ${review.review_status}`, statusName[review.review_status]);
+      head.append(statusBadge);
+      card.append(head);
+      const body = node("div", "case-body");
+      body.id = `case-body-${item.id}`;
+      body.append(node("p", "reason", item.reason || "未提供理由"));
+      const expand = node("button", "secondary");
+      expand.type = "button";
+      expand.setAttribute("aria-controls", body.id);
+      head.append(expand);
+      function updateFold() {
+        const folded = review.review_status === "approved" && !expandedApproved.has(item.id);
+        body.hidden = folded;
+        expand.hidden = review.review_status !== "approved";
+        expand.textContent = folded ? (frozen ? "展开查看" : "展开修改") : "折叠";
+        expand.setAttribute("aria-expanded", String(!folded));
+        card.classList.toggle("folded", folded);
+      }
+      expand.addEventListener("click", () => {
+        if (expandedApproved.has(item.id)) expandedApproved.delete(item.id);
+        else expandedApproved.add(item.id);
+        updateFold();
+      });
+
+      const expected = node("div", "expected");
+      expected.setAttribute("aria-live", "polite");
+      function updateExpected() {
+        const duplicate = contentResult(review) === "duplicate";
+        expected.className = `expected ${duplicate ? "duplicate" : "not-duplicate"}`;
+        const confirmation = review.review_status === "approved" ? "已确认" : review.review_status === "rejected" ? "已拒绝" : "待确认";
+        expected.replaceChildren(
+          node("strong", "", `预期：${duplicate ? "判重" : "判不重"} · ${confirmation}`),
+          node("div", "expected-detail", `内容关系：${relationName[review.relation]}　｜　预期动作：${actionName[review.action]}`)
+        );
+        if (duplicate && review.action === "import") {
+          expected.append(node("div", "expected-detail", "同图仍可导入：例如保留分辨率更高的版本。请结合本例说明确认。"));
+        }
+      }
+      updateExpected();
+      card.append(expected);
+      const comparison = node("div", "comparison");
+      appendImagePane(comparison, "查询图", item.query);
+      let selectedCandidate = item.candidates?.[0];
+      let candidatePane = appendImagePane(comparison, "候选图", selectedCandidate || "无候选");
+      body.append(comparison);
+      if ((item.candidates || []).length > 1) {
+        body.append(node("p", "muted", `本例含 ${item.candidates.length} 张候选图；批准时请逐张查看。`));
+        const strip = node("div", "candidate-strip");
+        for (const candidateId of item.candidates) {
+          const choice = node("button", "candidate-choice");
+          choice.type = "button";
+          choice.setAttribute("aria-pressed", String(candidateId === selectedCandidate));
+          const image = imageMap.get(candidateId);
+          const file = safeImagePath(image?.file);
+          if (file) { const thumb = node("img"); thumb.src = file; thumb.alt = ""; thumb.loading = "lazy"; choice.append(thumb); }
+          choice.append(node("span", "", candidateId));
+          choice.addEventListener("click", () => {
+            selectedCandidate = candidateId;
+            const replacement = appendImagePane(node("div"), "候选图", candidateId);
+            candidatePane.replaceWith(replacement);
+            candidatePane = replacement;
+            strip.querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button === choice)));
+          });
+          strip.append(choice);
+        }
+        body.append(strip);
+      }
+
+      const reviewBlock = node("div", "review");
+      const grid = node("div", "review-grid");
+      grid.append(selectField("照片关系", relationName, review.relation, value => {
+        review.relation = value; touch(item, true); statusBadge.className = "badge pending"; statusBadge.textContent = statusName.pending; updateExpected(); updateFold();
+      }));
+      grid.append(selectField("导入动作", actionName, review.action, value => {
+        review.action = value; touch(item, true); statusBadge.className = "badge pending"; statusBadge.textContent = statusName.pending; updateExpected(); updateFold();
+      }));
+      const noteLabel = node("label", "field notes", "备注（可选）");
+      const textarea = node("textarea");
+      textarea.maxLength = 3000;
+      textarea.value = review.notes;
+      textarea.placeholder = "记录内容差异、难例或拒绝原因";
+      textarea.addEventListener("input", () => { review.notes = textarea.value; touch(item); });
+      noteLabel.append(textarea);
+      grid.append(noteLabel);
+      const actions = node("div", "actions");
+      const approve = node("button", "primary", "批准此例");
+      approve.type = "button";
+      const reject = node("button", "secondary danger", "拒绝此例");
+      reject.type = "button";
+      const reset = node("button", "secondary", "改为待审阅");
+      reset.type = "button";
+      const hint = node("span", "hint", "这里只批准内容标签；来源许可由 reviewer 负责。");
+      function setStatus(status) {
+        review.review_status = status;
+        if (status === "approved") expandedApproved.delete(item.id);
+        review.reviewed_at = status === "pending" ? null : new Date().toISOString();
+        touch(item);
+        statusBadge.className = `badge ${status}`;
+        statusBadge.textContent = statusName[status];
+        updateExpected();
+        updateFold();
+      }
+      approve.addEventListener("click", () => setStatus("approved"));
+      reject.addEventListener("click", () => setStatus("rejected"));
+      reset.addEventListener("click", () => setStatus("pending"));
+      actions.append(approve, reject, reset, hint);
+      grid.append(actions);
+      reviewBlock.append(grid);
+      if (frozen) body.append(node("p", "muted", "此用例的预期已固化；修改需建立新的测试集版本。"));
+      else body.append(reviewBlock);
+      card.append(body);
+      updateFold();
+      return card;
+    }
+    function render() {
+      const filtered = filteredCases();
+      const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+      page = Math.min(page, pages - 1);
+      const start = page * pageSize;
+      const shown = filtered.slice(start, start + pageSize);
+      const container = byId("cases");
+      container.replaceChildren(...(shown.length ? shown.map(renderCase) : [node("div", "empty", "没有符合条件的案例。")]));
+      byId("visible-count").textContent = `筛选结果 ${filtered.length} 例`;
+      byId("page-info").textContent = `${page + 1} / ${pages} 页`;
+      byId("previous").disabled = page === 0;
+      byId("next").disabled = page + 1 >= pages;
+      updateProgress();
+    }
+    function exportReviews() {
+      const exported = {
+        review_schema_version: 2,
+        review_scope: "content_only",
+        source_license_review: {responsibility: "agent_reviewer", report: "LICENSE_REVIEW.md"},
+        dataset_id: manifest.dataset_id,
+        version: manifest.version,
+        content_sha256: manifest.content_sha256,
+        exported_at: new Date().toISOString(),
+        reminder: "pending/rejected cases are not approved ground truth",
+        cases: manifest.cases.map(item => ({
+          id: item.id,
+          group: item.group,
+          query: item.query,
+          candidates: item.candidates,
+          content_result: contentResult(reviewFor(item)),
+          relation: reviewFor(item).relation,
+          action: reviewFor(item).action,
+          review_status: reviewFor(item).review_status,
+          reviewed_at: reviewFor(item).reviewed_at,
+          updated_at: reviewFor(item).updated_at,
+          notes: reviewFor(item).notes
+        }))
+      };
+      const blob = new Blob([JSON.stringify(exported, null, 2) + "\n"], {type: "application/json;charset=utf-8"});
+      const link = node("a");
+      const url = URL.createObjectURL(blob);
+      link.href = url;
+      link.download = `${String(manifest.dataset_id).replace(/[^a-z0-9_-]+/gi, "-")}-${String(manifest.version).replace(/[^a-z0-9_-]+/gi, "-")}-reviews.json`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }
+    byId("dataset").textContent = `数据集：${manifest.dataset_id} · 版本：${manifest.version}`;
+    if (frozen) document.querySelector('.notice').textContent = `测试集 ${frozen.fixture_version} 已固化，以下为已批准的预期结果。当前页面只读；这不是模型实测结果或发布许可证明。`;
+    restore();
+    for (const item of manifest.cases) reviewFor(item);
+    for (const id of ["group-filter", "status-filter", "search"]) byId(id).addEventListener(id === "search" ? "input" : "change", () => { page = 0; render(); });
+    byId("previous").addEventListener("click", () => { page--; render(); window.scrollTo({top: 0, behavior: "smooth"}); });
+    byId("next").addEventListener("click", () => { page++; render(); window.scrollTo({top: 0, behavior: "smooth"}); });
+    byId("export").addEventListener("click", exportReviews);
+    byId("lightbox-close").addEventListener("click", () => byId("lightbox").close());
+    byId("lightbox").addEventListener("close", () => { byId("lightbox-image").removeAttribute("src"); });
+    render();
+  </script>
+</body>
+</html>

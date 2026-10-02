@@ -1,0 +1,260 @@
+{
+  "sources": [
+    {
+      "id": "user-01-1",
+      "title": "用户提供：虚化与景深编辑 / 1",
+      "source_url": null,
+      "download_url": null,
+      "author": "User-provided; authorship not independently established",
+      "license": "User-provided; redistribution license unspecified",
+      "license_url": null,
+      "license_evidence": "User supplied this attachment on 2026-10-02 and requested inclusion in the duplicate test set. No standalone redistribution license was specified.",
+      "distribution_status": "local_testing_only",
+      "original_sha256": "e110cbe20bbef9c2d029d00597dfeac3f908ad81b29044ba86b1593011c0bd06",
+      "split_group": "user-pair-01"
+    },
+    {
+      "id": "user-01-2",
+      "title": "用户提供：虚化与景深编辑 / 2",
+      "source_url": null,
+      "download_url": null,
+      "author": "User-provided; authorship not independently established",
+      "license": "User-provided; redistribution license unspecified",
+      "license_url": null,
+      "license_evidence": "User supplied this attachment on 2026-10-02 and requested inclusion in the duplicate test set. No standalone redistribution license was specified.",
+      "distribution_status": "local_testing_only",
+      "original_sha256": "3154732431b89d5a356c4de3806950d9126b3a358b95585efd037bc9eabec486",
+      "split_group": "user-pair-01"
+    },
+    {
+      "id": "user-02-1",
+      "title": "用户提供：色调与明暗编辑 / 1",
+      "source_url": null,
+      "download_url": null,
+      "author": "User-provided; authorship not independently established",
+      "license": "User-provided; redistribution license unspecified",
+      "license_url": null,
+      "license_evidence": "User supplied this attachment on 2026-10-02 and requested inclusion in the duplicate test set. No standalone redistribution license was specified.",
+      "distribution_status": "local_testing_only",
+      "original_sha256": "722ad4fe26460a231c93f7e070eca9ac5cb629f8b66c94047622704b1ce2ed75",
+      "split_group": "user-pair-02"
+    },
+    {
+      "id": "user-02-2",
+      "title": "用户提供：色调与明暗编辑 / 2",
+      "source_url": null,
+      "download_url": null,
+      "author": "User-provided; authorship not independently established",
+      "license": "User-provided; redistribution license unspecified",
+      "license_url": null,
+      "license_evidence": "User supplied this attachment on 2026-10-02 and requested inclusion in the duplicate test set. No standalone redistribution license was specified.",
+      "distribution_status": "local_testing_only",
+      "original_sha256": "2314197cc0531302c9dfef3d7265b6e93d3fb7e1180f03bd693fcf4af552429b",
+      "split_group": "user-pair-02"
+    },
+    {
+      "id": "user-03-1",
+      "title": "用户提供：相近时刻的街景照片 / 1",
+      "source_url": null,
+      "download_url": null,
+      "author": "User-provided; authorship not independently established",
+      "license": "User-provided; redistribution license unspecified",
+      "license_url": null,
+      "license_evidence": "User supplied this attachment on 2026-10-02 and requested inclusion in the duplicate test set. No standalone redistribution license was specified.",
+      "distribution_status": "local_testing_only",
+      "original_sha256": "2bc5d3b9a5d220fffac622ffcec1ced7fd06a9799f2d9d9c21ddb25e48946f3e",
+      "split_group": "user-pair-03"
+    },
+    {
+      "id": "user-03-2",
+      "title": "用户提供：相近时刻的街景照片 / 2",
+      "source_url": null,
+      "download_url": null,
+      "author": "User-provided; authorship not independently established",
+      "license": "User-provided; redistribution license unspecified",
+      "license_url": null,
+      "license_evidence": "User supplied this attachment on 2026-10-02 and requested inclusion in the duplicate test set. No standalone redistribution license was specified.",
+      "distribution_status": "local_testing_only",
+      "original_sha256": "b3d5562f97e867e6ac4af8df5f00ee1670542c459aabc0ea8b746ebc70228e67",
+      "split_group": "user-pair-03"
+    }
+  ],
+  "images": [
+    {
+      "id": "user-01-1",
+      "file": "images/user-01-1.jpg",
+      "source_id": "user-01-1",
+      "family_id": "user-pair-01",
+      "width": 1280,
+      "height": 1707,
+      "sha256": "ba204289b0231cbfd163b26499dd976dffdcbbd73ef56f17cf16b47e05f9f477",
+      "bytes": 427656,
+      "transform": {
+        "kind": "user-metadata-stripped",
+        "metadata": "removed except reviewed Display P3 ICC",
+        "jpeg_scan_unchanged": true,
+        "icc_sha256": "20789fdbea9835251a4f0796c8bf45cbd964896044886540da21ffc7457af0ab"
+      }
+    },
+    {
+      "id": "user-01-2",
+      "file": "images/user-01-2.jpg",
+      "source_id": "user-01-2",
+      "family_id": "user-pair-01",
+      "width": 1280,
+      "height": 1707,
+      "sha256": "8fb5449ed4e1a8a4f416c8456662d4ca158b571909f28440c90576656d77808d",
+      "bytes": 367320,
+      "transform": {
+        "kind": "user-metadata-stripped",
+        "metadata": "removed except reviewed Display P3 ICC",
+        "jpeg_scan_unchanged": true,
+        "icc_sha256": "20789fdbea9835251a4f0796c8bf45cbd964896044886540da21ffc7457af0ab"
+      }
+    },
+    {
+      "id": "user-02-1",
+      "file": "images/user-02-1.jpg",
+      "source_id": "user-02-1",
+      "family_id": "user-pair-02",
+      "width": 1280,
+      "height": 2775,
+      "sha256": "cc67f0722c6e407bf8adde1c7aca37e745769f21682c36b6ef78510c927365cb",
+      "bytes": 913719,
+      "transform": {
+        "kind": "user-metadata-stripped",
+        "metadata": "removed except reviewed Display P3 ICC",
+        "jpeg_scan_unchanged": true,
+        "icc_sha256": null
+      }
+    },
+    {
+      "id": "user-02-2",
+      "file": "images/user-02-2.jpg",
+      "source_id": "user-02-2",
+      "family_id": "user-pair-02",
+      "width": 1280,
+      "height": 2774,
+      "sha256": "f8edc6bede8172ed2b5238350d327648555aca3147512533f69ffeb6ba843aef",
+      "bytes": 830319,
+      "transform": {
+        "kind": "user-metadata-stripped",
+        "metadata": "removed except reviewed Display P3 ICC",
+        "jpeg_scan_unchanged": true,
+        "icc_sha256": "7e1c7ec53e8ea35fed3e169dee62115ac045f26c7bc256fab16a5c26c29eacbd"
+      }
+    },
+    {
+      "id": "user-03-1",
+      "file": "images/user-03-1.jpg",
+      "source_id": "user-03-1",
+      "family_id": "user-pair-03",
+      "width": 1280,
+      "height": 1707,
+      "sha256": "4db9665cf9212049c069f45ba0fc85442469a1e677190a40f5fcde4409a6736c",
+      "bytes": 521447,
+      "transform": {
+        "kind": "user-metadata-stripped",
+        "metadata": "removed except reviewed Display P3 ICC",
+        "jpeg_scan_unchanged": true,
+        "icc_sha256": "20789fdbea9835251a4f0796c8bf45cbd964896044886540da21ffc7457af0ab"
+      }
+    },
+    {
+      "id": "user-03-2",
+      "file": "images/user-03-2.jpg",
+      "source_id": "user-03-2",
+      "family_id": "user-pair-03",
+      "width": 1280,
+      "height": 1707,
+      "sha256": "b42d46e083aafdce60600aa42f533bbd40ac52c147c702367b4f083d97a7b7eb",
+      "bytes": 532895,
+      "transform": {
+        "kind": "user-metadata-stripped",
+        "metadata": "removed except reviewed Display P3 ICC",
+        "jpeg_scan_unchanged": true,
+        "icc_sha256": "20789fdbea9835251a4f0796c8bf45cbd964896044886540da21ffc7457af0ab"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "N051",
+      "group": "negative",
+      "title": "用户用例：虚化与景深编辑",
+      "query": "user-01-2",
+      "candidates": [
+        "user-01-1"
+      ],
+      "reason": "背景及部分主体区域的虚化强度不同；用户明确要求分别保留。",
+      "proposed": {
+        "relation": "derived_photo",
+        "action": "import"
+      },
+      "expected": {
+        "content_result": "not_duplicate",
+        "relation": "derived_photo",
+        "action": "import"
+      },
+      "review_status": "approved",
+      "approval": {
+        "date": "2026-10-02",
+        "basis": "explicit_user_message",
+        "instruction": "新增三组用例，都判不重"
+      },
+      "split_group": "user-pair-01"
+    },
+    {
+      "id": "N052",
+      "group": "negative",
+      "title": "用户用例：色调与明暗编辑",
+      "query": "user-02-2",
+      "candidates": [
+        "user-02-1"
+      ],
+      "reason": "明暗、对比和色调不同；用户明确要求分别保留。",
+      "proposed": {
+        "relation": "derived_photo",
+        "action": "import"
+      },
+      "expected": {
+        "content_result": "not_duplicate",
+        "relation": "derived_photo",
+        "action": "import"
+      },
+      "review_status": "approved",
+      "approval": {
+        "date": "2026-10-02",
+        "basis": "explicit_user_message",
+        "instruction": "新增三组用例，都判不重"
+      },
+      "split_group": "user-pair-02"
+    },
+    {
+      "id": "N053",
+      "group": "negative",
+      "title": "用户用例：相近时刻的街景照片",
+      "query": "user-03-2",
+      "candidates": [
+        "user-03-1"
+      ],
+      "reason": "车辆位置和取景细微变化，是不同画面；用户明确要求分别保留。",
+      "proposed": {
+        "relation": "different_photo",
+        "action": "import"
+      },
+      "expected": {
+        "content_result": "not_duplicate",
+        "relation": "different_photo",
+        "action": "import"
+      },
+      "review_status": "approved",
+      "approval": {
+        "date": "2026-10-02",
+        "basis": "explicit_user_message",
+        "instruction": "新增三组用例，都判不重"
+      },
+      "split_group": "user-pair-03"
+    }
+  ]
+}
