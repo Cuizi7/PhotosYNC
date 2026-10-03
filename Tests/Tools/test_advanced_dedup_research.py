@@ -156,6 +156,82 @@ class ResearchProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "origin"):
                 research.validate_dataset({"root": str(root), "entries": [first, second]}, FIXTURE_HASH)
 
+    def test_same_query_bytes_cannot_cross_calibration_and_sealed_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.entry(root, "a", "family-a", "group-a", "calibration")
+            second = self.entry(root, "b", "family-b", "group-b", "sealed")
+            (root / "b").write_bytes((root / "a").read_bytes())
+            second["sha256"] = first["sha256"]
+            with self.assertRaisesRegex(ValueError, "byte identity"):
+                research.validate_dataset({"root": str(root), "entries": [first, second]}, FIXTURE_HASH)
+
+    def test_same_query_bytes_cannot_inflate_sealed_group_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.entry(root, "a", "family-a", "group-a", "sealed")
+            second = self.entry(root, "b", "family-b", "group-b", "sealed")
+            (root / "b").write_bytes((root / "a").read_bytes())
+            second["sha256"] = first["sha256"]
+            with self.assertRaisesRegex(ValueError, "byte identity"):
+                research.validate_dataset({"root": str(root), "entries": [first, second]}, FIXTURE_HASH)
+
+    def test_query_and_true_match_candidate_cannot_leak_across_splits_in_either_order(self):
+        for reversed_order in (False, True):
+            with self.subTest(reversed_order=reversed_order), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                calibration = self.entry(root, "calibration", "family-a", "group-a", "calibration")
+                sealed = self.entry(root, "sealed", "family-b", "group-b", "sealed")
+                sealed["stratum"] = "renamed_metadata"
+                sealed["expected_action"] = "skip"
+                sealed["expected_candidates"] = [self.candidate(root, "calibration", sealed)]
+                entries = [sealed, calibration] if reversed_order else [calibration, sealed]
+                with self.assertRaisesRegex(ValueError, "byte identity"):
+                    research.validate_dataset({"root": str(root), "entries": entries}, FIXTURE_HASH)
+
+    def test_true_match_candidate_bytes_cannot_cross_audited_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.entry(root, "a", "family-a", "group-a", "calibration")
+            second = self.entry(root, "b", "family-b", "group-b", "sealed")
+            for entry in (first, second):
+                entry["stratum"] = "renamed_metadata"
+                entry["expected_action"] = "skip"
+            (root / "shared").write_bytes(b"true-match-representation")
+            first["expected_candidates"] = [self.candidate(root, "shared", first)]
+            second["expected_candidates"] = [self.candidate(root, "shared", second)]
+            with self.assertRaisesRegex(ValueError, "byte identity"):
+                research.validate_dataset({"root": str(root), "entries": [first, second]}, FIXTURE_HASH)
+
+    def test_same_audited_identity_can_reuse_query_and_candidate_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.entry(root, "a", "family", "group", "sealed")
+            second = self.entry(root, "b", "family", "group", "sealed")
+            for entry in (first, second):
+                entry["stratum"] = "renamed_metadata"
+                entry["expected_action"] = "skip"
+                entry["expected_candidates"] = [self.candidate(root, "a", entry)]
+            result = research.validate_dataset({"root": str(root), "entries": [first, second]}, FIXTURE_HASH)
+            self.assertEqual(result["independent_queries_by_split_and_stratum"],
+                             {"sealed": {"renamed_metadata": 1}})
+
+    def test_unrelated_distractor_gallery_can_be_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gallery = self.entry(root, "gallery", "gallery-family", "gallery-group", "distractor")
+            gallery_alias = self.entry(root, "gallery-alias", "another-gallery-family",
+                                       "another-gallery-group", "distractor")
+            (root / "gallery-alias").write_bytes((root / "gallery").read_bytes())
+            gallery_alias["sha256"] = gallery["sha256"]
+            calibration = self.entry(root, "a", "family-a", "group-a", "calibration")
+            sealed = self.entry(root, "b", "family-b", "group-b", "sealed")
+            # A repeated unrelated gallery representation has no true-match ownership.
+            result = research.validate_dataset({"root": str(root),
+                                                "entries": [gallery, calibration, gallery_alias, sealed]}, FIXTURE_HASH)
+            self.assertEqual(result["independent_queries_by_split"],
+                             {"calibration": 1, "sealed": 1})
+
     def test_repeat_variants_do_not_increase_independent_query_count(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -184,6 +260,7 @@ class ResearchProtocolTests(unittest.TestCase):
             entry = self.entry(root, "a", "family", "session", "sealed")
             entry["expected_candidates"] = [{"id": "c", "representation": "photosOriginal",
                                               "path": "a", "sha256": entry["sha256"],
+                                              "origin_sha256": entry["origin_sha256"],
                                               "width": 0, "height": 10,
                                               "license_record": self.license()}]
             with self.assertRaisesRegex(ValueError, "width"):
@@ -218,6 +295,13 @@ class ResearchProtocolTests(unittest.TestCase):
     @staticmethod
     def license():
         return {"license": "self-created", "source": "unit fixture", "permission": "local test"}
+
+    @classmethod
+    def candidate(cls, root, path, entry):
+        return {"id": path, "representation": "photosOriginal", "path": path,
+                "sha256": hashlib.sha256((root / path).read_bytes()).hexdigest(),
+                "origin_sha256": entry["origin_sha256"], "width": 10, "height": 10,
+                "license_record": cls.license()}
 
     @classmethod
     def entry(cls, root, query_id, family_id, split_group, split):

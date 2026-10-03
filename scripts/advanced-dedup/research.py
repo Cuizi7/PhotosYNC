@@ -202,6 +202,7 @@ def _file_record(record, root, label, public_hashes, split):
         _nonempty(license_record[name], f"{label}.license_record.{name}")
     if digest in public_hashes and split != "public_regression":
         raise ValueError(f"{label} reuses public regression corpus bytes in {split}")
+    return digest
 
 
 def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
@@ -231,6 +232,7 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
     family_split = {}
     group_split = {}
     origin_identity = {}
+    byte_identity = {}
     query_ids = set()
     groups_by_split = {split: set() for split in SPLITS}
     groups_by_stratum = {split: {} for split in SPLITS}
@@ -275,9 +277,11 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
             raise ValueError(f"family/split_group crosses split: {family}/{group}")
         family_split[family] = split
         group_split[group] = split
-        groups_by_split[split].add(group)
-        groups_by_stratum[split].setdefault(stratum, set()).add(group)
-        _file_record(entry, root, label, public_hashes, split)
+        query_digest = _file_record(entry, root, label, public_hashes, split)
+        if split != "distractor":
+            previous = byte_identity.setdefault(query_digest, identity)
+            if previous != identity:
+                raise ValueError(f"{label} verified byte identity conflicts with another audited query or match")
         candidates = entry["expected_candidates"]
         if not isinstance(candidates, list):
             raise ValueError(f"{label}.expected_candidates must be an array")
@@ -290,7 +294,9 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
             candidate_label = f"{label}.expected_candidates[{candidate_index}]"
             _mapping(candidate, candidate_label)
             _required(candidate, {"id", "representation", "width", "height", "path",
-                                  "sha256", "license_record"}, candidate_label)
+                                  "sha256", "origin_sha256", "license_record"}, candidate_label)
+            if candidate["origin_sha256"] != origin:
+                raise ValueError(f"{candidate_label}.origin_sha256 must reference query lineage")
             _nonempty(candidate["id"], f"{candidate_label}.id")
             if candidate["id"] in candidate_ids:
                 raise ValueError(f"{candidate_label}.id repeated")
@@ -300,7 +306,14 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
                 raise ValueError(f"{candidate_label}.representation invalid")
             for dimension in ("width", "height"):
                 _positive_int(candidate[dimension], f"{candidate_label}.{dimension}")
-            _file_record(candidate, root, candidate_label, public_hashes, split)
+            candidate_digest = _file_record(candidate, root, candidate_label, public_hashes, split)
+            if split != "distractor":
+                previous = byte_identity.setdefault(candidate_digest, identity)
+                if previous != identity:
+                    raise ValueError(f"{candidate_label} verified byte identity conflicts with another audited query or match")
+        if split in {"calibration", "sealed"}:
+            groups_by_split[split].add(group)
+            groups_by_stratum[split].setdefault(stratum, set()).add(group)
     return {"entries": len(entries),
             "independent_queries_by_split": {split: len(groups) for split, groups in
                                              sorted(groups_by_split.items()) if groups},
