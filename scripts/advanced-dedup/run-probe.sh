@@ -22,6 +22,8 @@ case "$COMMAND" in
   compare-tensors) LIST_FLAG=--tensor-list ;;
   score-batch) LIST_FLAG=--input ;;
   search-benchmark) LIST_FLAG=--vectors ;;
+  combined-benchmark) LIST_FLAG=--vectors ;;
+  validate-profile) LIST_FLAG=--profile ;;
   evaluate) LIST_FLAG=--dataset ;;
   *) echo 'probe: unknown command' >&2; exit 2 ;;
 esac
@@ -32,9 +34,12 @@ while (( $# )); do
   case "$FLAG" in
     --profile|--output-dir|"$LIST_FLAG") ;;
     --model)
-      [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors || "$COMMAND" == evaluate ]] || exit 2 ;;
+      [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors ||
+         "$COMMAND" == evaluate || "$COMMAND" == combined-benchmark ]] || exit 2 ;;
+    --input-list)
+      [[ "$COMMAND" == combined-benchmark ]] || exit 2 ;;
     --asset-count|--edited-fraction)
-      [[ "$COMMAND" == search-benchmark ]] || exit 2 ;;
+      [[ "$COMMAND" == search-benchmark || "$COMMAND" == combined-benchmark ]] || exit 2 ;;
     --approved-protocol-json|--protocol-sha256|--max-decoded-bytes|--max-abs-error|--min-cosine)
       echo "probe: reserved approved-protocol option $FLAG" >&2; exit 2 ;;
     *) echo "probe: unknown option $FLAG" >&2; exit 2 ;;
@@ -52,12 +57,16 @@ while (( $# )); do
   if [[ "$FLAG" == --profile ]]; then PROFILE="$1"; fi
   shift
 done
-REQUIRED_FLAGS=(--profile --output-dir "$LIST_FLAG")
+REQUIRED_FLAGS=(--profile --output-dir)
+if [[ "$COMMAND" != validate-profile ]]; then REQUIRED_FLAGS+=("$LIST_FLAG"); fi
 if [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors || "$COMMAND" == evaluate ]]; then
   REQUIRED_FLAGS+=(--model)
 fi
 if [[ "$COMMAND" == search-benchmark ]]; then
   REQUIRED_FLAGS+=(--asset-count --edited-fraction)
+fi
+if [[ "$COMMAND" == combined-benchmark ]]; then
+  REQUIRED_FLAGS+=(--model --input-list --asset-count --edited-fraction)
 fi
 for REQUIRED in "${REQUIRED_FLAGS[@]}"; do
   if [[ "$SEEN_FLAGS" != *"|$REQUIRED|"* ]]; then
@@ -83,7 +92,7 @@ document = json.loads(raw)
 protocol = module.validate_protocol(document)
 if not protocol["approved"]:
     raise ValueError("research protocol has not been approved")
-if command in {"score-batch", "search-benchmark", "evaluate"}:
+if command in {"score-batch", "search-benchmark", "combined-benchmark", "evaluate"}:
     module._validated_profile(Path(profile_path), hashlib.sha256(raw).hexdigest(), document)
 resources = document["resources"]
 if resources["inference_concurrency"] != 1 or resources["batch_size"] != 1:

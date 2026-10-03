@@ -23,6 +23,91 @@ FIXTURE_HASH = json.loads(FIXTURE_MANIFEST.read_text())["content_sha256"]
 
 
 class ResearchProtocolTests(unittest.TestCase):
+    @staticmethod
+    def acceptance_results(n=100, failures=0):
+        protocol_path = ROOT / "docs/research/advanced-dedup/protocol.json"
+        protocol = json.loads(protocol_path.read_text())
+        protocol_sha = hashlib.sha256(protocol_path.read_bytes()).hexdigest()
+        bindings = {name: "a" * 64 for name in ("protocolSHA256", "datasetSHA256",
+                    "calibrationSHA256", "sealedResultsSHA256", "modelSHA256",
+                    "preprocessSHA256", "profileSHA256")}
+        bindings["protocolSHA256"] = protocol_sha
+        sealed = {name: {"queries": minimum, "failedGroups": 0}
+                  for name, minimum in protocol["minimum_queries_by_stratum"].items()}
+        sealed["false_skip"] = {"queries": n, "failedGroups": failures}
+        return protocol, {"bindings": bindings, "protocolSHA256": protocol_sha,
+                          "expectedProtocolSHA256": protocol_sha, "artifactBytesVerified": True,
+                          "calibrationFrozenBeforeSealed": True,
+                          "conversion": {"maxAbsError": 0.001, "minCosine": 0.9999},
+                          "sealedStatistics": {"bySplitAndStratum": {"sealed": sealed}},
+                          "publicRegression": {"caseCount": 44, "passCount": 44,
+                                               "contentFailures": [], "actionFailures": []},
+                          "performance": {"scenarios": [
+                              {"assetCount": 100000, "editedFraction": fraction,
+                               "representationCount": int(100000 * (1 + fraction)),
+                               "hotQueryP95MS": 100, "incrementalP95MS": 1000,
+                               "hotQuerySamplesMS": [100] * 20,
+                               "incrementalSamplesMS": [1000] * 20,
+                               "peakRSSBytes": 1000000000, "realAssetCount": 100000,
+                               "provenance": "audited-real-media",
+                               "catalogDatasetSHA256": bindings["datasetSHA256"]}
+                              for fraction in (0, 0.5, 1)]}}
+
+    def testZeroErrorsCanStillFailConfidenceBound(self):
+        protocol, results = self.acceptance_results()
+        self.assertGreater(1 - 0.025 ** (1 / 100), 0.0001)
+        verdict = research.verify_acceptance(protocol, results)
+        self.assertEqual(verdict["reasons"], ["false_skip confidence bound", "false_skip independent minimum"])
+
+    def testRejectsPerfectSafetyWithZeroRecall(self):
+        protocol, results = self.acceptance_results(n=36887)
+        results["sealedStatistics"]["bySplitAndStratum"]["sealed"]["renamed_metadata"]["failedGroups"] = 108
+        verdict = research.verify_acceptance(protocol, results)
+        self.assertEqual(verdict["reasons"], ["renamed_metadata recall bound"])
+
+    def testGateRejectsChangedProtocolOrMissingMeasurements(self):
+        protocol, results = self.acceptance_results(n=36887)
+        results["expectedProtocolSHA256"] = "1" * 64
+        results["performance"]["scenarios"][0].pop("hotQueryP95MS")
+        verdict = research.verify_acceptance(protocol, results)
+        self.assertEqual(verdict["reasons"], ["performance measurements incomplete", "protocol binding"])
+
+    def testAnyFalseSkipFailsSealedGate(self):
+        protocol, results = self.acceptance_results(n=100000, failures=1)
+        verdict = research.verify_acceptance(protocol, results)
+        self.assertEqual(verdict["reasons"], ["observed false skip"])
+
+    def testAllocatedExactBoundsAtPredeclaredMinima(self):
+        self.assertLessEqual(research._one_sided_error_upper(36887, 0, 0.025), 0.0001)
+        self.assertGreater(research._one_sided_error_upper(36886, 0, 0.025), 0.0001)
+        self.assertLessEqual(research._one_sided_error_upper(108, 0, 0.004), 0.05)
+        self.assertGreater(research._one_sided_error_upper(107, 0, 0.004), 0.05)
+        self.assertGreater(research._one_sided_error_upper(108, 1, 0.004), 0.05)
+
+    def testGateRecomputesP95FromRawSamples(self):
+        protocol, results = self.acceptance_results(n=36887)
+        self.assertTrue(research.verify_acceptance(protocol, results)["pass"])
+        results["performance"]["scenarios"][0]["hotQueryP95MS"] = 1
+        verdict = research.verify_acceptance(protocol, results)
+        self.assertEqual(verdict["reasons"], ["performance measurements incomplete"])
+
+    def testAcceptanceCLIRequiresActualArtifactsBeforeWriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = self.entry(root, "negative", "family", "group", "sealed")
+            dataset = root / "dataset.json"
+            dataset.write_text(json.dumps({"root": str(root), "entries": [entry]}))
+            results = root / "results.json"
+            results.write_text("{}")
+            output = root / "acceptance"
+            result = subprocess.run([sys.executable, str(SCRIPT), "accept", "--protocol",
+                                     str(ROOT / "docs/research/advanced-dedup/protocol.json"),
+                                     "--dataset", str(dataset), "--results", str(results),
+                                     "--output-dir", str(output)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("results.profile", result.stderr)
+            self.assertFalse(output.exists())
+
     def testPositiveImportNeedsContentRecognition(self):
         protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())
         dataset = {"entries": [{"query_id": "upgrade", "split": "sealed",

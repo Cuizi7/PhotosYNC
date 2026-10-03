@@ -75,6 +75,120 @@ def _zero_error_minimum(target, alpha):
     return math.ceil(math.log(alpha) / math.log1p(-target))
 
 
+def _one_sided_error_upper(n, errors, alpha):
+    """Exact one-sided binomial error bound (Clopper-Pearson inversion)."""
+    if type(n) is not int or type(errors) is not int or n <= 0 or not 0 <= errors <= n:
+        raise ValueError("independent trial/error counts invalid")
+    if errors == n:
+        return 1.0
+    if errors == 0:
+        return -math.expm1(math.log(alpha) / n)
+    low, high = 0.0, 1.0
+    for _ in range(65):
+        probability = (low + high) / 2
+        log_terms = [math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+                     + k * math.log(probability) + (n - k) * math.log1p(-probability)
+                     for k in range(errors + 1)]
+        scale = max(log_terms)
+        cdf = math.exp(scale) * sum(math.exp(term - scale) for term in log_terms)
+        if cdf > alpha:
+            low = probability
+        else:
+            high = probability
+    return high
+
+
+def _nearest_rank_p95(samples):
+    if not isinstance(samples, list) or len(samples) < 20:
+        raise ValueError("P95 needs at least 20 raw measurements")
+    for index, sample in enumerate(samples):
+        _number(sample, f"sample[{index}]")
+    ordered = sorted(samples)
+    return ordered[math.ceil(0.95 * len(ordered)) - 1]
+
+
+def verify_acceptance(protocol: dict, results: dict) -> dict:
+    """Apply the predeclared gates; only the accept CLI can verify artifact bytes."""
+    if not validate_protocol(protocol)["approved"]:
+        raise ValueError("acceptance requires approved protocol")
+    reasons = []
+    bounds = {}
+    bindings = results.get("bindings", {})
+    for name in ("protocolSHA256", "datasetSHA256", "calibrationSHA256",
+                 "sealedResultsSHA256", "modelSHA256", "preprocessSHA256", "profileSHA256"):
+        value = bindings.get(name)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            reasons.append(f"{name} binding missing")
+    if (results.get("protocolSHA256") != results.get("expectedProtocolSHA256") or
+            results.get("protocolSHA256") != bindings.get("protocolSHA256")):
+        reasons.append("protocol binding")
+    if not results.get("artifactBytesVerified"):
+        reasons.append("artifact bytes unverified")
+    sealed = results.get("sealedStatistics", {}).get("bySplitAndStratum", {}).get("sealed", {})
+    targets = {"false_skip": protocol["max_false_skip_upper_bound"],
+               "candidate_recall": 1 - protocol["min_candidate_recall"]}
+    targets.update({name: 1 - value for name, value in protocol["min_copy_recall_by_stratum"].items()})
+    for name, target in targets.items():
+        row = sealed.get(name, {})
+        n, failed = row.get("queries"), row.get("failedGroups")
+        if type(n) is not int or type(failed) is not int or n <= 0 or not 0 <= failed <= n:
+            reasons.append(f"{name} independent trials missing")
+            continue
+        if n < protocol["minimum_queries_by_stratum"][name]:
+            reasons.append(f"{name} independent minimum")
+        upper = _one_sided_error_upper(n, failed, protocol["alpha_allocation_by_stratum"][name])
+        bounds[name] = {"independentGroups": n, "failedGroups": failed,
+                        "errorUpper": upper, "recallLower": 1 - upper}
+        if name == "false_skip" and failed:
+            reasons.append("observed false skip")
+        if upper > target:
+            reasons.append(f"{name} {'confidence' if name == 'false_skip' else 'recall'} bound")
+    public = results.get("publicRegression", {})
+    if (public.get("caseCount") != 44 or public.get("passCount") != 44 or
+            public.get("contentFailures") != [] or public.get("actionFailures") != []):
+        reasons.append("mandatory frozen 44 regression")
+    scenarios = results.get("performance", {}).get("scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != 3 or any(
+            not isinstance(item, dict) or type(item.get("editedFraction")) not in (int, float)
+            for item in scenarios) or {
+            item["editedFraction"] for item in scenarios} != {0, 0.5, 1}:
+        reasons.append("performance measurements incomplete")
+    else:
+        for item in scenarios:
+            try:
+                fraction = item["editedFraction"]
+                if (item["assetCount"] != 100000 or item["realAssetCount"] != 100000 or
+                        item["representationCount"] != int(100000 * (1 + fraction)) or
+                        item["provenance"] != "audited-real-media" or
+                        item["catalogDatasetSHA256"] != bindings.get("datasetSHA256")):
+                    raise ValueError("performance corpus or representation count invalid")
+                for field in ("hotQueryP95MS", "incrementalP95MS", "peakRSSBytes"):
+                    _number(item[field], field)
+                if (item["hotQueryP95MS"] != _nearest_rank_p95(item["hotQuerySamplesMS"]) or
+                        item["incrementalP95MS"] != _nearest_rank_p95(item["incrementalSamplesMS"])):
+                    raise ValueError("reported P95 differs from raw measurements")
+                if (item["hotQueryP95MS"] > protocol["max_hot_query_p95_ms"] or
+                        item["incrementalP95MS"] > protocol["max_incremental_p95_ms"] or
+                        item["peakRSSBytes"] > protocol["max_peak_rss_bytes"]):
+                    reasons.append(f"performance budget {fraction}")
+            except (KeyError, TypeError, ValueError):
+                reasons.append("performance measurements incomplete")
+                break
+    conversion = results.get("conversion", {})
+    try:
+        _number(conversion["maxAbsError"], "maxAbsError", inclusive_min=True)
+        _number(conversion["minCosine"], "minCosine", maximum=1)
+        conversion_ok = (conversion["maxAbsError"] <= protocol["conversion_max_abs_error"] and
+                         conversion["minCosine"] >= protocol["conversion_min_cosine"])
+    except (KeyError, TypeError, ValueError):
+        conversion_ok = False
+    if not conversion_ok:
+        reasons.append("model conversion evidence")
+    if not results.get("calibrationFrozenBeforeSealed"):
+        reasons.append("independent frozen calibration")
+    return {"pass": not reasons, "reasons": sorted(set(reasons)), "bounds": bounds}
+
+
 def validate_protocol(document: dict) -> dict:
     """Reject missing or inconsistent precommitted research targets."""
     _mapping(document, "protocol")
@@ -487,7 +601,7 @@ def query_level_statistics(dataset, swift_results, protocol):
                                                for bucket in sealed.values())}
 
 
-def score_dataset(protocol_path, dataset_path, vectors, profile_path, output):
+def score_dataset(protocol_path, dataset_path, vectors, profile_path, output, split=None):
     protocol, protocol_sha = _approved_protocol(protocol_path)
     dataset = json.loads(dataset_path.read_text())
     validate_dataset(dataset, protocol["fixture_manifest_sha256"])
@@ -496,7 +610,7 @@ def score_dataset(protocol_path, dataset_path, vectors, profile_path, output):
     public_hashes, _, _, _ = _public_inventory(protocol["fixture_manifest_sha256"])
     queries = []
     for entry in dataset["entries"]:
-        if entry["split"] == "distractor":
+        if entry["split"] == "distractor" or (split and entry["split"] != split):
             continue
         _positive_int(entry.get("width"), f"{entry['query_id']}.width")
         _positive_int(entry.get("height"), f"{entry['query_id']}.height")
@@ -522,11 +636,13 @@ def score_dataset(protocol_path, dataset_path, vectors, profile_path, output):
                                         **_vector_reference(item, inventory)} for item in candidates]})
     swift_results, batch = _run_swift_score(profile_path, queries, protocol_sha)
     evidence = public_evaluation_evidence(swift_results, batch)
-    statistics = query_level_statistics(dataset, swift_results, protocol)
+    evaluated = {"entries": [entry for entry in dataset["entries"]
+                             if entry["split"] != "distractor" and (not split or entry["split"] == split)]}
+    statistics = query_level_statistics(evaluated, swift_results, protocol)
     report = {"protocolSHA256": protocol_sha, "datasetSHA256": _sha256_file(dataset_path),
               "profileSHA256": _sha256_file(profile_path), "vectorManifestSHA256": inventory_sha,
               "statistics": statistics, **evidence,
-              "researchOnly": True}
+              "evaluatedSplit": split, "researchOnly": True}
     if output.exists():
         raise ValueError("output already exists")
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -606,6 +722,189 @@ def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir
     return report
 
 
+def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
+    """Audit saved experiment bytes and emit a release profile only on full success."""
+    if output_dir.exists():
+        raise ValueError("acceptance output already exists")
+    protocol, protocol_sha = _approved_protocol(protocol_path)
+    dataset = json.loads(dataset_path.read_text())
+    inventory = validate_dataset(dataset, protocol["fixture_manifest_sha256"])
+    distractor_hashes = {entry["sha256"] for entry in dataset["entries"]
+                         if entry["split"] == "distractor"}
+    sealed_entries = [entry for entry in dataset["entries"] if entry["split"] == "sealed"]
+    hypotheses = [(entry["stratum"], entry["split_group"]) for entry in sealed_entries]
+    if len(hypotheses) != len(set(hypotheses)):
+        raise ValueError("sealed set requires one prespecified query per split group and hypothesis")
+    positive_groups = {entry["split_group"] for entry in sealed_entries
+                       if entry["stratum"] in COPY_STRATA}
+    dataset_sha = _sha256_file(dataset_path)
+    manifest = json.loads(results_path.read_text())
+    paths = {}
+    for name in ("profile", "model", "calibration", "sealed", "publicRegression",
+                 "conversion", "performance"):
+        record = _mapping(manifest.get(name), f"results.{name}")
+        _required(record, {"path", "sha256"}, f"results.{name}")
+        path = Path(record["path"])
+        if not path.is_absolute():
+            raise ValueError(f"results.{name}.path must be absolute")
+        if name == "model":
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "advanced_dedup_converter", REPO_ROOT / "scripts/advanced-dedup/convert-model.py")
+            converter = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(converter)
+            actual = converter.package_sha256(path)
+        else:
+            actual = _sha256_file(path)
+        if actual != record["sha256"]:
+            raise ValueError(f"results.{name} actual-byte SHA256 mismatch")
+        paths[name] = path
+    profile = _validated_profile(paths["profile"], protocol_sha, protocol)
+    if profile["fingerprint"]["modelSHA256"] != manifest["model"]["sha256"]:
+        raise ValueError("model/profile package binding mismatch")
+    preprocess = {key: profile["fingerprint"][key] for key in
+                  ("inputSide", "resizeMode", "colorSpace", "mean", "std")}
+    preprocess_sha = hashlib.sha256(json.dumps(preprocess, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    reports = {name: json.loads(paths[name].read_text()) for name in
+               ("calibration", "sealed", "publicRegression", "conversion", "performance")}
+    for name in ("calibration", "sealed"):
+        report = reports[name]
+        if (report.get("protocolSHA256") != protocol_sha or
+                report.get("datasetSHA256") != dataset_sha or
+                report.get("profileSHA256") != manifest["profile"]["sha256"] or
+                report.get("evaluatedSplit") != name):
+            raise ValueError(f"{name} score report binding mismatch")
+        if (report["swift"].get("protocolSHA256") != protocol_sha or
+                report["swift"].get("profileSHA256") != manifest["profile"]["sha256"] or
+                report["swift"].get("fingerprintVersion") != profile["fingerprint"]["version"] or
+                report["swift"].get("policyVersion") != profile["policyVersion"]):
+            raise ValueError(f"{name} Swift profile/model binding mismatch")
+        public_evaluation_evidence(report["swift"], report["swiftBatch"])
+        for query in report["swiftBatch"]["queries"]:
+            for vector in [query, *query["candidates"]]:
+                if _sha256_file(Path(vector["vector"])) != vector["vectorSHA256"]:
+                    raise ValueError(f"{name} vector byte binding mismatch")
+        entries = {"entries": [entry for entry in dataset["entries"] if entry["split"] == name]}
+        statistics = query_level_statistics(entries, report["swift"], protocol)
+        if statistics != report["statistics"]:
+            raise ValueError(f"{name} statistics differ from actual queries and oracle")
+    public = reports["publicRegression"]
+    subprocess.run([sys.executable, str(REPO_ROOT / "scripts/dedup-fixtures/validate.py"),
+                    "--dataset", str(REPO_ROOT / "Tests/Fixtures/AdvancedDedup"),
+                    "--require-approved"], check=True, capture_output=True, text=True)
+    if (public.get("protocolSHA256") != protocol_sha or
+            public.get("profileSHA256") != manifest["profile"]["sha256"] or
+            public.get("expectedResultsSHA256") != _sha256_file(
+                REPO_ROOT / "Tests/Fixtures/AdvancedDedup/expected-results.json")):
+        raise ValueError("public regression binding mismatch")
+    if (public["swift"].get("protocolSHA256") != protocol_sha or
+            public["swift"].get("profileSHA256") != manifest["profile"]["sha256"] or
+            public["swift"].get("fingerprintVersion") != profile["fingerprint"]["version"] or
+            public["swift"].get("policyVersion") != profile["policyVersion"]):
+        raise ValueError("public Swift profile/model binding mismatch")
+    public_evaluation_evidence(public["swift"], public["swiftBatch"])
+    for query in public["swiftBatch"]["queries"]:
+        for vector in [query, *query["candidates"]]:
+            if _sha256_file(Path(vector["vector"])) != vector["vectorSHA256"]:
+                raise ValueError("public regression vector byte binding mismatch")
+    truth = json.loads((REPO_ROOT / "Tests/Fixtures/AdvancedDedup/expected-results.json").read_text())
+    truth_by_id = {case["id"]: case for case in truth["cases"]}
+    observed_by_id = {query["id"]: query for query in public["swift"]["queries"]}
+    if len(truth_by_id) != 44 or set(observed_by_id) != set(truth_by_id):
+        raise ValueError("mandatory frozen 44 result IDs mismatch")
+    actual_content_failures = []
+    actual_action_failures = []
+    for case_id, expected in truth_by_id.items():
+        observed = observed_by_id[case_id]
+        desired_content = ("notDuplicate" if expected["expected"]["content_result"] == "not_duplicate"
+                           else "duplicate")
+        desired_action = ("importFile" if expected["expected"]["action"] == "import" else "skip")
+        if observed["content"] != desired_content:
+            actual_content_failures.append(case_id)
+        if observed["action"] != desired_action:
+            actual_action_failures.append(case_id)
+    conversion = reports["conversion"]
+    if (conversion.get("protocolSHA256") != protocol_sha or
+            conversion.get("modelSHA256") != manifest["model"]["sha256"] or
+            conversion.get("fingerprintVersion") != profile["fingerprint"]["version"] or
+            not conversion.get("comparisons")):
+        raise ValueError("conversion binding or independent comparison missing")
+    for row in conversion["comparisons"]:
+        if not row.get("pass"):
+            raise ValueError("conversion comparison failed")
+    performance = reports["performance"]
+    if (performance.get("protocolSHA256") != protocol_sha or
+            performance.get("profileSHA256") != manifest["profile"]["sha256"] or
+            performance.get("modelSHA256") != manifest["model"]["sha256"] or
+            performance.get("fingerprintVersion") != profile["fingerprint"]["version"] or
+            performance.get("policyVersion") != profile["policyVersion"] or
+            performance.get("backend") != profile["backend"] or
+            performance.get("computeUnits") != "cpuOnly"):
+        raise ValueError("performance model/profile/compute-unit binding mismatch")
+    bindings = {"protocolSHA256": protocol_sha, "datasetSHA256": dataset_sha,
+                "calibrationSHA256": manifest["calibration"]["sha256"],
+                "sealedResultsSHA256": manifest["sealed"]["sha256"],
+                "modelSHA256": manifest["model"]["sha256"],
+                "preprocessSHA256": preprocess_sha,
+                "profileSHA256": manifest["profile"]["sha256"]}
+    verdict = verify_acceptance(protocol, {
+        "bindings": bindings, "protocolSHA256": protocol_sha,
+        "expectedProtocolSHA256": protocol_sha, "artifactBytesVerified": True,
+        "sealedStatistics": reports["sealed"]["statistics"],
+        "publicRegression": {"caseCount": len(truth_by_id),
+                             "passCount": len(truth_by_id) - len(set(actual_content_failures + actual_action_failures)),
+                             "contentFailures": actual_content_failures,
+                             "actionFailures": actual_action_failures},
+        "performance": performance,
+        "conversion": {"maxAbsError": max(row["maxAbsError"] for row in conversion["comparisons"]),
+                       "minCosine": min(row["cosine"] for row in conversion["comparisons"])},
+        "calibrationFrozenBeforeSealed": manifest.get("calibrationFrozenBeforeSealed") is True,
+    })
+    if inventory["independent_queries_by_split_and_stratum"].get("sealed", {}) != {
+            name: row["queries"] for name, row in
+            reports["sealed"]["statistics"]["bySplitAndStratum"].get("sealed", {}).items()}:
+        verdict["reasons"].append("sealed inventory/query counts mismatch")
+        verdict["pass"] = False
+    if len(positive_groups) < sum(protocol["minimum_queries_by_stratum"][name]
+                                  for name in COPY_STRATA):
+        verdict["reasons"].append("540 distinct positive sealed groups")
+        verdict["pass"] = False
+    if len(distractor_hashes) < 100000:
+        verdict["reasons"].append("100000 audited distinct distractor assets")
+        verdict["pass"] = False
+    if not verdict["pass"]:
+        return verdict
+    acceptance_id = hashlib.sha256(bytes.fromhex(protocol_sha) + bytes.fromhex(
+        bindings["sealedResultsSHA256"])).hexdigest()
+    accepted_profile = {**profile, "acceptanceID": acceptance_id}
+    profile_bytes = (json.dumps(accepted_profile, indent=2, sort_keys=True) + "\n").encode()
+    profile_sha = hashlib.sha256(profile_bytes).hexdigest()
+    with tempfile.TemporaryDirectory() as temporary:
+        candidate = Path(temporary) / "accepted-profile.json"
+        candidate.write_bytes(profile_bytes)
+        subprocess.run([str(REPO_ROOT / "scripts/advanced-dedup/run-probe.sh"),
+                        "validate-profile", "--profile", str(candidate),
+                        "--output-dir", str(Path(temporary) / "validation")],
+                       check=True, capture_output=True, text=True)
+        validated = json.loads((Path(temporary) / "validation/validated-profile.json").read_text())
+        if validated != {"profileSHA256": profile_sha, "acceptanceID": acceptance_id}:
+            raise ValueError("accepted Swift profile deserialization binding mismatch")
+    acceptance = {"protocol_sha256": protocol_sha, "dataset_sha256": dataset_sha,
+                  "calibration_sha256": bindings["calibrationSHA256"],
+                  "sealed_results_sha256": bindings["sealedResultsSHA256"],
+                  "model_sha256": bindings["modelSHA256"],
+                  "preprocess_sha256": bindings["preprocessSHA256"],
+                  "candidate_profile_sha256": bindings["profileSHA256"],
+                  "profile_sha256": profile_sha, "acceptanceID": acceptance_id,
+                  "pass": True, "bounds": verdict["bounds"],
+                  "results_manifest_sha256": _sha256_file(results_path)}
+    output_dir.mkdir(parents=False)
+    (output_dir / "accepted-profile.json").write_bytes(profile_bytes)
+    (output_dir / "acceptance.json").write_text(json.dumps(acceptance, indent=2, sort_keys=True) + "\n")
+    return verdict
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -618,20 +917,34 @@ def main(argv=None):
     score.add_argument("--vectors", type=Path, required=True)
     score.add_argument("--profile", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
+    score.add_argument("--split", choices=("calibration", "sealed"))
     evaluate = subcommands.add_parser("evaluate")
     evaluate.add_argument("--protocol", type=Path, required=True)
     evaluate.add_argument("--profile", type=Path, required=True)
     evaluate.add_argument("--model", type=Path, required=True)
     evaluate.add_argument("--dataset", type=Path, required=True)
     evaluate.add_argument("--output-dir", type=Path, required=True)
+    accept = subcommands.add_parser("accept")
+    accept.add_argument("--protocol", type=Path, required=True)
+    accept.add_argument("--dataset", type=Path, required=True)
+    accept.add_argument("--results", type=Path, required=True)
+    accept.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == "score":
         try:
-            report = score_dataset(args.protocol, args.dataset, args.vectors, args.profile, args.output)
+            report = score_dataset(args.protocol, args.dataset, args.vectors,
+                                   args.profile, args.output, args.split)
         except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
             parser.exit(1, f"research score invalid: {error}\n")
         print(json.dumps(report["statistics"], sort_keys=True))
         return 0
+    if args.command == "accept":
+        try:
+            verdict = accept_evidence(args.protocol, args.dataset, args.results, args.output_dir)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+            parser.exit(1, f"research acceptance invalid: {error}\n")
+        print(json.dumps(verdict, sort_keys=True))
+        return 0 if verdict["pass"] else 1
     if args.command == "evaluate":
         try:
             report = evaluate_public(args.protocol, args.profile, args.model,

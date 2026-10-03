@@ -20,7 +20,8 @@ struct ApprovedProtocolBinding: Decodable {
 func parseArguments() throws -> (command: String, values: [String: String]) {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let command = args.first,
-          ["fingerprint", "compare-tensors", "score-batch", "search-benchmark"].contains(command) else {
+          ["fingerprint", "compare-tensors", "score-batch", "search-benchmark",
+           "combined-benchmark", "validate-profile"].contains(command) else {
         throw ProbeError(description: "unknown probe command")
     }
     let required: [String]
@@ -28,6 +29,9 @@ func parseArguments() throws -> (command: String, values: [String: String]) {
     case "fingerprint": required = ["--profile", "--model", "--output-dir", "--input-list"]
     case "compare-tensors": required = ["--profile", "--model", "--output-dir", "--tensor-list"]
     case "score-batch": required = ["--profile", "--input", "--output-dir"]
+    case "combined-benchmark": required = ["--profile", "--model", "--vectors", "--input-list",
+                                            "--asset-count", "--edited-fraction", "--output-dir"]
+    case "validate-profile": required = ["--profile", "--output-dir"]
     default: required = ["--profile", "--vectors", "--asset-count", "--edited-fraction", "--output-dir"]
     }
     let allowed = Set(required + ["--approved-protocol-json"])
@@ -92,11 +96,19 @@ func run() async throws {
             throw ProbeError(description: "profile resource limits conflict with approved protocol")
         }
     }
-    if parsed.command == "score-batch" || parsed.command == "search-benchmark" {
+    if ["score-batch", "search-benchmark", "combined-benchmark", "validate-profile"].contains(parsed.command) {
         let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: profileData)
-        guard configuration.acceptanceID == "research:\(protocolSHA)",
-              configuration.backend == "exact-f32-v1" else {
+        guard configuration.backend == "exact-f32-v1",
+              (parsed.command == "validate-profile" || configuration.acceptanceID == "research:\(protocolSHA)"),
+              configuration.resources.maxDecodedBytes == maxDecodedBytes else {
             throw ProbeError(description: "research profile binding or backend mismatch")
+        }
+        if parsed.command == "validate-profile" {
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            try writeJSON(["profileSHA256": try sha256(profile),
+                           "acceptanceID": configuration.acceptanceID],
+                          at: output.appendingPathComponent("validated-profile.json"))
+            return
         }
         if parsed.command == "score-batch" {
             try runScoreBatch(input: URL(fileURLWithPath: args["--input"]!), output: output,
@@ -104,7 +116,10 @@ func run() async throws {
         } else {
             try await runSearchBenchmark(vectors: URL(fileURLWithPath: args["--vectors"]!),
                 assetCount: args["--asset-count"]!, editedFraction: args["--edited-fraction"]!,
-                output: output, configuration: configuration, protocolSHA: protocolSHA)
+                output: output, configuration: configuration, protocolSHA: protocolSHA,
+                model: args["--model"].map { URL(fileURLWithPath: $0) },
+                inputList: args["--input-list"].map { URL(fileURLWithPath: $0) },
+                maxDecodedBytes: maxDecodedBytes, profileSHA: try sha256(profile))
         }
         return
     }
@@ -330,9 +345,49 @@ private func percentile(_ samples: [Double], _ percentile: Double) -> Double {
     return sorted[max(0, Int(ceil(Double(sorted.count) * percentile)) - 1)]
 }
 
+private func fingerprintLocalImage(_ url: URL, fingerprinter: CoreMLFingerprinter,
+                                   configuration: FingerprintConfiguration,
+                                   maxDecodedBytes: Int64) async throws -> (Fingerprint, [String: Double]) {
+    let start = CFAbsoluteTimeGetCurrent()
+    guard let source = CGImageSourceCreateWithURL(url as CFURL,
+            [kCGImageSourceShouldCache: false] as CFDictionary),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = properties[kCGImagePropertyPixelWidth] as? Int,
+          let height = properties[kCGImagePropertyPixelHeight] as? Int,
+          width > 0, height > 0 else {
+        throw ProbeError(description: "benchmark image decode failed")
+    }
+    let long = max(width, height), short = min(width, height)
+    let bound = Int(sqrt(Double(maxDecodedBytes) / (4 * Double(short) / Double(long))))
+    guard bound > 0,
+          let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: min(4096, long, bound),
+            kCGImageSourceCreateThumbnailWithTransform: false,
+            kCGImageSourceShouldCacheImmediately: false,
+          ] as CFDictionary) else {
+        throw ProbeError(description: "benchmark image decode budget failed")
+    }
+    let decoded = CFAbsoluteTimeGetCurrent()
+    let orientationRaw = (properties[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+    guard let orientation = CGImagePropertyOrientation(rawValue: orientationRaw) else {
+        throw ProbeError(description: "benchmark orientation invalid")
+    }
+    let tensor = try ImagePreprocessor.prepare(image: image, orientation: orientation,
+                                               configuration: configuration)
+    let prepared = CFAbsoluteTimeGetCurrent()
+    let fingerprint = try await fingerprinter.fingerprintPrepared(tensor)
+    let inferred = CFAbsoluteTimeGetCurrent()
+    return (fingerprint, ["decodeMS": (decoded - start) * 1000,
+                          "preprocessMS": (prepared - decoded) * 1000,
+                          "inferenceMS": (inferred - prepared) * 1000,
+                          "fingerprintMS": (inferred - start) * 1000])
+}
+
 private func runSearchBenchmark(vectors: URL, assetCount: String, editedFraction: String,
                                 output: URL, configuration: DedupConfiguration,
-                                protocolSHA: String) async throws {
+                                protocolSHA: String, model: URL?, inputList: URL?,
+                                maxDecodedBytes: Int64, profileSHA: String) async throws {
     guard let count = Int(assetCount), count == 100000,
           let fraction = Double(editedFraction), [0.0, 0.5, 1.0].contains(fraction) else {
         throw ProbeError(description: "benchmark requires 100000 assets and edited fraction 0, 0.5, or 1")
@@ -385,6 +440,68 @@ private func runSearchBenchmark(vectors: URL, assetCount: String, editedFraction
     let incrementalStart = CFAbsoluteTimeGetCurrent()
     try await index.replace(entries: entries, generation: 2)
     let incrementalMS = (CFAbsoluteTimeGetCurrent() - incrementalStart) * 1000
+    var combined: [String: Any]?
+    if let model, let inputList {
+        let imagePaths = try JSONDecoder().decode([String].self, from: Data(contentsOf: inputList))
+        guard !imagePaths.isEmpty else { throw ProbeError(description: "empty benchmark image list") }
+        let coldStart = CFAbsoluteTimeGetCurrent()
+        let fingerprinter = try CoreMLFingerprinter(modelURL: model,
+                                                    configuration: configuration.fingerprint)
+        let first = try await fingerprintLocalImage(URL(fileURLWithPath: imagePaths[0]),
+            fingerprinter: fingerprinter, configuration: configuration.fingerprint,
+            maxDecodedBytes: maxDecodedBytes)
+        let coldFingerprintMS = (CFAbsoluteTimeGetCurrent() - coldStart) * 1000
+        var hotCombined = [Double](), incrementalCombined = [Double]()
+        var components = [[String: Double]]()
+        for iteration in 0..<20 {
+            let url = URL(fileURLWithPath: imagePaths[iteration % imagePaths.count])
+            let queryStart = CFAbsoluteTimeGetCurrent()
+            let (fingerprint, parts) = try await fingerprintLocalImage(url,
+                fingerprinter: fingerprinter, configuration: configuration.fingerprint,
+                maxDecodedBytes: maxDecodedBytes)
+            let scored = try await index.search(query: fingerprint,
+                minimumScore: configuration.threshold, generation: Int64(iteration + 2))
+            let _ = try AdvancedDuplicatePolicy.evaluate(sourceSize: nil,
+                candidates: scored, configuration: configuration)
+            hotCombined.append((CFAbsoluteTimeGetCurrent() - queryStart) * 1000)
+            components.append(parts)
+            let updateStart = CFAbsoluteTimeGetCurrent()
+            let (updated, _) = try await fingerprintLocalImage(url,
+                fingerprinter: fingerprinter, configuration: configuration.fingerprint,
+                maxDecodedBytes: maxDecodedBytes)
+            var replacement = Array(entries.prefix(total))
+            replacement.append(VectorEntry(key: "updated", origin: .photosCurrent,
+                                           fingerprint: updated, size: nil))
+            try await index.replace(entries: replacement, generation: Int64(iteration + 3))
+            incrementalCombined.append((CFAbsoluteTimeGetCurrent() - updateStart) * 1000)
+        }
+        combined = ["provenance": "real local fixture query over synthetic deterministic index; performance only",
+                    "computeUnits": "cpuOnly",
+                    "modelSHA256": configuration.fingerprint.modelSHA256,
+                    "fingerprintVersion": configuration.fingerprint.version,
+                    "profileSHA256": profileSHA,
+                    "backend": configuration.backend,
+                    "seedVectorSHA256": seedSHA,
+                    "vectorManifestSHA256": try sha256(manifestURL),
+                    "inputListSHA256": try sha256(inputList),
+                    "inputImageSHA256": try imagePaths.map {
+                        try sha256(URL(fileURLWithPath: $0)) },
+                    "coldModelLoadAndFingerprintMS": coldFingerprintMS,
+                    "coldFirstFingerprintComponents": first.1,
+                    "percentileMethod": "nearest-rank empirical; sorted sample at ceil(p*n)-1",
+                    "hotQueryCount": hotCombined.count,
+                    "hotQuerySamplesMS": hotCombined,
+                    "hotQueryP50MS": percentile(hotCombined, 0.50),
+                    "hotQueryP95MS": percentile(hotCombined, 0.95),
+                    "hotQueryP99MS": percentile(hotCombined, 0.99),
+                    "incrementalCount": incrementalCombined.count,
+                    "incrementalSamplesMS": incrementalCombined,
+                    "incrementalP50MS": percentile(incrementalCombined, 0.50),
+                    "incrementalP95MS": percentile(incrementalCombined, 0.95),
+                    "incrementalP99MS": percentile(incrementalCombined, 0.99),
+                    "incrementalMethod": "local decode/preprocess/inference plus full N+1 replacement",
+                    "components": components]
+    }
     var usage = rusage()
     getrusage(RUSAGE_SELF, &usage)
     try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
@@ -403,8 +520,17 @@ private func runSearchBenchmark(vectors: URL, assetCount: String, editedFraction
                    "hotQueryP50MS": percentile(hot, 0.50),
                    "hotQueryP95MS": percentile(hot, 0.95),
                    "hotQueryP99MS": percentile(hot, 0.99),
-                   "peakRSSBytes": usage.ru_maxrss],
+                  "peakRSSBytes": usage.ru_maxrss],
                   at: output.appendingPathComponent("search-benchmark.json"))
+    if var combined {
+        combined["protocolSHA256"] = protocolSHA
+        combined["profileVersion"] = configuration.policyVersion
+        combined["assetCount"] = count
+        combined["editedFraction"] = fraction
+        combined["representationCount"] = total
+        combined["peakRSSBytes"] = usage.ru_maxrss
+        try writeJSON(combined, at: output.appendingPathComponent("combined-benchmark.json"))
+    }
     print("benchmarked \(total) synthetic representations")
 }
 
