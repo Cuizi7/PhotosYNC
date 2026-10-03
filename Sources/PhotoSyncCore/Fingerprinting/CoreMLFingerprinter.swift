@@ -1,6 +1,7 @@
 import CoreGraphics
 import CoreML
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 
@@ -24,6 +25,7 @@ private struct InferenceInput: @unchecked Sendable {
 public actor CoreMLFingerprinter: ImageFingerprinting {
     public let configuration: FingerprintConfiguration
     private let predict: @Sendable (MLMultiArray) throws -> [Float]
+    private let onSubmitted: (@Sendable () -> Void)?
     // A single queue retains the physical slot until prediction returns, even when its waiter cancels.
     private let physicalQueue = DispatchQueue(label: "PhotoSyncCore.SSCD.physicalInference")
 
@@ -31,6 +33,15 @@ public actor CoreMLFingerprinter: ImageFingerprinting {
                 predict: @escaping @Sendable (MLMultiArray) throws -> [Float]) {
         self.configuration = configuration
         self.predict = predict
+        self.onSubmitted = nil
+    }
+
+    init(configuration: FingerprintConfiguration,
+         predict: @escaping @Sendable (MLMultiArray) throws -> [Float],
+         onSubmitted: @escaping @Sendable () -> Void) {
+        self.configuration = configuration
+        self.predict = predict
+        self.onSubmitted = onSubmitted
     }
 
     public init(modelURL: URL, configuration: FingerprintConfiguration) throws {
@@ -68,6 +79,7 @@ public actor CoreMLFingerprinter: ImageFingerprinting {
             throw AdvancedDedupError.invalidConfiguration
         }
         self.configuration = configuration
+        self.onSubmitted = nil
         self.predict = { tensor in
             let features = try MLDictionaryFeatureProvider(dictionary: ["image": tensor])
             guard let output = try model.prediction(from: features).featureValue(for: "embedding")?.multiArrayValue,
@@ -91,6 +103,7 @@ public actor CoreMLFingerprinter: ImageFingerprinting {
         let flag = CancellationFlag()
         let prediction = predict
         let queue = physicalQueue
+        let submitted = onSubmitted
         let input = InferenceInput(tensor: tensor)
         let values: [Float] = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -105,15 +118,18 @@ public actor CoreMLFingerprinter: ImageFingerprinting {
                         else { continuation.resume(returning: values) }
                     } catch { continuation.resume(throwing: error) }
                 }
+                submitted?()
             }
         } onCancel: { flag.cancel() }
         return try Fingerprint(version: configuration.version, values: values)
     }
 
     public static func packageSHA256(_ url: URL) -> String? {
-        // Populated by the conversion manifest helper; R2 probe verifies this before model load.
+        // Versioned, length-framed manifest; Python's convert-model.py uses identical bytes.
+        let root = url.standardizedFileURL
+        guard let rootPath = canonicalPath(root.path) else { return nil }
         guard let entries = FileManager.default.enumerator(
-            at: url, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
         )?.allObjects.compactMap({ $0 as? URL }) else { return nil }
         var files = [URL]()
         for entry in entries {
@@ -121,25 +137,42 @@ public actor CoreMLFingerprinter: ImageFingerprinting {
                   values.isSymbolicLink != true else { return nil }
             if values.isRegularFile == true { files.append(entry) }
         }
-        files.sort {
-            let left = Data($0.path.dropFirst(url.path.count + 1).utf8)
-            let right = Data($1.path.dropFirst(url.path.count + 1).utf8)
-            return left.lexicographicallyPrecedes(right)
-        }
-        guard !files.isEmpty else { return nil }
-        var hasher = SHA256()
+        var relativeFiles = [(path: URL, relative: Data)]()
         for file in files {
-            let relative = String(file.path.dropFirst(url.path.count + 1))
+            guard let canonical = canonicalPath(file.path), canonical.hasPrefix(rootPath + "/") else { return nil }
+            relativeFiles.append((file, Data(canonical.dropFirst(rootPath.count + 1).utf8)))
+        }
+        relativeFiles.sort { $0.relative.lexicographicallyPrecedes($1.relative) }
+        guard !relativeFiles.isEmpty else { return nil }
+        var hasher = SHA256()
+        hasher.update(data: Data("PhotoSync.mlpackage.manifest.v2\0".utf8))
+        func appendLength(_ value: Int) {
+            var littleEndian = UInt64(value).littleEndian
+            withUnsafeBytes(of: &littleEndian) { hasher.update(data: Data($0)) }
+        }
+        appendLength(relativeFiles.count)
+        for (file, relative) in relativeFiles {
             guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
-            hasher.update(data: Data(relative.utf8)); hasher.update(data: Data([0]))
+            guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                  size >= 0 else { try? handle.close(); return nil }
+            appendLength(relative.count); hasher.update(data: relative)
+            appendLength(size)
+            var readBytes = 0
             do {
                 while let bytes = try handle.read(upToCount: 1024 * 1024), !bytes.isEmpty {
                     hasher.update(data: bytes)
+                    readBytes += bytes.count
                 }
                 try handle.close()
             } catch { try? handle.close(); return nil }
-            hasher.update(data: Data([0]))
+            guard readBytes == size else { return nil }
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func canonicalPath(_ path: String) -> String? {
+        guard let pointer = path.withCString({ realpath($0, nil) }) else { return nil }
+        defer { free(pointer) }
+        return String(cString: pointer)
     }
 }

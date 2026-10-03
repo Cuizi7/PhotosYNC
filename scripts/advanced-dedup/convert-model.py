@@ -19,19 +19,30 @@ def file_sha256(path: Path) -> str:
 
 
 def package_sha256(path: Path) -> str:
-    """Hash sorted UTF-8 relative paths and bytes, each followed by a NUL."""
+    """Hash a versioned, length-framed sorted relative-path/file-byte manifest."""
     digest = hashlib.sha256()
-    files = sorted((item for item in path.rglob("*") if item.is_file()),
+    entries = list(path.rglob("*"))
+    if any(item.is_symlink() for item in entries):
+        raise ValueError("model package contains a symbolic link")
+    files = sorted((item for item in entries if item.is_file()),
                    key=lambda item: item.relative_to(path).as_posix().encode("utf-8"))
     if not files:
         raise ValueError("empty model package")
+    digest.update(b"PhotoSync.mlpackage.manifest.v2\0")
+    digest.update(len(files).to_bytes(8, "little"))
     for item in files:
-        digest.update(item.relative_to(path).as_posix().encode("utf-8"))
-        digest.update(b"\0")
+        relative = item.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "little"))
+        digest.update(relative)
+        size = item.stat().st_size
+        digest.update(size.to_bytes(8, "little"))
+        read_bytes = 0
         with item.open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
-        digest.update(b"\0")
+                read_bytes += len(chunk)
+        if read_bytes != size:
+            raise ValueError("model package changed while hashing")
     return digest.hexdigest()
 
 
@@ -96,6 +107,7 @@ def main() -> None:
             "batchSize": 1, "skipModelLoad": True,
         },
         "modelSHA256": package_sha256(args.output_package),
+        "modelSHA256ManifestEncoding": "PhotoSync.mlpackage.manifest.v2: UInt64LE count, path length/path, byte length/bytes",
     }
     args.provenance.parent.mkdir(parents=True, exist_ok=True)
     args.provenance.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")

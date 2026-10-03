@@ -8,11 +8,37 @@ struct ProbeError: Error, CustomStringConvertible {
     let description: String
 }
 
-func value(after flag: String, in args: [String]) throws -> String {
-    guard let i = args.firstIndex(of: flag), i + 1 < args.count else {
-        throw ProbeError(description: "missing \(flag)")
+struct ApprovedProtocolBinding: Decodable {
+    let bindingVersion: Int
+    let protocolSHA256: String
+    let maxDecodedBytes: Int64
+    let maxAbsError: Double
+    let minCosine: Double
+}
+
+func parseArguments() throws -> (command: String, values: [String: String]) {
+    let args = Array(CommandLine.arguments.dropFirst())
+    guard let command = args.first, command == "fingerprint" || command == "compare-tensors" else {
+        throw ProbeError(description: "expected fingerprint or compare-tensors command")
     }
-    return args[i + 1]
+    let listFlag = command == "fingerprint" ? "--input-list" : "--tensor-list"
+    let allowed = Set(["--profile", "--model", "--output-dir", listFlag, "--approved-protocol-json"])
+    guard (args.count - 1).isMultiple(of: 2) else {
+        throw ProbeError(description: "unpaired probe option")
+    }
+    var values = [String: String]()
+    for index in stride(from: 1, to: args.count, by: 2) {
+        let flag = args[index]
+        guard allowed.contains(flag), values[flag] == nil else {
+            throw ProbeError(description: "unknown or duplicate probe option \(flag)")
+        }
+        values[flag] = args[index + 1]
+    }
+    guard ["--profile", "--model", "--output-dir", listFlag, "--approved-protocol-json"]
+        .allSatisfy({ values[$0] != nil }) else {
+        throw ProbeError(description: "missing required probe option")
+    }
+    return (command, values)
 }
 
 func sha256(_ url: URL) throws -> String {
@@ -30,17 +56,21 @@ func sha256(_ url: URL) throws -> String {
 }
 
 func run() async throws {
-    let args = Array(CommandLine.arguments.dropFirst())
-    guard args.first == "fingerprint" || args.first == "compare-tensors" else {
-        throw ProbeError(description: "expected fingerprint or compare-tensors command")
+    let parsed = try parseArguments()
+    let args = parsed.values
+    let profile = URL(fileURLWithPath: args["--profile"]!)
+    let model = URL(fileURLWithPath: args["--model"]!)
+    let output = URL(fileURLWithPath: args["--output-dir"]!)
+    let approved = try JSONDecoder().decode(ApprovedProtocolBinding.self,
+                                            from: Data(args["--approved-protocol-json"]!.utf8))
+    let protocolSHA = approved.protocolSHA256
+    let maxDecodedBytes = approved.maxDecodedBytes
+    guard approved.bindingVersion == 1,
+          protocolSHA.count == 64, protocolSHA.allSatisfy(\.isHexDigit),
+          maxDecodedBytes > 0, approved.maxAbsError.isFinite, approved.maxAbsError > 0,
+          approved.minCosine.isFinite, approved.minCosine > 0, approved.minCosine <= 1 else {
+        throw ProbeError(description: "invalid approved protocol binding")
     }
-    let profile = URL(fileURLWithPath: try value(after: "--profile", in: args))
-    let model = URL(fileURLWithPath: try value(after: "--model", in: args))
-    let output = URL(fileURLWithPath: try value(after: "--output-dir", in: args))
-    let protocolSHA = try value(after: "--protocol-sha256", in: args)
-    guard protocolSHA.count == 64, protocolSHA.allSatisfy(\.isHexDigit),
-          let maxDecodedBytes = Int64(try value(after: "--max-decoded-bytes", in: args)),
-          maxDecodedBytes > 0 else { throw ProbeError(description: "invalid approved protocol binding") }
     guard !FileManager.default.fileExists(atPath: output.path) else {
         throw ProbeError(description: "output directory already exists")
     }
@@ -59,15 +89,11 @@ func run() async throws {
     let configuration = try JSONDecoder().decode(FingerprintConfiguration.self,
                                                    from: JSONSerialization.data(withJSONObject: selected))
     let fingerprinter = try CoreMLFingerprinter(modelURL: model, configuration: configuration)
-    if args.first == "compare-tensors" {
-        let maxError = try Double(value(after: "--max-abs-error", in: args))
-        let minCosine = try Double(value(after: "--min-cosine", in: args))
-        guard let maxError = maxError, let minCosine = minCosine,
-              maxError.isFinite, minCosine.isFinite else {
-            throw ProbeError(description: "invalid conversion tolerance")
-        }
+    if parsed.command == "compare-tensors" {
+        let maxError = approved.maxAbsError
+        let minCosine = approved.minCosine
         let entries = try JSONDecoder().decode([TensorPair].self,
-                                                from: Data(contentsOf: URL(fileURLWithPath: try value(after: "--tensor-list", in: args))))
+                                                from: Data(contentsOf: URL(fileURLWithPath: args["--tensor-list"]!)))
         guard !entries.isEmpty else { throw ProbeError(description: "empty tensor list") }
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
         var comparisons = [[String: Any]]()
@@ -107,7 +133,7 @@ func run() async throws {
         print("conversion comparison passed for \(comparisons.count) tensor(s)")
         return
     }
-    let list = URL(fileURLWithPath: try value(after: "--input-list", in: args))
+    let list = URL(fileURLWithPath: args["--input-list"]!)
     let paths = try JSONDecoder().decode([String].self, from: Data(contentsOf: list))
     guard !paths.isEmpty else { throw ProbeError(description: "empty input list") }
     try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)

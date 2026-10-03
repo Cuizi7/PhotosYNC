@@ -2,7 +2,7 @@ import CoreGraphics
 import CoreML
 import ImageIO
 import XCTest
-import PhotoSyncCore
+@testable import PhotoSyncCore
 
 private final class PhysicalStartCounter: @unchecked Sendable {
     private let lock = NSLock()
@@ -104,7 +104,7 @@ final class FingerprintTests: XCTestCase {
         let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().appendingPathComponent("Fixtures/FingerprintTiny.mlpackage")
         let hash = try XCTUnwrap(CoreMLFingerprinter.packageSHA256(fixture))
-        XCTAssertEqual(hash, "1ba8818cbbe2c89706e09026534f3edba69993d17739e4369d2cf881aff96612")
+        XCTAssertEqual(hash, "a29f3271363d7740d0d4cbd29926aec5974877c329278fbc603af4f8da4b9bc6")
         let configuration = try FingerprintConfiguration(modelSHA256: hash, inputSide: 4,
                                                         resizeMode: .stretchFullFrame,
                                                         colorSpace: "sRGB", mean: [0, 0, 0], std: [1, 1, 1])
@@ -116,24 +116,53 @@ final class FingerprintTests: XCTestCase {
         XCTAssertEqual(output.values.reduce(0.0) { $0 + $1 * $1 }, 1, accuracy: 0.0001)
     }
 
+    func testPackageHashSeparatesBinaryFileBoundaries() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = root.appendingPathComponent("first.mlpackage")
+        let second = root.appendingPathComponent("second.mlpackage")
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        try Data([120, 0, 98, 0, 121]).write(to: first.appendingPathComponent("a"))
+        try Data([120]).write(to: second.appendingPathComponent("a"))
+        try Data([121]).write(to: second.appendingPathComponent("b"))
+        XCTAssertEqual(CoreMLFingerprinter.packageSHA256(first),
+                       "687b7c969279950d5afa6a2e23eade95c6b35c79bd5ed2abe9cab59f9bba70bd")
+        XCTAssertEqual(CoreMLFingerprinter.packageSHA256(second),
+                       "fc30ed02e8ac87e6272d4d692bb62d5e7580638df5052fa841943d848c5b373b")
+    }
+
     func testCancelledWaitDoesNotStartSecondPhysicalInference() async throws {
         let entered = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
+        let secondSubmitted = DispatchSemaphore(value: 0)
+        let secondPhysicalStart = DispatchSemaphore(value: 0)
         let starts = PhysicalStartCounter()
-        let fingerprinter = CoreMLFingerprinter(configuration: try configuration()) { _ in
+        let submissions = PhysicalStartCounter()
+        let fingerprinter = CoreMLFingerprinter(configuration: try configuration(), predict: { _ in
             let count = starts.increment()
             if count == 1 { entered.signal(); release.wait() }
+            if count == 2 { secondPhysicalStart.signal() }
             return Array(repeating: 1, count: 1024)
-        }
+        }, onSubmitted: {
+            if submissions.increment() == 2 { secondSubmitted.signal() }
+        })
         let source = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
         let first = Task { try await fingerprinter.fingerprint(image: source, orientation: .up) }
         XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
         first.cancel()
         let second = Task { try await fingerprinter.fingerprint(image: source, orientation: .up) }
+        XCTAssertEqual(secondSubmitted.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(secondPhysicalStart.wait(timeout: .now() + 0.5), .timedOut)
         let before = starts.current()
         XCTAssertEqual(before, 1)
         release.signal()
-        _ = try? await first.value
+        do {
+            _ = try await first.value
+            XCTFail("Cancelled waiter must report cancellation")
+        } catch is CancellationError {
+            // The physical slot remains occupied until the first predictor returns.
+        }
         _ = try await second.value
         let after = starts.current()
         XCTAssertEqual(after, 2)

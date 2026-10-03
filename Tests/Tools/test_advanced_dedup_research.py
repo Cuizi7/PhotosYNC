@@ -29,12 +29,37 @@ class ResearchProtocolTests(unittest.TestCase):
             (package / "Data").mkdir(parents=True)
             (package / "Manifest.json").write_bytes(b"{}")
             (package / "Data" / "weights.bin").write_bytes(b"abc")
-            expected = hashlib.sha256(
-                b"Data/weights.bin\0abc\0Manifest.json\0{}\0"
-            ).hexdigest()
-            self.assertEqual(converter.package_sha256(package), expected)
+            expected = converter.package_sha256(package)
+            self.assertEqual(len(expected), 64)
             (package / "Data" / "weights.bin").write_bytes(b"abd")
             self.assertNotEqual(converter.package_sha256(package), expected)
+
+    def test_conversion_manifest_boundaries_are_unambiguous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.mlpackage"
+            second = root / "second.mlpackage"
+            first.mkdir()
+            second.mkdir()
+            (first / "a").write_bytes(b"x\0b\0y")
+            (second / "a").write_bytes(b"x")
+            (second / "b").write_bytes(b"y")
+            self.assertEqual(converter.package_sha256(first),
+                             "687b7c969279950d5afa6a2e23eade95c6b35c79bd5ed2abe9cab59f9bba70bd")
+            self.assertEqual(converter.package_sha256(second),
+                             "fc30ed02e8ac87e6272d4d692bb62d5e7580638df5052fa841943d848c5b373b")
+
+    def test_probe_rejects_caller_override_of_approved_protocol(self):
+        base = ["bash", str(ROOT / "scripts/advanced-dedup/run-probe.sh"), "compare-tensors",
+                "--profile", "missing", "--model", "missing", "--tensor-list", "missing",
+                "--output-dir", "missing"]
+        for extra, reason in [(["--min-cosine", "-1"], "reserved"),
+                              (["--protocol-sha256", "0" * 64], "reserved"),
+                              (["--profile", "another"], "duplicate")]:
+            with self.subTest(extra=extra):
+                result = subprocess.run(base + extra, capture_output=True, text=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
 
     def test_conversion_rejects_missing_explicit_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,6 +98,7 @@ class ResearchProtocolTests(unittest.TestCase):
         record = json.loads((ROOT / "docs/research/advanced-dedup/model-provenance.json").read_text())
         self.assertEqual(record["weightsSHA256"], record["officialTorchScriptSHA256"])
         self.assertEqual(len(record["modelSHA256"]), 64)
+        self.assertIn("manifest.v2", record["modelSHA256ManifestEncoding"])
         self.assertEqual(record["conversion"]["computePrecision"], "float32")
         self.assertEqual(record["runtimeComputeUnits"], "cpuOnly")
         self.assertEqual(record["modelWeightsRedistributionLicenseStatus"], "unresolved")
