@@ -839,6 +839,14 @@ def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir
     return report
 
 
+def _distractor_catalog_sufficient(entries, minimum):
+    """Edited views cannot multiply assets; relabelled identical bytes cannot either."""
+    _positive_int(minimum, "distractor minimum")
+    distractors = [entry for entry in entries if entry["split"] == "distractor"]
+    return (len({entry["origin_sha256"] for entry in distractors}) >= minimum and
+            len({entry["sha256"] for entry in distractors}) >= minimum)
+
+
 def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
     """Audit saved experiment bytes and emit a release profile only on full success."""
     if output_dir.exists():
@@ -846,8 +854,6 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
     protocol, protocol_sha = _approved_protocol(protocol_path)
     dataset = json.loads(dataset_path.read_text())
     inventory = validate_dataset(dataset, protocol["fixture_manifest_sha256"])
-    distractor_origins = {entry["origin_sha256"] for entry in dataset["entries"]
-                          if entry["split"] == "distractor"}
     sealed_entries = [entry for entry in dataset["entries"] if entry["split"] == "sealed"]
     hypotheses = [(entry["stratum"], entry["split_group"]) for entry in sealed_entries]
     if len(hypotheses) != len(set(hypotheses)):
@@ -980,7 +986,7 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
                                   for name in COPY_STRATA):
         verdict["reasons"].append("540 distinct positive sealed groups")
         verdict["pass"] = False
-    if len(distractor_origins) < 100000:
+    if not _distractor_catalog_sufficient(dataset["entries"], minimum=100000):
         verdict["reasons"].append("100000 audited distinct distractor assets")
         verdict["pass"] = False
     if not verdict["pass"]:

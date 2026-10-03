@@ -723,6 +723,23 @@ class ResearchAcceptanceArtifactTests(unittest.TestCase):
             research._audit_catalog_score(report, self.dataset, "sealed",
                                           self.profile_path, self.profile, self.protocol)
 
+    def testSameDistractorBytesWithDifferentOriginsDoNotMakeDistinctAssets(self):
+        first = ResearchProtocolTests.entry(self.root, "same-file", "family-one",
+                                            "group-one", "distractor")
+        second = ResearchProtocolTests.entry(self.root, "other-label", "family-two",
+                                             "group-two", "distractor")
+        second["path"] = first["path"]
+        second["sha256"] = first["sha256"]
+        dataset = {"root": str(self.root), "entries": [first, second]}
+        research.validate_dataset(dataset, FIXTURE_HASH)
+        self.assertEqual(len({entry["origin_sha256"] for entry in dataset["entries"]}), 2)
+        self.assertFalse(research._distractor_catalog_sufficient(dataset["entries"], minimum=2))
+        second["path"] = "other-label"
+        second["sha256"] = hashlib.sha256((self.root / "other-label").read_bytes()).hexdigest()
+        self.assertTrue(research._distractor_catalog_sufficient(dataset["entries"], minimum=2))
+        second["origin_sha256"] = first["origin_sha256"]
+        self.assertFalse(research._distractor_catalog_sufficient(dataset["entries"], minimum=2))
+
     def testChangedQueryDimensionsOrDecisionsFailArtifactAudit(self):
         dimensions = json.loads(json.dumps(self.report))
         dimensions["swiftBatch"]["queries"][0]["size"] = {"width": 1, "height": 1}
