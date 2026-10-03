@@ -124,6 +124,15 @@ def verify_acceptance(protocol: dict, results: dict) -> dict:
         reasons.append("protocol binding")
     if not results.get("artifactBytesVerified"):
         reasons.append("artifact bytes unverified")
+    outcomes = results.get("sealedOutcomes")
+    if not isinstance(outcomes, list) or not outcomes or any(
+            not isinstance(item, dict) or item.get("split") != "sealed" or
+            item.get("expectedAction") not in ACTIONS or item.get("observedAction") not in ACTIONS
+            for item in outcomes):
+        reasons.append("sealed query outcomes missing")
+    elif any(item["expectedAction"] == "importFile" and item["observedAction"] == "skip"
+             for item in outcomes):
+        reasons.append("observed false skip")
     sealed = results.get("sealedStatistics", {}).get("bySplitAndStratum", {}).get("sealed", {})
     targets = {"false_skip": protocol["max_false_skip_upper_bound"],
                "candidate_recall": 1 - protocol["min_candidate_recall"]}
@@ -386,6 +395,7 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
             raise ValueError(f"family_id {family} assigned multiple split_group values")
         family_group[family] = group
         identity = (family, group, split)
+        byte_owner = (family, group, split, origin)
         if origin in origin_identity and origin_identity[origin] != identity:
             raise ValueError(f"{label}.origin_sha256 relabelled across family/split_group/split")
         origin_identity[origin] = identity
@@ -395,8 +405,8 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
         group_split[group] = split
         query_digest = _file_record(entry, root, label, public_hashes, split)
         if split != "distractor":
-            previous = byte_identity.setdefault(query_digest, identity)
-            if previous != identity:
+            previous = byte_identity.setdefault(query_digest, byte_owner)
+            if previous != byte_owner:
                 raise ValueError(f"{label} verified byte identity conflicts with another audited query or match")
         candidates = entry["expected_candidates"]
         if not isinstance(candidates, list):
@@ -424,8 +434,8 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
                 _positive_int(candidate[dimension], f"{candidate_label}.{dimension}")
             candidate_digest = _file_record(candidate, root, candidate_label, public_hashes, split)
             if split != "distractor":
-                previous = byte_identity.setdefault(candidate_digest, identity)
-                if previous != identity:
+                previous = byte_identity.setdefault(candidate_digest, byte_owner)
+                if previous != byte_owner:
                     raise ValueError(f"{candidate_label} verified byte identity conflicts with another audited query or match")
         if split in {"calibration", "sealed"}:
             groups_by_split[split].add(group)
@@ -488,6 +498,8 @@ def _vector_inventory(vectors, profile, protocol_sha):
         if not vector_path.is_file() or vector_path.stat().st_size != 4096:
             raise ValueError("R2 vector bytes missing or wrong length")
         vector_sha = _sha256_file(vector_path)
+        if record.get("vectorSHA256") != vector_sha:
+            raise ValueError("R2 vector manifest does not bind actual vector bytes")
         if digest in by_image and by_image[digest] != (vector_path, vector_sha):
             raise ValueError("R2 vector input SHA256 has conflicting records")
         by_image[digest] = (vector_path, vector_sha)
@@ -518,6 +530,72 @@ def _run_swift_score(profile_path, queries, protocol_sha):
         return result, batch_document
 
 
+def _statistical_views(dataset, split, inventory, fixture_sha):
+    """One full catalog per split, with each audited distractor present exactly once."""
+    root = Path(dataset["root"]).expanduser().resolve()
+    public_hashes, _, _, _ = _public_inventory(fixture_sha)
+    catalog = {}
+    queries = []
+
+    def add(key, item, label):
+        _nonempty(key, f"{label}.key")
+        _nonempty(item.get("representation"), f"{label}.representation")
+        if item["representation"] not in REPRESENTATIONS:
+            raise ValueError(f"{label}.representation invalid")
+        for dimension in ("width", "height"):
+            _positive_int(item.get(dimension), f"{label}.{dimension}")
+        record = {"key": key, "origin": item["representation"],
+                  "size": {"width": item["width"], "height": item["height"]},
+                  **_vector_reference(item, inventory)}
+        if key in catalog and catalog[key] != record:
+            raise ValueError(f"catalog key {key} maps to conflicting audited representations")
+        catalog[key] = record
+
+    for entry in dataset["entries"]:
+        if entry["split"] == "distractor":
+            if entry["expected_candidates"] or entry.get("gallery_candidates"):
+                raise ValueError("standalone distractor cannot declare a related/gallery candidate")
+            add(f"distractor:{entry['query_id']}", entry, "distractor")
+            continue
+        if split and entry["split"] != split:
+            continue
+        if entry["split"] == "public_regression":
+            continue
+        for candidate in entry["expected_candidates"]:
+            add(candidate["id"], candidate, "expected candidate")
+        for candidate in entry.get("gallery_candidates", []):
+            _file_record(candidate, root, "gallery candidate", public_hashes, entry["split"])
+            add(candidate["id"], candidate, "gallery candidate")
+        for dimension in ("width", "height"):
+            _positive_int(entry.get(dimension), f"{entry['query_id']}.{dimension}")
+        queries.append({"id": entry["query_id"],
+                        "size": {"width": entry["width"], "height": entry["height"]},
+                        **_vector_reference(entry, inventory)})
+    if not catalog or not queries:
+        raise ValueError("statistical scoring requires a nonempty query set and full catalog")
+    return {"candidates": [catalog[key] for key in sorted(catalog)]}, {"queries": queries}
+
+
+def _run_swift_catalog_score(profile_path, catalog_path, batch, protocol_sha):
+    with tempfile.TemporaryDirectory(prefix="photosync-r4-score-") as temporary:
+        temporary = Path(temporary)
+        input_path = temporary / "queries.json"
+        input_path.write_text(json.dumps(batch, sort_keys=True))
+        output = temporary / "swift-output"
+        subprocess.run([str(REPO_ROOT / "scripts/advanced-dedup/run-probe.sh"), "score-catalog",
+                        "--profile", str(profile_path), "--catalog", str(catalog_path),
+                        "--input", str(input_path), "--output-dir", str(output)],
+                       check=True, capture_output=True, text=True)
+        result = json.loads((output / "query-results.json").read_text())
+        if (result.get("protocolSHA256") != protocol_sha or
+                result.get("profileSHA256") != _sha256_file(profile_path) or
+                result.get("catalogSHA256") != _sha256_file(catalog_path) or
+                result.get("batchSHA256") != _sha256_file(input_path) or
+                len(result.get("queries", [])) != len(batch["queries"])):
+            raise ValueError("Swift full-catalog score binding mismatch")
+        return result
+
+
 def public_evaluation_evidence(swift, batch):
     """Retain and verify the complete Swift request/result and every vector byte identity."""
     digest = hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
@@ -535,6 +613,9 @@ def public_evaluation_evidence(swift, batch):
         candidate_hashes = {item["key"]: item["vectorSHA256"] for item in request["candidates"]}
         if len(candidate_hashes) != len(request["candidates"]):
             raise ValueError("saved batch repeats candidate keys")
+        if (len(result["candidates"]) != len(candidate_hashes) or
+                {item["key"] for item in result["candidates"]} != set(candidate_hashes)):
+            raise ValueError("saved candidate result set incomplete or duplicated")
         for candidate in result["candidates"]:
             if (candidate["key"] not in candidate_hashes or
                     not candidate["vectorSHA256"] or
@@ -607,46 +688,92 @@ def score_dataset(protocol_path, dataset_path, vectors, profile_path, output, sp
     validate_dataset(dataset, protocol["fixture_manifest_sha256"])
     profile = _validated_profile(profile_path, protocol_sha, protocol)
     inventory, inventory_sha = _vector_inventory(vectors, profile, protocol_sha)
-    public_hashes, _, _, _ = _public_inventory(protocol["fixture_manifest_sha256"])
-    queries = []
-    for entry in dataset["entries"]:
-        if entry["split"] == "distractor" or (split and entry["split"] != split):
-            continue
-        _positive_int(entry.get("width"), f"{entry['query_id']}.width")
-        _positive_int(entry.get("height"), f"{entry['query_id']}.height")
-        candidates = entry["expected_candidates"] + entry.get("gallery_candidates", [])
-        if not candidates:
-            raise ValueError(f"{entry['query_id']} has no designated candidate gallery")
-        if len({item["id"] for item in candidates}) != len(candidates):
-            raise ValueError(f"{entry['query_id']} repeats a candidate in its gallery")
-        for index, item in enumerate(entry.get("gallery_candidates", [])):
-            label = f"{entry['query_id']}.gallery_candidates[{index}]"
-            _required(item, {"id", "representation", "width", "height", "path",
-                             "sha256", "license_record"}, label)
-            if item["representation"] not in REPRESENTATIONS:
-                raise ValueError(f"{label}.representation invalid")
-            _positive_int(item["width"], f"{label}.width")
-            _positive_int(item["height"], f"{label}.height")
-            _file_record(item, Path(dataset["root"]).expanduser().resolve(), label,
-                         public_hashes, entry["split"])
-        queries.append({"id": entry["query_id"], "size": {"width": entry["width"],
-                        "height": entry["height"]}, **_vector_reference(entry, inventory),
-                        "candidates": [{"key": item["id"], "origin": item["representation"],
-                                        "size": {"width": item["width"], "height": item["height"]},
-                                        **_vector_reference(item, inventory)} for item in candidates]})
-    swift_results, batch = _run_swift_score(profile_path, queries, protocol_sha)
-    evidence = public_evaluation_evidence(swift_results, batch)
+    catalog, batch = _statistical_views(dataset, split, inventory,
+                                        protocol["fixture_manifest_sha256"])
+    if output.exists():
+        raise ValueError("output already exists")
+    catalog_path = output.with_name(output.stem + "-catalog.json")
+    if catalog_path.exists():
+        raise ValueError("catalog output already exists")
+    catalog_path.write_text(json.dumps(catalog, sort_keys=True))
+    swift_results = _run_swift_catalog_score(profile_path, catalog_path, batch, protocol_sha)
     evaluated = {"entries": [entry for entry in dataset["entries"]
                              if entry["split"] != "distractor" and (not split or entry["split"] == split)]}
     statistics = query_level_statistics(evaluated, swift_results, protocol)
     report = {"protocolSHA256": protocol_sha, "datasetSHA256": _sha256_file(dataset_path),
               "profileSHA256": _sha256_file(profile_path), "vectorManifestSHA256": inventory_sha,
-              "statistics": statistics, **evidence,
+              "vectorManifestPath": str((vectors / "fingerprints.json").resolve()),
+              "catalogPath": str(catalog_path.resolve()), "catalogSHA256": _sha256_file(catalog_path),
+              "statistics": statistics, "swift": swift_results, "swiftBatch": batch,
               "evaluatedSplit": split, "researchOnly": True}
-    if output.exists():
-        raise ValueError("output already exists")
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return report
+
+
+def _public_queries(manifest, expected, inventory):
+    images = {item["id"]: item for item in manifest["images"]}
+    queries = []
+    for case in expected["cases"]:
+        image = images[case["query"]]
+        candidates = [images[key] for key in case["candidates"]]
+        queries.append({"id": case["id"], "size": {"width": image["width"],
+                        "height": image["height"]}, **_vector_reference(image, inventory),
+                        "candidates": [{"key": candidate["id"], "origin": "photosOriginal",
+                                        "size": {"width": candidate["width"],
+                                                 "height": candidate["height"]},
+                                        **_vector_reference(candidate, inventory)}
+                                       for candidate in candidates]})
+    return queries
+
+
+def _audited_report_inventory(report, profile, protocol_sha):
+    path = Path(report["vectorManifestPath"])
+    if not path.is_absolute() or path.name != "fingerprints.json":
+        raise ValueError("R2 vector manifest path invalid")
+    inventory, actual_sha = _vector_inventory(path.parent, profile, protocol_sha)
+    if report.get("vectorManifestSHA256") != actual_sha:
+        raise ValueError("saved R2 vector manifest binding mismatch")
+    return inventory
+
+
+def _audit_catalog_score(report, dataset, split, profile_path, profile, protocol):
+    protocol_sha = report["protocolSHA256"]
+    inventory = _audited_report_inventory(report, profile, protocol_sha)
+    catalog, batch = _statistical_views(dataset, split, inventory,
+                                        protocol["fixture_manifest_sha256"])
+    catalog_path = Path(report["catalogPath"])
+    if not catalog_path.is_absolute() or not catalog_path.is_file():
+        raise ValueError("saved full catalog missing")
+    if (_sha256_file(catalog_path) != report.get("catalogSHA256") or
+            json.loads(catalog_path.read_text()) != catalog):
+        raise ValueError("saved full catalog differs from audited dataset and R2 vectors")
+    if report.get("swiftBatch") != batch:
+        raise ValueError("saved statistical queries differ from audited dataset")
+    swift = report["swift"]
+    if (swift.get("catalogSHA256") != report["catalogSHA256"] or
+            len(swift.get("queries", [])) != len(batch["queries"]) or
+            len({item["id"] for item in swift["queries"]}) != len(batch["queries"])):
+        raise ValueError("saved catalog results incomplete")
+    fresh = _run_swift_catalog_score(profile_path, catalog_path, batch, protocol_sha)
+    if swift != fresh:
+        raise ValueError("saved catalog decisions differ from shared Swift scorer")
+    return query_level_statistics({"entries": [entry for entry in dataset["entries"]
+                                               if entry["split"] == split]}, fresh, protocol)
+
+
+def _audit_public_score(report, profile_path, profile, protocol_sha, fixture=None):
+    inventory = _audited_report_inventory(report, profile, protocol_sha)
+    fixture = fixture or REPO_ROOT / "Tests/Fixtures/AdvancedDedup"
+    manifest = json.loads((fixture / "manifest.json").read_text())
+    expected = json.loads((fixture / "expected-results.json").read_text())
+    batch = {"queries": _public_queries(manifest, expected, inventory)}
+    if report.get("swiftBatch") != batch:
+        raise ValueError("saved public batch differs from frozen images, dimensions or gallery")
+    public_evaluation_evidence(report["swift"], batch)
+    fresh, _ = _run_swift_score(profile_path, batch["queries"], protocol_sha)
+    if report["swift"] != fresh:
+        raise ValueError("saved public decisions differ from shared Swift scorer")
+    return fresh
 
 
 def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir):
@@ -677,18 +804,7 @@ def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir
                     "--input-list", str(list_path), "--output-dir", str(vectors)],
                    check=True, capture_output=True, text=True)
     inventory, inventory_sha = _vector_inventory(vectors, profile, protocol_sha)
-    images = {item["id"]: item for item in manifest["images"]}
-    queries = []
-    for case in expected["cases"]:
-        image = images[case["query"]]
-        candidates = [images[key] for key in case["candidates"]]
-        queries.append({"id": case["id"], "size": {"width": image["width"],
-                        "height": image["height"]}, **_vector_reference(image, inventory),
-                        "candidates": [{"key": candidate["id"], "origin": "photosOriginal",
-                                        "size": {"width": candidate["width"],
-                                                 "height": candidate["height"]},
-                                        **_vector_reference(candidate, inventory)}
-                                       for candidate in candidates]})
+    queries = _public_queries(manifest, expected, inventory)
     swift_results, batch = _run_swift_score(profile_path, queries, protocol_sha)
     evidence = public_evaluation_evidence(swift_results, batch)
     by_id = {item["id"]: item for item in swift_results["queries"]}
@@ -710,6 +826,7 @@ def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir
               "manifestSHA256": _sha256_file(manifest_path),
               "profileSHA256": _sha256_file(profile_path),
               "modelPath": str(model_path), "vectorManifestSHA256": inventory_sha,
+              "vectorManifestPath": str((vectors / "fingerprints.json").resolve()),
               "threshold": profile["threshold"],
               "thresholdStatus": "predeclared synthetic example; diagnostic only; not calibrated or accepted",
               **evidence,
@@ -729,8 +846,8 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
     protocol, protocol_sha = _approved_protocol(protocol_path)
     dataset = json.loads(dataset_path.read_text())
     inventory = validate_dataset(dataset, protocol["fixture_manifest_sha256"])
-    distractor_hashes = {entry["sha256"] for entry in dataset["entries"]
-                         if entry["split"] == "distractor"}
+    distractor_origins = {entry["origin_sha256"] for entry in dataset["entries"]
+                          if entry["split"] == "distractor"}
     sealed_entries = [entry for entry in dataset["entries"] if entry["split"] == "sealed"]
     hypotheses = [(entry["stratum"], entry["split_group"]) for entry in sealed_entries]
     if len(hypotheses) != len(set(hypotheses)):
@@ -780,13 +897,7 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
                 report["swift"].get("fingerprintVersion") != profile["fingerprint"]["version"] or
                 report["swift"].get("policyVersion") != profile["policyVersion"]):
             raise ValueError(f"{name} Swift profile/model binding mismatch")
-        public_evaluation_evidence(report["swift"], report["swiftBatch"])
-        for query in report["swiftBatch"]["queries"]:
-            for vector in [query, *query["candidates"]]:
-                if _sha256_file(Path(vector["vector"])) != vector["vectorSHA256"]:
-                    raise ValueError(f"{name} vector byte binding mismatch")
-        entries = {"entries": [entry for entry in dataset["entries"] if entry["split"] == name]}
-        statistics = query_level_statistics(entries, report["swift"], protocol)
+        statistics = _audit_catalog_score(report, dataset, name, paths["profile"], profile, protocol)
         if statistics != report["statistics"]:
             raise ValueError(f"{name} statistics differ from actual queries and oracle")
     public = reports["publicRegression"]
@@ -795,6 +906,8 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
                     "--require-approved"], check=True, capture_output=True, text=True)
     if (public.get("protocolSHA256") != protocol_sha or
             public.get("profileSHA256") != manifest["profile"]["sha256"] or
+            public.get("manifestSHA256") != _sha256_file(
+                REPO_ROOT / "Tests/Fixtures/AdvancedDedup/manifest.json") or
             public.get("expectedResultsSHA256") != _sha256_file(
                 REPO_ROOT / "Tests/Fixtures/AdvancedDedup/expected-results.json")):
         raise ValueError("public regression binding mismatch")
@@ -803,11 +916,7 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
             public["swift"].get("fingerprintVersion") != profile["fingerprint"]["version"] or
             public["swift"].get("policyVersion") != profile["policyVersion"]):
         raise ValueError("public Swift profile/model binding mismatch")
-    public_evaluation_evidence(public["swift"], public["swiftBatch"])
-    for query in public["swiftBatch"]["queries"]:
-        for vector in [query, *query["candidates"]]:
-            if _sha256_file(Path(vector["vector"])) != vector["vectorSHA256"]:
-                raise ValueError("public regression vector byte binding mismatch")
+    _audit_public_score(public, paths["profile"], profile, protocol_sha)
     truth = json.loads((REPO_ROOT / "Tests/Fixtures/AdvancedDedup/expected-results.json").read_text())
     truth_by_id = {case["id"]: case for case in truth["cases"]}
     observed_by_id = {query["id"]: query for query in public["swift"]["queries"]}
@@ -852,6 +961,7 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
         "bindings": bindings, "protocolSHA256": protocol_sha,
         "expectedProtocolSHA256": protocol_sha, "artifactBytesVerified": True,
         "sealedStatistics": reports["sealed"]["statistics"],
+        "sealedOutcomes": reports["sealed"]["statistics"]["queryOutcomes"],
         "publicRegression": {"caseCount": len(truth_by_id),
                              "passCount": len(truth_by_id) - len(set(actual_content_failures + actual_action_failures)),
                              "contentFailures": actual_content_failures,
@@ -870,7 +980,7 @@ def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
                                   for name in COPY_STRATA):
         verdict["reasons"].append("540 distinct positive sealed groups")
         verdict["pass"] = False
-    if len(distractor_hashes) < 100000:
+    if len(distractor_origins) < 100000:
         verdict["reasons"].append("100000 audited distinct distractor assets")
         verdict["pass"] = False
     if not verdict["pass"]:

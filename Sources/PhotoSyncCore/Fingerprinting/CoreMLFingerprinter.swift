@@ -96,6 +96,9 @@ public actor CoreMLFingerprinter: ImageFingerprinting {
     }
 
     /// Probe seam: the same serialized prediction path, after independently timed preprocessing.
+    /// The caller lends tensor storage exclusively and must not mutate or reuse it until physical
+    /// prediction completes. Logical task cancellation does not release that physical work;
+    /// after cancellation, discard the tensor rather than assuming the prediction has finished.
     public func fingerprintPrepared(_ tensor: MLMultiArray) async throws -> Fingerprint {
         try Task.checkCancellation()
         guard tensor.shape.map(\.intValue) == [1, 3, configuration.inputSide, configuration.inputSide],

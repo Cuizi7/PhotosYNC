@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,8 @@ class ResearchProtocolTests(unittest.TestCase):
         return protocol, {"bindings": bindings, "protocolSHA256": protocol_sha,
                           "expectedProtocolSHA256": protocol_sha, "artifactBytesVerified": True,
                           "calibrationFrozenBeforeSealed": True,
+                          "sealedOutcomes": [{"split": "sealed", "stratum": "false_skip",
+                                              "expectedAction": "importFile", "observedAction": "importFile"}],
                           "conversion": {"maxAbsError": 0.001, "minCosine": 0.9999},
                           "sealedStatistics": {"bySplitAndStratum": {"sealed": sealed}},
                           "publicRegression": {"caseCount": 44, "passCount": 44,
@@ -76,6 +79,32 @@ class ResearchProtocolTests(unittest.TestCase):
         protocol, results = self.acceptance_results(n=100000, failures=1)
         verdict = research.verify_acceptance(protocol, results)
         self.assertEqual(verdict["reasons"], ["observed false skip"])
+
+    def testPositiveUpgradeWrongSkipFailsAcrossStrata(self):
+        protocol, results = self.acceptance_results(n=36887)
+        entry = {"query_id": "upgrade", "split": "sealed", "stratum": "compression_downscale",
+                 "split_group": "one", "expected_action": "importFile",
+                 "expected_candidates": [{"id": "original"}]}
+        observed = {"queries": [{"id": "upgrade", "content": "duplicate", "action": "skip",
+                                 "matchedKeys": ["original"]}]}
+        statistics = research.query_level_statistics({"entries": [entry]}, observed, protocol)
+        self.assertEqual(statistics["bySplitAndStratum"]["sealed"]["compression_downscale"]
+                         ["failedGroups"], 0)
+        self.assertEqual(statistics["bySplitAndStratum"]["sealed"]["compression_downscale"]
+                         ["actionFailedGroups"], 1)
+        results["sealedOutcomes"] = statistics["queryOutcomes"]
+        self.assertIn("observed false skip", research.verify_acceptance(protocol, results)["reasons"])
+
+    def testCandidateRecallWrongSkipFailsButExtraImportIsNotUnsafeSkip(self):
+        protocol, results = self.acceptance_results(n=36887)
+        results["sealedOutcomes"] = [{"split": "sealed", "stratum": "candidate_recall",
+                                      "expectedAction": "importFile", "observedAction": "skip",
+                                      "retrievalHit": True}]
+        self.assertIn("observed false skip", research.verify_acceptance(protocol, results)["reasons"])
+        results["sealedOutcomes"] = [{"split": "sealed", "stratum": "renamed_metadata",
+                                      "expectedAction": "skip", "observedAction": "importFile",
+                                      "contentPass": True, "retrievalHit": True}]
+        self.assertNotIn("observed false skip", research.verify_acceptance(protocol, results)["reasons"])
 
     def testAllocatedExactBoundsAtPredeclaredMinima(self):
         self.assertLessEqual(research._one_sided_error_upper(36887, 0, 0.025), 0.0001)
@@ -510,6 +539,17 @@ class ResearchProtocolTests(unittest.TestCase):
             self.assertEqual(result["independent_queries_by_split_and_stratum"],
                              {"sealed": {"false_skip": 1}})
 
+    def test_same_group_bytes_cannot_change_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.entry(root, "first", "family", "group", "sealed")
+            second = self.entry(root, "second", "family", "group", "sealed")
+            (root / "second").write_bytes((root / "first").read_bytes())
+            second["sha256"] = first["sha256"]
+            second["origin_sha256"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "byte identity"):
+                research.validate_dataset({"root": str(root), "entries": [first, second]}, FIXTURE_HASH)
+
     def test_hash_and_license_evidence_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -581,6 +621,153 @@ class ResearchProtocolTests(unittest.TestCase):
                 "origin_sha256": hashlib.sha256(family_id.encode()).hexdigest(),
                 "license_record": cls.license(), "expected_candidates": [],
                 "expected_action": "importFile"}
+
+
+class ResearchAcceptanceArtifactTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        cls.protocol_path = ROOT / "docs/research/advanced-dedup/protocol.json"
+        cls.protocol = json.loads(cls.protocol_path.read_text())
+        protocol_sha = hashlib.sha256(cls.protocol_path.read_bytes()).hexdigest()
+        model_sha = "a" * 64
+        mean, std = [0.0] * 3, [1.0] * 3
+        bits = lambda value: str(struct.unpack("<I", struct.pack("<f", value))[0])
+        fields = ["sscd-preprocess-v1", model_sha, "320", "stretchFullFrame", "sRGB"]
+        fields += [bits(value) for value in mean + std]
+        fingerprint_version = hashlib.sha256("\n".join(fields).encode()).hexdigest()
+        policy_fields = ["advanced-dedup-policy-v1", fingerprint_version,
+                         str(struct.unpack("<Q", struct.pack("<d", 0.8))[0]),
+                         "exact-f32-v1", "cover-if-both-sorted-pixel-edges-gte-v1"]
+        policy_sha = hashlib.sha256(b"".join(len(value.encode()).to_bytes(8, "little")
+                             + value.encode() for value in policy_fields)).hexdigest()
+        resource_names = {"inference_concurrency": "inferenceConcurrency", "batch_size": "batchSize",
+                          "max_in_flight_tasks": "maxInFlightTasks", "decode_concurrency": "decodeConcurrency",
+                          "photo_request_concurrency": "photoRequestConcurrency",
+                          "max_decoded_bytes": "maxDecodedBytes", "catalog_batch_size": "catalogBatchSize",
+                          "request_timeout_seconds": "requestTimeoutSeconds",
+                          "retry_delays_seconds": "retryDelaysSeconds",
+                          "progress_publish_interval_seconds": "progressPublishIntervalSeconds"}
+        cls.profile = {"fingerprint": {"version": fingerprint_version, "modelSHA256": model_sha,
+                       "inputSide": 320, "resizeMode": "stretchFullFrame", "colorSpace": "sRGB",
+                       "mean": mean, "std": std}, "policyVersion": policy_sha, "threshold": 0.8,
+                       "backend": "exact-f32-v1",
+                       "resources": {target: cls.protocol["resources"][source]
+                                     for source, target in resource_names.items()},
+                       "evidenceCandidateLimit": 200000,
+                       "acceptanceID": "research:" + protocol_sha}
+        cls.profile_path = cls.root / "profile.json"
+        cls.profile_path.write_text(json.dumps(cls.profile))
+        query = ResearchProtocolTests.entry(cls.root, "query", "query-family", "query-group", "sealed")
+        distractor = ResearchProtocolTests.entry(cls.root, "distractor", "other-family",
+                                                    "other-group", "distractor")
+        for entry in (query, distractor):
+            entry.update({"width": 10, "height": 10, "representation": "photosOriginal"})
+        cls.dataset = {"root": str(cls.root), "entries": [query, distractor]}
+        cls.dataset_path = cls.root / "dataset.json"
+        cls.dataset_path.write_text(json.dumps(cls.dataset))
+        cls.vectors = cls.root / "vectors"
+        cls.vectors.mkdir()
+        records = []
+        for index, entry in enumerate((query, distractor)):
+            values = [0.0] * 1024
+            values[index] = 1.0
+            vector_name = f"{entry['sha256']}.f32"
+            vector = cls.vectors / vector_name
+            vector.write_bytes(struct.pack("<1024f", *values))
+            records.append({"inputSHA256": entry["sha256"], "vectorFile": vector_name,
+                            "vectorSHA256": hashlib.sha256(vector.read_bytes()).hexdigest()})
+        (cls.vectors / "fingerprints.json").write_text(json.dumps({
+            "protocolSHA256": protocol_sha, "modelSHA256": model_sha,
+            "fingerprintVersion": fingerprint_version, "records": records}))
+        cls.output = cls.root / "sealed-score.json"
+        cls.report = research.score_dataset(cls.protocol_path, cls.dataset_path, cls.vectors,
+                                             cls.profile_path, cls.output, "sealed")
+        cls.public_fixture = cls.root / "public"
+        cls.public_fixture.mkdir()
+        public_images = [{"id": name, "sha256": item["sha256"], "width": 10, "height": 10}
+                         for name, item in (("query", query), ("distractor", distractor))]
+        public_manifest = {"images": public_images}
+        public_truth = {"cases": [{"id": "P001", "query": "query",
+                                   "candidates": ["distractor"]}]}
+        (cls.public_fixture / "manifest.json").write_text(json.dumps(public_manifest))
+        (cls.public_fixture / "expected-results.json").write_text(json.dumps(public_truth))
+        vector_inventory, vector_manifest_sha = research._vector_inventory(
+            cls.vectors, cls.profile, protocol_sha)
+        public_queries = research._public_queries(public_manifest, public_truth, vector_inventory)
+        swift, batch = research._run_swift_score(cls.profile_path, public_queries, protocol_sha)
+        cls.public_report = {"vectorManifestPath": str(cls.vectors / "fingerprints.json"),
+                             "vectorManifestSHA256": vector_manifest_sha,
+                             "swift": swift, "swiftBatch": batch}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def testSyntheticFullCatalogArtifactAuditSucceedsWithoutAcceptance(self):
+        statistics = research._audit_catalog_score(self.report, self.dataset, "sealed",
+            self.profile_path, self.profile, self.protocol)
+        self.assertEqual(statistics["bySplitAndStratum"]["sealed"]["false_skip"]["queries"], 1)
+        self.assertTrue(statistics["queryOutcomes"][0]["metricPass"])
+        self.assertFalse(statistics["sealedMinimumsMet"])
+        self.assertEqual(len(json.loads(Path(self.report["catalogPath"]).read_text())["candidates"]), 1)
+
+    def testOmittedAuditedDistractorFailsCatalogAudit(self):
+        report = json.loads(json.dumps(self.report))
+        catalog = self.root / "omitted-catalog.json"
+        catalog.write_text(json.dumps({"candidates": []}))
+        report["catalogPath"] = str(catalog)
+        report["catalogSHA256"] = hashlib.sha256(catalog.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "full catalog"):
+            research._audit_catalog_score(report, self.dataset, "sealed",
+                                          self.profile_path, self.profile, self.protocol)
+
+    def testChangedQueryDimensionsOrDecisionsFailArtifactAudit(self):
+        dimensions = json.loads(json.dumps(self.report))
+        dimensions["swiftBatch"]["queries"][0]["size"] = {"width": 1, "height": 1}
+        with self.assertRaisesRegex(ValueError, "audited dataset"):
+            research._audit_catalog_score(dimensions, self.dataset, "sealed",
+                                          self.profile_path, self.profile, self.protocol)
+        decisions = json.loads(json.dumps(self.report))
+        decisions["swift"]["queries"][0]["action"] = "skip"
+        with self.assertRaisesRegex(ValueError, "shared Swift scorer"):
+            research._audit_catalog_score(decisions, self.dataset, "sealed",
+                                          self.profile_path, self.profile, self.protocol)
+
+    def testChangedVectorBytesFailR2ManifestBinding(self):
+        from shutil import copytree
+        mutated = self.root / "mutated-vectors"
+        copytree(self.vectors, mutated)
+        manifest = json.loads((mutated / "fingerprints.json").read_text())
+        vector = mutated / manifest["records"][0]["vectorFile"]
+        vector.write_bytes(b"x" * 4096)
+        report = json.loads(json.dumps(self.report))
+        report["vectorManifestPath"] = str(mutated / "fingerprints.json")
+        with self.assertRaisesRegex(ValueError, "actual vector bytes"):
+            research._audit_catalog_score(report, self.dataset, "sealed",
+                                          self.profile_path, self.profile, self.protocol)
+
+    def testPublicArtifactAuditRejectsDimensionsDecisionsAndMissingResults(self):
+        self.assertEqual(research._audit_public_score(self.public_report, self.profile_path,
+            self.profile, self.report["protocolSHA256"], self.public_fixture)["queries"][0]["action"],
+            "importFile")
+        dimensions = json.loads(json.dumps(self.public_report))
+        dimensions["swiftBatch"]["queries"][0]["size"] = {"width": 1, "height": 1}
+        with self.assertRaisesRegex(ValueError, "frozen images, dimensions or gallery"):
+            research._audit_public_score(dimensions, self.profile_path, self.profile,
+                                         self.report["protocolSHA256"], self.public_fixture)
+        decisions = json.loads(json.dumps(self.public_report))
+        decisions["swift"]["queries"][0]["content"] = "duplicate"
+        decisions["swift"]["queries"][0]["action"] = "skip"
+        with self.assertRaisesRegex(ValueError, "shared Swift scorer"):
+            research._audit_public_score(decisions, self.profile_path, self.profile,
+                                         self.report["protocolSHA256"], self.public_fixture)
+        truncated = json.loads(json.dumps(self.public_report))
+        truncated["swift"]["queries"][0]["candidates"] = []
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            research._audit_public_score(truncated, self.profile_path, self.profile,
+                                         self.report["protocolSHA256"], self.public_fixture)
 
 
 if __name__ == "__main__":

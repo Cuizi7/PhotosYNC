@@ -20,7 +20,7 @@ struct ApprovedProtocolBinding: Decodable {
 func parseArguments() throws -> (command: String, values: [String: String]) {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let command = args.first,
-          ["fingerprint", "compare-tensors", "score-batch", "search-benchmark",
+          ["fingerprint", "compare-tensors", "score-batch", "score-catalog", "search-benchmark",
            "combined-benchmark", "validate-profile"].contains(command) else {
         throw ProbeError(description: "unknown probe command")
     }
@@ -29,6 +29,7 @@ func parseArguments() throws -> (command: String, values: [String: String]) {
     case "fingerprint": required = ["--profile", "--model", "--output-dir", "--input-list"]
     case "compare-tensors": required = ["--profile", "--model", "--output-dir", "--tensor-list"]
     case "score-batch": required = ["--profile", "--input", "--output-dir"]
+    case "score-catalog": required = ["--profile", "--catalog", "--input", "--output-dir"]
     case "combined-benchmark": required = ["--profile", "--model", "--vectors", "--input-list",
                                             "--asset-count", "--edited-fraction", "--output-dir"]
     case "validate-profile": required = ["--profile", "--output-dir"]
@@ -96,7 +97,7 @@ func run() async throws {
             throw ProbeError(description: "profile resource limits conflict with approved protocol")
         }
     }
-    if ["score-batch", "search-benchmark", "combined-benchmark", "validate-profile"].contains(parsed.command) {
+    if ["score-batch", "score-catalog", "search-benchmark", "combined-benchmark", "validate-profile"].contains(parsed.command) {
         let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: profileData)
         guard configuration.backend == "exact-f32-v1",
               (parsed.command == "validate-profile" || configuration.acceptanceID == "research:\(protocolSHA)"),
@@ -113,6 +114,10 @@ func run() async throws {
         if parsed.command == "score-batch" {
             try runScoreBatch(input: URL(fileURLWithPath: args["--input"]!), output: output,
                               profile: profile, configuration: configuration, protocolSHA: protocolSHA)
+        } else if parsed.command == "score-catalog" {
+            try await runScoreCatalog(catalog: URL(fileURLWithPath: args["--catalog"]!),
+                input: URL(fileURLWithPath: args["--input"]!), output: output,
+                profile: profile, configuration: configuration, protocolSHA: protocolSHA)
         } else {
             try await runSearchBenchmark(vectors: URL(fileURLWithPath: args["--vectors"]!),
                 assetCount: args["--asset-count"]!, editedFraction: args["--edited-fraction"]!,
@@ -218,6 +223,7 @@ func run() async throws {
             records.append([
                 "inputSHA256": inputHash, "fingerprintVersion": fingerprint.version,
                 "vectorFile": vectorFile.lastPathComponent,
+                "vectorSHA256": try sha256(vectorFile),
                 "decodeMS": (decoded - start) * 1000,
                 "preprocessMS": (prepared - decoded) * 1000,
                 "inferenceMS": (inferred - prepared) * 1000,
@@ -240,6 +246,21 @@ struct TensorPair: Decodable {
 
 private struct BatchInput: Decodable {
     let queries: [BatchQuery]
+}
+
+private struct CatalogInput: Decodable {
+    let candidates: [BatchCandidate]
+}
+
+private struct CatalogQueries: Decodable {
+    let queries: [CatalogQuery]
+}
+
+private struct CatalogQuery: Decodable {
+    let id: String
+    let vector: String
+    let vectorSHA256: String
+    let size: PixelSize?
 }
 
 private struct BatchQuery: Decodable {
@@ -327,6 +348,54 @@ private func runScoreBatch(input: URL, output: URL, profile: URL, configuration:
                    "batchSHA256": try sha256(input), "queries": reports],
                   at: output.appendingPathComponent("query-results.json"))
     print("scored \(reports.count) complete query gallery views")
+}
+
+private func runScoreCatalog(catalog: URL, input: URL, output: URL, profile: URL,
+                             configuration: DedupConfiguration, protocolSHA: String) async throws {
+    let declared = try JSONDecoder().decode(CatalogInput.self, from: Data(contentsOf: catalog))
+    let batch = try JSONDecoder().decode(CatalogQueries.self, from: Data(contentsOf: input))
+    guard !declared.candidates.isEmpty, !batch.queries.isEmpty,
+          Set(declared.candidates.map(\.key)).count == declared.candidates.count,
+          Set(batch.queries.map(\.id)).count == batch.queries.count,
+          declared.candidates.count <= configuration.evidenceCandidateLimit else {
+        throw ProbeError(description: "catalog/query count or key invalid")
+    }
+    let entries = try declared.candidates.map { item in
+        VectorEntry(key: item.key, origin: item.origin,
+            fingerprint: try readVector(path: item.vector, expectedSHA: item.vectorSHA256,
+                                        version: configuration.fingerprint.version), size: item.size)
+    }
+    let hashes = Dictionary(uniqueKeysWithValues:
+        declared.candidates.map { ($0.key, $0.vectorSHA256) })
+    let index = ExactVectorIndex(version: configuration.fingerprint.version)
+    try await index.replace(entries: entries, generation: 1)
+    var reports = [[String: Any]]()
+    for query in batch.queries {
+        let fingerprint = try readVector(path: query.vector, expectedSHA: query.vectorSHA256,
+                                         version: configuration.fingerprint.version)
+        let matches = try await index.search(query: fingerprint,
+            minimumScore: configuration.threshold, generation: 1)
+        let evaluation = try AdvancedDuplicatePolicy.evaluate(sourceSize: query.size,
+            candidates: matches, configuration: configuration)
+        reports.append(["id": query.id, "queryVectorSHA256": query.vectorSHA256,
+            "candidates": matches.map { item in
+                ["key": item.key, "origin": item.origin.rawValue, "score": item.score,
+                 "vectorSHA256": hashes[item.key]!] as [String: Any]
+            },
+            "content": evaluation.content.rawValue,
+            "action": evaluation.action.rawValue,
+            "reason": evaluation.reason.rawValue,
+            "matchedKeys": evaluation.matchedKeys,
+            "coveringKeys": evaluation.coveringKeys])
+    }
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+    try writeJSON(["protocolSHA256": protocolSHA, "profileSHA256": try sha256(profile),
+                   "fingerprintVersion": configuration.fingerprint.version,
+                   "policyVersion": configuration.policyVersion,
+                   "threshold": configuration.threshold, "backend": configuration.backend,
+                   "catalogSHA256": try sha256(catalog), "batchSHA256": try sha256(input),
+                   "queries": reports], at: output.appendingPathComponent("query-results.json"))
+    print("scored \(reports.count) queries against \(entries.count) catalog representations")
 }
 
 private struct FingerprintManifest: Decodable {

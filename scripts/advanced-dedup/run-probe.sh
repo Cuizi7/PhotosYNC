@@ -21,6 +21,7 @@ case "$COMMAND" in
   fingerprint) LIST_FLAG=--input-list ;;
   compare-tensors) LIST_FLAG=--tensor-list ;;
   score-batch) LIST_FLAG=--input ;;
+  score-catalog) LIST_FLAG=--input ;;
   search-benchmark) LIST_FLAG=--vectors ;;
   combined-benchmark) LIST_FLAG=--vectors ;;
   validate-profile) LIST_FLAG=--profile ;;
@@ -38,6 +39,8 @@ while (( $# )); do
          "$COMMAND" == evaluate || "$COMMAND" == combined-benchmark ]] || exit 2 ;;
     --input-list)
       [[ "$COMMAND" == combined-benchmark ]] || exit 2 ;;
+    --catalog)
+      [[ "$COMMAND" == score-catalog ]] || exit 2 ;;
     --asset-count|--edited-fraction)
       [[ "$COMMAND" == search-benchmark || "$COMMAND" == combined-benchmark ]] || exit 2 ;;
     --approved-protocol-json|--protocol-sha256|--max-decoded-bytes|--max-abs-error|--min-cosine)
@@ -68,6 +71,7 @@ fi
 if [[ "$COMMAND" == combined-benchmark ]]; then
   REQUIRED_FLAGS+=(--model --input-list --asset-count --edited-fraction)
 fi
+if [[ "$COMMAND" == score-catalog ]]; then REQUIRED_FLAGS+=(--catalog); fi
 for REQUIRED in "${REQUIRED_FLAGS[@]}"; do
   if [[ "$SEEN_FLAGS" != *"|$REQUIRED|"* ]]; then
     echo "probe: missing option $REQUIRED" >&2
@@ -92,7 +96,7 @@ document = json.loads(raw)
 protocol = module.validate_protocol(document)
 if not protocol["approved"]:
     raise ValueError("research protocol has not been approved")
-if command in {"score-batch", "search-benchmark", "combined-benchmark", "evaluate"}:
+if command in {"score-batch", "score-catalog", "search-benchmark", "combined-benchmark", "evaluate"}:
     module._validated_profile(Path(profile_path), hashlib.sha256(raw).hexdigest(), document)
 resources = document["resources"]
 if resources["inference_concurrency"] != 1 or resources["batch_size"] != 1:
