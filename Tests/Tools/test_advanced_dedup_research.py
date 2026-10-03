@@ -14,11 +14,72 @@ SCRIPT = ROOT / "scripts/advanced-dedup/research.py"
 SPEC = importlib.util.spec_from_file_location("advanced_dedup_research", SCRIPT)
 research = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(research)
+CONVERTER = ROOT / "scripts/advanced-dedup/convert-model.py"
+CONVERTER_SPEC = importlib.util.spec_from_file_location("advanced_dedup_converter", CONVERTER)
+converter = importlib.util.module_from_spec(CONVERTER_SPEC)
+CONVERTER_SPEC.loader.exec_module(converter)
 FIXTURE_MANIFEST = ROOT / "Tests/Fixtures/AdvancedDedup/manifest.json"
 FIXTURE_HASH = json.loads(FIXTURE_MANIFEST.read_text())["content_sha256"]
 
 
 class ResearchProtocolTests(unittest.TestCase):
+    def test_conversion_manifest_hash_uses_relative_paths_and_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "model.mlpackage"
+            (package / "Data").mkdir(parents=True)
+            (package / "Manifest.json").write_bytes(b"{}")
+            (package / "Data" / "weights.bin").write_bytes(b"abc")
+            expected = hashlib.sha256(
+                b"Data/weights.bin\0abc\0Manifest.json\0{}\0"
+            ).hexdigest()
+            self.assertEqual(converter.package_sha256(package), expected)
+            (package / "Data" / "weights.bin").write_bytes(b"abd")
+            self.assertNotEqual(converter.package_sha256(package), expected)
+
+    def test_conversion_rejects_missing_explicit_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = subprocess.run(
+                [sys.executable, str(CONVERTER), "--weights", str(root / "missing.pt"),
+                 "--expected-weights-sha256", "0" * 64,
+                 "--license-file", str(root / "missing-license"),
+                 "--upstream-revision", "test", "--upstream-url", "https://example.invalid",
+                 "--precision", "float32",
+                 "--output-package", str(root / "model.mlpackage"),
+                 "--provenance", str(root / "record.json")],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "model.mlpackage").exists())
+
+    def test_conversion_rejects_unverified_weight_identity_before_importing_toolchain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "weights.pt").write_bytes(b"not-the-verified-checkpoint")
+            (root / "LICENSE").write_text("MIT License\n")
+            result = subprocess.run(
+                [sys.executable, str(CONVERTER), "--weights", str(root / "weights.pt"),
+                 "--expected-weights-sha256", "0" * 64,
+                 "--license-file", str(root / "LICENSE"),
+                 "--upstream-revision", "test", "--upstream-url", "https://example.invalid",
+                 "--precision", "float32", "--output-package", str(root / "model.mlpackage"),
+                 "--provenance", str(root / "record.json")],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertIn("weights SHA256", result.stderr)
+            self.assertFalse((root / "model.mlpackage").exists())
+
+    def test_model_provenance_records_research_boundary(self):
+        record = json.loads((ROOT / "docs/research/advanced-dedup/model-provenance.json").read_text())
+        self.assertEqual(record["weightsSHA256"], record["officialTorchScriptSHA256"])
+        self.assertEqual(len(record["modelSHA256"]), 64)
+        self.assertEqual(record["conversion"]["computePrecision"], "float32")
+        self.assertEqual(record["runtimeComputeUnits"], "cpuOnly")
+        self.assertEqual(record["modelWeightsRedistributionLicenseStatus"], "unresolved")
+        self.assertTrue(record["conversionEquivalence"]["pass"])
+        self.assertFalse(record["releaseAccepted"])
+        self.assertFalse(record["publicFixtureProbe"]["classificationEvaluated"])
+
     def test_protocol_has_no_implicit_targets(self):
         with self.assertRaises(ValueError):
             research.validate_protocol({})
