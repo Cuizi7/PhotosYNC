@@ -1,0 +1,65 @@
+{
+  "approved": true,
+  "approval": {
+    "date": "2026-10-03",
+    "text": "采用更严格的 ≤0.01%（推荐；至少 36,887 个独立负例组）",
+    "approved_fields": [
+      "max_false_skip_upper_bound",
+      "min_copy_recall_by_stratum",
+      "min_candidate_recall",
+      "max_hot_query_p95_ms",
+      "max_incremental_p95_ms",
+      "max_peak_rss_bytes"
+    ],
+    "protocol_sha256": "fa480439dd427a2e44a07dc2acd4df4043e334e468acfc9a8c778145420543b3"
+  },
+  "fixture_manifest_sha256": "6c4854844ce958fa5514cb4ccb7e2ccbafd8750b05e5279ca2720bc74691d8a1",
+  "confidence_level": 0.95,
+  "max_false_skip_upper_bound": 0.0001,
+  "min_copy_recall_by_stratum": {
+    "renamed_metadata": 0.95,
+    "compression_downscale": 0.95,
+    "format_change": 0.95,
+    "edited_representations": 0.95,
+    "hard_copy": 0.95
+  },
+  "min_candidate_recall": 0.99,
+  "minimum_queries_by_stratum": {
+    "false_skip": 36887,
+    "candidate_recall": 528,
+    "renamed_metadata": 108,
+    "compression_downscale": 108,
+    "format_change": 108,
+    "edited_representations": 108,
+    "hard_copy": 108
+  },
+  "max_hot_query_p95_ms": 250,
+  "max_incremental_p95_ms": 2000,
+  "max_peak_rss_bytes": 4294967296,
+  "resources": {
+    "inference_concurrency": 1,
+    "batch_size": 1,
+    "max_in_flight_tasks": 2,
+    "decode_concurrency": 1,
+    "photo_request_concurrency": 1,
+    "max_decoded_bytes": 134217728,
+    "request_timeout_seconds": 30,
+    "retry_delays_seconds": [5, 15, 30, 60],
+    "catalog_batch_size": 128,
+    "max_candidate_representations": 200000,
+    "progress_publish_interval_seconds": 1
+  },
+  "seed": 20261003,
+  "sampling_unit": "split_group",
+  "alpha_allocation_by_stratum": {
+    "false_skip": 0.025,
+    "candidate_recall": 0.005,
+    "renamed_metadata": 0.004,
+    "compression_downscale": 0.004,
+    "format_change": 0.004,
+    "edited_representations": 0.004,
+    "hard_copy": 0.004
+  },
+  "conversion_max_abs_error": 0.02,
+  "conversion_min_cosine": 0.999
+}
