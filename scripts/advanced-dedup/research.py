@@ -338,7 +338,7 @@ def _validated_profile(path, protocol_sha, protocol):
                         "resources", "evidenceCandidateLimit", "acceptanceID"}, "profile")
     if profile["acceptanceID"] != f"research:{protocol_sha}":
         raise ValueError("profile acceptanceID does not bind approved protocol bytes")
-    if profile["backend"] != "exact-accelerate-f32":
+    if profile["backend"] != "exact-f32-v1":
         raise ValueError("profile backend must use the exact Swift scorer")
     _number(profile["threshold"], "profile.threshold", maximum=1)
     resources = _mapping(profile["resources"], "profile.resources")
@@ -389,7 +389,8 @@ def _run_swift_score(profile_path, queries, protocol_sha):
     with tempfile.TemporaryDirectory(prefix="photosync-r3-") as temporary:
         temporary = Path(temporary)
         batch = temporary / "batch.json"
-        batch.write_text(json.dumps({"queries": queries}, sort_keys=True))
+        batch_document = {"queries": queries}
+        batch.write_text(json.dumps(batch_document, sort_keys=True))
         output = temporary / "swift-output"
         subprocess.run([str(REPO_ROOT / "scripts/advanced-dedup/run-probe.sh"), "score-batch",
                         "--profile", str(profile_path), "--input", str(batch),
@@ -400,7 +401,32 @@ def _run_swift_score(profile_path, queries, protocol_sha):
                 result["batchSHA256"] != _sha256_file(batch) or
                 len(result["queries"]) != len(queries)):
             raise ValueError("Swift score result binding mismatch")
-        return result
+        return result, batch_document
+
+
+def public_evaluation_evidence(swift, batch):
+    """Retain and verify the complete Swift request/result and every vector byte identity."""
+    digest = hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
+    if swift["batchSHA256"] != digest:
+        raise ValueError("saved Swift batch hash mismatch")
+    requested = {item["id"]: item for item in batch["queries"]}
+    observed = {item["id"]: item for item in swift["queries"]}
+    if (len(requested) != len(batch["queries"]) or
+            len(observed) != len(swift["queries"]) or set(requested) != set(observed)):
+        raise ValueError("saved Swift query IDs mismatch")
+    for query_id, result in observed.items():
+        request = requested[query_id]
+        if result["queryVectorSHA256"] != request["vectorSHA256"]:
+            raise ValueError("saved query vector binding mismatch")
+        candidate_hashes = {item["key"]: item["vectorSHA256"] for item in request["candidates"]}
+        if len(candidate_hashes) != len(request["candidates"]):
+            raise ValueError("saved batch repeats candidate keys")
+        for candidate in result["candidates"]:
+            if (candidate["key"] not in candidate_hashes or
+                    not candidate["vectorSHA256"] or
+                    candidate_hashes[candidate["key"]] != candidate["vectorSHA256"]):
+                raise ValueError("saved candidate vector binding mismatch")
+    return {"swift": swift, "swiftBatch": batch}
 
 
 def query_level_statistics(dataset, swift_results, protocol):
@@ -410,25 +436,54 @@ def query_level_statistics(dataset, swift_results, protocol):
     if set(by_id) != {entry["query_id"] for entry in entries}:
         raise ValueError("Swift query result IDs differ from declared dataset queries")
     groups = {}
+    query_outcomes = []
     for entry in entries:
         key = (entry["split"], entry["stratum"], entry["split_group"])
         observed = by_id[entry["query_id"]]
-        correct = observed["action"] == entry["expected_action"]
-        groups.setdefault(key, []).append(correct)
+        required = sorted({item["id"] for item in entry.get("expected_candidates", [])})
+        matched = set(observed.get("matchedKeys", []))
+        retrieval_hit = bool(matched.intersection(required)) if required else None
+        content_pass = observed.get("content") == "duplicate" if entry["stratum"] != "false_skip" else None
+        action_pass = observed["action"] == entry["expected_action"]
+        copy_pass = content_pass and retrieval_hit if content_pass is not None else None
+        if entry["stratum"] == "false_skip":
+            metric_pass = action_pass
+        elif entry["stratum"] == "candidate_recall":
+            metric_pass = retrieval_hit
+        else:
+            metric_pass = copy_pass
+        outcome = {"id": entry["query_id"], "split": entry["split"],
+                   "stratum": entry["stratum"], "splitGroup": entry["split_group"],
+                   "requiredCandidateKeys": required,
+                   "matchedKeys": sorted(matched),
+                   "observedContent": observed.get("content"),
+                   "observedAction": observed["action"],
+                   "expectedAction": entry["expected_action"],
+                   "contentPass": content_pass, "copyPass": copy_pass,
+                   "retrievalHit": retrieval_hit, "actionPass": action_pass,
+                   "metricPass": metric_pass}
+        query_outcomes.append(outcome)
+        groups.setdefault(key, []).append(outcome)
     per_split = {}
     for (split, stratum, _group), outcomes in groups.items():
-        bucket = per_split.setdefault(split, {}).setdefault(stratum, {"queries": 0, "failedGroups": 0})
+        bucket = per_split.setdefault(split, {}).setdefault(stratum,
+            {"queries": 0, "failedGroups": 0, "contentFailedGroups": 0,
+             "retrievalFailedGroups": 0, "actionFailedGroups": 0})
         bucket["queries"] += 1
-        bucket["failedGroups"] += int(not all(outcomes))
+        bucket["failedGroups"] += int(not all(item["metricPass"] for item in outcomes))
+        bucket["contentFailedGroups"] += int(any(item["contentPass"] is False for item in outcomes))
+        bucket["retrievalFailedGroups"] += int(any(item["retrievalHit"] is False for item in outcomes))
+        bucket["actionFailedGroups"] += int(any(not item["actionPass"] for item in outcomes))
     sealed = per_split.get("sealed", {})
     minimums = protocol["minimum_queries_by_stratum"]
     shortfalls = {name: max(0, minimum - sealed.get(name, {}).get("queries", 0))
                   for name, minimum in minimums.items()}
     # No statistical acceptance without the prescribed independent negative queries.
     passes_minimums = all(value == 0 for value in shortfalls.values())
-    return {"bySplitAndStratum": per_split, "sealedShortfalls": shortfalls,
+    return {"queryOutcomes": query_outcomes, "bySplitAndStratum": per_split, "sealedShortfalls": shortfalls,
             "sealedMinimumsMet": passes_minimums,
-            "pass": passes_minimums and all(bucket["failedGroups"] == 0
+            "pass": passes_minimums and all(bucket["failedGroups"] == 0 and
+                                               bucket["actionFailedGroups"] == 0
                                                for bucket in sealed.values())}
 
 
@@ -465,11 +520,12 @@ def score_dataset(protocol_path, dataset_path, vectors, profile_path, output):
                         "candidates": [{"key": item["id"], "origin": item["representation"],
                                         "size": {"width": item["width"], "height": item["height"]},
                                         **_vector_reference(item, inventory)} for item in candidates]})
-    swift_results = _run_swift_score(profile_path, queries, protocol_sha)
+    swift_results, batch = _run_swift_score(profile_path, queries, protocol_sha)
+    evidence = public_evaluation_evidence(swift_results, batch)
     statistics = query_level_statistics(dataset, swift_results, protocol)
     report = {"protocolSHA256": protocol_sha, "datasetSHA256": _sha256_file(dataset_path),
               "profileSHA256": _sha256_file(profile_path), "vectorManifestSHA256": inventory_sha,
-              "statistics": statistics, "swift": swift_results,
+              "statistics": statistics, **evidence,
               "researchOnly": True}
     if output.exists():
         raise ValueError("output already exists")
@@ -517,7 +573,8 @@ def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir
                                                  "height": candidate["height"]},
                                         **_vector_reference(candidate, inventory)}
                                        for candidate in candidates]})
-    swift_results = _run_swift_score(profile_path, queries, protocol_sha)
+    swift_results, batch = _run_swift_score(profile_path, queries, protocol_sha)
+    evidence = public_evaluation_evidence(swift_results, batch)
     by_id = {item["id"]: item for item in swift_results["queries"]}
     cases = []
     for truth in expected["cases"]:
@@ -539,6 +596,7 @@ def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir
               "modelPath": str(model_path), "vectorManifestSHA256": inventory_sha,
               "threshold": profile["threshold"],
               "thresholdStatus": "predeclared synthetic example; diagnostic only; not calibrated or accepted",
+              **evidence,
               "cases": cases, "caseCount": len(cases),
               "contentFailures": [case["id"] for case in cases if not case["contentPass"]],
               "actionFailures": [case["id"] for case in cases if not case["actionPass"]],

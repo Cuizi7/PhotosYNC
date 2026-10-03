@@ -95,7 +95,7 @@ func run() async throws {
     if parsed.command == "score-batch" || parsed.command == "search-benchmark" {
         let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: profileData)
         guard configuration.acceptanceID == "research:\(protocolSHA)",
-              configuration.backend == "exact-accelerate-f32" else {
+              configuration.backend == "exact-f32-v1" else {
             throw ProbeError(description: "research profile binding or backend mismatch")
         }
         if parsed.command == "score-batch" {
@@ -284,13 +284,16 @@ private func runScoreBatch(input: URL, output: URL, profile: URL, configuration:
         // Score the whole declared gallery, including below-threshold candidates for diagnostics.
         let allScores = try ExactVectorIndex.score(query: fingerprint, entries: entries,
                                                     minimumScore: -1)
+        let candidateHashes = Dictionary(uniqueKeysWithValues:
+            query.candidates.map { ($0.key, $0.vectorSHA256) })
         let evaluation = try AdvancedDuplicatePolicy.evaluate(sourceSize: query.size,
             candidates: allScores, configuration: configuration)
         reports.append([
             "id": query.id,
             "queryVectorSHA256": query.vectorSHA256,
             "candidates": allScores.map { item in
-                ["key": item.key, "origin": item.origin.rawValue, "score": item.score] as [String: Any]
+                ["key": item.key, "origin": item.origin.rawValue, "score": item.score,
+                 "vectorSHA256": candidateHashes[item.key]!] as [String: Any]
             },
             "content": evaluation.content.rawValue,
             "action": evaluation.action.rawValue,

@@ -12,8 +12,8 @@ final class AdvancedDuplicatePolicyTests: XCTestCase {
             inferenceConcurrency: 1, batchSize: 1)
         return try DedupConfiguration(fingerprint: fingerprint,
             policyVersion: DedupConfiguration.computePolicyVersion(fingerprintVersion: fingerprint.version,
-                threshold: 0.8, backend: "exact-accelerate-f32"), threshold: 0.8,
-            backend: "exact-accelerate-f32", resources: resources, evidenceCandidateLimit: 5,
+                threshold: 0.8, backend: "exact-f32-v1"), threshold: 0.8,
+            backend: "exact-f32-v1", resources: resources, evidenceCandidateLimit: 5,
             acceptanceID: "research:test")
     }
 
@@ -58,5 +58,19 @@ final class AdvancedDuplicatePolicyTests: XCTestCase {
                                    config.fingerprint.version)], configuration: config)
         XCTAssertEqual(unknownSource.action, .importFile)
         XCTAssertEqual(unknownSource.reason, .insufficientSizeEvidence)
+    }
+
+    func testOneEqualEdgeIsResolutionUpgradeInEitherOrientation() throws {
+        let config = try configuration()
+        for source in [try PixelSize(width: 4000, height: 2000),
+                       try PixelSize(width: 2000, height: 4000)] {
+            let result = try AdvancedDuplicatePolicy.evaluate(sourceSize: source,
+                candidates: [candidate("lower", 0.9,
+                                       try PixelSize(width: 3000, height: 2000),
+                                       config.fingerprint.version)], configuration: config)
+            XCTAssertEqual(result.content, .duplicate)
+            XCTAssertEqual(result.action, .importFile)
+            XCTAssertEqual(result.reason, .resolutionUpgrade)
+        }
     }
 }

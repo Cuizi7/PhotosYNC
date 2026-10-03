@@ -23,6 +23,72 @@ FIXTURE_HASH = json.loads(FIXTURE_MANIFEST.read_text())["content_sha256"]
 
 
 class ResearchProtocolTests(unittest.TestCase):
+    def testPositiveImportNeedsContentRecognition(self):
+        protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())
+        dataset = {"entries": [{"query_id": "upgrade", "split": "sealed",
+                                "stratum": "compression_downscale", "split_group": "family",
+                                "expected_action": "importFile",
+                                "expected_candidates": [{"id": "original"}]}]}
+        swift = {"queries": [{"id": "upgrade", "action": "importFile",
+                              "content": "notDuplicate", "matchedKeys": []}]}
+        result = research.query_level_statistics(dataset, swift, protocol)
+        self.assertEqual(result["bySplitAndStratum"]["sealed"]["compression_downscale"]["failedGroups"], 1)
+        self.assertFalse(result["queryOutcomes"][0]["contentPass"])
+        self.assertTrue(result["queryOutcomes"][0]["actionPass"])
+
+    def testCandidateRecallNeedsRequiredCandidateIdentity(self):
+        protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())
+        dataset = {"entries": [{"query_id": "retrieval", "split": "sealed",
+                                "stratum": "candidate_recall", "split_group": "family",
+                                "expected_action": "skip",
+                                "expected_candidates": [{"id": "required"}]}]}
+        swift = {"queries": [{"id": "retrieval", "action": "skip",
+                              "content": "duplicate", "matchedKeys": ["unrelated"]}]}
+        result = research.query_level_statistics(dataset, swift, protocol)
+        self.assertEqual(result["bySplitAndStratum"]["sealed"]["candidate_recall"]["failedGroups"], 1)
+        self.assertFalse(result["queryOutcomes"][0]["retrievalHit"])
+        self.assertTrue(result["queryOutcomes"][0]["actionPass"])
+
+    def testApprovedExactBackendIdentifier(self):
+        protocol_path = ROOT / "docs/research/advanced-dedup/protocol.json"
+        protocol = json.loads(protocol_path.read_text())
+        resources = protocol["resources"]
+        profile = {"fingerprint": {"version": "version", "modelSHA256": "a" * 64},
+                   "policyVersion": "binding", "threshold": 0.8, "backend": "exact-f32-v1",
+                   "resources": {"inferenceConcurrency": resources["inference_concurrency"],
+                                 "batchSize": resources["batch_size"],
+                                 "maxInFlightTasks": resources["max_in_flight_tasks"],
+                                 "decodeConcurrency": resources["decode_concurrency"],
+                                 "photoRequestConcurrency": resources["photo_request_concurrency"],
+                                 "maxDecodedBytes": resources["max_decoded_bytes"],
+                                 "catalogBatchSize": resources["catalog_batch_size"],
+                                 "requestTimeoutSeconds": resources["request_timeout_seconds"],
+                                 "retryDelaysSeconds": resources["retry_delays_seconds"],
+                                 "progressPublishIntervalSeconds": resources["progress_publish_interval_seconds"]},
+                   "evidenceCandidateLimit": resources["max_candidate_representations"],
+                   "acceptanceID": "research:" + hashlib.sha256(protocol_path.read_bytes()).hexdigest()}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            path.write_text(json.dumps(profile))
+            self.assertEqual(research._validated_profile(path, profile["acceptanceID"][9:], protocol), profile)
+
+    def testSavedPublicReportRetainsEveryVectorBinding(self):
+        swift = {"protocolSHA256": "p", "queries": [{
+            "id": "one", "queryVectorSHA256": "q", "candidates": [{
+                "key": "candidate-only", "vectorSHA256": "c", "score": 0.9}],
+            "content": "duplicate", "action": "skip", "matchedKeys": ["candidate-only"]}]}
+        batch = {"queries": [{"id": "one", "vectorSHA256": "q", "candidates": [{
+            "key": "candidate-only", "vectorSHA256": "c"}]}]}
+        swift["batchSHA256"] = hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
+        report = research.public_evaluation_evidence(swift, batch)
+        self.assertEqual(report["swift"]["queries"][0]["candidates"][0]["vectorSHA256"], "c")
+        self.assertEqual(report["swiftBatch"]["queries"][0]["candidates"][0]["vectorSHA256"], "c")
+        self.assertEqual(report["swift"]["batchSHA256"], swift["batchSHA256"])
+        altered = json.loads(json.dumps(report))
+        altered["swiftBatch"]["queries"][0]["candidates"][0]["vectorSHA256"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "batch hash mismatch"):
+            research.public_evaluation_evidence(altered["swift"], altered["swiftBatch"])
+
     def testZeroNegativeQueriesCannotPass(self):
         protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())
         dataset = {"entries": [{"query_id": "one", "split": "sealed",

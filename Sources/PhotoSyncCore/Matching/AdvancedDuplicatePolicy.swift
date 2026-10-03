@@ -28,8 +28,12 @@ public enum AdvancedDuplicatePolicy {
         }
         let upgrade = sourceSize != nil && matches.allSatisfy { candidate in
             guard let source = sourceSize, let size = candidate.size else { return false }
-            return min(source.width, source.height) > min(size.width, size.height) &&
-                   max(source.width, source.height) > max(size.width, size.height)
+            let sourceShort = min(source.width, source.height)
+            let sourceLong = max(source.width, source.height)
+            let candidateShort = min(size.width, size.height)
+            let candidateLong = max(size.width, size.height)
+            return sourceShort >= candidateShort && sourceLong >= candidateLong &&
+                   (sourceShort > candidateShort || sourceLong > candidateLong)
         }
         return DuplicateEvaluation(content: .duplicate, action: .importFile,
                                    reason: upgrade ? .resolutionUpgrade : .insufficientSizeEvidence,
