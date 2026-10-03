@@ -10,7 +10,9 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -322,13 +324,266 @@ def validate_dataset(document: dict, fixture_manifest_sha256: str) -> dict:
                 for split, strata in sorted(groups_by_stratum.items()) if strata}}
 
 
+def _approved_protocol(path):
+    raw = path.read_bytes()
+    document = json.loads(raw)
+    if not validate_protocol(document)["approved"]:
+        raise ValueError("measurement requires an approved protocol")
+    return document, hashlib.sha256(raw).hexdigest()
+
+
+def _validated_profile(path, protocol_sha, protocol):
+    profile = json.loads(path.read_text())
+    _required(profile, {"fingerprint", "policyVersion", "threshold", "backend",
+                        "resources", "evidenceCandidateLimit", "acceptanceID"}, "profile")
+    if profile["acceptanceID"] != f"research:{protocol_sha}":
+        raise ValueError("profile acceptanceID does not bind approved protocol bytes")
+    if profile["backend"] != "exact-accelerate-f32":
+        raise ValueError("profile backend must use the exact Swift scorer")
+    _number(profile["threshold"], "profile.threshold", maximum=1)
+    resources = _mapping(profile["resources"], "profile.resources")
+    names = {"inference_concurrency": "inferenceConcurrency", "batch_size": "batchSize",
+             "max_in_flight_tasks": "maxInFlightTasks", "decode_concurrency": "decodeConcurrency",
+             "photo_request_concurrency": "photoRequestConcurrency",
+             "max_decoded_bytes": "maxDecodedBytes", "catalog_batch_size": "catalogBatchSize",
+             "request_timeout_seconds": "requestTimeoutSeconds",
+             "retry_delays_seconds": "retryDelaysSeconds",
+             "progress_publish_interval_seconds": "progressPublishIntervalSeconds"}
+    for source, target in names.items():
+        if resources.get(target) != protocol["resources"][source]:
+            raise ValueError(f"profile.resources.{target} differs from approved protocol")
+    if profile["evidenceCandidateLimit"] != protocol["resources"]["max_candidate_representations"]:
+        raise ValueError("profile.evidenceCandidateLimit differs from approved protocol")
+    return profile
+
+
+def _vector_inventory(vectors, profile, protocol_sha):
+    manifest_path = vectors / "fingerprints.json"
+    manifest = json.loads(manifest_path.read_text())
+    if (manifest["protocolSHA256"] != protocol_sha or
+            manifest["fingerprintVersion"] != profile["fingerprint"]["version"] or
+            manifest["modelSHA256"] != profile["fingerprint"]["modelSHA256"]):
+        raise ValueError("R2 vector manifest binding mismatch")
+    by_image = {}
+    for record in manifest["records"]:
+        digest = record["inputSHA256"]
+        vector_name = record["vectorFile"]
+        if vector_name != f"{digest}.f32":
+            raise ValueError("R2 vector path is not bound to input SHA256")
+        vector_path = vectors / vector_name
+        if not vector_path.is_file() or vector_path.stat().st_size != 4096:
+            raise ValueError("R2 vector bytes missing or wrong length")
+        vector_sha = _sha256_file(vector_path)
+        if digest in by_image and by_image[digest] != (vector_path, vector_sha):
+            raise ValueError("R2 vector input SHA256 has conflicting records")
+        by_image[digest] = (vector_path, vector_sha)
+    return by_image, _sha256_file(manifest_path)
+
+
+def _vector_reference(image, inventory):
+    path, vector_sha = inventory[image["sha256"]]
+    return {"vector": str(path.resolve()), "vectorSHA256": vector_sha}
+
+
+def _run_swift_score(profile_path, queries, protocol_sha):
+    with tempfile.TemporaryDirectory(prefix="photosync-r3-") as temporary:
+        temporary = Path(temporary)
+        batch = temporary / "batch.json"
+        batch.write_text(json.dumps({"queries": queries}, sort_keys=True))
+        output = temporary / "swift-output"
+        subprocess.run([str(REPO_ROOT / "scripts/advanced-dedup/run-probe.sh"), "score-batch",
+                        "--profile", str(profile_path), "--input", str(batch),
+                        "--output-dir", str(output)], check=True, capture_output=True, text=True)
+        result = json.loads((output / "query-results.json").read_text())
+        if (result["protocolSHA256"] != protocol_sha or
+                result["profileSHA256"] != _sha256_file(profile_path) or
+                result["batchSHA256"] != _sha256_file(batch) or
+                len(result["queries"]) != len(queries)):
+            raise ValueError("Swift score result binding mismatch")
+        return result
+
+
+def query_level_statistics(dataset, swift_results, protocol):
+    """Count independent query groups, never pairs or reusable distractors."""
+    by_id = {query["id"]: query for query in swift_results["queries"]}
+    entries = [entry for entry in dataset["entries"] if entry["split"] != "distractor"]
+    if set(by_id) != {entry["query_id"] for entry in entries}:
+        raise ValueError("Swift query result IDs differ from declared dataset queries")
+    groups = {}
+    for entry in entries:
+        key = (entry["split"], entry["stratum"], entry["split_group"])
+        observed = by_id[entry["query_id"]]
+        correct = observed["action"] == entry["expected_action"]
+        groups.setdefault(key, []).append(correct)
+    per_split = {}
+    for (split, stratum, _group), outcomes in groups.items():
+        bucket = per_split.setdefault(split, {}).setdefault(stratum, {"queries": 0, "failedGroups": 0})
+        bucket["queries"] += 1
+        bucket["failedGroups"] += int(not all(outcomes))
+    sealed = per_split.get("sealed", {})
+    minimums = protocol["minimum_queries_by_stratum"]
+    shortfalls = {name: max(0, minimum - sealed.get(name, {}).get("queries", 0))
+                  for name, minimum in minimums.items()}
+    # No statistical acceptance without the prescribed independent negative queries.
+    passes_minimums = all(value == 0 for value in shortfalls.values())
+    return {"bySplitAndStratum": per_split, "sealedShortfalls": shortfalls,
+            "sealedMinimumsMet": passes_minimums,
+            "pass": passes_minimums and all(bucket["failedGroups"] == 0
+                                               for bucket in sealed.values())}
+
+
+def score_dataset(protocol_path, dataset_path, vectors, profile_path, output):
+    protocol, protocol_sha = _approved_protocol(protocol_path)
+    dataset = json.loads(dataset_path.read_text())
+    validate_dataset(dataset, protocol["fixture_manifest_sha256"])
+    profile = _validated_profile(profile_path, protocol_sha, protocol)
+    inventory, inventory_sha = _vector_inventory(vectors, profile, protocol_sha)
+    public_hashes, _, _, _ = _public_inventory(protocol["fixture_manifest_sha256"])
+    queries = []
+    for entry in dataset["entries"]:
+        if entry["split"] == "distractor":
+            continue
+        _positive_int(entry.get("width"), f"{entry['query_id']}.width")
+        _positive_int(entry.get("height"), f"{entry['query_id']}.height")
+        candidates = entry["expected_candidates"] + entry.get("gallery_candidates", [])
+        if not candidates:
+            raise ValueError(f"{entry['query_id']} has no designated candidate gallery")
+        if len({item["id"] for item in candidates}) != len(candidates):
+            raise ValueError(f"{entry['query_id']} repeats a candidate in its gallery")
+        for index, item in enumerate(entry.get("gallery_candidates", [])):
+            label = f"{entry['query_id']}.gallery_candidates[{index}]"
+            _required(item, {"id", "representation", "width", "height", "path",
+                             "sha256", "license_record"}, label)
+            if item["representation"] not in REPRESENTATIONS:
+                raise ValueError(f"{label}.representation invalid")
+            _positive_int(item["width"], f"{label}.width")
+            _positive_int(item["height"], f"{label}.height")
+            _file_record(item, Path(dataset["root"]).expanduser().resolve(), label,
+                         public_hashes, entry["split"])
+        queries.append({"id": entry["query_id"], "size": {"width": entry["width"],
+                        "height": entry["height"]}, **_vector_reference(entry, inventory),
+                        "candidates": [{"key": item["id"], "origin": item["representation"],
+                                        "size": {"width": item["width"], "height": item["height"]},
+                                        **_vector_reference(item, inventory)} for item in candidates]})
+    swift_results = _run_swift_score(profile_path, queries, protocol_sha)
+    statistics = query_level_statistics(dataset, swift_results, protocol)
+    report = {"protocolSHA256": protocol_sha, "datasetSHA256": _sha256_file(dataset_path),
+              "profileSHA256": _sha256_file(profile_path), "vectorManifestSHA256": inventory_sha,
+              "statistics": statistics, "swift": swift_results,
+              "researchOnly": True}
+    if output.exists():
+        raise ValueError("output already exists")
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return report
+
+
+def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir):
+    protocol, protocol_sha = _approved_protocol(protocol_path)
+    profile = _validated_profile(profile_path, protocol_sha, protocol)
+    # The existing frozen-corpus validator checks expected-results.json, review/manifest
+    # bindings, every file byte, and all 44 approvals before the model is loaded.
+    subprocess.run([sys.executable, str(REPO_ROOT / "scripts/dedup-fixtures/validate.py"),
+                    "--dataset", str(fixture), "--require-approved"],
+                   check=True, capture_output=True, text=True)
+    manifest_path = fixture / "manifest.json"
+    expected_path = fixture / "expected-results.json"
+    manifest = json.loads(manifest_path.read_text())
+    expected = json.loads(expected_path.read_text())
+    if (manifest["content_sha256"] != protocol["fixture_manifest_sha256"] or
+            expected["manifest_content_sha256"] != manifest["content_sha256"] or
+            len(expected["cases"]) != 44):
+        raise ValueError("frozen public corpus binding/count mismatch")
+    if output_dir.exists():
+        raise ValueError("output directory already exists")
+    output_dir.mkdir(parents=False)
+    list_path = output_dir / "input-list.json"
+    list_path.write_text(json.dumps([str((fixture / item["file"]).resolve())
+                                     for item in manifest["images"]]))
+    vectors = output_dir / "vectors"
+    subprocess.run([str(REPO_ROOT / "scripts/advanced-dedup/run-probe.sh"), "fingerprint",
+                    "--profile", str(profile_path), "--model", str(model_path),
+                    "--input-list", str(list_path), "--output-dir", str(vectors)],
+                   check=True, capture_output=True, text=True)
+    inventory, inventory_sha = _vector_inventory(vectors, profile, protocol_sha)
+    images = {item["id"]: item for item in manifest["images"]}
+    queries = []
+    for case in expected["cases"]:
+        image = images[case["query"]]
+        candidates = [images[key] for key in case["candidates"]]
+        queries.append({"id": case["id"], "size": {"width": image["width"],
+                        "height": image["height"]}, **_vector_reference(image, inventory),
+                        "candidates": [{"key": candidate["id"], "origin": "photosOriginal",
+                                        "size": {"width": candidate["width"],
+                                                 "height": candidate["height"]},
+                                        **_vector_reference(candidate, inventory)}
+                                       for candidate in candidates]})
+    swift_results = _run_swift_score(profile_path, queries, protocol_sha)
+    by_id = {item["id"]: item for item in swift_results["queries"]}
+    cases = []
+    for truth in expected["cases"]:
+        observed = by_id[truth["id"]]
+        wanted_content = ("notDuplicate" if truth["expected"]["content_result"] == "not_duplicate"
+                          else "duplicate")
+        wanted_action = ("importFile" if truth["expected"]["action"] == "import" else "skip")
+        content_pass = observed["content"] == wanted_content
+        action_pass = observed["action"] == wanted_action
+        cases.append({"id": truth["id"], "query": truth["query"],
+                      "gallery": truth["candidates"], "expectedContent": wanted_content,
+                      "expectedAction": wanted_action, "observed": observed,
+                      "contentPass": content_pass, "actionPass": action_pass,
+                      "pass": content_pass and action_pass})
+    report = {"protocolSHA256": protocol_sha,
+              "expectedResultsSHA256": _sha256_file(expected_path),
+              "manifestSHA256": _sha256_file(manifest_path),
+              "profileSHA256": _sha256_file(profile_path),
+              "modelPath": str(model_path), "vectorManifestSHA256": inventory_sha,
+              "threshold": profile["threshold"],
+              "thresholdStatus": "predeclared synthetic example; diagnostic only; not calibrated or accepted",
+              "cases": cases, "caseCount": len(cases),
+              "contentFailures": [case["id"] for case in cases if not case["contentPass"]],
+              "actionFailures": [case["id"] for case in cases if not case["actionPass"]],
+              "passCount": sum(case["pass"] for case in cases),
+              "researchOnly": True}
+    (output_dir / "public-evaluation.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return report
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     check = subcommands.add_parser("check-protocol")
     check.add_argument("--protocol", type=Path, required=True)
     check.add_argument("--dataset", type=Path, required=True)
+    score = subcommands.add_parser("score")
+    score.add_argument("--protocol", type=Path, required=True)
+    score.add_argument("--dataset", type=Path, required=True)
+    score.add_argument("--vectors", type=Path, required=True)
+    score.add_argument("--profile", type=Path, required=True)
+    score.add_argument("--output", type=Path, required=True)
+    evaluate = subcommands.add_parser("evaluate")
+    evaluate.add_argument("--protocol", type=Path, required=True)
+    evaluate.add_argument("--profile", type=Path, required=True)
+    evaluate.add_argument("--model", type=Path, required=True)
+    evaluate.add_argument("--dataset", type=Path, required=True)
+    evaluate.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "score":
+        try:
+            report = score_dataset(args.protocol, args.dataset, args.vectors, args.profile, args.output)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+            parser.exit(1, f"research score invalid: {error}\n")
+        print(json.dumps(report["statistics"], sort_keys=True))
+        return 0
+    if args.command == "evaluate":
+        try:
+            report = evaluate_public(args.protocol, args.profile, args.model,
+                                     args.dataset, args.output_dir)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+            parser.exit(1, f"public evaluation invalid: {error}\n")
+        print(json.dumps({"cases": report["caseCount"], "passed": report["passCount"],
+                          "contentFailures": report["contentFailures"],
+                          "actionFailures": report["actionFailures"]}, sort_keys=True))
+        return 0
     try:
         protocol_bytes = args.protocol.read_bytes()
         protocol = json.loads(protocol_bytes)

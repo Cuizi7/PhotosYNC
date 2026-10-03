@@ -15,9 +15,14 @@ if (( $# < 1 )); then
 fi
 COMMAND="$1"
 shift
+DATASET=''
+PROFILE=''
 case "$COMMAND" in
   fingerprint) LIST_FLAG=--input-list ;;
   compare-tensors) LIST_FLAG=--tensor-list ;;
+  score-batch) LIST_FLAG=--input ;;
+  search-benchmark) LIST_FLAG=--vectors ;;
+  evaluate) LIST_FLAG=--dataset ;;
   *) echo 'probe: unknown command' >&2; exit 2 ;;
 esac
 SEEN_FLAGS='|'
@@ -25,7 +30,11 @@ while (( $# )); do
   FLAG="$1"
   shift
   case "$FLAG" in
-    --profile|--model|--output-dir|"$LIST_FLAG") ;;
+    --profile|--output-dir|"$LIST_FLAG") ;;
+    --model)
+      [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors || "$COMMAND" == evaluate ]] || exit 2 ;;
+    --asset-count|--edited-fraction)
+      [[ "$COMMAND" == search-benchmark ]] || exit 2 ;;
     --approved-protocol-json|--protocol-sha256|--max-decoded-bytes|--max-abs-error|--min-cosine)
       echo "probe: reserved approved-protocol option $FLAG" >&2; exit 2 ;;
     *) echo "probe: unknown option $FLAG" >&2; exit 2 ;;
@@ -39,9 +48,18 @@ while (( $# )); do
     exit 2
   fi
   SEEN_FLAGS="$SEEN_FLAGS$FLAG|"
+  if [[ "$FLAG" == --dataset ]]; then DATASET="$1"; fi
+  if [[ "$FLAG" == --profile ]]; then PROFILE="$1"; fi
   shift
 done
-for REQUIRED in --profile --model --output-dir "$LIST_FLAG"; do
+REQUIRED_FLAGS=(--profile --output-dir "$LIST_FLAG")
+if [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors || "$COMMAND" == evaluate ]]; then
+  REQUIRED_FLAGS+=(--model)
+fi
+if [[ "$COMMAND" == search-benchmark ]]; then
+  REQUIRED_FLAGS+=(--asset-count --edited-fraction)
+fi
+for REQUIRED in "${REQUIRED_FLAGS[@]}"; do
   if [[ "$SEEN_FLAGS" != *"|$REQUIRED|"* ]]; then
     echo "probe: missing option $REQUIRED" >&2
     exit 2
@@ -49,14 +67,14 @@ for REQUIRED in --profile --model --output-dir "$LIST_FLAG"; do
 done
 
 # One read and one R1 validation produce the immutable values passed to Swift.
-APPROVED_BINDING="$(python3 - "$ROOT" "$PROTOCOL" <<'PY'
+APPROVED_BINDING="$(python3 - "$ROOT" "$PROTOCOL" "$PROFILE" "$COMMAND" <<'PY'
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import sys
 
-root, path = Path(sys.argv[1]), Path(sys.argv[2])
+root, path, profile_path, command = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
 spec = importlib.util.spec_from_file_location("advanced_dedup_research", root / "scripts/advanced-dedup/research.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -65,6 +83,8 @@ document = json.loads(raw)
 protocol = module.validate_protocol(document)
 if not protocol["approved"]:
     raise ValueError("research protocol has not been approved")
+if command in {"score-batch", "search-benchmark", "evaluate"}:
+    module._validated_profile(Path(profile_path), hashlib.sha256(raw).hexdigest(), document)
 resources = document["resources"]
 if resources["inference_concurrency"] != 1 or resources["batch_size"] != 1:
     raise ValueError("probe requires serial single-item inference")
@@ -79,10 +99,18 @@ print(json.dumps({
 }, sort_keys=True, separators=(",", ":")))
 PY
 )"
+if [[ "$COMMAND" == evaluate ]]; then
+  # The frozen expected-results binding must pass before decoding or scoring any image.
+  python3 "$ROOT/scripts/dedup-fixtures/validate.py" --dataset "$DATASET" --require-approved >/dev/null
+  exec python3 "$ROOT/scripts/advanced-dedup/research.py" evaluate \
+    --protocol "$PROTOCOL" "${ARGS[@]:1}"
+fi
 mkdir -p "$MODULE_CACHE"
 export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
 xcrun swiftc -O -module-cache-path "$MODULE_CACHE" -module-name AdvancedDedupProbe \
   "$ROOT/Sources/PhotoSyncCore/Matching/AdvancedDedupTypes.swift" \
+  "$ROOT/Sources/PhotoSyncCore/Matching/ExactVectorIndex.swift" \
+  "$ROOT/Sources/PhotoSyncCore/Matching/AdvancedDuplicatePolicy.swift" \
   "$ROOT/Sources/PhotoSyncCore/Fingerprinting/ImagePreprocessor.swift" \
   "$ROOT/Sources/PhotoSyncCore/Fingerprinting/CoreMLFingerprinter.swift" \
   "$ROOT/Tools/AdvancedDedupProbe/main.swift" \

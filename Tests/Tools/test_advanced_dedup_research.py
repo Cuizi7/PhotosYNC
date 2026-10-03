@@ -23,6 +23,36 @@ FIXTURE_HASH = json.loads(FIXTURE_MANIFEST.read_text())["content_sha256"]
 
 
 class ResearchProtocolTests(unittest.TestCase):
+    def testZeroNegativeQueriesCannotPass(self):
+        protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())
+        dataset = {"entries": [{"query_id": "one", "split": "sealed",
+                                "stratum": "hard_copy", "split_group": "group-one",
+                                "expected_action": "skip"}]}
+        swift = {"queries": [{"id": "one", "action": "skip"}]}
+        result = research.query_level_statistics(dataset, swift, protocol)
+        self.assertFalse(result["pass"])
+        self.assertGreater(result["sealedShortfalls"]["false_skip"], 0)
+
+    def testRepeatedPairsCountAsOneIndependentQueryGroup(self):
+        protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())
+        dataset = {"entries": [{"query_id": name, "split": "sealed",
+                                "stratum": "false_skip", "split_group": "one-session",
+                                "expected_action": "importFile"} for name in ("one", "two")]}
+        swift = {"queries": [{"id": name, "action": "importFile",
+                              "candidates": [{"key": "a"}, {"key": "b"}]}
+                             for name in ("one", "two")]}
+        result = research.query_level_statistics(dataset, swift, protocol)
+        self.assertEqual(result["bySplitAndStratum"]["sealed"]["false_skip"]["queries"], 1)
+        self.assertEqual(result["sealedShortfalls"]["false_skip"], 36886)
+
+    def testScoreRequiresExplicitProfile(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), "score", "--protocol",
+                                 "protocol.json", "--dataset", "dataset.json",
+                                 "--vectors", "vectors", "--output", "out.json"],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--profile", result.stderr)
+
     def test_conversion_manifest_hash_uses_relative_paths_and_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "model.mlpackage"

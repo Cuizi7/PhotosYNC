@@ -1,6 +1,7 @@
 import CoreGraphics
 import CoreML
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 
@@ -18,11 +19,18 @@ struct ApprovedProtocolBinding: Decodable {
 
 func parseArguments() throws -> (command: String, values: [String: String]) {
     let args = Array(CommandLine.arguments.dropFirst())
-    guard let command = args.first, command == "fingerprint" || command == "compare-tensors" else {
-        throw ProbeError(description: "expected fingerprint or compare-tensors command")
+    guard let command = args.first,
+          ["fingerprint", "compare-tensors", "score-batch", "search-benchmark"].contains(command) else {
+        throw ProbeError(description: "unknown probe command")
     }
-    let listFlag = command == "fingerprint" ? "--input-list" : "--tensor-list"
-    let allowed = Set(["--profile", "--model", "--output-dir", listFlag, "--approved-protocol-json"])
+    let required: [String]
+    switch command {
+    case "fingerprint": required = ["--profile", "--model", "--output-dir", "--input-list"]
+    case "compare-tensors": required = ["--profile", "--model", "--output-dir", "--tensor-list"]
+    case "score-batch": required = ["--profile", "--input", "--output-dir"]
+    default: required = ["--profile", "--vectors", "--asset-count", "--edited-fraction", "--output-dir"]
+    }
+    let allowed = Set(required + ["--approved-protocol-json"])
     guard (args.count - 1).isMultiple(of: 2) else {
         throw ProbeError(description: "unpaired probe option")
     }
@@ -34,7 +42,7 @@ func parseArguments() throws -> (command: String, values: [String: String]) {
         }
         values[flag] = args[index + 1]
     }
-    guard ["--profile", "--model", "--output-dir", listFlag, "--approved-protocol-json"]
+    guard (required + ["--approved-protocol-json"])
         .allSatisfy({ values[$0] != nil }) else {
         throw ProbeError(description: "missing required probe option")
     }
@@ -59,7 +67,6 @@ func run() async throws {
     let parsed = try parseArguments()
     let args = parsed.values
     let profile = URL(fileURLWithPath: args["--profile"]!)
-    let model = URL(fileURLWithPath: args["--model"]!)
     let output = URL(fileURLWithPath: args["--output-dir"]!)
     let approved = try JSONDecoder().decode(ApprovedProtocolBinding.self,
                                             from: Data(args["--approved-protocol-json"]!.utf8))
@@ -85,6 +92,23 @@ func run() async throws {
             throw ProbeError(description: "profile resource limits conflict with approved protocol")
         }
     }
+    if parsed.command == "score-batch" || parsed.command == "search-benchmark" {
+        let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: profileData)
+        guard configuration.acceptanceID == "research:\(protocolSHA)",
+              configuration.backend == "exact-accelerate-f32" else {
+            throw ProbeError(description: "research profile binding or backend mismatch")
+        }
+        if parsed.command == "score-batch" {
+            try runScoreBatch(input: URL(fileURLWithPath: args["--input"]!), output: output,
+                              profile: profile, configuration: configuration, protocolSHA: protocolSHA)
+        } else {
+            try await runSearchBenchmark(vectors: URL(fileURLWithPath: args["--vectors"]!),
+                assetCount: args["--asset-count"]!, editedFraction: args["--edited-fraction"]!,
+                output: output, configuration: configuration, protocolSHA: protocolSHA)
+        }
+        return
+    }
+    let model = URL(fileURLWithPath: args["--model"]!)
     let selected = (raw["fingerprint"] as? [String: Any]) ?? raw
     let configuration = try JSONDecoder().decode(FingerprintConfiguration.self,
                                                    from: JSONSerialization.data(withJSONObject: selected))
@@ -197,6 +221,188 @@ func run() async throws {
 struct TensorPair: Decodable {
     let input: String
     let reference: String
+}
+
+private struct BatchInput: Decodable {
+    let queries: [BatchQuery]
+}
+
+private struct BatchQuery: Decodable {
+    let id: String
+    let vector: String
+    let vectorSHA256: String
+    let size: PixelSize?
+    let candidates: [BatchCandidate]
+}
+
+private struct BatchCandidate: Decodable {
+    let key: String
+    let origin: CandidateOrigin
+    let vector: String
+    let vectorSHA256: String
+    let size: PixelSize?
+}
+
+private func readVector(path: String, expectedSHA: String, version: String) throws -> Fingerprint {
+    let url = URL(fileURLWithPath: path)
+    guard try sha256(url) == expectedSHA else { throw ProbeError(description: "vector SHA256 mismatch: \(path)") }
+    let bytes = try Data(contentsOf: url)
+    guard bytes.count == 4096 else { throw ProbeError(description: "invalid Float32 vector length") }
+    let values: [Float] = bytes.withUnsafeBytes { raw in
+        let source = raw.bindMemory(to: UInt8.self)
+        return (0..<1024).map { index in
+            let offset = index * 4
+            let bits = UInt32(source[offset]) | UInt32(source[offset + 1]) << 8 |
+                       UInt32(source[offset + 2]) << 16 | UInt32(source[offset + 3]) << 24
+            return Float(bitPattern: bits)
+        }
+    }
+    return try Fingerprint(version: version, values: values)
+}
+
+private func writeJSON(_ report: [String: Any], at url: URL) throws {
+    try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+        .write(to: url, options: .atomic)
+}
+
+private func runScoreBatch(input: URL, output: URL, profile: URL, configuration: DedupConfiguration,
+                           protocolSHA: String) throws {
+    let batch = try JSONDecoder().decode(BatchInput.self, from: Data(contentsOf: input))
+    guard !batch.queries.isEmpty, Set(batch.queries.map(\.id)).count == batch.queries.count else {
+        throw ProbeError(description: "empty or duplicate query IDs")
+    }
+    var reports = [[String: Any]]()
+    for query in batch.queries {
+        let fingerprint = try readVector(path: query.vector, expectedSHA: query.vectorSHA256,
+                                         version: configuration.fingerprint.version)
+        let entries = try query.candidates.map { candidate in
+            VectorEntry(key: candidate.key, origin: candidate.origin,
+                fingerprint: try readVector(path: candidate.vector,
+                    expectedSHA: candidate.vectorSHA256, version: configuration.fingerprint.version),
+                size: candidate.size)
+        }
+        // Score the whole declared gallery, including below-threshold candidates for diagnostics.
+        let allScores = try ExactVectorIndex.score(query: fingerprint, entries: entries,
+                                                    minimumScore: -1)
+        let evaluation = try AdvancedDuplicatePolicy.evaluate(sourceSize: query.size,
+            candidates: allScores, configuration: configuration)
+        reports.append([
+            "id": query.id,
+            "queryVectorSHA256": query.vectorSHA256,
+            "candidates": allScores.map { item in
+                ["key": item.key, "origin": item.origin.rawValue, "score": item.score] as [String: Any]
+            },
+            "content": evaluation.content.rawValue,
+            "action": evaluation.action.rawValue,
+            "reason": evaluation.reason.rawValue,
+            "matchedKeys": evaluation.matchedKeys,
+            "coveringKeys": evaluation.coveringKeys,
+        ])
+    }
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+    try writeJSON(["protocolSHA256": protocolSHA,
+                   "profileSHA256": try sha256(profile),
+                   "fingerprintVersion": configuration.fingerprint.version,
+                   "policyVersion": configuration.policyVersion,
+                   "threshold": configuration.threshold,
+                   "backend": configuration.backend,
+                   "batchSHA256": try sha256(input), "queries": reports],
+                  at: output.appendingPathComponent("query-results.json"))
+    print("scored \(reports.count) complete query gallery views")
+}
+
+private struct FingerprintManifest: Decodable {
+    let protocolSHA256: String
+    let modelSHA256: String
+    let fingerprintVersion: String
+    let records: [FingerprintRecord]
+}
+
+private struct FingerprintRecord: Decodable {
+    let vectorFile: String
+}
+
+private func percentile(_ samples: [Double], _ percentile: Double) -> Double {
+    let sorted = samples.sorted()
+    return sorted[max(0, Int(ceil(Double(sorted.count) * percentile)) - 1)]
+}
+
+private func runSearchBenchmark(vectors: URL, assetCount: String, editedFraction: String,
+                                output: URL, configuration: DedupConfiguration,
+                                protocolSHA: String) async throws {
+    guard let count = Int(assetCount), count == 100000,
+          let fraction = Double(editedFraction), [0.0, 0.5, 1.0].contains(fraction) else {
+        throw ProbeError(description: "benchmark requires 100000 assets and edited fraction 0, 0.5, or 1")
+    }
+    let manifestURL = vectors.appendingPathComponent("fingerprints.json")
+    let manifest = try JSONDecoder().decode(FingerprintManifest.self, from: Data(contentsOf: manifestURL))
+    guard manifest.protocolSHA256 == protocolSHA,
+          manifest.modelSHA256 == configuration.fingerprint.modelSHA256,
+          manifest.fingerprintVersion == configuration.fingerprint.version,
+          let record = manifest.records.first else {
+        throw ProbeError(description: "benchmark vector manifest binding mismatch")
+    }
+    let seedURL = vectors.appendingPathComponent(record.vectorFile)
+    let seedSHA = try sha256(seedURL)
+    let seed = try readVector(path: seedURL.path, expectedSHA: seedSHA,
+                              version: configuration.fingerprint.version)
+    var state: UInt64 = UInt64(seedSHA.prefix(16), radix: 16)! ^ 0x9e3779b97f4a7c15
+    var entries = [VectorEntry]()
+    let total = count + Int(Double(count) * fraction)
+    entries.reserveCapacity(total + 1000)
+    for index in 0..<(total + 1000) {
+        let vector: Fingerprint
+        if index.isMultiple(of: 10000) {
+            vector = seed
+        } else {
+            var values = [Float]()
+            values.reserveCapacity(1024)
+            for _ in 0..<1024 {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17
+                values.append(Float(Int(state & 0xffff) - 32768) / 32768)
+            }
+            vector = try Fingerprint(version: configuration.fingerprint.version, values: values)
+        }
+        entries.append(VectorEntry(key: String(index), origin: .photosCurrent,
+                                   fingerprint: vector, size: nil))
+    }
+    let index = ExactVectorIndex(version: configuration.fingerprint.version)
+    let buildStart = CFAbsoluteTimeGetCurrent()
+    try await index.replace(entries: Array(entries.prefix(total)), generation: 1)
+    let buildMS = (CFAbsoluteTimeGetCurrent() - buildStart) * 1000
+    var hot = [Double]()
+    var hits = 0
+    for _ in 0..<20 {
+        let start = CFAbsoluteTimeGetCurrent()
+        let found = try await index.search(query: seed, minimumScore: configuration.threshold,
+                                           generation: 1)
+        hot.append((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        hits = found.count
+    }
+    let incrementalStart = CFAbsoluteTimeGetCurrent()
+    try await index.replace(entries: entries, generation: 2)
+    let incrementalMS = (CFAbsoluteTimeGetCurrent() - incrementalStart) * 1000
+    var usage = rusage()
+    getrusage(RUSAGE_SELF, &usage)
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+    try writeJSON(["protocolSHA256": protocolSHA,
+                   "vectorManifestSHA256": try sha256(manifestURL),
+                   "seedVectorSHA256": seedSHA,
+                   "syntheticGenerator": "xorshift64 seeded from first 64 bits of seedVectorSHA256 xor 0x9e3779b97f4a7c15; 1024 independent generated components in [-1,1), normalized Float32; one seed-vector hit every 10000 rows",
+                   "profileVersion": configuration.policyVersion,
+                   "assetCount": count, "editedFraction": fraction,
+                   "representationCount": total,
+                   "provenance": "synthetic deterministic Float32 vectors seeded by local R2 vector identity; performance only, no image accuracy evidence",
+                   "hitCount": hits, "hitDensity": Double(hits) / Double(total),
+                   "indexBuildMS": buildMS,
+                   "incremental1000FullReplaceMS": incrementalMS,
+                   "incrementalMethod": "replace complete N+1000 view; no in-place append API",
+                   "hotQueryP50MS": percentile(hot, 0.50),
+                   "hotQueryP95MS": percentile(hot, 0.95),
+                   "hotQueryP99MS": percentile(hot, 0.99),
+                   "peakRSSBytes": usage.ru_maxrss],
+                  at: output.appendingPathComponent("search-benchmark.json"))
+    print("benchmarked \(total) synthetic representations")
 }
 
 Task {

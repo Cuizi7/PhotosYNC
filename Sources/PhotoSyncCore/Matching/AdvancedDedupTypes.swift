@@ -209,13 +209,33 @@ public struct DedupConfiguration: Codable, Sendable {
     public init(fingerprint: FingerprintConfiguration, policyVersion: String, threshold: Double,
                 backend: String, resources: ResourceLimits, evidenceCandidateLimit: Int,
                 acceptanceID: String) throws {
-        guard !policyVersion.isEmpty, threshold.isFinite, threshold > 0, threshold <= 1,
+        guard threshold.isFinite, threshold > 0, threshold <= 1,
               !backend.isEmpty, evidenceCandidateLimit > 0, !acceptanceID.isEmpty else {
+            throw AdvancedDedupError.invalidConfiguration
+        }
+        guard policyVersion == Self.computePolicyVersion(fingerprintVersion: fingerprint.version,
+                                                         threshold: threshold, backend: backend) else {
             throw AdvancedDedupError.invalidConfiguration
         }
         self.fingerprint = fingerprint; self.policyVersion = policyVersion; self.threshold = threshold
         self.backend = backend; self.resources = resources
         self.evidenceCandidateLimit = evidenceCandidateLimit; self.acceptanceID = acceptanceID
+    }
+
+    public static func computePolicyVersion(fingerprintVersion: String, threshold: Double,
+                                            backend: String) -> String {
+        // Length framing binds each field without separator ambiguity. Rule changes require a new tag.
+        let fields = ["advanced-dedup-policy-v1", fingerprintVersion,
+                      String(threshold.bitPattern), backend,
+                      "cover-if-both-sorted-pixel-edges-gte-v1"]
+        var bytes = Data()
+        for field in fields {
+            let encoded = Data(field.utf8)
+            var count = UInt64(encoded.count).littleEndian
+            withUnsafeBytes(of: &count) { bytes.append(contentsOf: $0) }
+            bytes.append(encoded)
+        }
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     private enum CodingKeys: String, CodingKey {
