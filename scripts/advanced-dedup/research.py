@@ -17,6 +17,7 @@ import tempfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_MANIFEST = REPO_ROOT / "Tests/Fixtures/AdvancedDedup/manifest.json"
+PUBLIC_ACTIVE_SUITE = PUBLIC_MANIFEST.with_name("active-suite.json")
 SPLITS = {"calibration", "sealed", "distractor", "public_regression"}
 ACTIONS = {"importFile", "skip"}
 REPRESENTATIONS = {"photosOriginal", "photosCurrent", "localPending",
@@ -777,6 +778,8 @@ def _audit_public_score(report, profile_path, profile, protocol_sha, fixture=Non
 
 
 def evaluate_public(protocol_path, profile_path, model_path, fixture, output_dir):
+    if (fixture / "active-suite.json").exists():
+        raise ValueError("new 33-case scope requires next-study protocol/evidence binding; original 44-case evidence is historical")
     protocol, protocol_sha = _approved_protocol(protocol_path)
     profile = _validated_profile(profile_path, protocol_sha, protocol)
     # The existing frozen-corpus validator checks expected-results.json, review/manifest
@@ -849,6 +852,8 @@ def _distractor_catalog_sufficient(entries, minimum):
 
 def accept_evidence(protocol_path, dataset_path, results_path, output_dir):
     """Audit saved experiment bytes and emit a release profile only on full success."""
+    if PUBLIC_ACTIVE_SUITE.exists():
+        raise ValueError("new 33-case scope requires next-study protocol/evidence binding; original 44-case evidence is historical")
     if output_dir.exists():
         raise ValueError("acceptance output already exists")
     protocol, protocol_sha = _approved_protocol(protocol_path)

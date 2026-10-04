@@ -136,6 +136,9 @@
     // Generator must JSON-serialize the manifest and escape '<' as '\u003c' before replacing this token.
     const manifest = __MANIFEST_JSON__;
     const frozen = __FROZEN_JSON__;
+    const activeSuite = __ACTIVE_SUITE_JSON__;
+    const activeIds = activeSuite ? new Set(activeSuite.kept_case_ids) : null;
+    const activeCases = activeIds ? manifest.cases.filter(item => activeIds.has(item.id)) : manifest.cases;
     const frozenMap = new Map((frozen?.cases || []).map(item => [item.id, item]));
     const pageSize = 10;
     const groupName = {positive: "同图副本", negative: "不同照片", boundary: "边界案例"};
@@ -205,7 +208,7 @@
           }
         }
         if (saved?.dataset_id === manifest.dataset_id && saved?.version === expectedVersion && saved?.content_sha256 === expectedHash && saved.cases && typeof saved.cases === "object") {
-          for (const item of manifest.cases) {
+          for (const item of activeCases) {
             if (carriedIds && !carriedIds.has(item.id)) continue;
             const prior = saved.cases[item.id];
             if (!prior || typeof prior !== "object") continue;
@@ -235,19 +238,19 @@
     }
     function updateProgress() {
       let approved = 0, rejected = 0;
-      for (const item of manifest.cases) {
+      for (const item of activeCases) {
         const status = reviewFor(item).review_status;
         if (status === "approved") approved++;
         if (status === "rejected") rejected++;
       }
-      const pending = manifest.cases.length - approved - rejected;
-      byId("progress").textContent = `共 ${manifest.cases.length} 例 · 已批准 ${approved} · 已拒绝 ${rejected} · 待审阅 ${pending}`;
+      const pending = activeCases.length - approved - rejected;
+      byId("progress").textContent = `共 ${activeCases.length} 例 · 已批准 ${approved} · 已拒绝 ${rejected} · 待审阅 ${pending}`;
     }
     function filteredCases() {
       const group = byId("group-filter").value;
       const status = byId("status-filter").value;
       const text = byId("search").value.trim().toLocaleLowerCase();
-      return manifest.cases.filter(item => {
+      return activeCases.filter(item => {
         if (group !== "all" && item.group !== group) return false;
         if (status !== "all" && reviewFor(item).review_status !== status) return false;
         if (!text) return true;
@@ -474,7 +477,7 @@
         content_sha256: manifest.content_sha256,
         exported_at: new Date().toISOString(),
         reminder: "pending/rejected cases are not approved ground truth",
-        cases: manifest.cases.map(item => ({
+        cases: activeCases.map(item => ({
           id: item.id,
           group: item.group,
           query: item.query,
@@ -500,8 +503,12 @@
     }
     byId("dataset").textContent = `数据集：${manifest.dataset_id} · 版本：${manifest.version}`;
     if (frozen) document.querySelector('.notice').textContent = `测试集 ${frozen.fixture_version} 已固化，以下为已批准的预期结果。当前页面只读；这不是模型实测结果或发布许可证明。`;
+    if (activeSuite) {
+      document.querySelector('.notice').textContent = `当前研究用例范围 ${activeSuite.revision}：显示 ${activeCases.length} 个已批准用例，11 个信息看板用例退出当前范围；原始 ${manifest.cases.length} 例及标签仍保留为历史证据。这不是新的模型验收结果。`;
+      byId("export").hidden = true;
+    }
     restore();
-    for (const item of manifest.cases) reviewFor(item);
+    for (const item of activeCases) reviewFor(item);
     for (const id of ["group-filter", "status-filter", "search"]) byId(id).addEventListener(id === "search" ? "input" : "change", () => { page = 0; render(); });
     byId("previous").addEventListener("click", () => { page--; render(); window.scrollTo({top: 0, behavior: "smooth"}); });
     byId("next").addEventListener("click", () => { page++; render(); window.scrollTo({top: 0, behavior: "smooth"}); });

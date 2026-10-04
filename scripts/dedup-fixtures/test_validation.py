@@ -11,7 +11,7 @@ import unittest
 
 from PIL import Image, ImageDraw
 
-from build import build, case_fingerprint, render_review, reviewed_expectations
+from build import build, case_fingerprint, load_active_suite, render_review, reviewed_expectations
 from validate import validate
 
 
@@ -58,6 +58,114 @@ class FixtureValidationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def freeze_synthetic(self) -> dict:
+        manifest = json.loads((self.directory / 'manifest.json').read_text())
+        review = {key: manifest[key] for key in ('dataset_id', 'version', 'content_sha256')}
+        review.update(review_schema_version=2, review_scope='content_only', cases=[])
+        for item in manifest['cases']:
+            label = item['proposed']
+            duplicate = label['relation'] == 'same_photo' or (label['relation'] == 'derived_photo' and label['action'] == 'skip')
+            review['cases'].append({key: item[key] for key in ('id', 'group', 'query', 'candidates')} | {
+                **label, 'content_result': 'duplicate' if duplicate else 'not_duplicate',
+                'review_status': 'approved', 'reviewed_at': '2026-10-02T02:00:00Z', 'notes': ''})
+        review_bytes = json.dumps(review).encode()
+        frozen = reviewed_expectations(manifest, review_bytes)
+        (self.directory / 'human-review.json').write_bytes(review_bytes)
+        (self.directory / 'expected-results.json').write_text(json.dumps(frozen))
+        return frozen
+
+    def scope_synthetic(self) -> dict:
+        inputs = Path(self.temp.name) / 'scope-sources'
+        inputs.mkdir()
+        shutil.copyfile(Path(self.root.name) / 'sources.json', inputs / 'sources.json')
+        baseline = json.loads((self.baseline / 'manifest.json').read_text())
+        originals = [i for i in baseline['images'] if i['transform']['kind'] == 'sanitized_baseline'][:6]
+        contributions = {'sources': [], 'images': [], 'cases': []}
+        for n, original in enumerate(originals):
+            source_id = f'user-scope-{n}'
+            relative = f'images/{source_id}.jpg'
+            path = inputs / relative
+            path.parent.mkdir(exist_ok=True)
+            shutil.copyfile(self.baseline / original['file'], path)
+            contributions['images'].append({**original, 'id': source_id, 'file': relative,
+                'source_id': source_id, 'family_id': source_id, 'transform': {'kind': 'user-metadata-stripped'}})
+            contributions['sources'].append({'id': source_id, 'author': 'Synthetic test author',
+                'license': 'User-provided; redistribution license unspecified',
+                'license_evidence': 'Synthetic test contribution', 'distribution_status': 'local_testing_only',
+                'split_group': f'test-scope-{n//2}'})
+            if n % 2:
+                label = {'relation': 'different_photo', 'action': 'import'}
+                contributions['cases'].append({'id': f'N{51+n//2:03d}', 'group': 'negative',
+                    'title': 'Synthetic scope contribution', 'reason': 'Different test images',
+                    'query': source_id, 'candidates': [f'user-scope-{n-1}'], 'proposed': label,
+                    'expected': {'content_result': 'not_duplicate', **label}, 'review_status': 'approved',
+                    'approval': {'date': '2026-10-02', 'basis': 'explicit_user_message',
+                                 'instruction': '新增三组用例，都判不重'},
+                    'split_group': f'test-scope-{n//2}'})
+        (inputs / 'contributions.json').write_text(json.dumps(contributions))
+        self.directory = Path(self.temp.name) / 'scope-dataset'
+        build(inputs / 'sources.json', Path(self.root.name) / 'cache', self.directory)
+        frozen = self.freeze_synthetic()
+        manifest = json.loads((self.directory / 'manifest.json').read_text())
+        excluded = ['N031', 'N032', 'N033', 'N035', 'N037', 'N039', 'N041', 'N043', 'N045', 'N047', 'N049']
+        scope = {
+            'schema_version': 1,
+            'revision': '2026-10-04-no-information-panels',
+            'date': '2026-10-04',
+            'user_instruction': '看来信息看板的例子过于极端了，先把信息看板的几个用例砍掉吧。然后评估哪些研究结果可以复用，是否需要执行更多的研究步骤',
+            'parent_fixture_version': '2026-10-02-v1',
+            'parent_manifest_sha256': hashlib.sha256((self.directory / 'manifest.json').read_bytes()).hexdigest(),
+            'parent_manifest_content_sha256': manifest['content_sha256'],
+            'parent_expected_results_sha256': hashlib.sha256((self.directory / 'expected-results.json').read_bytes()).hexdigest(),
+            'parent_expected_results_content_sha256': frozen['content_sha256'],
+            'parent_human_review_sha256': hashlib.sha256((self.directory / 'human-review.json').read_bytes()).hexdigest(),
+            'kept_case_ids': [case['id'] for case in manifest['cases'] if case['id'] not in excluded],
+            'excluded_case_ids': excluded,
+            'reason': '2026-10-04 user instruction: remove synthetic information-panel examples from active research fixtures.'
+        }
+        (self.directory / 'active-suite.json').write_text(json.dumps(scope))
+        return scope
+
+    def test_active_scope_keeps_only_approved_non_panel_cases(self) -> None:
+        scope = self.scope_synthetic()
+        manifest = json.loads((self.directory / 'manifest.json').read_text())
+        frozen = json.loads((self.directory / 'expected-results.json').read_text())
+        self.assertEqual(load_active_suite(self.directory, manifest, frozen), scope)
+        render_review(self.directory)
+        result = validate(self.directory, require_approved=True)
+        self.assertEqual((result['cases'], result['images']), (33, 42))
+        self.assertEqual((result['archived_cases'], result['archived_images']), (44, 63))
+        self.assertEqual((result['source_families'], result['split_groups']), (24, 12))
+        self.assertEqual((result['archived_source_families'], result['archived_split_groups']), (36, 14))
+        for change in ('duplicate', 'missing', 'overlap', 'wrong_exclusion',
+                       'manifest_hash', 'expected_hash', 'review_hash', 'manifest_content_hash'):
+            bad = json.loads(json.dumps(scope))
+            if change == 'duplicate': bad['kept_case_ids'].append(bad['kept_case_ids'][0])
+            if change == 'missing': bad['kept_case_ids'].pop()
+            if change == 'overlap': bad['kept_case_ids'].append(bad['excluded_case_ids'][0])
+            if change == 'wrong_exclusion': bad['excluded_case_ids'][0] = 'N001'
+            if change == 'manifest_hash': bad['parent_manifest_sha256'] = '0' * 64
+            if change == 'expected_hash': bad['parent_expected_results_sha256'] = '0' * 64
+            if change == 'review_hash': bad['parent_human_review_sha256'] = '0' * 64
+            if change == 'manifest_content_hash': bad['parent_manifest_content_sha256'] = '0' * 64
+            (self.directory / 'active-suite.json').write_text(json.dumps(bad))
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                load_active_suite(self.directory, manifest, frozen)
+
+    def test_active_scope_rebuild_preserves_revision(self) -> None:
+        scope = self.scope_synthetic()
+        inputs = Path(self.temp.name) / 'scope-inputs'
+        inputs.mkdir()
+        shutil.copyfile(Path(self.temp.name) / 'scope-sources/sources.json', inputs / 'sources.json')
+        shutil.copyfile(Path(self.temp.name) / 'scope-sources/contributions.json', inputs / 'contributions.json')
+        shutil.copytree(Path(self.temp.name) / 'scope-sources/images', inputs / 'images')
+        for name in ('human-review.json', 'expected-results.json', 'active-suite.json'):
+            shutil.copyfile(self.directory / name, inputs / name)
+        rebuilt = Path(self.temp.name) / 'scope-rebuilt'
+        build(inputs / 'sources.json', Path(self.root.name) / 'cache', rebuilt)
+        self.assertEqual(json.loads((rebuilt / 'active-suite.json').read_text()), scope)
+        self.assertEqual(validate(rebuilt, require_approved=True)['cases'], 33)
+
     def test_complete_synthetic_build_passes_integrity_but_not_human_approval(self) -> None:
         result = validate(self.directory)
         self.assertEqual(result['cases'], 41)
@@ -76,18 +184,8 @@ class FixtureValidationTests(unittest.TestCase):
 
     def test_freeze_binds_complete_review_and_survives_rebuild(self) -> None:
         manifest = json.loads((self.directory / 'manifest.json').read_text())
-        review = {key: manifest[key] for key in ('dataset_id', 'version', 'content_sha256')}
-        review.update(review_schema_version=2, review_scope='content_only', cases=[])
-        for item in manifest['cases']:
-            label = item['proposed']
-            duplicate = label['relation'] == 'same_photo' or (label['relation'] == 'derived_photo' and label['action'] == 'skip')
-            review['cases'].append({key: item[key] for key in ('id', 'group', 'query', 'candidates')} | {
-                **label, 'content_result': 'duplicate' if duplicate else 'not_duplicate',
-                'review_status': 'approved', 'reviewed_at': '2026-10-02T02:00:00Z', 'notes': ''})
-        review_bytes = json.dumps(review).encode()
-        frozen = reviewed_expectations(manifest, review_bytes)
-        (self.directory / 'human-review.json').write_bytes(review_bytes)
-        (self.directory / 'expected-results.json').write_text(json.dumps(frozen))
+        frozen = self.freeze_synthetic()
+        review_bytes = (self.directory / 'human-review.json').read_bytes()
         render_review(self.directory)
         self.assertEqual(validate(self.directory, require_approved=True)['labels'], '41 approved and frozen')
         inputs = Path(self.temp.name) / 'frozen-inputs'

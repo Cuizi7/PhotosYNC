@@ -1,5 +1,7 @@
 # PhotosYNC 0.2.0 高级照片判重集成 Implementation Plan
 
+> **2026-10-04 当前状态：** 产品集成仍未开始，继续等待用户指示及研究验收。用户已停用 11 个信息看板用例，当前 active suite 为 33 例，v1 的 44 例底本仍保留。下方 P9 的回归数量已同步新范围；这不代表已经得到有效阈值或成功 R4 配置。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将经过验收的 SSCD 判重接入 Photos 持续索引、SQLite 恢复、串行导入及生产日志，保持来源只读和成功历史保护。
@@ -23,7 +25,7 @@
 - “旧已提交结果和成功历史不得因此重新导入”；未知高版本 schema 拒绝打开，不清库重置。
 - 现有日志轮转“10 × 10 MiB”；不记原图、完整向量或 metadata 全量转储，不自动上传。
 - 保持 macOS 13、Universal、现有 bundle identity、数据目录 `Application Support/PhotoSync` 和本地 ad-hoc 发布契约。
-- 44 个固定回归用例不等于封存阈值集；用户附件的公开分发许可仍未补全，不打包这些图片进 App、不自行推送。
+- 当前 33 个固定回归用例不等于封存阈值集；历史 v1 的 44 例仍须保留为已见样本；用户附件的公开分发许可仍未补全，不打包这些图片进 App、不自行推送。
 
 ## Review Focus
 
@@ -223,9 +225,9 @@ XCTAssertEqual(progress.totalRepresentations, 200000)
 
 **Interfaces:** Consumes P1 的 `DedupConfiguration.loadValidated(resourceDirectory: URL) throws -> DedupConfiguration`，本任务用真实 Bundle 资源验证该入口，不再新增另一个加载器。Bundle 通过 `Bundle(for:)` 的Core资源定位模型，不能指向work研究路径。以文件夹资源原样复制已批准 .mlpackage，不让Xcode自动替换成另一哈希的 .mlmodelc；R2 加载器验证包后在后台编译/缓存当前平台产物。发行 provenance 绑定源模型包和转换身份，系统验收另记录当时编译缓存的哈希，不误当成跨SDK永恒相同。冷启动预算包含首次编译。
 
-- [ ] **Step 1 — 写失败测试。** `testFrozenCorpusContentAndActions`：先验证固定素材标签哈希，再用发行预处理、模型、策略断言44例，明确14/30及11/33；`testReleaseRejectsMissingModelProfileOrLicense`：缺一项、错误SHA、未通过研究配置、backend不符均拒绝；`testNoImagesOrResearchCorpusInAppBundle`：包无测试图片/原片/研究数据。普通自动单测只用自制图；本地完整44例回归可使用已授权六附件，未获公开许可前不得将其推到公共CI。
+- [ ] **Step 1 — 写失败测试。** `testFrozenCorpusContentAndActions`：先验证固定素材、真值及 active suite 哈希，再用发行预处理、模型、策略断言当前33例，明确14/19及11/22；`testReleaseRejectsMissingModelProfileOrLicense`：缺一项、错误SHA、未通过研究配置、backend不符均拒绝；`testNoImagesOrResearchCorpusInAppBundle`：包无测试图片/原片/研究数据。普通自动单测只用自制图；本地完整33例回归可使用已授权六附件，未获公开许可前不得将其推到公共CI。不得用旧44例协议身份替代当前scope绑定。
 ```swift
-XCTAssertEqual(results.count, 44)
+XCTAssertEqual(results.count, 33)
 XCTAssertEqual(results.filter { $0.content == .duplicate }.count, 14)
 XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 ```

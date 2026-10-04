@@ -1,5 +1,7 @@
 # PhotosYNC 0.2.0 判重研究与配置冻结 Implementation Plan
 
+> **2026-10-04 范围修订：** 本文件记录第一轮按 v1 全部 44 例执行的研究，已按失败结果收尾。用户现已通过 `Tests/Fixtures/AdvancedDedup/active-suite.json` 停用 11 个信息看板用例，当前为 33 例。不要重跑下面整套已完成步骤，也不要把旧协议或旧 44 例结论改写为新范围验收。下一轮仅补范围绑定、独立校准/封存和真实图库性能证据，具体复用边界见 [范围修订评估](../../research/advanced-dedup/2026-10-04-scope-reassessment.md)。本次没有授权执行这些后续研究或产品集成。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付可复现的 SSCD Large 特征、精确检索和查询级评估工具，得到满足事先批准要求的发行配置，或明确报告该方案不能通过。

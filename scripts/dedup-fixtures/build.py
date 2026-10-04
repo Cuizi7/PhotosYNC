@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = ROOT / 'Tests/Fixtures/AdvancedDedup'
 DATASET_ID = 'photosync-advanced-dedup-v1'
 VERSION = '2026-10-02-review-7'
+PANEL_CASE_IDS = ('N031', 'N032', 'N033', 'N035', 'N037', 'N039',
+                  'N041', 'N043', 'N045', 'N047', 'N049')
+ACTIVE_REVISION = '2026-10-04-no-information-panels'
 
 
 def sha256(path: Path) -> str:
@@ -83,6 +86,56 @@ def frozen_expectations(directory: Path, manifest: dict) -> dict | None:
     if result != expected:
         raise ValueError('Frozen expectations differ from the bound human review')
     return result
+
+
+def load_active_suite(directory: Path, manifest: dict, frozen: dict | None) -> dict | None:
+    """Validate the one approved subset against the untouched frozen v1 files."""
+    path = directory / 'active-suite.json'
+    if not path.exists():
+        return None
+    if frozen is None:
+        raise ValueError('Active suite requires frozen approved expectations')
+    suite = json.loads(path.read_text())
+    bindings = {
+        'parent_manifest_sha256': sha256(directory / 'manifest.json'),
+        'parent_manifest_content_sha256': manifest['content_sha256'],
+        'parent_expected_results_sha256': sha256(directory / 'expected-results.json'),
+        'parent_expected_results_content_sha256': frozen['content_sha256'],
+        'parent_human_review_sha256': sha256(directory / 'human-review.json'),
+    }
+    for key, actual in {'schema_version': 1, 'revision': ACTIVE_REVISION,
+                        'parent_fixture_version': '2026-10-02-v1', **bindings}.items():
+        if suite.get(key) != actual:
+            raise ValueError('Active suite identity or parent binding mismatch: ' + key)
+    if any(not isinstance(suite.get(key), str) or not suite[key].strip()
+           for key in ('date', 'user_instruction', 'reason')):
+        raise ValueError('Active suite requires dated user instruction and reason')
+    if frozen['fixture_version'] != suite['parent_fixture_version']:
+        raise ValueError('Active suite frozen version mismatch')
+    kept, excluded = suite.get('kept_case_ids'), suite.get('excluded_case_ids')
+    if not isinstance(kept, list) or not isinstance(excluded, list) or not all(
+            isinstance(case_id, str) for case_id in kept + excluded):
+        raise ValueError('Active suite case IDs must be lists of strings')
+    if len(kept) != len(set(kept)) or len(excluded) != len(set(excluded)):
+        raise ValueError('Active suite contains duplicate case IDs')
+    if set(kept) & set(excluded):
+        raise ValueError('Active suite kept/excluded case IDs overlap')
+    manifest_cases = {case['id']: case for case in manifest['cases']}
+    frozen_ids = [case['id'] for case in frozen['cases']]
+    if len(manifest_cases) != len(manifest['cases']) or set(frozen_ids) != set(manifest_cases):
+        raise ValueError('Active suite parent case catalog mismatch')
+    if any(case_id not in manifest_cases for case_id in kept + excluded):
+        raise ValueError('Active suite references unknown case ID')
+    if excluded != list(PANEL_CASE_IDS) or any(
+            manifest_cases[case_id]['group'] != 'negative' or
+            not manifest_cases[case_id]['query'].startswith('synthetic-') or
+            not all(candidate.startswith('synthetic-') for candidate in manifest_cases[case_id]['candidates'])
+            for case_id in excluded):
+        raise ValueError('Active suite may exclude only the eleven synthetic panel cases')
+    expected_kept = [case['id'] for case in manifest['cases'] if case['id'] not in PANEL_CASE_IDS]
+    if kept != expected_kept or len(kept) != 33 or len(frozen_ids) != 44:
+        raise ValueError('Active suite must retain exactly the other 33 frozen cases')
+    return suite
 
 
 def verify_original(source: dict, path: Path) -> None:
@@ -376,11 +429,18 @@ def build(sources_path: Path, cache: Path, output: Path) -> None:
         manifest['review_migration'] = migration
     manifest['content_sha256'] = hashlib.sha256(json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
     write_json(output / 'manifest.json', manifest)
+    if (sources_path.parent / 'active-suite.json').exists() and not (
+            sources_path.parent / 'expected-results.json').exists():
+        raise ValueError('Active suite rebuild requires its frozen parent expectations')
     if (sources_path.parent / 'expected-results.json').exists():
         # A rebuild may carry frozen labels only when it reproduced their content.
         frozen_expectations(sources_path.parent, manifest)
         for name in ('expected-results.json', 'human-review.json'):
             shutil.copyfile(sources_path.parent / name, output / name)
+        if (sources_path.parent / 'active-suite.json').exists():
+            # Rebuilds of the current frozen fixture must keep its reviewed scope.
+            shutil.copyfile(sources_path.parent / 'active-suite.json', output / 'active-suite.json')
+            load_active_suite(output, manifest, frozen_expectations(output, manifest))
     render_review(output)
     print(json.dumps({'images': len(corpus.images), 'cases': len(corpus.cases),
                       'image_bytes': sum(i['bytes'] for i in corpus.images)}, indent=2))
@@ -392,10 +452,17 @@ def render_review(output: Path) -> None:
     payload = json.dumps(manifest, ensure_ascii=False).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
     if template.count('__MANIFEST_JSON__') != 1:
         raise ValueError('Review template must contain exactly one data placeholder')
-    frozen = json.dumps(frozen_expectations(output, manifest), ensure_ascii=False).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+    frozen_data = frozen_expectations(output, manifest)
+    frozen = json.dumps(frozen_data, ensure_ascii=False).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
     if template.count('__FROZEN_JSON__') != 1:
         raise ValueError('Review template must contain exactly one frozen-label placeholder')
-    (output / 'review.html').write_text(template.replace('__MANIFEST_JSON__', payload).replace('__FROZEN_JSON__', frozen))
+    active = json.dumps(load_active_suite(output, manifest, frozen_data), ensure_ascii=False)
+    active = active.replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+    if template.count('__ACTIVE_SUITE_JSON__') != 1:
+        raise ValueError('Review template must contain exactly one active-suite placeholder')
+    (output / 'review.html').write_text(template.replace('__MANIFEST_JSON__', payload)
+                                        .replace('__FROZEN_JSON__', frozen)
+                                        .replace('__ACTIVE_SUITE_JSON__', active))
 
 
 def main() -> None:

@@ -120,7 +120,7 @@ class ResearchProtocolTests(unittest.TestCase):
         verdict = research.verify_acceptance(protocol, results)
         self.assertEqual(verdict["reasons"], ["performance measurements incomplete"])
 
-    def testAcceptanceCLIRequiresActualArtifactsBeforeWriting(self):
+    def testLegacyAcceptanceCLIRejectsNewActiveScopeBeforeWriting(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             entry = self.entry(root, "negative", "family", "group", "sealed")
@@ -134,8 +134,24 @@ class ResearchProtocolTests(unittest.TestCase):
                                      "--dataset", str(dataset), "--results", str(results),
                                      "--output-dir", str(output)], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("results.profile", result.stderr)
+            self.assertIn("new 33-case scope requires next-study protocol/evidence binding", result.stderr)
             self.assertFalse(output.exists())
+
+    def testLegacyPublicEntryRejectsScopeBeforeProtocolOrModelUse(self):
+        fixture = ROOT / "Tests/Fixtures/AdvancedDedup"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protocol = root / "arbitrary-protocol.json"
+            protocol.write_text(json.dumps({"fixture_manifest_sha256": "f" * 64}))
+            output = root / "public-score"
+            with self.assertRaisesRegex(ValueError, "new 33-case scope requires next-study protocol/evidence binding"):
+                research.evaluate_public(protocol, root / "missing-profile", root / "missing-model",
+                                         fixture, output)
+            self.assertFalse(output.exists())
+            with self.assertRaisesRegex(ValueError, "new 33-case scope requires next-study protocol/evidence binding"):
+                research.accept_evidence(protocol, root / "missing-dataset", root / "missing-results",
+                                         root / "acceptance")
+            self.assertFalse((root / "acceptance").exists())
 
     def testPositiveImportNeedsContentRecognition(self):
         protocol = json.loads((ROOT / "docs/research/advanced-dedup/protocol.json").read_text())

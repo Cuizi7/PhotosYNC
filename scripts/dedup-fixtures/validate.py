@@ -11,7 +11,7 @@ import re
 import struct
 
 from PIL import Image
-from build import case_fingerprint, frozen_expectations
+from build import case_fingerprint, frozen_expectations, load_active_suite
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT = ROOT / 'Tests/Fixtures/AdvancedDedup'
@@ -195,16 +195,31 @@ def validate(directory: Path, require_approved: bool = False) -> dict:
     frozen_embedded = re.search(r'    const frozen = (.*);\n', review_html)
     require(frozen_embedded is not None and json.loads(frozen_embedded.group(1)) == frozen,
             'Review HTML has stale frozen expectations')
+    active = load_active_suite(directory, {**manifest, 'content_sha256': content_hash}, frozen)
+    active_embedded = re.search(r'    const activeSuite = (.*);\n', review_html)
+    require(active_embedded is not None and json.loads(active_embedded.group(1)) == active,
+            'Review HTML has stale active suite scope')
     if require_approved and frozen is None:
         raise ValueError('Dataset is pending human review for remaining cases; the whole dataset is not fully approved.')
-    return {'cases': len(cases), 'groups': dict(Counter(c['group'] for c in cases)),
-            'images': len(images), 'source_families': len(sources),
-            'split_groups': len({s['split_group'] for s in sources.values()}),
-            'image_bytes': sum(i['bytes'] for i in images.values()),
+    active_cases = [case for case in cases if active is None or case['id'] in active['kept_case_ids']]
+    active_image_ids = {image_id for case in active_cases for image_id in [case['query'], *case['candidates']]}
+    active_source_ids = {images[image_id]['source_id'] for image_id in active_image_ids}
+    active_split_groups = {case['split_group'] for case in active_cases}
+    result = {'cases': len(active_cases), 'groups': dict(Counter(c['group'] for c in active_cases)),
+            'images': len(active_image_ids),
+            'source_families': len(active_source_ids) if active else len(sources),
+            'split_groups': len(active_split_groups) if active else len({s['split_group'] for s in sources.values()}),
+            'image_bytes': sum(images[i]['bytes'] for i in active_image_ids),
             'metadata': 'synthetic EXIF whitelist and reviewed Display P3 profiles only',
-            'labels': f'{len(cases)} approved and frozen' if frozen else f'{len(contributed_cases)} explicitly approved contributions; remaining manifest labels pending',
+            'labels': f'{len(active_cases)} approved and frozen' if frozen else f'{len(contributed_cases)} explicitly approved contributions; remaining manifest labels pending',
             'fixture_version': frozen['fixture_version'] if frozen else None,
             'integrity': 'passed'}
+    if active:
+        result.update(active_revision=active['revision'], archived_cases=len(cases),
+                      archived_images=len(images), archived_image_bytes=sum(i['bytes'] for i in images.values()),
+                      archived_source_families=len(sources),
+                      archived_split_groups=len({s['split_group'] for s in sources.values()}))
+    return result
 
 
 def main() -> None:
