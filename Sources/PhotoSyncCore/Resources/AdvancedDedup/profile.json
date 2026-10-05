@@ -1,0 +1,47 @@
+{
+  "fingerprint": {
+    "version": "d7412709d47be7d1f56529adda4956f555feafd86843ca38f408a8dda87dacf6",
+    "modelSHA256": "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
+    "inputSide": 320,
+    "resizeMode": "stretchFullFrame",
+    "colorSpace": "sRGB",
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "policyVersion": "42a811d97844de4a0e2223060178ee1136ef74775a31d2d12a56f9007eff6570",
+  "threshold": 0.98,
+  "backend": "exact-f32-v1",
+  "resources": {
+    "decodeConcurrency": 1,
+    "photoRequestConcurrency": 1,
+    "maxDecodedBytes": 536870912,
+    "requestTimeoutSeconds": 30,
+    "retryDelaysSeconds": [
+      5,
+      15,
+      30,
+      60
+    ],
+    "catalogBatchSize": 128,
+    "maxInFlightTasks": 2,
+    "progressPublishIntervalSeconds": 1,
+    "inferenceConcurrency": 1,
+    "batchSize": 1
+  },
+  "evidenceCandidateLimit": 200000,
+  "acceptanceID": "user-decision:62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+  "resourcePolicyAmendment": {
+    "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+    "priorProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
+    "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
+    "reason": "decodedResourceLimit"
+  }
+}

@@ -40,7 +40,7 @@ EXCLUDED_MANIFEST_DIRECTORIES = {
     "worktrees",
     "outputs",
 }
-XCTEST_SUMMARY = re.compile(r"Executed\s+(\d+)\s+tests?,\s+with\s+(\d+)\s+failures?", re.IGNORECASE)
+XCTEST_SUMMARY = re.compile(r"Executed\s+(\d+)\s+tests?,\s+with\s+(?:\d+\s+tests?\s+skipped\s+and\s+)?(\d+)\s+failures?", re.IGNORECASE)
 UNITTEST_SUMMARY = re.compile(r"Ran\s+(\d+)\s+tests?\s+in", re.IGNORECASE)
 
 
@@ -132,6 +132,23 @@ def prepare_paths(*, source_root: Path, output_dir: Path, derived_data: Path) ->
 
 def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None:
     environment = child_environment()
+    for name in ("PHOTOSYNC_SCALE_REPRESENTATIONS", "PHOTOSYNC_SCALE_HISTORY", "PHOTOSYNC_SCALE_BUILD_CONFIGURATION"):
+        environment.pop(name, None)
+    if environment.get("CI", "").lower() in {"1", "true", "yes"}:
+        raise ValidationError("The authorized local corpus includes non-redistributable user photos; public CI is not approved.")
+    environment["PHOTOSYNC_REGRESSION_DATASET"] = str(source_root / "Tests/Fixtures/AdvancedDedup")
+    environment["PHOTOSYNC_ACCEPTANCE_OUTPUT"] = str(output_dir)
+    environment["PHOTOSYNC_MODEL_CACHE_DIR"] = str(derived_data / "model-cache")
+    resources = run_command(
+        [sys.executable, "scripts/advanced-dedup/release.py", "--resources",
+         str(source_root / "Sources/PhotoSyncCore/Resources/AdvancedDedup"),
+         "--output", str(output_dir / "resources.json")], cwd=source_root, environment=environment,
+        log_path=output_dir / "resources.log", timeout_seconds=60, label="fixed model resources")
+    fixtures = run_command(
+        [sys.executable, "scripts/dedup-fixtures/validate.py", "--dataset",
+         str(source_root / "Tests/Fixtures/AdvancedDedup"), "--require-approved"],
+        cwd=source_root, environment=environment, log_path=output_dir / "fixtures.log",
+        timeout_seconds=60, label="approved fixture integrity")
     before_manifest = build_source_manifest(source_root)
     write_json(
         output_dir / "source-manifest.json",
@@ -195,6 +212,43 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
     )
     xctest_count = validate_xctest_summary(xctest.log_path)
 
+    # Performance budgets apply to the optimized product code. Testability only
+    # exposes internal APIs to this isolated test host; the packager still makes
+    # its own normal Release build after canonical validation.
+    scale_derived = derived_data / "ScaleRelease"
+    scale_build = run_command(
+        ["xcodebuild", "-project", "PhotoSync.xcodeproj", "-scheme", "PhotoSync",
+         "-configuration", "Release", "-destination", "platform=macOS",
+         "-derivedDataPath", str(scale_derived), "CODE_SIGNING_ALLOWED=NO", "ENABLE_TESTABILITY=YES", "build-for-testing"],
+        cwd=source_root, environment=environment, log_path=output_dir / "scale-build.log",
+        timeout_seconds=BUILD_TIMEOUT_SECONDS, label="optimized scale test host")
+    scale_bundle = scale_derived / "Build/Products/Release/PhotoSyncCoreTests.xctest"
+    if not scale_bundle.is_dir() or scale_bundle.is_symlink():
+        raise ValidationError("Optimized scale test bundle missing")
+    scale_results = {}
+    scale_phases = [phase_record("scale-build", scale_build, output_dir)]
+    for count, history_count in ((100000, 0), (150000, 0), (200000, 0), (200000, 100000)):
+        sample = str(count) if history_count == 0 else f"{count}-history-{history_count}"
+        scale_environment = dict(environment, PHOTOSYNC_SCALE_REPRESENTATIONS=str(count),
+                                 PHOTOSYNC_SCALE_HISTORY=str(history_count), PHOTOSYNC_SCALE_BUILD_CONFIGURATION="Release")
+        scale = run_command(
+            ["xcrun", "xctest", "-XCTest",
+             "PhotoSyncCoreTests.AdvancedDedupRegressionTests/testControlledScaleThroughActualGraph", str(scale_bundle)],
+            cwd=source_root, environment=scale_environment, log_path=output_dir / f"scale-{sample}.log",
+            timeout_seconds=XCTEST_TIMEOUT_SECONDS, label=f"actual graph synthetic {count} representations + {history_count} history")
+        output = read_log(scale.log_path)
+        summaries = XCTEST_SUMMARY.findall(output)
+        if not summaries or tuple(map(int, summaries[-1])) != (1, 0) or "Selected tests' passed" not in output:
+            raise ValidationError(f"Scale {count} did not finish its one selected XCTest")
+        report = output_dir / f"scale-{sample}.json"
+        result = json.loads(report.read_text())
+        if result.get("representations") != count or result.get("success_history_vectors") != history_count or result.get("budget_pass") is not True:
+            raise ValidationError(f"Scale {count} failed current runtime/resource budgets")
+        if count == 200000 and len(result.get("large_source_samples", [])) != 2:
+            raise ValidationError("Maximum scale lacks both representative large-source measurements")
+        scale_results[sample] = {"result": report.name, "result_sha256": sha256_file(report)}
+        scale_phases.append(phase_record(f"scale-{sample}", scale, output_dir))
+
     tool_tests = run_command(
         [
             sys.executable,
@@ -214,22 +268,38 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
     )
     tool_test_count = validate_unittest_summary(tool_tests.log_path)
 
-    continuation_output = output_dir / "continuation-race"
-    continuation = run_command(
-        [
-            sys.executable,
-            "scripts/test-continuation-race.py",
-            "--output-dir",
-            str(continuation_output),
-        ],
-        cwd=source_root,
-        environment=environment,
-        log_path=output_dir / "continuation-race.log",
-        timeout_seconds=CONTINUATION_TIMEOUT_SECONDS,
-        label="continuation-race regression",
-    )
-    continuation_result = validate_continuation_result(continuation_output / "result.json")
+    continuations = {}
+    continuation_phases = []
+    for scenario in ("stamp", "advanced-preparation"):
+        name = "continuation-race" if scenario == "stamp" else "continuation-advanced-preparation"
+        continuation_output = output_dir / name
+        continuation = run_command(
+            [sys.executable, "scripts/test-continuation-race.py", "--output-dir", str(continuation_output),
+             "--scenario", scenario], cwd=source_root, environment=environment,
+            log_path=output_dir / f"{name}.log", timeout_seconds=CONTINUATION_TIMEOUT_SECONDS,
+            label=f"{scenario} continuation regression")
+        result = validate_continuation_result(continuation_output / "result.json")
+        if result.get("scenario") != scenario:
+            raise ValidationError("Continuation evidence scenario mismatch")
+        continuations[scenario] = {
+            "status": result["status"], "regression": result["regression"],
+            "result": relative_to_output(continuation_output / "result.json", output_dir),
+            "result_sha256": sha256_file(continuation_output / "result.json"),
+            "log": relative_to_output(continuation.log_path, output_dir),
+        }
+        continuation_phases.append(phase_record(name, continuation, output_dir))
+    model_result = json.loads((output_dir / "model-regression.json").read_text())
+    runtime_result = json.loads((output_dir / "runtime-load.json").read_text())
+    if (model_result.get("case_count"), model_result.get("duplicate_count"), model_result.get("skip_count")) != (33, 14, 11):
+        raise ValidationError("Missing complete actual-model 33-case regression evidence")
+    if runtime_result.get("legacy_imports") != 1 or runtime_result.get("one_changed_inferences") != 1 or runtime_result.get("unchanged_inferences") != 0:
+        raise ValidationError("Missing nonempty actual runtime integration evidence")
 
+    compiled_cache = build_source_manifest(derived_data / "model-cache")
+    if not compiled_cache.entries:
+        raise ValidationError("Actual model compilation cache is absent")
+    write_json(output_dir / "compiled-cache.json", {"manifest_sha256": compiled_cache.digest,
+        "entries": compiled_cache.entries, "scope": "current OS/CoreML compilation only; not portable source-model identity"})
     after_manifest = build_source_manifest(source_root)
     if after_manifest.digest != before_manifest.digest or after_manifest.entries != before_manifest.entries:
         raise ValidationError("Source snapshot changed while validation was running; refusing to record success.")
@@ -259,8 +329,9 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             phase_record("build-for-testing", build, output_dir),
             phase_record("xctest", xctest, output_dir),
             phase_record("tool-tests", tool_tests, output_dir),
-            phase_record("continuation-race", continuation, output_dir),
-        ],
+            phase_record("resources", resources, output_dir),
+            phase_record("fixtures", fixtures, output_dir),
+        ] + scale_phases + continuation_phases,
         "xctest": {
             "test_count": xctest_count,
             "log": relative_to_output(xctest.log_path, output_dir),
@@ -269,12 +340,14 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             "test_count": tool_test_count,
             "log": relative_to_output(tool_tests.log_path, output_dir),
         },
-        "continuation_race": {
-            "status": continuation_result["status"],
-            "regression": continuation_result["regression"],
-            "result": relative_to_output(continuation_output / "result.json", output_dir),
-            "result_sha256": sha256_file(continuation_output / "result.json"),
-            "log": relative_to_output(continuation.log_path, output_dir),
+        "continuation_race": continuations["stamp"],
+        "continuations": continuations,
+        "advanced_dedup": {
+            "scale": scale_results,
+            "resources": "resources.json", "model_regression": "model-regression.json", "runtime_load": "runtime-load.json",
+            "resources_sha256": sha256_file(output_dir / "resources.json"),
+            "model_regression_sha256": sha256_file(output_dir / "model-regression.json"),
+            "runtime_load_sha256": sha256_file(output_dir / "runtime-load.json"),
         },
     }
     write_text(output_dir / "validation-report.md", format_report(evidence))
@@ -381,6 +454,15 @@ def validate_continuation_result(result_path: Path) -> dict[str, Any]:
         raise ValidationError("Continuation-race result.json must contain an object.")
     if result.get("status") != "passed" or result.get("regression") != "continuation-race":
         raise ValidationError("Continuation-race result.json did not prove the expected passing regression.")
+    runs = result.get("runs", {})
+    green, red = runs.get("green", {}), runs.get("red", {})
+    if (green.get("exit_code") != 0 or green.get("timed_out") is not False or
+        green.get("fixture_result", {}).get("status") != "passed" or
+        not isinstance(red.get("exit_code"), int) or red["exit_code"] == 0 or red.get("timed_out") is not False or
+        red.get("fixture_result", {}).get("status") != "failed" or
+        red.get("fixture_result", {}).get("failure_stage") != "assertion" or
+        red.get("fixture_result", {}).get("assertion") != "post_resume_waiting_sources"):
+        raise ValidationError("Continuation evidence lacks successful GREEN and intended assertion-failing RED")
     return result
 
 

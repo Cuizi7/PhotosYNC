@@ -636,7 +636,7 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             try self.transaction {
                 let revision = try self.indexStateRow().map { try self.int64($0[6]) } ?? 0
-                let rows = try self.rows("""
+                let entries = try self.mappedRows("""
                     SELECT f.id, f.state, f.success_id, v.width, v.height, v.vector FROM file_record f
                     JOIN source s ON s.id = f.source_id JOIN file_fingerprint v ON v.file_id = f.id
                     WHERE f.id <> ? AND v.fingerprint_version = ? AND (
@@ -644,8 +644,7 @@ public final class SyncStore: @unchecked Sendable {
                         (f.success_id IS NULL AND f.state IN ('pending', 'importing') AND f.created_order < ?
                          AND s.enabled = 1 AND s.removed = 0 AND v.purpose = 'current'
                          AND v.size = f.size AND v.modified_ns = f.modified_ns)) ORDER BY f.created_order
-                    """, [.text(excluding.uuidString), .text(version), .int64(beforeOrder)])
-                let entries = try rows.map { row -> VectorEntry in
+                    """, [.text(excluding.uuidString), .text(version), .int64(beforeOrder)]) { row -> VectorEntry in
                     guard case .blob(let data) = row[5] else { throw AdvancedDedupError.invalidFingerprint }
                     let size: PixelSize?
                     if let width = self.optionalInteger(row[3]), let height = self.optionalInteger(row[4]) {
@@ -1331,8 +1330,7 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
                 let token = try self.indexToken(state)
-                let rows = try self.rows("SELECT asset_id, kind, width, height, fingerprint_version, vector FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ? ORDER BY asset_id, kind", [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)])
-                let entries = try rows.map { row -> VectorEntry in
+                let entries = try self.mappedRows("SELECT asset_id, kind, width, height, fingerprint_version, vector FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ? ORDER BY asset_id, kind", [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)]) { row -> VectorEntry in
                     guard let kind = RepresentationKind(rawValue: try self.text(row[1])),
                           try self.text(row[4]) == token.fingerprintVersion, case .blob(let data) = row[5] else {
                         throw AdvancedDedupError.invalidFingerprint
@@ -1387,10 +1385,12 @@ public final class SyncStore: @unchecked Sendable {
         IndexToken(context: try libraryContext(row), photosGeneration: Int(try int64(row[5])),
                    indexGeneration: try int64(row[2]), localRevision: try int64(row[6]), fingerprintVersion: try text(row[4]))
     }
+    // Keep every integrity check. The explicit 0/1 comparison lets SQLite read
+    // the partial expression index instead of fetching each 4 KiB vector row.
     private func indexFactsComplete(_ row: [Value]) throws -> Bool {
         guard try int64(row[7]) != 0 else { return false }
         let context = try libraryContext(row)
-        let incomplete = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <> ? OR state <> 'ready' OR fingerprint_version <> ? OR vector IS NULL) LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))])
+        let incomplete = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <> ? OR state <> 'ready' OR fingerprint_version <> ? OR (vector IS NULL) = 1) LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))])
         guard incomplete == nil else { return false }
         return try one("SELECT 1 FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND generation = ? AND fingerprint_version = ? LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))]) == nil
     }
@@ -1429,6 +1429,7 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 try execute("CREATE INDEX IF NOT EXISTS advanced_evidence_file ON advanced_match_evidence(file_id)")
                 try execute("CREATE INDEX IF NOT EXISTS dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id)")
+                try execute(Self.readinessIndexSchema)
                 try ensureLegacyRecheckSchema()
             }
             return
@@ -1517,17 +1518,31 @@ public final class SyncStore: @unchecked Sendable {
     private func rows(_ sql: String, _ bindings: [Binding]) throws -> [[Value]] { try statement(sql, bindings, collect: true) }
 
     private func statement(_ sql: String, _ bindings: [Binding], collect: Bool) throws -> [[Value]] {
+        var result: [[Value]] = []
+        try withRows(sql, bindings, collect: collect) { result.append($0) }
+        return result
+    }
+
+    // Decode vector facts while each SQLite row is current; do not retain a second
+    // complete collection of BLOBs alongside the resulting Float32 vectors.
+    private func mappedRows<T>(_ sql: String, _ bindings: [Binding], transform: ([Value]) throws -> T) throws -> [T] {
+        var result: [T] = []
+        try withRows(sql, bindings, collect: true) { result.append(try transform($0)) }
+        return result
+    }
+
+    private func withRows(_ sql: String, _ bindings: [Binding], collect: Bool,
+                          consume: ([Value]) throws -> Void) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw databaseError() }
         defer { sqlite3_finalize(statement) }
         for (offset, binding) in bindings.enumerated() { try bind(binding, to: statement, index: Int32(offset + 1)) }
-        var result: [[Value]] = []
         while true {
             switch sqlite3_step(statement) {
-            case SQLITE_DONE: return result
+            case SQLITE_DONE: return
             case SQLITE_ROW:
                 guard collect else { continue }
-                result.append((0..<Int(sqlite3_column_count(statement))).map { index in
+                try consume((0..<Int(sqlite3_column_count(statement))).map { index in
                     switch sqlite3_column_type(statement, Int32(index)) {
                     case SQLITE_INTEGER: return .int64(sqlite3_column_int64(statement, Int32(index)))
                     case SQLITE_FLOAT: return .double(sqlite3_column_double(statement, Int32(index)))
@@ -1591,6 +1606,10 @@ public final class SyncStore: @unchecked Sendable {
     );
     """
 
+    private static let readinessIndexSchema = """
+    CREATE INDEX IF NOT EXISTS photos_representation_readiness ON photos_representation(context_id,context_epoch,seen_generation,state,fingerprint_version,(vector IS NULL)) WHERE tombstoned=0;
+    """
+
     private static let advancedSchema = """
     CREATE TABLE dedup_index_state (
      id INTEGER PRIMARY KEY CHECK(id = 1), context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL,
@@ -1610,6 +1629,7 @@ public final class SyncStore: @unchecked Sendable {
      CHECK((width IS NULL AND height IS NULL) OR (width > 0 AND height > 0)),
      CHECK(vector IS NULL OR length(vector) = 4096)
     );
+    \(readinessIndexSchema)
     CREATE TABLE fingerprint_task (
      context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
      kind TEXT NOT NULL, revision TEXT NOT NULL, fingerprint_version TEXT NOT NULL,

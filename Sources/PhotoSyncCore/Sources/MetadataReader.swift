@@ -41,9 +41,9 @@ public struct MetadataReader: MetadataReading {
         }
     }
 
-    /// Decode original source pixels, with a conservative full allowance held
-    /// before ImageIO can materialize them. R2 alone resizes/orients/colors the
-    /// comparable image; an extra thumbnail resample would change its version.
+    /// Restore the bound R2 full-frame bounded ImageIO decode before its common
+    /// stretch/orientation/color pipeline. Reserve the full allowance first;
+    /// original-backing preflight still decides conservative oversize admission.
     func readForFingerprint(url: URL, configuration: DedupConfiguration, budget: ImageWorkBudget) async throws -> ImageWorkResult<SourceImage> {
         let allowance = configuration.resources.maxDecodedBytes
         return try await executor.executeImage(sourceID: sourceID, budget: budget,
@@ -82,8 +82,17 @@ public struct MetadataReader: MetadataReading {
             let image: CGImage
             switch eligibility {
             case .safeSingleFrame:
-                guard let decoded = CGImageSourceCreateImageAtIndex(source, 0,
-                    [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { throw MetadataError.unreadable }
+                guard let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                      let height = properties[kCGImagePropertyPixelHeight] as? Int else { throw MetadataError.unreadable }
+                let long = max(width, height), short = min(width, height)
+                let decodedSide = Int(sqrt(Double(allowance) / (4 * Double(short) / Double(long))))
+                let bounded = min(4096, long, decodedSide)
+                guard bounded >= 1, let decoded = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: bounded,
+                    kCGImageSourceCreateThumbnailWithTransform: false,
+                    kCGImageSourceShouldCacheImmediately: false
+                ] as CFDictionary) else { throw MetadataError.unreadable }
                 image = decoded
             case .conservative:
                 // Validate readability without inference. A complete image

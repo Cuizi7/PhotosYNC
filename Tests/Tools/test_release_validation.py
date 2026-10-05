@@ -101,6 +101,19 @@ class ReleaseFixture:
             "if __name__ == '__main__':\n"
             "    unittest.main()\n"
         )
+        for directory in ("scripts/advanced-dedup", "scripts/dedup-fixtures"):
+            (self.root / directory).mkdir()
+        # Physical resource/model work is replaced only in this synthetic CLI
+        # orchestration fixture; exact-byte gates have their own independent tests.
+        (self.root / "scripts/advanced-dedup/release.py").write_text(
+            "import argparse,json,os,sys\nfrom pathlib import Path\n"
+            "p=argparse.ArgumentParser();p.add_argument('--output');a,_=p.parse_known_args()\n"
+            "if os.environ.get('FAKE_RESOURCE_MODE') == 'fail': sys.exit(25)\n"
+            "if a.output: Path(a.output).write_text(json.dumps({'status':'passed'}))\n"
+        )
+        (self.root / "scripts/dedup-fixtures/validate.py").write_text(
+            "import os,sys\nif os.environ.get('FAKE_FIXTURE_MODE') == 'fail': sys.exit(26)\n"
+        )
         (self.root / "scripts/test-continuation-race.py").write_text(
             textwrap.dedent(
                 """\
@@ -112,16 +125,20 @@ class ReleaseFixture:
 
                 parser = argparse.ArgumentParser()
                 parser.add_argument("--output-dir", required=True)
+                parser.add_argument("--scenario", required=True)
                 args = parser.parse_args()
                 with Path(os.environ["FAKE_EVENTS"]).open("a") as events:
                     events.write("continuation:%s\\n" % os.environ.get("RQDATAC2_CONF", "absent"))
-                if os.environ.get("FAKE_PROBE_MODE") == "fail":
+                if (os.environ.get("FAKE_PROBE_MODE") == "fail" or
+                    (os.environ.get("FAKE_PROBE_MODE") == "advanced-fail" and args.scenario == "advanced-preparation")):
                     sys.exit(23)
                 output = Path(args.output_dir)
                 output.mkdir(parents=True)
                 (output / "probe evidence with spaces.txt").write_text("synthetic evidence")
                 json.dump(
-                    {"status": "passed", "regression": "continuation-race"},
+                    {"status": "passed", "regression": "continuation-race", "scenario": args.scenario,
+                     "runs": {"green": {"exit_code": 0, "timed_out": False, "fixture_result": {"status": "passed"}},
+                              "red": {"exit_code": 1, "timed_out": False, "fixture_result": {"status": "failed", "failure_stage": "assertion", "assertion": "post_resume_waiting_sources"}}}},
                     (output / "result.json").open("w"),
                 )
                 """
@@ -166,7 +183,7 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertNotIn("must-not-reach-child-tools", "\n".join(self.fixture.event_lines()))
         self.assertEqual(
             [line.split(":", 1)[0] for line in self.fixture.event_lines()],
-            ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "continuation"],
+            ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcrun", "xcrun", "xcrun", "continuation", "continuation"],
         )
 
     def test_validator_build_failure_stops_before_xctest_and_never_marks_success(self) -> None:
@@ -197,8 +214,11 @@ class ReleaseValidationTests(unittest.TestCase):
 
     def test_validator_rejects_tool_or_continuation_failures_without_success_marker(self) -> None:
         for label, environment in (
+            ("resources", {"FAKE_RESOURCE_MODE": "fail"}),
+            ("fixtures", {"FAKE_FIXTURE_MODE": "fail"}),
             ("tool-tests", {}),
             ("continuation", {"FAKE_PROBE_MODE": "fail"}),
+            ("advanced-continuation", {"FAKE_PROBE_MODE": "advanced-fail"}),
         ):
             with self.subTest(label=label):
                 temporary_directory = tempfile.TemporaryDirectory()
@@ -346,6 +366,11 @@ for argument in "$@"; do
 done
 case " $* " in
   *' build-for-testing '*)
+    if [ "$configuration" = 'Release' ]; then
+      printf 'xcodebuild:scale\\n' >> "$FAKE_EVENTS"
+      mkdir -p "$derived/Build/Products/Release/PhotoSyncCoreTests.xctest"
+      exit 0
+    fi
     printf 'xcodebuild:debug\\n' >> "$FAKE_EVENTS"
     if [ "${FAKE_XCODEBUILD_MODE:-}" = 'fail-debug-build' ]; then exit 17; fi
     mkdir -p "$derived/Build/Products/Debug/PhotoSyncCoreTests.xctest"
@@ -388,8 +413,20 @@ if [ "${1:-}" = 'swift' ]; then
   exit 0
 fi
 if [ "${1:-}" != 'xctest' ]; then exit 19; fi
+if [ -n "${PHOTOSYNC_SCALE_REPRESENTATIONS:-}" ]; then
+  sample="$PHOTOSYNC_SCALE_REPRESENTATIONS"
+  if [ "${PHOTOSYNC_SCALE_HISTORY:-0}" != 0 ]; then sample="$sample-history-$PHOTOSYNC_SCALE_HISTORY"; fi
+  printf '{"representations":%s,"success_history_vectors":%s,"budget_pass":true,"large_source_samples":[{},{}]}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  printf "Test Suite 'Selected tests' passed at fixture.\\n"
+  printf 'Executed 1 test, with 0 failures\\n'
+  exit 0
+fi
 case "${FAKE_XCTEST_MODE:-success}" in
   success)
+    printf '{"case_count":33,"duplicate_count":14,"skip_count":11}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-regression.json"
+    printf '{"legacy_imports":1,"one_changed_inferences":1,"unchanged_inferences":0}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
+    mkdir -p "$PHOTOSYNC_MODEL_CACHE_DIR"
+    printf 'synthetic compiled bytes' > "$PHOTOSYNC_MODEL_CACHE_DIR/fixture.bin"
     printf "Test Suite 'All tests' passed at fixture.\\n"
     printf '\\t Executed 7 tests, with 0 failures (0 unexpected) in 0.001 seconds\\n'
     ;;

@@ -1,0 +1,75 @@
+{
+  "codeLicense": "MIT",
+  "codeLicenseSHA256": "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93",
+  "codeLicenseText": "MIT License\n\nCopyright (c) Meta Platforms, Inc. and affiliates.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
+  "conversion": {
+    "batchSize": 1,
+    "computePrecision": "float32",
+    "format": "mlprogram",
+    "input": [
+      1,
+      3,
+      320,
+      320
+    ],
+    "inputName": "image",
+    "minimumDeploymentTarget": "macOS13",
+    "outputName": "embedding",
+    "skipModelLoad": true
+  },
+  "conversionEquivalence": {
+    "maxAbsErrorLimit": 0.02,
+    "maximumObservedAbsError": 1.4491379261016846e-06,
+    "minCosineLimit": 0.999,
+    "minimumObservedCosine": 0.9999999780491561,
+    "pass": true,
+    "protocolSHA256": "ea0060bb4839fe25f3fe30f781c4c51470adad19ed684cc6630ef05d8be25ae8",
+    "reportSHA256": "3ca2e290d85a0b331202cee249b6f5a645a45819254ddac64b2fbca36ffcc186",
+    "syntheticTensorCount": 4
+  },
+  "coremltoolsVersion": "9.0",
+  "declaredUpstreamRevision": "95902662f2217a5f4aa45f2a3fc70a01dfd3b66a",
+  "declaredUpstreamURL": "https://dl.fbaipublicfiles.com/sscd-copy-detection/sscd_disc_large.torchscript.pt",
+  "fingerprintVersion": "d7412709d47be7d1f56529adda4956f555feafd86843ca38f408a8dda87dacf6",
+  "legacyModelSHA256": "50704c3af3b447e5a6463d8d31c7113b501741a46ada0d37b2b6dc9508e2128f",
+  "macOSSDKVersion": "26.5",
+  "macOSVersion": "27.0",
+  "modelSHA256": "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
+  "modelSHA256ManifestEncoding": "PhotoSync.mlpackage.manifest.v2: prefix, uint64LE file count, sorted UTF-8 relative paths framed by uint64LE length, uint64LE byte length, raw file bytes",
+  "modelWeightsRedistributionLicenseStatus": "MIT-upstream-explicit-weights-clarification",
+  "officialTorchScriptSHA256": "16a196359f91e5fc4e774d5679244c8a661c182309ad4ede0c7e83f6a9861fa0",
+  "officialTorchScriptURL": "https://dl.fbaipublicfiles.com/sscd-copy-detection/sscd_disc_large.torchscript.pt",
+  "officialWeightsIdentityCheck": "2026-10-03 full official download SHA256 equals local TorchScript SHA256",
+  "packageReproducibility": "Same conversion inputs/settings produced distinct package bytes in consecutive runs; weights/weight.bin matched, model.mlmodel and Manifest.json differed. modelSHA256 binds exact selected package bytes.",
+  "publicFixtureProbe": {
+    "classificationEvaluated": false,
+    "dataset": "2026-10-02-v1",
+    "listedInputs": 63,
+    "protocolSHA256": "ea0060bb4839fe25f3fe30f781c4c51470adad19ed684cc6630ef05d8be25ae8",
+    "reportSHA256": "bd6154bbaf595140dbe9f568c4e2cff65d631b661bf8331955d8c35cda540540",
+    "uniqueInputSHA256": 62
+  },
+  "pythonVersion": "3.10.8",
+  "releaseAccepted": false,
+  "runtimeComputeUnits": "cpuOnly",
+  "runtimeLimitations": "CPU-only candidate on macOS 27.0; FP32 .all crashed in CoreML Espresso on this machine. macOS 13/Intel and GPU/ANE performance unverified.",
+  "status": "research-candidate-not-accepted",
+  "toolCompatibilityNote": "coremltools 9.0 warns Torch 2.13.0 is newer than its tested Torch 2.7.0; conversion output was independently compared on four synthetic tensors.",
+  "torchVersion": "2.13.0",
+  "weightsBytes": 178141104,
+  "weightsLineageStatus": "official-TorchScript-by-byte-identity",
+  "weightsSHA256": "16a196359f91e5fc4e774d5679244c8a661c182309ad4ede0c7e83f6a9861fa0",
+  "weightsLicenseClarification": {
+    "url": "https://github.com/facebookresearch/sscd-copy-detection/issues/12#issuecomment-1736328008",
+    "date": "2023-09-26",
+    "author": "Ed Pizzi",
+    "authorRole": "upstream contributor",
+    "statement": "The entire project, including model weights, is licensed under the MIT license.",
+    "conversionCoverage": "Inference from MIT permission to modify and distribute; upstream statement does not name Core ML."
+  },
+  "productIntegration": {
+    "basis": "user-selected configuration, not statistical acceptance",
+    "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+    "systemAndPlatformAcceptance": "See docs/release/0.2.0-advanced-dedup-validation.md; not all performed"
+  }
+}

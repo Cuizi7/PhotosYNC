@@ -90,6 +90,19 @@ final class FingerprintTests: XCTestCase {
         XCTAssertGreaterThan(values[2 * 32 * 32 + 31], 0.5)
     }
 
+    func testStoredFloat32DecodePreservesBitsAndHandlesByteViewOffsets() throws {
+        // Literal little-endian facts: 1, negative zero, smallest positive subnormal.
+        // Their squared norm rounds to 1; decoding must not renormalize or lose bits.
+        let payload = Data([0, 0, 128, 63, 0, 0, 0, 128, 1, 0, 0, 0] + [UInt8](repeating: 0, count: 4084))
+        var framed = Data([0xff]); framed.append(payload)
+        let decoded = try Fingerprint(version: "v1", littleEndianFloat32: framed.dropFirst())
+        XCTAssertEqual(decoded.values[0].bitPattern, 0x3f800000)
+        XCTAssertEqual(decoded.values[1].bitPattern, 0x80000000)
+        XCTAssertEqual(decoded.values[2].bitPattern, 1)
+        XCTAssertEqual(decoded.littleEndianFloat32, payload)
+        XCTAssertThrowsError(try Fingerprint(version: "", littleEndianFloat32: payload))
+    }
+
     func testInvalidVectorsRejected() throws {
         XCTAssertThrowsError(try Fingerprint(version: "unit", values: Array(repeating: 1, count: 1023)))
         XCTAssertThrowsError(try Fingerprint(version: "unit", values: Array(repeating: 0, count: 1024)))

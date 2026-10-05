@@ -40,10 +40,12 @@ public actor ExactVectorIndex {
               Set(entries.map(\.key)).count == entries.count else {
             throw AdvancedDedupError.modelMismatch
         }
-        var next = [Float]()
-        next.reserveCapacity(entries.count * 1024)
-        for entry in entries { next.append(contentsOf: entry.fingerprint.values) }
-        vectors = next
+        // Every rejection is above this point. This actor method never suspends
+        // and the buffer is private, so no search can observe a partial replacement.
+        let count = entries.count * 1024
+        vectors.removeAll(keepingCapacity: vectors.capacity >= count)
+        vectors.reserveCapacity(count)
+        for entry in entries { vectors.append(contentsOf: entry.fingerprint.values) }
         metadata = entries.map { Metadata(key: $0.key, origin: $0.origin, size: $0.size) }
         self.generation = generation
     }
@@ -76,10 +78,23 @@ public actor ExactVectorIndex {
                                                         minimumScore: Double, diagnosticLimit: Int) throws -> VectorSearchResult {
         guard entries.allSatisfy({ !$0.key.isEmpty && $0.fingerprint.version == query.version }),
               Set(entries.map(\.key)).count == entries.count else { throw AdvancedDedupError.modelMismatch }
-        let vectors = entries.flatMap { $0.fingerprint.values }
-        let metadata = entries.map { Metadata(key: $0.key, origin: $0.origin, size: $0.size) }
-        return try scan(query: query, vectors: vectors, metadata: metadata,
-                        minimumScore: minimumScore, diagnosticLimit: diagnosticLimit)
+        guard diagnosticLimit >= 0, minimumScore.isFinite, (-1...1).contains(minimumScore) else {
+            throw AdvancedDedupError.invalidConfiguration
+        }
+        var matches = [ScoredCandidate]()
+        var diagnostics = [ScoredCandidate]()
+        query.values.withUnsafeBufferPointer { q in
+            for entry in entries {
+                var dot: Float = 0
+                entry.fingerprint.values.withUnsafeBufferPointer { data in
+                    vDSP_dotpr(q.baseAddress!, 1, data.baseAddress!, 1, &dot, 1024)
+                }
+                collect(dot: dot, item: Metadata(key: entry.key, origin: entry.origin, size: entry.size),
+                        version: query.version, minimumScore: minimumScore, diagnosticLimit: diagnosticLimit,
+                        matches: &matches, diagnostics: &diagnostics)
+            }
+        }
+        return VectorSearchResult(matches: matches.sorted(by: ranked), diagnostics: diagnostics)
     }
 
     private nonisolated static func scan(query: Fingerprint, vectors: [Float], metadata: [Metadata],
@@ -96,21 +111,28 @@ public actor ExactVectorIndex {
                     var dot: Float = 0
                     vDSP_dotpr(q.baseAddress!, 1, data.baseAddress!.advanced(by: index * 1024),
                                1, &dot, 1024)
-                    let score = Double(dot)
-                    guard score.isFinite else { continue }
-                    let item = metadata[index]
-                    let candidate = ScoredCandidate(key: item.key, origin: item.origin,
-                        score: score, size: item.size, fingerprintVersion: query.version)
-                    if score >= minimumScore { matches.append(candidate) }
-                    if diagnosticLimit > 0 {
-                        diagnostics.append(candidate)
-                        diagnostics.sort(by: ranked)
-                        if diagnostics.count > diagnosticLimit { diagnostics.removeLast() }
-                    }
+                    collect(dot: dot, item: metadata[index], version: query.version,
+                            minimumScore: minimumScore, diagnosticLimit: diagnosticLimit,
+                            matches: &matches, diagnostics: &diagnostics)
                 }
             }
         }
         return VectorSearchResult(matches: matches.sorted(by: ranked), diagnostics: diagnostics)
+    }
+
+    private nonisolated static func collect(dot: Float, item: Metadata, version: String,
+                                            minimumScore: Double, diagnosticLimit: Int,
+                                            matches: inout [ScoredCandidate], diagnostics: inout [ScoredCandidate]) {
+        let score = Double(dot)
+        guard score.isFinite else { return }
+        let candidate = ScoredCandidate(key: item.key, origin: item.origin,
+            score: score, size: item.size, fingerprintVersion: version)
+        if score >= minimumScore { matches.append(candidate) }
+        if diagnosticLimit > 0 {
+            diagnostics.append(candidate)
+            diagnostics.sort(by: ranked)
+            if diagnostics.count > diagnosticLimit { diagnostics.removeLast() }
+        }
     }
 
     private nonisolated static func ranked(_ lhs: ScoredCandidate, _ rhs: ScoredCandidate) -> Bool {

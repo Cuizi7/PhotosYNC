@@ -578,8 +578,13 @@ final class AdvancedDedupStoreTests: XCTestCase {
         var data = try Data(contentsOf: decision); data.append(0x20)
         try data.write(to: decision)
         XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: root))
-        try mutate(root, file: "profile.json") { $0["acceptanceID"] = "research:old" }
-        XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: root))
+        let validRoot = try configurationFiles()
+        defer { try? FileManager.default.removeItem(at: validRoot) }
+        XCTAssertNoThrow(try DedupConfiguration.loadValidated(resourceDirectory: validRoot))
+        try mutate(validRoot, file: "profile.json") { $0["acceptanceID"] = "research:old" }
+        XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: validRoot)) {
+            XCTAssertEqual($0 as? AdvancedDedupError, .invalidConfiguration)
+        }
     }
 
     func testThresholdMustMatchDecisionAndPolicyVersion() throws {
@@ -715,6 +720,36 @@ final class AdvancedDedupStoreTests: XCTestCase {
         }
         try rebind(root)
         XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: root))
+    }
+
+    func testReadinessIndexPreservesEveryIntegrityGuardAndExtendsV4() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([descriptor(context, asset: "a")], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        let vector = try Fingerprint(version: "v1", values: [1] + Array(repeating: 0, count: 1023))
+        try await assertTrue(try await store.completeRepresentation(task, fingerprint: vector))
+        try await store.finishIndexReconciliation(generation: generation)
+        let indexSQL = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='photos_representation_readiness'"
+        XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
+        let hex = vector.littleEndianFloat32.map { String(format: "%02x", $0) }.joined()
+        for corruption in ["seen_generation=0", "state='pending'", "fingerprint_version='other'", "vector=NULL"] {
+            try injectEngineSQL("UPDATE photos_representation SET \(corruption)", at: db)
+            try await assertNil(try await store.indexReadiness())
+            try injectEngineSQL("UPDATE photos_representation SET seen_generation=\(generation),state='ready',fingerprint_version='v1',vector=X'\(hex)'", at: db)
+            let ready = try await store.indexReadiness(); XCTAssertEqual(ready?.entryCount, 1)
+        }
+        try injectEngineSQL("UPDATE photos_representation SET tombstoned=1", at: db)
+        let tombstoned = try await store.indexReadiness(); XCTAssertEqual(tombstoned?.entryCount, 0)
+        try injectEngineSQL("UPDATE photos_representation SET tombstoned=0; DROP INDEX IF EXISTS photos_representation_readiness", at: db)
+        let upgraded = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 4)
+        let after = try await upgraded.indexReadiness(); XCTAssertEqual(after?.entryCount, 1)
+        let publication = try await upgraded.indexPublication()
+        XCTAssertEqual(publication?.entries.first?.fingerprint, vector)
     }
 
     func testFreshDependencyReverseQueriesUseIndexedLookup() throws {

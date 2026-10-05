@@ -234,18 +234,19 @@ final class AdvancedDedupServiceTests: XCTestCase {
         await gate.release()
         guard case .waiting = try await work.value else { return XCTFail("Old local revision must wait") }
     }
-    func testSourcePassesOriginalPixelsToCommonPreprocessor() async throws {
+    func testSourcePreservesBoundR2DecodeAndOriginalMetadataDimensions() async throws {
         let f = try await fixture(); try await ready(f, candidates: [])
         let url = f.file.url.deletingLastPathComponent().appendingPathComponent("large.png")
-        try writeImage(url, type: "public.png", width: 640, height: 320)
+        try writeImage(url, type: "public.png", width: 5120, height: 256)
         let metadata = MediaMetadata(filename: url.lastPathComponent, kind: .image, captureSecond: nil,
-            rawCaptureTime: nil, make: nil, model: nil, width: 640, height: 320, duration: nil)
+            rawCaptureTime: nil, make: nil, model: nil, width: 5120, height: 256, duration: nil)
         let file = SourceFile(sourceID: f.file.sourceID, relativePath: url.lastPathComponent, url: url,
             stamp: try await DirectoryReader().stamp(of: url), metadata: metadata)
         let id = try await f.store.save(file, decision: .importNew)
-        guard case .ready = try await f.service.prepare(fileID: id, file: file) else { return XCTFail("Expected static source admission") }
+        guard case .ready(let admission) = try await f.service.prepare(fileID: id, file: file) else { return XCTFail("Expected static source admission") }
         let dimensions = await f.model.dimensions
-        XCTAssertEqual(dimensions, try PixelSize(width: 640, height: 320))
+        XCTAssertEqual(dimensions, try PixelSize(width: 4096, height: 205))
+        XCTAssertEqual(admission.source.size, try PixelSize(width: 5120, height: 256))
     }
     func testReadableStillBeyondDecodeAllowanceImportsOriginalWithoutComparison() async throws {
         let (f, service, configuration, budget) = try await resourceFixture()

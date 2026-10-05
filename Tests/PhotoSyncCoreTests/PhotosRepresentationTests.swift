@@ -641,11 +641,19 @@ private final class RepresentationLifecycle: PhotoKitLifecycle, @unchecked Senda
     }
 }
 
+private final class RecordingDrawCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+}
+
 private final class RecordingDrawImage: NSImage {
-    var drawCount = 0
+    private let counter = RecordingDrawCounter()
+    var drawCount: Int { counter.value }
     override func draw(in rect: NSRect, from fromRect: NSRect, operation op: NSCompositingOperation,
                        fraction delta: CGFloat, respectFlipped: Bool, hints: [NSImageRep.HintKey: Any]?) {
-        drawCount += 1
+        counter.increment()
     }
 }
 

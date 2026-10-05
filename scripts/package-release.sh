@@ -53,6 +53,12 @@ mkdir -p "$source_dir"
 print "Build evidence: $build_dir"
 
 git archive "$source_commit" | tar -x -C "$source_dir"
+# Git archives contain pointers. Hydrate only this immutable commit's local LFS
+# object and verify the complete approved package before any build or validation.
+env -u RQDATAC2_CONF python3 "$source_dir/scripts/advanced-dedup/release.py" \
+  --hydrate-from "$PWD" --commit "$source_commit" --archive "$source_dir" \
+  --resources "$source_dir/Sources/PhotoSyncCore/Resources/AdvancedDedup" \
+  --output "$build_dir/hydrated-resources.json" > "$build_dir/hydration.log" 2>&1
 cd "$source_dir"
 
 env -u RQDATAC2_CONF python3 scripts/validate.py \
@@ -74,6 +80,8 @@ try:
     tool_test_count = evidence["tool_tests"]["test_count"]
     manifest = evidence["source"]["manifest_sha256"]
     continuation = evidence["continuation_race"]
+    continuations = evidence["continuations"]
+    advanced = evidence["advanced_dedup"]
 except (KeyError, TypeError) as error:
     raise SystemExit("validation evidence is missing required fields") from error
 if evidence.get("status") != "passed" or not isinstance(test_count, int) or test_count <= 0:
@@ -84,6 +92,12 @@ if not isinstance(manifest, str) or len(manifest) != 64:
     raise SystemExit("validation evidence does not contain a source manifest hash")
 if continuation.get("status") != "passed" or continuation.get("regression") != "continuation-race":
     raise SystemExit("validation evidence does not prove the continuation regression")
+if set(continuations) != {"stamp", "advanced-preparation"} or any(item.get("status") != "passed" for item in continuations.values()):
+    raise SystemExit("validation evidence lacks both continuation scenarios")
+if set(advanced.get("scale", {})) != {"100000", "150000", "200000", "200000-history-100000"}:
+    raise SystemExit("validation evidence lacks current graph scale samples")
+if any(not advanced.get(key) for key in ("resources_sha256", "model_regression_sha256", "runtime_load_sha256")):
+    raise SystemExit("validation evidence lacks advanced model/runtime/resource gates")
 print(f"{test_count}\t{tool_test_count}\t{manifest}")
 ' "$validation_json")
 IFS=$'\t' read -r validation_test_count validation_tool_test_count validation_manifest_hash <<< "$validation_summary"
@@ -114,6 +128,10 @@ require_validated_source_snapshot
 
 app_path="$release_dir/PhotosYNC.app"
 ditto "$build_dir/ReleaseDerivedData/Build/Products/Release/PhotosYNC.app" "$app_path"
+env -u RQDATAC2_CONF python3 scripts/advanced-dedup/release.py \
+  --resources "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Resources/AdvancedDedup" \
+  --app "$app_path" --output "$build_dir/built-resources.json" > "$build_dir/resources.log" 2>&1
+cmp "$build_dir/hydrated-resources.json" "$build_dir/built-resources.json" || fail 'Built resources differ from the hydrated archive.' 70
 codesign --force --sign - --timestamp=none "$app_path/Contents/Frameworks/PhotoSyncCore.framework"
 codesign --force --sign - --timestamp=none "$app_path"
 codesign --verify --deep --strict --all-architectures "$app_path"
@@ -131,6 +149,7 @@ cp CHANGELOG.md "$release_dir/CHANGELOG.md"
 ditto "$validation_dir" "$release_dir/validation"
 cp "$build_dir/validate.log" "$release_dir/validate.log"
 cp "$build_dir/release-build.log" "$release_dir/release-build.log"
+cp "$build_dir/built-resources.json" "$release_dir/resources.json"
 
 validation_json_hash=$(shasum -a 256 "$release_dir/validation/validation.json" | awk '{print $1}')
 validation_report_hash=$(shasum -a 256 "$release_dir/validation/validation-report.md" | awk '{print $1}')
@@ -153,11 +172,15 @@ continuation_result_hash=$(shasum -a 256 "$release_dir/validation/continuation-r
   print "release_source_manifest_sha256=$(archive_source_manifest)"
   print 'validation_continuation_result=validation/continuation-race/result.json'
   print "validation_continuation_result_sha256=$continuation_result_hash"
+  print 'advanced_dedup_resources=resources.json'
+  print "advanced_dedup_resources_sha256=$(shasum -a 256 "$release_dir/resources.json" | awk '{print $1}')"
+  print 'validation_advanced_continuation_result=validation/continuation-advanced-preparation/result.json'
+  print "validation_advanced_continuation_sha256=$(shasum -a 256 "$release_dir/validation/continuation-advanced-preparation/result.json" | awk '{print $1}')"
   print 'release_build_log=release-build.log'
   print 'validation_wrapper_log=validate.log'
   xcodebuild -version
   print 'packaging_scripts_sha256:'
-  shasum -a 256 scripts/package-release.sh scripts/build-dmg.sh scripts/validate.py
+  shasum -a 256 scripts/package-release.sh scripts/build-dmg.sh scripts/validate.py scripts/advanced-dedup/release.py
 } > "$release_dir/PhotosYNC.provenance"
 
 (

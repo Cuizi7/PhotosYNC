@@ -120,12 +120,37 @@ if [[ "$COMMAND" == evaluate ]]; then
 fi
 mkdir -p "$MODULE_CACHE"
 export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
+# The probe uses internal policy APIs, so compile the canonical Core source set
+# in the same module. Domain/admission dependencies must not be duplicated here.
+CORE_SOURCES=()
+while IFS= read -r -d '' SOURCE; do CORE_SOURCES+=("$SOURCE"); done < <(
+  find "$ROOT/Sources/PhotoSyncCore" -name '*.swift' -type f -print0
+)
+# The expanded Core boundary is expensive to compile. Reuse only a binary keyed
+# by every input byte, this driver and the actual compiler; never by timestamps.
+BUILD_KEY="$(python3 - "$ROOT" <<'HASH'
+import hashlib
+from pathlib import Path
+import subprocess
+import sys
+root = Path(sys.argv[1])
+h = hashlib.sha256(subprocess.check_output(['xcrun', 'swiftc', '--version']))
+h.update(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path']))
+h.update(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-version']))
+paths = sorted((root / 'Sources/PhotoSyncCore').rglob('*.swift'))
+paths += [root / 'Tools/AdvancedDedupProbe/main.swift', root / 'scripts/advanced-dedup/run-probe.sh']
+for path in paths:
+    h.update(path.relative_to(root).as_posix().encode() + b'\0')
+    h.update(path.read_bytes())
+print(h.hexdigest())
+HASH
+)"
+BIN="$ROOT/work/advanced-dedup-probe-$BUILD_KEY"
+if [[ ! -x "$BIN" ]]; then
 xcrun swiftc -O -module-cache-path "$MODULE_CACHE" -module-name AdvancedDedupProbe \
-  "$ROOT/Sources/PhotoSyncCore/Matching/AdvancedDedupTypes.swift" \
-  "$ROOT/Sources/PhotoSyncCore/Matching/ExactVectorIndex.swift" \
-  "$ROOT/Sources/PhotoSyncCore/Matching/AdvancedDuplicatePolicy.swift" \
-  "$ROOT/Sources/PhotoSyncCore/Fingerprinting/ImagePreprocessor.swift" \
-  "$ROOT/Sources/PhotoSyncCore/Fingerprinting/CoreMLFingerprinter.swift" \
-  "$ROOT/Tools/AdvancedDedupProbe/main.swift" \
-  -o "$BIN"
+  "${CORE_SOURCES[@]}" "$ROOT/Tools/AdvancedDedupProbe/main.swift" \
+  -o "$BIN.tmp.$$"
+mv "$BIN.tmp.$$" "$BIN"
+fi
+
 exec "$BIN" "${ARGS[@]}" --approved-protocol-json "$APPROVED_BINDING"

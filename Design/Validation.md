@@ -181,3 +181,9 @@ The continuation harness preserves the legal ordering proven during beta3: retry
 Ordinary beta changes do not require repeating all historical real-Photos tests. Their unchanged system boundaries can reuse the dated evidence above, with current automated regression and package verification. Changed PhotoKit, authorization, media-extraction or platform boundaries require targeted acceptance and explicit reporting of any unverified behavior. This policy does not authorize accessing a personal library or changing system settings.
 
 Current execution results must be taken from the final package's provenance and validation evidence. This section defines the gate; it does not predeclare a future build successful. The original beta3 archive at 1f0047d remains historical and is not retroactively relabeled as having run the new gate.
+
+## 0.2 advanced dedup integration gate (2026-10-05)
+
+The current scope, resource/LFS identities, approved 512 MiB conservative-overlimit policy and evidence are in [0.2 validation](../docs/release/0.2.0-advanced-dedup-validation.md). The canonical entry point now requires the local approved fixture validator, actual-model 33-case content/action regression, a nonempty injected actual runtime graph, complete XCTest/Tools, and both continuation scenarios with GREEN and intended RED. It preserves source-manifest identity and records current compilation cache identity separately from the portable source model package. Missing resources, license, model bytes, reports or passing cases block acceptance.
+
+Real Photos/iCloud, 100k real-library load, older macOS/Intel model execution, keyboard/VoiceOver and release/signing remain distinct unperformed gates. The synthetic runtime test must not be called those system tests. Six user images are local-only and excluded from App resources and public CI. No new personal-library, production-database or system-setting authorization is implied.

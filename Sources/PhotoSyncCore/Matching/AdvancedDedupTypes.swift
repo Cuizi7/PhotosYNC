@@ -104,10 +104,11 @@ public struct Fingerprint: Codable, Equatable, Sendable {
         guard !version.isEmpty, data.count == 4096 else { throw AdvancedDedupError.invalidFingerprint }
         var values = [Float]()
         values.reserveCapacity(1024)
-        for offset in stride(from: 0, to: data.count, by: 4) {
-            let bits = UInt32(data[offset]) | UInt32(data[offset + 1]) << 8
-                | UInt32(data[offset + 2]) << 16 | UInt32(data[offset + 3]) << 24
-            values.append(Float(bitPattern: bits))
+        data.withUnsafeBytes { bytes in
+            for offset in stride(from: 0, to: bytes.count, by: 4) {
+                let bits = UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+                values.append(Float(bitPattern: bits))
+            }
         }
         let norm = values.reduce(0.0) { $0 + Double($1) * Double($1) }
         guard values.allSatisfy(\.isFinite), norm.isFinite, abs(norm - 1) <= 0.00001 else {
