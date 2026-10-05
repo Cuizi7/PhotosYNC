@@ -46,6 +46,9 @@ public enum RepresentationConservativeReason: String, Equatable, Sendable {
     case multiFrameOrCompound
     case unverifiedContainer
     case ambiguousResource
+    /// Readable source still whose estimated native backing exceeds the fixed
+    /// decoded allowance. Import original bytes without producing a vector.
+    case decodedResourceLimit
 }
 
 public enum RepresentationEligibility: Equatable, Sendable {

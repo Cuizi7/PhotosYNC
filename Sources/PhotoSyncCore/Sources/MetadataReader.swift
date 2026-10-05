@@ -58,13 +58,11 @@ public struct MetadataReader: MetadataReading {
                   let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any] else {
                 throw MetadataError.unreadable
             }
-            let eligibility: RepresentationEligibility
+            var eligibility: RepresentationEligibility
             if CGImageSourceGetCount(source) != 1 { eligibility = .conservative(.multiFrameOrCompound) }
             else if ["public.jpeg", "public.png", "public.heic", "public.heif"].contains(type) { eligibility = .safeSingleFrame }
             else { eligibility = .conservative(.unverifiedContainer) }
-            let image: CGImage
-            switch eligibility {
-            case .safeSingleFrame:
+            if eligibility == .safeSingleFrame {
                 // Header facts precede eager decode. Four channels, component
                 // storage rounded up to bytes, and aligned rows conservatively
                 // estimate native backing; opaque ImageIO storage is measured
@@ -76,16 +74,22 @@ public struct MetadataReader: MetadataReading {
                 let (rowBytes, rowOverflow) = Int64(width).multipliedReportingOverflow(by: Int64(((depth + 7) / 8) * 4))
                 let (padded, paddingOverflow) = rowBytes.addingReportingOverflow(127)
                 let (estimate, sizeOverflow) = (padded / 128 * 128).multipliedReportingOverflow(by: Int64(height))
-                guard !rowOverflow, !paddingOverflow, !sizeOverflow, estimate > 0, estimate <= allowance else {
-                    throw ImageWorkBudgetError.invalidReservation
+                guard !rowOverflow, !paddingOverflow, !sizeOverflow, estimate > 0 else {
+                    throw MetadataError.unreadable
                 }
+                if estimate > allowance { eligibility = .conservative(.decodedResourceLimit) }
+            }
+            let image: CGImage
+            switch eligibility {
+            case .safeSingleFrame:
                 guard let decoded = CGImageSourceCreateImageAtIndex(source, 0,
                     [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { throw MetadataError.unreadable }
                 image = decoded
             case .conservative:
                 // Validate readability without inference. A complete image
-                // container with explicitly unverified content is imported as
-                // original bytes; it never enters the comparable vector cache.
+                // container with unverified content or excessive native backing
+                // is imported as original bytes. This bounded readability probe
+                // never enters R2/inference or supplies comparable dimensions.
                 guard let decoded = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                     kCGImageSourceCreateThumbnailFromImageAlways: true,
                     kCGImageSourceCreateThumbnailWithTransform: false,

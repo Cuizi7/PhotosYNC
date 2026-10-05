@@ -193,11 +193,19 @@ final class AdvancedDedupEngineTests: XCTestCase {
         XCTAssertEqual(row?.state, .skipped); XCTAssertEqual(count, 0)
     }
 
-    func testOverBudgetSourceWaitDoesNotStarveHealthyPendingFile() async throws {
-        let f = try await fixture(second: true, maximumDecodedBytes: 800_000)
-        try writeImage(f.root.appendingPathComponent("a.png"), width: 640, height: 320)
+    func testTemporaryBudgetOccupancyDoesNotStarveCachedPendingFile() async throws {
+        let f = try await fixture(second: true)
+        let url = f.root.appendingPathComponent("b.png")
+        let file = SourceFile(sourceID: f.source, relativePath: "b.png", url: url,
+            stamp: try await DirectoryReader().stamp(of: url), metadata: try await MetadataReader().read(url: url, filename: "b.png"))
+        let id = try await f.store.save(file, decision: .importNew)
+        let cached = try await f.store.cacheFingerprint(.init(fileID: id, file: file,
+            fingerprint: f.model.vector, size: try PixelSize(width: 2, height: 2)))
+        XCTAssertTrue(cached)
         try await ready(f)
+        let lease = try await f.budget.acquire(bytes: f.configuration.resources.maxDecodedBytes)
         await f.engine.scanEnabledSources()
+        await lease.finishPhysicalWork()
         let a = try await f.store.file(sourceID: f.source, relativePath: "a.png")
         let b = try await f.store.file(sourceID: f.source, relativePath: "b.png")
         let count = await f.photos.createCount
@@ -207,6 +215,21 @@ final class AdvancedDedupEngineTests: XCTestCase {
         XCTAssertEqual(snapshot.latestScan.failed, 0)
         XCTAssertNotNil(snapshot.advancedWaitingReasons[f.source])
     }
+    func testOversizeReadableSourceImportsOriginalWithoutSuccessVector() async throws {
+        let f = try await fixture(maximumDecodedBytes: 800_000)
+        try writeImage(f.root.appendingPathComponent("a.png"), width: 640, height: 320)
+        try await ready(f)
+        await f.engine.scanEnabledSources()
+        let a = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+        let count = await f.photos.createCount
+        XCTAssertEqual(a?.state, .imported); XCTAssertNotNil(a?.successID); XCTAssertEqual(count, 1)
+        let vectors = try await f.store.localVectorCandidates(beforeOrder: Int64.max, excluding: UUID(), version: f.model.vector.version)
+        XCTAssertTrue(vectors.entries.isEmpty)
+        let inferenceCount = await f.model.count; XCTAssertEqual(inferenceCount, 0)
+        let snapshot = await f.engine.snapshot()
+        XCTAssertEqual(snapshot.latestScan.failed, 0)
+        XCTAssertNil(snapshot.advancedWaitingReasons[f.source])
+    }
 
     private func ready(_ f: Fixture) async throws {
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: Date())
@@ -214,7 +237,7 @@ final class AdvancedDedupEngineTests: XCTestCase {
 
     private struct Fixture {
         let engine: SyncEngine; let store: SyncStore; let photos: EngineIndexPhotos
-        let coordinator: PhotosIndexCoordinator; let model: EngineIndexModel; let source: UUID; let root: URL; let clock: EngineIndexClock
+        let coordinator: PhotosIndexCoordinator; let model: EngineIndexModel; let budget: ImageWorkBudget; let configuration: DedupConfiguration; let source: UUID; let root: URL; let clock: EngineIndexClock
     }
     private func fixture(second: Bool = false, maximumDecodedBytes: Int64? = nil) async throws -> Fixture {
         let root = try temporaryDirectory()
@@ -242,11 +265,12 @@ final class AdvancedDedupEngineTests: XCTestCase {
         let model = EngineIndexModel(vector: try Fingerprint(version: c.fingerprint.version, values: values))
         let index = ExactVectorIndex(version: c.fingerprint.version)
         let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, index: index, configuration: c)
+        let budget = ImageWorkBudget(limits: c.resources)
         let service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator, fingerprinter: model,
-            index: index, configuration: c, executor: ReadExecutor(maxConcurrentOperations: c.resources.maxInFlightTasks), budget: ImageWorkBudget(limits: c.resources))
+            index: index, configuration: c, executor: ReadExecutor(maxConcurrentOperations: c.resources.maxInFlightTasks), budget: budget)
         let clock = EngineIndexClock()
         let engine = SyncEngine(store: store, photos: photos, advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, now: { clock.now })
-        return Fixture(engine: engine, store: store, photos: photos, coordinator: coordinator, model: model, source: source, root: sourceURL, clock: clock)
+        return Fixture(engine: engine, store: store, photos: photos, coordinator: coordinator, model: model, budget: budget, configuration: c, source: source, root: sourceURL, clock: clock)
     }
     private func writeImage(_ url: URL, type: String = "public.png", frames: Int = 1, width: Int = 2, height: Int = 2) throws {
         let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
@@ -260,10 +284,11 @@ final class AdvancedDedupEngineTests: XCTestCase {
 private actor EngineIndexModel: ImageFingerprinting {
     let vector: Fingerprint
     private var gate: EngineBoundaryGate?
+    private(set) var count = 0
     init(vector: Fingerprint) { self.vector = vector }
     func setGate(_ gate: EngineBoundaryGate) { self.gate = gate }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
-        if let gate { await gate.hold() }; return vector
+        count += 1; if let gate { await gate.hold() }; return vector
     }
 }
 private actor EngineIndexPhotos: PhotosIndexGateway {

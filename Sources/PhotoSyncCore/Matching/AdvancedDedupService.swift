@@ -20,8 +20,19 @@ public actor AdvancedDedupService {
         self.fingerprinter = fingerprinter; self.index = index; self.configuration = configuration
         self.executor = executor; self.budget = budget
     }
+    /// Stops new admissions; already-started physical reads/inference retain
+    /// their leases until completion. The caller also gates actual submission.
     public func setPaused(_ paused: Bool) { self.paused = paused }
 
+    /// Returns a genuine vector admission, or an explicit no-comparison original
+    /// import for confirmed readable unsupported comparison content/resource size.
+    /// Both require current source/history/stamp/index and synchronous validity.
+    /// Unknown/stale evidence, pause, cancellation and temporary read/budget
+    /// occupancy return waiting. Source metadata/read, cache/record lookup and
+    /// model failures throw into the caller's typed retry/diagnostic path; failed
+    /// readiness/snapshot checks remain unknown/waiting. Neither failure route
+    /// authorizes conservative import. The caller owns the final atomic admission
+    /// transaction and native submit rechecks; this method does not submit Photos.
     public func prepare(fileID: UUID, file: SourceFile) async throws -> AdvancedPreparation {
         do { return try await prepareCurrent(fileID: fileID, file: file) }
         catch is ReadExecutorError { return .waiting(reason: "来源读取稍后继续。") }

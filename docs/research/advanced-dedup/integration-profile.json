@@ -22,7 +22,7 @@
   "resources": {
     "decodeConcurrency": 1,
     "photoRequestConcurrency": 1,
-    "maxDecodedBytes": 134217728,
+    "maxDecodedBytes": 536870912,
     "requestTimeoutSeconds": 30,
     "retryDelaysSeconds": [
       5,
@@ -37,5 +37,11 @@
     "batchSize": 1
   },
   "evidenceCandidateLimit": 200000,
-  "acceptanceID": "user-decision:5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926"
+  "acceptanceID": "user-decision:62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+  "resourcePolicyAmendment": {
+    "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+    "priorProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
+    "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
+    "reason": "decodedResourceLimit"
+  }
 }

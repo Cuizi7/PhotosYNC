@@ -31,7 +31,7 @@
     "resources": {
       "decodeConcurrency": 1,
       "photoRequestConcurrency": 1,
-      "maxDecodedBytes": 134217728,
+      "maxDecodedBytes": 536870912,
       "requestTimeoutSeconds": 30,
       "retryDelaysSeconds": [
         5,
@@ -71,5 +71,25 @@
     "preserve successful import and unknown submission history",
     "no product human-review queue",
     "distribution rights and targeted system verification are separate from threshold selection"
-  ]
+  ],
+  "resourcePolicyAmendment": {
+    "date": "2026-10-05",
+    "basis": "explicit_user_selected_resource_policy",
+    "maxDecodedBytes": 536870912,
+    "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
+    "reason": "decodedResourceLimit",
+    "content": "notCompared",
+    "transientOccupancyOrCancellation": "waiting",
+    "corruptUnknownOrReadFailure": "typed_error_or_waiting_never_conservative_import",
+    "fingerprintPipelineAndThreshold": "unchanged_original_pixels_common_R2_cpuOnly_FP32_score_gte_0.98",
+    "policyIdentity": "unchanged_by_established_computePolicyVersion_definition_fingerprint_threshold_backend_coverage_rule",
+    "priorRecordSHA256": {
+      "integration-decision.json": "5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
+      "integration-profile.json": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
+      "2026-10-05-threshold-098-regression.json": "a61f1e9485a56e4d3bdad2505aa060960e15ccdf235002ccf49af40552e75724",
+      "research-closeout.json": "d7b642888a6f12b58dd9bd2076b4fc3048f9ca93803e05c457ab31e50b2229c5"
+    },
+    "priorSourceCommit": "1c77ef1d991f36d16ca0fcfde1d1b3cf73a92238",
+    "resourceMeasurements": "historical_controlled_generated_sources_in_task-4-report.md_and_work/P4-fix1-20261005_not_full_app_acceptance"
+  }
 }

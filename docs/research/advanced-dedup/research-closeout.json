@@ -5,10 +5,10 @@
   "approvedForProductIntegration": true,
   "productImplementationStarted": false,
   "decisionFile": "integration-decision.json",
-  "decisionSHA256": "5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
+  "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
   "profileFile": "integration-profile.json",
-  "profileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
-  "acceptanceID": "user-decision:5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
+  "profileSHA256": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
+  "acceptanceID": "user-decision:62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
   "threshold": 0.98,
   "thresholdBasis": "explicit_user_choice",
   "computeUnits": "cpuOnly",
@@ -19,7 +19,7 @@
   "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
   "regression": {
     "file": "2026-10-05-threshold-098-regression.json",
-    "sha256": "a61f1e9485a56e4d3bdad2505aa060960e15ccdf235002ccf49af40552e75724",
+    "sha256": "c30e33331aa73a0e574c13d1648db2b2f65a7318023888db3c0a07b42ba4e5b6",
     "caseCount": 33,
     "passCount": 33,
     "contentFailures": [],
@@ -35,8 +35,9 @@
   },
   "profileDeserialization": {
     "tool": "existing Swift DedupConfiguration / validate-profile",
-    "status": "passed",
-    "reportSHA256": "364d06d8849e3ddc58941e0caef1924fba5b6826c853d193a9f63c6c804af627"
+    "status": "historical_prior_profile_pass_not_current_profile_verification",
+    "reportSHA256": "364d06d8849e3ddc58941e0caef1924fba5b6826c853d193a9f63c6c804af627",
+    "priorProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404"
   },
   "statisticalAcceptance": {
     "status": "not_performed",
@@ -73,5 +74,14 @@
     "model and fixture distribution permission before distributing assets"
   ],
   "supersedesForIntegration": "The original R4 statistical pass requirement is replaced by the explicit user decision plus bound 0.98 configuration and current regression. Original R4 artifacts remain historical and are not relabeled passed.",
-  "scopeOfThisCompletion": "Research handoff artifacts and product-plan revision only; no production App, Photos, database, packaging or product-task execution."
+  "scopeOfThisCompletion": "Research handoff artifacts and product-plan revision only; no production App, Photos, database, packaging or product-task execution.",
+  "resourcePolicyAmendment": {
+    "maxDecodedBytes": 536870912,
+    "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
+    "reason": "decodedResourceLimit",
+    "priorCloseoutSHA256": "d7b642888a6f12b58dd9bd2076b4fc3048f9ca93803e05c457ab31e50b2229c5",
+    "regressionEvidence": "exact_prior33_case_score_evidence_rebound_without_replay_or_new_inference",
+    "finalRealModelRegression": "pending_P9",
+    "fullAppResourceAcceptance": "not_performed"
+  }
 }

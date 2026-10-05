@@ -222,15 +222,76 @@ final class AdvancedDedupServiceTests: XCTestCase {
         let dimensions = await f.model.dimensions
         XCTAssertEqual(dimensions, try PixelSize(width: 640, height: 320))
     }
-    func testReadableStillBeyondConfiguredDecodeAllowanceWaitsWithoutInference() async throws {
-        let f = try await fixture(); try await ready(f, candidates: [])
-        let url = f.file.url.deletingLastPathComponent().appendingPathComponent("over-budget.png")
+    func testReadableStillBeyondDecodeAllowanceImportsOriginalWithoutComparison() async throws {
+        let (f, service, configuration, budget) = try await resourceFixture()
+        guard case .conservative(let admission) = try await service.prepare(fileID: f.id, file: f.file) else {
+            return XCTFail("Readable over-limit still must import without comparison")
+        }
+        XCTAssertEqual(admission.reason.rawValue, "decodedResourceLimit")
+        XCTAssertEqual(admission.file.url, f.file.url)
+        XCTAssertEqual(admission.evidence.evaluation.content, .notCompared)
+        XCTAssertEqual(admission.evidence.evaluation.action, .importFile)
+        XCTAssertEqual(admission.evidence.evaluation.reason, .nonComparableSource)
+        XCTAssertTrue(admission.evidence.evaluation.matchedKeys.isEmpty)
+        XCTAssertTrue(admission.evidence.evaluation.coveringKeys.isEmpty)
+        XCTAssertTrue(admission.evidence.decisiveCandidates.isEmpty)
+        XCTAssertTrue(admission.evidence.diagnostics.isEmpty)
+        let count = await f.model.count; XCTAssertEqual(count, 0)
+        let cached = try await f.store.fingerprint(fileID: f.id, stamp: f.file.stamp, version: configuration.fingerprint.version)
+        XCTAssertNil(cached)
+        let vectors = try await f.store.localVectorCandidates(beforeOrder: Int64.max, excluding: UUID(), version: configuration.fingerprint.version)
+        XCTAssertTrue(vectors.entries.isEmpty)
+        let occupied = await budget.snapshot(); XCTAssertEqual(occupied.images, 0); XCTAssertEqual(occupied.bytes, 0)
+        let stored = try await f.store.file(sourceID: f.file.sourceID, relativePath: f.file.relativePath)
+        XCTAssertEqual(stored?.state, .pending); XCTAssertNil(stored?.successID)
+    }
+    func testOversizeSourceContentionWaitsAndCorruptionThrows() async throws {
+        let (f, service, configuration, budget) = try await resourceFixture()
+        let lease = try await budget.acquire(bytes: configuration.resources.maxDecodedBytes)
+        guard case .waiting = try await service.prepare(fileID: f.id, file: f.file) else { return XCTFail("Occupancy must wait") }
+        await lease.finishPhysicalWork()
+        let encoded = try Data(contentsOf: f.file.url)
+        // Complete PNG IHDR retains the over-limit dimensions, with no pixel
+        // data. Test actual native failure, not byte-integrity of every input.
+        try encoded.prefix(33).write(to: f.file.url)
+        let file = SourceFile(sourceID: f.file.sourceID, relativePath: f.file.relativePath, url: f.file.url,
+            stamp: try await DirectoryReader().stamp(of: URL(fileURLWithPath: f.file.url.path)), metadata: f.file.metadata)
+        _ = try await f.store.recordSourceChange(fileID: f.id, stamp: file.stamp)
+        do { _ = try await service.prepare(fileID: f.id, file: file); XCTFail("Native read failure must throw, not import") }
+        catch MetadataError.unreadable {}
+        let count = await f.model.count; XCTAssertEqual(count, 0)
+    }
+    func testResourceConservativeAdmissionRetainsAllInvalidationGuards() async throws {
+        for change in ["pause", "stamp", "disabled", "unknown", "success", "generation", "localRevision", "validity"] {
+            let (f, service, _, _) = try await resourceFixture()
+            let gate = AdmissionGate(); await f.photos.gateSnapshot(gate, at: 4)
+            let work = Task { try await service.prepare(fileID: f.id, file: f.file) }
+            await gate.waitUntilEntered() // Original read finished; final decision snapshot is held.
+            switch change {
+            case "pause": await service.setPaused(true)
+            case "stamp": try Data([1, 2, 3]).write(to: f.file.url)
+            case "disabled": try await f.store.disableSource(id: f.file.sourceID)
+            case "unknown": try await f.store.beginAttempt(fileID: f.id, attemptID: UUID())
+            case "success":
+                let attempt = UUID(); try await f.store.beginAttempt(fileID: f.id, attemptID: attempt)
+                try await f.store.markImported(fileID: f.id, attemptID: attempt, identifier: "late-success")
+            case "generation": await f.photos.change()
+            case "localRevision": _ = try await f.store.save(copy(f.file, path: "new-candidate.png"), decision: .importNew)
+            default: f.photos.validity.invalidateAtNextCheck()
+            }
+            await gate.release()
+            guard case .waiting = try await work.value else { XCTFail("Invalid \(change) must block conservative admission"); continue }
+            let count = await f.model.count; XCTAssertEqual(count, 0)
+        }
+    }
+    private func resourceFixture() async throws -> (Fixture, AdvancedDedupService, DedupConfiguration, ImageWorkBudget) {
+        let base = try await fixture(); try await ready(base, candidates: [("covering", .original, 1, 1000)])
+        let url = base.file.url.deletingLastPathComponent().appendingPathComponent("over-budget.png")
         try writeImage(url, type: "public.png", width: 640, height: 320)
-        let metadata = MediaMetadata(filename: url.lastPathComponent, kind: .image, captureSecond: nil,
-            rawCaptureTime: nil, make: nil, model: nil, width: 640, height: 320, duration: nil)
-        let file = SourceFile(sourceID: f.file.sourceID, relativePath: url.lastPathComponent, url: url,
-            stamp: try await DirectoryReader().stamp(of: url), metadata: metadata)
-        let id = try await f.store.save(file, decision: .importNew), c = f.configuration, r = c.resources
+        let file = SourceFile(sourceID: base.file.sourceID, relativePath: url.lastPathComponent, url: url,
+            stamp: try await DirectoryReader().stamp(of: url), metadata: MediaMetadata(filename: url.lastPathComponent,
+            kind: .image, captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: 640, height: 320, duration: nil))
+        let id = try await base.store.save(file, decision: .importNew), c = base.configuration, r = c.resources
         let limits = try ResourceLimits(decodeConcurrency: r.decodeConcurrency, photoRequestConcurrency: r.photoRequestConcurrency,
             maxDecodedBytes: 800_000, requestTimeoutSeconds: r.requestTimeoutSeconds, retryDelaysSeconds: r.retryDelaysSeconds,
             catalogBatchSize: r.catalogBatchSize, maxInFlightTasks: r.maxInFlightTasks,
@@ -238,15 +299,11 @@ final class AdvancedDedupServiceTests: XCTestCase {
         let configuration = try DedupConfiguration(fingerprint: c.fingerprint, policyVersion: c.policyVersion,
             threshold: c.threshold, backend: c.backend, resources: limits, evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
         let budget = ImageWorkBudget(limits: limits)
-        let reader = MetadataReader(sourceID: file.sourceID, executor: f.executor)
-        do { _ = try await reader.readForFingerprint(url: file.url, configuration: configuration, budget: budget); XCTFail("Native backing exceeds configured bytes") }
-        catch ImageWorkBudgetError.invalidReservation {}
-        let service = AdvancedDedupService(store: f.store, photos: f.photos, coordinator: f.coordinator,
-            fingerprinter: f.model, index: f.index, configuration: configuration, executor: f.executor, budget: ImageWorkBudget(limits: limits))
-        guard case .waiting = try await service.prepare(fileID: id, file: file) else { return XCTFail("Over-budget still must wait, not claim unique/conservative import") }
-        let count = await f.model.count; XCTAssertEqual(count, 0)
-        let fingerprint = try await f.store.fingerprint(fileID: id, stamp: file.stamp, version: c.fingerprint.version)
-        XCTAssertNil(fingerprint)
+        let service = AdvancedDedupService(store: base.store, photos: base.photos, coordinator: base.coordinator,
+            fingerprinter: base.model, index: base.index, configuration: configuration, executor: base.executor, budget: budget)
+        let f = Fixture(store: base.store, photos: base.photos, model: base.model, index: base.index, coordinator: base.coordinator,
+            service: service, configuration: configuration, executor: base.executor, budget: budget, file: file, id: id)
+        return (f, service, configuration, budget)
     }
     func testFinalSynchronousValidityRejectsRegularAdmission() async throws {
         let f = try await fixture(); try await ready(f, candidates: [])
@@ -351,13 +408,14 @@ private actor AdmissionPhotos: PhotosIndexGateway {
     nonisolated let validity = AdmissionValidity()
     private var generation = 1; private var descriptors: [RepresentationDescriptor] = []
     private(set) var createCount = 0
-    private var gate: AdmissionGate?, snapshots = 0
-    func gateSecondSnapshot(_ gate: AdmissionGate) { self.gate = gate; snapshots = 0 }
+    private var gate: AdmissionGate?, snapshots = 0, gateTarget = 2
+    func gateSecondSnapshot(_ gate: AdmissionGate) { gateSnapshot(gate, at: 2) }
+    func gateSnapshot(_ gate: AdmissionGate, at count: Int) { self.gate = gate; snapshots = 0; gateTarget = count }
     func set(_ descriptors: [RepresentationDescriptor]) { self.descriptors = descriptors }
     func change() { generation += 1 }
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
         snapshots += 1
-        if snapshots == 2, let gate { self.gate = nil; await gate.hold() }
+        if snapshots == gateTarget, let gate { self.gate = nil; await gate.hold() }
         return .init(generation: generation, candidates: [], validity: validity)
     }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { _ in } }

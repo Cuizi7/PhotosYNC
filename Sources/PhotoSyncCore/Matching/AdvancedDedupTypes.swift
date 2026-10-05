@@ -385,6 +385,11 @@ public struct VectorSearchResult: Codable, Equatable, Sendable {
     public let diagnostics: [ScoredCandidate]
     public init(matches: [ScoredCandidate], diagnostics: [ScoredCandidate]) { self.matches = matches; self.diagnostics = diagnostics }
 }
+/// Durable bounded evidence, not the complete search result. The producer runs
+/// policy over every threshold match, then projects evaluation matched/covering
+/// keys to the zero/one independently chosen decisive candidate. Diagnostics are
+/// at most ten nearest candidates and cannot decide a skip. Consumers validate
+/// decisive evidence; they must not interpret key arrays as a candidate inventory.
 public struct AdvancedEvidence: Codable, Equatable, Sendable {
     public let eventID: UUID
     public let fileID: UUID
@@ -412,6 +417,12 @@ public struct AdvancedAdmission: Sendable {
         self.source = source; self.evidence = evidence; self.validity = validity
     }
 }
+/// Explicit notCompared/importFile evidence for confirmed readable content that
+/// cannot be safely compared, including a decoded resource limit. No fingerprint,
+/// vector cache, success vector, uniqueness claim or automatic skip is created.
+/// The caller must preserve the original URL/bytes and all final source, stamp,
+/// success/unknown, pause, index and native submission guards. Store the evidence
+/// through the conservative attempt overload; never send this through a skip path.
 public struct ConservativeSourceAdmission: Sendable {
     public let fileID: UUID
     public let file: SourceFile
@@ -424,6 +435,8 @@ public struct ConservativeSourceAdmission: Sendable {
         self.evidence = evidence; self.validity = validity
     }
 }
+/// Waiting carries no import decision. Conservative is an explicit original-byte
+/// import without comparison; ready contains a real fingerprint and policy result.
 public enum AdvancedPreparation: Sendable {
     case ready(AdvancedAdmission), conservative(ConservativeSourceAdmission), waiting(reason: String)
 }
@@ -450,7 +463,7 @@ extension DedupConfiguration {
               decision.comparison == "score >= threshold",
               d.computeUnits == "cpuOnly", d.weightPrecision == "float32",
               d.resources.decodeConcurrency == 1, d.resources.photoRequestConcurrency == 1,
-              d.resources.maxDecodedBytes == 134217728, d.resources.requestTimeoutSeconds == 30,
+              d.resources.maxDecodedBytes == 536870912, d.resources.requestTimeoutSeconds == 30,
               d.resources.retryDelaysSeconds == [5, 15, 30, 60], d.resources.catalogBatchSize == 128,
               d.resources.maxInFlightTasks == 2, d.resources.progressPublishIntervalSeconds == 1,
               d.resources.inferenceConcurrency == 1, d.resources.batchSize == 1,

@@ -4,11 +4,11 @@
   "kind": "fixed_user_threshold_replay_of_existing_vectors",
   "threshold": 0.98,
   "thresholdBasis": "explicit_user_choice_not_independent_calibration",
-  "decisionSHA256": "5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
-  "integrationProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
+  "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+  "integrationProfileSHA256": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
   "replayProfileSHA256": "107e03d70e04494f96128a180e9dc56ebc6c428ddb42978055c141f9a1783637",
   "replayProfileDifference": [
-    "acceptanceID only; numerical/model/resources fields identical"
+    "Historical replay used the prior 128MiB resource allowance and prior acceptanceID; score/model/preprocessing/threshold/coverage fields are unchanged. No new replay or inference was performed for this 512MiB amendment."
   ],
   "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
   "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
@@ -1035,5 +1035,15 @@
       "actionPass": true,
       "pass": true
     }
-  ]
+  ],
+  "resourcePolicyAmendment": {
+    "maxDecodedBytes": 536870912,
+    "scoreEvidence": "reused_exact_existing_cases_scores_actions_and_vector_hashes_without_rerun",
+    "priorRegressionSHA256": "a61f1e9485a56e4d3bdad2505aa060960e15ccdf235002ccf49af40552e75724",
+    "priorDecisionSHA256": "5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
+    "priorProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
+    "priorSourceCommit": "1c77ef1d991f36d16ca0fcfde1d1b3cf73a92238",
+    "finalRealModelRegression": "pending_P9",
+    "independentCalibration": "not_performed"
+  }
 }
