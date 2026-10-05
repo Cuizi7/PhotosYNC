@@ -117,6 +117,10 @@ public actor PhotosIndexCoordinator {
                     guard !paused, !needsReconciliation, !reconciling else { break }
                     let expected = reconciledGeneration
                     let snapshot = try await photos.candidateSnapshot()
+                    // Snapshot acquisition suspends this actor. Admit no new
+                    // physical work if pause or reconciliation changed meanwhile.
+                    guard !paused, !needsReconciliation, !reconciling,
+                          reconciledGeneration == expected else { break }
                     guard snapshot.generation == expected else { needsReconciliation = true; acknowledgedGeneration = nil; break }
                     // An unstructured owned Task does not inherit later caller
                     // cancellation. Pause cannot cancel already-started consumers.

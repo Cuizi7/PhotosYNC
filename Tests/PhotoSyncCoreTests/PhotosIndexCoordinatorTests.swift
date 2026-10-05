@@ -121,6 +121,26 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await assertEqual(await f.photos.readCount, 1)
     }
 
+    func testPauseDuringPreReadSnapshotStartsNoPhysicalWork() async throws {
+        let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+        try await f.coordinator.reconcile()
+        let gate = CoordinatorGate(); await f.photos.gateSnapshot(1, using: gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered()
+        await f.coordinator.setPaused(true)
+        await gate.release(); await work.value
+        await assertEqual(await f.photos.readCount, 0)
+        await assertEqual(await f.model.count, 0)
+        let pending = try await f.store.nextRepresentationTasks(now: now, limit: 1)
+        XCTAssertEqual(pending.count, 1)
+        let progress = await f.coordinator.progress(); XCTAssertEqual(progress.state, .paused)
+        await f.coordinator.setPaused(false)
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 1)
+        await assertEqual(await f.model.count, 1)
+        try await assertNotNil(try await f.coordinator.readyToken())
+    }
+
     func testPauseAndRepeatedPollingDoNotDuplicateInFlightWork() async throws {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context, asset: "a"), descriptor(f.photos.context, asset: "b")])
         let gate = CoordinatorGate(); await f.model.setGate(gate)
