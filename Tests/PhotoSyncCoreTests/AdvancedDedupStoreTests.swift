@@ -5,6 +5,423 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testLocalRevisionChangesWithCandidateLifecycle() async throws {
+        let (root, _, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let generation = try await store.beginIndexReconciliation(context: .init(id: UUID(), epoch: 1), photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.finishIndexReconciliation(generation: generation)
+        let before = try await unwrap(try await store.indexPublication()).token.localRevision
+        try await store.disableSource(id: source)
+        let after = try await unwrap(try await store.indexPublication()).token.localRevision
+        XCTAssertGreaterThan(after, before, "Source retirement must invalidate prepared local evidence")
+    }
+
+    func testOnlyOlderPendingCanBeDependency() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        let b = try await prepared(store, source, root, "B.jpg")
+        try await publishEmpty(store)
+        let reverse = try await admission(store, a, candidate: b)
+        try await assertFalse(try await store.commitAdvancedSkip(reverse))
+        let forward = try await admission(store, b, candidate: a)
+        try await assertTrue(try await store.commitAdvancedSkip(forward))
+        try await assertEqual(try await store.state(of: a.fileID), .pending)
+        try await assertEqual(try await store.state(of: b.fileID), .skipped)
+        try await assertNil(try await store.successIdentifier(of: b.fileID))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
+    }
+
+    func testDisabledOrMissingCandidateReopensDependents() async throws {
+        for event in ["disable", "remove", "missing", "stamp", "skip"] {
+            let (root, db, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let source = try await store.registerSource(url: root)
+            let a = try await prepared(store, source, root, "A.jpg")
+            let b = try await prepared(store, source, root, "B.jpg")
+            try await publishEmpty(store)
+            try await assertTrue(try await store.commitAdvancedSkip(admission(store, b, candidate: a)))
+            switch event {
+            case "disable": try await store.disableSource(id: source)
+            case "remove": try await store.removeSource(id: source)
+            case "missing": try await assertTrue(try await store.removeConfirmedAbsentPending(fileID: a.fileID))
+            case "stamp": _ = try await store.recordSourceChange(fileID: a.fileID, stamp: .init(size: 20, modifiedNanoseconds: 30))
+            default: try await store.markSkipped(fileID: a.fileID, reason: .unsupportedFormat, candidates: [])
+            }
+            try await assertEqual(try await store.state(of: b.fileID), .pending)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 0)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM advanced_match_evidence", at: db), 1)
+        }
+    }
+
+    func testSuccessFingerprintSurvivesPhotosDeletionAndSourceRemoval() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let historyRoot = root.appendingPathComponent("history"), incomingRoot = root.appendingPathComponent("incoming")
+        try FileManager.default.createDirectory(at: historyRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: incomingRoot, withIntermediateDirectories: true)
+        let source = try await store.registerSource(url: historyRoot)
+        let incomingSource = try await store.registerSource(url: incomingRoot)
+        let incoming = try await prepared(store, incomingSource, incomingRoot, "older-incoming.jpg")
+        let a = try await prepared(store, source, historyRoot, "newer-success.jpg")
+        try await publishEmpty(store)
+        let attempt = UUID()
+        try await assertTrue(try await store.beginAdvancedAttempt(admission(store, a), attemptID: attempt))
+        try await store.removeSource(id: source)
+        try await store.invalidateIndexPublication()
+        // Three-argument recovery uses the immutable prepared attempt after restart/invalidation.
+        try await store.markImported(fileID: a.fileID, attemptID: attempt, identifier: "original-success")
+        _ = try await store.recordSourceChange(fileID: a.fileID, stamp: .init(size: 900, modifiedNanoseconds: 800))
+        // Observe the imported Photos representation, then remove it from the next
+        // complete inventory in the same library context.
+        let library = LibraryContext(id: UUID(), epoch: 1)
+        var generation = try await store.beginIndexReconciliation(context: library, photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([descriptor(library, asset: "original-success")], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await store.completeRepresentation(task, fingerprint: a.fingerprint))
+        try await store.finishIndexReconciliation(generation: generation)
+        try await assertEqual(try await store.indexPublication()?.entries.count, 1)
+        generation = try await store.beginIndexReconciliation(context: library, photosGeneration: 3, fingerprintVersion: "v1")
+        try await store.finishIndexReconciliation(generation: generation)
+        try await assertEqual(try await store.indexPublication()?.entries.count, 0)
+        let candidates = try await store.localVectorCandidates(beforeOrder: 1, excluding: incoming.fileID, version: "v1")
+        XCTAssertEqual(candidates.entries.map(\.key), ["file:\(a.fileID.uuidString)"])
+        XCTAssertEqual(candidates.entries.first?.origin, .successHistory)
+        XCTAssertEqual(candidates.entries.first?.size, a.size)
+        try await assertEqual(try await store.successIdentifier(of: a.fileID), "original-success")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose = 'success'", at: db), 1)
+        let publication = try await unwrap(try await store.indexPublication())
+        try await assertTrue(try await store.markIndexPublished(token: publication.token))
+        try await assertTrue(try await store.commitAdvancedSkip(admission(store, incoming, candidate: a, origin: .successHistory)))
+        try await assertNil(try await store.successIdentifier(of: incoming.fileID))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 0)
+    }
+
+    func testEvidenceFailureRollsBackSkipAndAttempt() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        let b = try await prepared(store, source, root, "B.jpg")
+        try await publishEmpty(store)
+        let skip = try await admission(store, b, candidate: a)
+        let start = try await admission(store, a)
+        try injectEngineSQL("CREATE TRIGGER reject_evidence BEFORE INSERT ON advanced_match_evidence BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;", at: db)
+        await XCTAssertThrowsErrorAsync(try await store.commitAdvancedSkip(skip))
+        await XCTAssertThrowsErrorAsync(try await store.beginAdvancedAttempt(start, attemptID: UUID()))
+        try await assertEqual(try await store.state(of: b.fileID), .pending)
+        try await assertEqual(try await store.state(of: a.fileID), .pending)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose = 'attempt'", at: db), 0)
+        try await assertTrue(try await store.indexIsReady(token: skip.evidence.token))
+    }
+
+    func testLocalRevisionChangeRejectsAdmission() async throws {
+        let (root, _, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        let b = try await prepared(store, source, root, "B.jpg")
+        try await publishEmpty(store)
+        let skip = try await admission(store, b, candidate: a)
+        try await store.beginAttempt(fileID: a.fileID, attemptID: UUID())
+        try await assertFalse(try await store.commitAdvancedSkip(skip))
+        let importing = try await admission(store, b, candidate: a, origin: .localImporting)
+        try await assertTrue(try await store.commitAdvancedSkip(importing))
+        try await assertFalse(try await store.removeConfirmedAbsentPending(fileID: a.fileID))
+        try await assertEqual(try await store.state(of: b.fileID), .skipped)
+    }
+
+    func testConservativeAdmissionCreatesEvidenceWithoutFingerprint() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "animated.gif", cache: false)
+        try await publishEmpty(store)
+        let token = try await unwrap(try await store.indexReadiness()).token
+        let evidence = AdvancedEvidence(eventID: UUID(), fileID: a.fileID, stamp: a.file.stamp, token: token,
+            policyVersion: "policy", evaluation: .init(content: .notCompared, action: .importFile,
+            reason: .nonComparableSource, matchedKeys: [], coveringKeys: []), decisiveCandidates: [], diagnostics: [], timingsMS: [:])
+        let conservative = ConservativeSourceAdmission(fileID: a.fileID, file: a.file, reason: .multiFrameOrCompound,
+            evidence: evidence, validity: AlwaysValidPhotosCandidateValidity())
+        let attempt = UUID()
+        try await assertTrue(try await store.beginAdvancedAttempt(conservative, attemptID: attempt))
+        try await assertTrue(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+        let afterOwnWrite = try await unwrap(try await store.indexReadiness()).token.localRevision
+        XCTAssertEqual(afterOwnWrite, evidence.token.localRevision + 1)
+        _ = try await prepared(store, source, root, "other.jpg", cache: false)
+        try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+        try await store.markImported(fileID: a.fileID, attemptID: attempt, identifier: "animated", sourceFingerprint: a)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM advanced_match_evidence", at: db), 1)
+    }
+
+    func testUnknownAttemptRetainsImmutableFingerprintUntilSuccess() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        try await publishEmpty(store)
+        let attempt = UUID()
+        try await assertTrue(try await store.beginAdvancedAttempt(admission(store, a), attemptID: attempt))
+        try await store.recordRetry(fileID: a.fileID, attemptID: attempt, nextRetry: Date(), error: "unknown", definitelyNotCommitted: false)
+        try await assertFalse(try await store.removeConfirmedAbsentPending(fileID: a.fileID))
+        try await assertFalse(try await store.recordSourceChange(fileID: a.fileID, stamp: .init(size: 2, modifiedNanoseconds: 3)))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose = 'attempt'", at: db), 1)
+        // A caller carrying a different image cannot overwrite the frozen submitted facts.
+        let replacement = PreparedSource(fileID: a.fileID, file: a.file,
+            fingerprint: try Fingerprint(version: "v1", values: [0, 1] + Array(repeating: 0, count: 1022)), size: try PixelSize(width: 1, height: 1))
+        try await store.markImported(fileID: a.fileID, attemptID: attempt, identifier: "success", sourceFingerprint: replacement)
+        let history = try await store.localVectorCandidates(beforeOrder: 0, excluding: UUID(), version: "v1")
+        XCTAssertEqual(history.entries.first?.fingerprint, a.fingerprint)
+        XCTAssertEqual(history.entries.first?.size, a.size)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose = 'attempt'", at: db), 0)
+        await XCTAssertThrowsErrorAsync(try await store.markSkipped(fileID: a.fileID, reason: .suspectedDuplicate, candidates: []))
+        await XCTAssertThrowsErrorAsync(try await store.recordRetry(fileID: a.fileID, attemptID: attempt, nextRetry: Date(), error: "late failure", definitelyNotCommitted: true))
+        try await assertEqual(try await store.successIdentifier(of: a.fileID), "success")
+    }
+
+    func testDefiniteRetriesBoundAttemptFactsAndAbsenceDeletesObsoleteEvidence() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        try await publishEmpty(store)
+        for _ in 0..<3 {
+            let attempt = UUID()
+            try await assertTrue(try await store.beginAdvancedAttempt(admission(store, a), attemptID: attempt))
+            try await store.recordRetry(fileID: a.fileID, attemptID: attempt, nextRetry: Date(), error: "definite", definitelyNotCommitted: true)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose = 'attempt'", at: db), 0)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM advanced_match_evidence", at: db), 1)
+        }
+        try await assertTrue(try await store.removeConfirmedAbsentPending(fileID: a.fileID))
+        try await assertNil(try await store.file(sourceID: source, relativePath: "A.jpg"))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM advanced_match_evidence", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 0)
+    }
+
+    func testPhotosValidityAndChangedStampRejectWithoutWriting() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        try await publishEmpty(store)
+        let prepared = try await admission(store, a)
+        let stale = AdvancedAdmission(source: a, evidence: prepared.evidence, validity: P5InvalidValidity())
+        try await assertFalse(try await store.beginAdvancedAttempt(stale, attemptID: UUID()))
+        _ = try await store.recordSourceChange(fileID: a.fileID, stamp: .init(size: 99, modifiedNanoseconds: 100))
+        try await assertFalse(try await store.beginAdvancedAttempt(prepared, attemptID: UUID()))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM advanced_match_evidence", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose = 'attempt'", at: db), 0)
+    }
+
+    func testPhotosCoveringCandidateValidatedInTransaction() async throws {
+        let (root, _, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([descriptor(context, asset: "asset:é")], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await store.completeRepresentation(task, fingerprint: a.fingerprint))
+        try await store.finishIndexReconciliation(generation: generation)
+        let publication = try await unwrap(try await store.indexPublication())
+        try await assertTrue(try await store.markIndexPublished(token: publication.token))
+        let candidate = ScoredCandidate(key: "photos:8:asset:é:original", origin: .photosOriginal, score: 1, size: a.size, fingerprintVersion: "v1")
+        let evidence = AdvancedEvidence(eventID: UUID(), fileID: a.fileID, stamp: a.file.stamp, token: publication.token,
+            policyVersion: "policy", evaluation: .init(content: .duplicate, action: .skip, reason: .covered,
+            matchedKeys: [candidate.key], coveringKeys: [candidate.key]), decisiveCandidates: [candidate], diagnostics: [], timingsMS: [:])
+        let valid = AdvancedAdmission(source: a, evidence: evidence, validity: AlwaysValidPhotosCandidateValidity())
+        try await assertTrue(try await store.commitAdvancedSkip(valid))
+    }
+
+    func testEarlierUnreleasedV4MigrationPreservesFingerprintFactsAndRollsBackFailure() async throws {
+        for fail in [false, true] {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let db = root.appendingPathComponent("old-v4.sqlite")
+            let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            var sql = try String(contentsOf: repository.appendingPathComponent("Sources/PhotoSyncCore/Storage/Schema.sql"), encoding: .utf8)
+            sql = sql.replacingOccurrences(of: "'current','success','attempt'", with: "'current','success'")
+                .replacingOccurrences(of: " attempt_id TEXT NOT NULL DEFAULT '',\n", with: "")
+                .replacingOccurrences(of: "PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose, attempt_id),\n CHECK((purpose = 'attempt' AND attempt_id <> '') OR (purpose <> 'attempt' AND attempt_id = ''))", with: "PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose)")
+                .replacingOccurrences(of: "CREATE INDEX advanced_evidence_file ON advanced_match_evidence(file_id);", with: "")
+            try injectEngineSQL(sql + "PRAGMA user_version = 4;", at: db)
+            // Fixtures are opaque historical records, never source paths to scan.
+            try injectEngineSQL("""
+                INSERT INTO source (id, path, enabled) VALUES ('source', '/fixture-only', 0);
+                INSERT INTO file_record (id, created_order, source_id, relative_path, filename, size, modified_ns, metadata_json, state, rule_version, success_id) VALUES ('file', 1, 'source', 'a.jpg', 'a.jpg', 1, 2, '{}', 'imported', 1, 'success');
+                INSERT INTO file_fingerprint VALUES ('file', 1, 2, 'v1', 'current', 640, 480, zeroblob(4096)), ('file', 1, 2, 'v1', 'success', 640, 480, zeroblob(4096));
+                """, at: db)
+            if fail {
+                // Force the final index creation to fail after table replacement/copy.
+                try injectEngineSQL("CREATE TABLE advanced_evidence_file (id INTEGER);", at: db)
+                XCTAssertThrowsError(try SyncStore(url: db))
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('file_fingerprint') WHERE name = 'attempt_id'", at: db), 0)
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE name = 'old_file_fingerprint'", at: db), 0)
+            } else {
+                let migrated = try SyncStore(url: db)
+                withExtendedLifetime(migrated) {}
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE attempt_id = ''", at: db), 2)
+            }
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 2)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 4)
+        }
+    }
+
+    func testEveryCandidateQualificationMutationRejectsPreparedAdmission() async throws {
+        for event in ["save", "disable", "enable", "remove", "restore", "begin", "retry", "skip", "stamp", "missing", "success"] {
+            let (root, _, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let left = root.appendingPathComponent("left"), right = root.appendingPathComponent("right")
+            try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: right, withIntermediateDirectories: true)
+            let candidateSource = try await store.registerSource(url: left)
+            let incomingSource = try await store.registerSource(url: right)
+            let a = try await prepared(store, candidateSource, left, "A.jpg")
+            let b = try await prepared(store, incomingSource, right, "B.jpg")
+            let attempt = UUID()
+            if event == "enable" { try await store.disableSource(id: candidateSource) }
+            if event == "restore" { try await store.removeSource(id: candidateSource) }
+            if event == "retry" || event == "success" { try await store.beginAttempt(fileID: a.fileID, attemptID: attempt) }
+            try await publishEmpty(store)
+            let old = try await admission(store, b)
+            switch event {
+            case "save": _ = try await prepared(store, candidateSource, left, "C.jpg", cache: false)
+            case "disable": try await store.disableSource(id: candidateSource)
+            case "enable", "restore": _ = try await store.registerSource(url: left)
+            case "remove": try await store.removeSource(id: candidateSource)
+            case "begin": try await store.beginAttempt(fileID: a.fileID, attemptID: attempt)
+            case "retry": try await store.recordRetry(fileID: a.fileID, attemptID: attempt, nextRetry: Date(), error: "definite", definitelyNotCommitted: true)
+            case "skip": try await store.markSkipped(fileID: a.fileID, reason: .unsupportedFormat, candidates: [])
+            case "stamp": _ = try await store.recordSourceChange(fileID: a.fileID, stamp: .init(size: 100, modifiedNanoseconds: 200))
+            case "missing": _ = try await store.removeConfirmedAbsentPending(fileID: a.fileID)
+            default: try await store.markImported(fileID: a.fileID, attemptID: attempt, identifier: "success", sourceFingerprint: a)
+            }
+            let current = try await unwrap(try await store.indexReadiness()).token
+            XCTAssertGreaterThan(current.localRevision, old.evidence.token.localRevision, event)
+            try await assertFalse(try await store.beginAdvancedAttempt(old, attemptID: UUID()))
+            try await assertEqual(try await store.state(of: b.fileID), .pending)
+        }
+    }
+
+    func testSuccessResolvesDependencyWithoutReopeningOrRequiringCurrentSource() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        let b = try await prepared(store, source, root, "B.jpg")
+        try await publishEmpty(store)
+        let attempt = UUID()
+        let incoming = try await admission(store, a)
+        let gate = P5BeforeTransactionValidity(database: db)
+        try await assertTrue(try await store.beginAdvancedAttempt(.init(source: a, evidence: incoming.evidence, validity: gate), attemptID: attempt))
+        try await assertTrue(try await store.commitAdvancedSkip(admission(store, b, candidate: a, origin: .localImporting)))
+        try await store.markImported(fileID: a.fileID, attemptID: attempt, identifier: "success")
+        try await store.removeSource(id: source)
+        try await assertEqual(try await store.state(of: b.fileID), .skipped)
+        try await assertNil(try await store.successIdentifier(of: b.fileID))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 0)
+    }
+
+    func testAdvancedDecisionReplacesSupersededLegacyDependencyEvidence() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let old = try await prepared(store, source, root, "old.jpg")
+        let current = try await prepared(store, source, root, "current.jpg")
+        let b = try await prepared(store, source, root, "incoming.jpg")
+        try await store.markSkipped(fileID: b.fileID, reason: .suspectedDuplicate,
+            candidates: [.init(key: "file:\(old.fileID.uuidString)", metadata: old.file.metadata)])
+        // A legacy recheck reopened this unsubmitted file; its old evidence still
+        // describes the previous decision until the new transaction replaces it.
+        try injectEngineSQL("UPDATE file_record SET state = 'pending', skip_reason = NULL WHERE id = '\(b.fileID.uuidString)';", at: db)
+        try await publishEmpty(store)
+        try await assertTrue(try await store.commitAdvancedSkip(admission(store, b, candidate: current)))
+        try await assertTrue(try await store.removeConfirmedAbsentPending(fileID: old.fileID))
+        try await assertEqual(try await store.state(of: b.fileID), .skipped)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM match_evidence", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
+    }
+
+    func testAdvancedAttemptReceiptAcceptsOnlyItsOwnRevisionIncrement() async throws {
+        let (root, _, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let left = root.appendingPathComponent("left"), right = root.appendingPathComponent("right")
+        try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: right, withIntermediateDirectories: true)
+        let source = try await store.registerSource(url: left)
+        let otherSource = try await store.registerSource(url: right)
+        let a = try await prepared(store, source, left, "A.jpg")
+        _ = try await prepared(store, otherSource, right, "other.jpg")
+        try await publishEmpty(store)
+        let admission = try await admission(store, a)
+        let attempt = UUID()
+        try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+        try await assertTrue(try await store.beginAdvancedAttempt(admission, attemptID: attempt))
+        try await assertTrue(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+        try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: UUID()))
+        let afterOwnWrite = try await unwrap(try await store.indexReadiness()).token.localRevision
+        XCTAssertEqual(afterOwnWrite, admission.evidence.token.localRevision + 1)
+        // Even a different source's eligibility change invalidates the scored view.
+        try await store.disableSource(id: otherSource)
+        try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+    }
+
+    func testAdvancedAttemptReceiptRejectsOverflowAndIndexInvalidation() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let a = try await prepared(store, source, root, "A.jpg")
+        try await publishEmpty(store)
+        let admission = try await admission(store, a)
+        let attempt = UUID()
+        try await assertTrue(try await store.beginAdvancedAttempt(admission, attemptID: attempt))
+        try await store.invalidateIndexPublication()
+        try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+        let publication = try await unwrap(try await store.indexPublication())
+        try await assertTrue(try await store.markIndexPublished(token: publication.token))
+        try await assertTrue(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+        var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(admission.evidence.token)) as! [String: Any]
+        json["localRevision"] = Int64.max
+        let corruptToken = String(decoding: try JSONSerialization.data(withJSONObject: json), as: UTF8.self)
+        try injectEngineSQL("UPDATE advanced_match_evidence SET token_json = '\(corruptToken)' WHERE file_id = '\(a.fileID.uuidString)';", at: db)
+        try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
+    }
+
+    private func prepared(_ store: SyncStore, _ source: UUID, _ root: URL, _ path: String, cache: Bool = true) async throws -> PreparedSource {
+        let file = SourceFile(sourceID: source, relativePath: path, url: root.appendingPathComponent(path),
+            stamp: .init(size: 10, modifiedNanoseconds: 12), metadata: .init(filename: path, kind: .image,
+                captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: 640, height: 480, duration: nil))
+        let id = try await store.save(file, decision: .importNew)
+        let result = PreparedSource(fileID: id, file: file, fingerprint: try fingerprint("v1"), size: try PixelSize(width: 640, height: 480))
+        if cache { _ = try await store.cacheFingerprint(result) }
+        return result
+    }
+
+    private func publishEmpty(_ store: SyncStore) async throws {
+        let generation = try await store.beginIndexReconciliation(context: .init(id: UUID(), epoch: 1), photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.finishIndexReconciliation(generation: generation)
+        let publication = try await unwrap(try await store.indexPublication())
+        try await assertTrue(try await store.markIndexPublished(token: publication.token))
+    }
+
+    private func admission(_ store: SyncStore, _ source: PreparedSource, candidate: PreparedSource? = nil,
+                           origin: CandidateOrigin = .localPending) async throws -> AdvancedAdmission {
+        let token = try await unwrap(try await store.indexReadiness()).token
+        let key = candidate.map { "file:\($0.fileID.uuidString)" }
+        let evidence = AdvancedEvidence(eventID: UUID(), fileID: source.fileID, stamp: source.file.stamp, token: token,
+            policyVersion: "policy", evaluation: .init(content: candidate == nil ? .notDuplicate : .duplicate,
+            action: candidate == nil ? .importFile : .skip, reason: candidate == nil ? .noMatch : .covered,
+            matchedKeys: key.map { [$0] } ?? [], coveringKeys: key.map { [$0] } ?? []),
+            decisiveCandidates: candidate.map { [.init(key: key!, origin: origin, score: 1, size: $0.size, fingerprintVersion: "v1")] } ?? [],
+            diagnostics: [], timingsMS: [:])
+        return AdvancedAdmission(source: source, evidence: evidence, validity: AlwaysValidPhotosCandidateValidity())
+    }
+
     func testV3MigrationPreservesSuccessAndUnknown() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -409,5 +826,20 @@ final class AdvancedDedupStoreTests: XCTestCase {
             $0["decisionSHA256"] = decisionHash; $0["profileSHA256"] = profileHash; $0["acceptanceID"] = "user-decision:" + decisionHash
             var r = $0["regression"] as! [String: Any]; r["sha256"] = regressionHash; $0["regression"] = r
         }
+    }
+}
+
+private struct P5InvalidValidity: PhotosCandidateValidity {
+    func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool { false }
+}
+
+private struct P5BeforeTransactionValidity: PhotosCandidateValidity {
+    let database: URL
+    func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
+        // A second connection can acquire the write lock before the gate enters the
+        // store closure. Acquiring BEGIN before this gate would fail with SQLITE_BUSY.
+        try injectEngineSQL("BEGIN IMMEDIATE; COMMIT;", at: database)
+        try commit()
+        return true
     }
 }

@@ -61,15 +61,18 @@ CREATE TABLE fingerprint_task (
 CREATE INDEX fingerprint_task_due ON fingerprint_task(generation, next_retry_at);
 CREATE TABLE file_fingerprint (
  file_id TEXT NOT NULL REFERENCES file_record(id), size INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
- fingerprint_version TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('current','success')),
+ fingerprint_version TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('current','success','attempt')),
  width INTEGER, height INTEGER, vector BLOB NOT NULL CHECK(length(vector) = 4096),
- PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose)
+ attempt_id TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose, attempt_id),
+ CHECK((purpose = 'attempt' AND attempt_id <> '') OR (purpose <> 'attempt' AND attempt_id = ''))
 );
 CREATE TABLE advanced_match_evidence (
  event_id TEXT PRIMARY KEY, file_id TEXT NOT NULL REFERENCES file_record(id),
  size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, token_json TEXT NOT NULL,
  policy_version TEXT NOT NULL, action TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at REAL NOT NULL
 );
+CREATE INDEX advanced_evidence_file ON advanced_match_evidence(file_id);
 CREATE TABLE dedup_dependency (
  file_id TEXT NOT NULL REFERENCES file_record(id), candidate_file_id TEXT NOT NULL REFERENCES file_record(id),
  candidate_revision TEXT NOT NULL, PRIMARY KEY(file_id, candidate_file_id), CHECK(file_id <> candidate_file_id)

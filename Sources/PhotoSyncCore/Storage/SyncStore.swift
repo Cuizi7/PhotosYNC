@@ -113,13 +113,13 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     public func disableSource(id: UUID) async throws {
-        try await perform { try self.requireChange("UPDATE source SET enabled = 0 WHERE id = ? AND removed = 0", [.text(id.uuidString)]) }
+        try await perform { try self.transaction { try self.retireSourceSync(id: id, removed: false) } }
     }
 
     /// Removes a source from configuration while retaining its file and submission history.
     /// Existing callbacks can still resolve the source by ID for durable audit records.
     public func removeSource(id: UUID) async throws {
-        try await perform { try self.requireChange("UPDATE source SET enabled = 0, removed = 1 WHERE id = ? AND removed = 0", [.text(id.uuidString)]) }
+        try await perform { try self.transaction { try self.retireSourceSync(id: id, removed: true) } }
     }
 
     public func sources() async throws -> [RegisteredSource] {
@@ -153,6 +153,7 @@ public final class SyncStore: @unchecked Sendable {
                     INSERT INTO file_record (id, created_order, source_id, relative_path, filename, size, modified_ns, metadata_json, state, rule_version)
                     VALUES (?, (SELECT COALESCE(MAX(created_order), 0) + 1 FROM file_record), ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """, [.text(id.uuidString), .text(file.sourceID.uuidString), .text(file.relativePath), .text(file.metadata.filename), .int64(file.stamp.size), .int64(file.stamp.modifiedNanoseconds), .text(metadata), .int64(Int64(self.ruleVersion))])
+                try self.bumpLocalRevision()
                 if case .skip(let keys) = decision {
                     guard Set(keys) == Set(candidates.map(\.key)), keys.count == candidates.count else {
                         throw SyncStoreError.invalidTransition("Skipped files require the complete compared candidate snapshots.")
@@ -183,6 +184,7 @@ public final class SyncStore: @unchecked Sendable {
                     INSERT INTO file_record (id, created_order, source_id, relative_path, filename, size, modified_ns, metadata_json, state, rule_version)
                     VALUES (?, (SELECT COALESCE(MAX(created_order), 0) + 1 FROM file_record), ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """, [.text(id.uuidString), .text(file.sourceID.uuidString), .text(file.relativePath), .text(file.metadata.filename), .int64(file.stamp.size), .int64(file.stamp.modifiedNanoseconds), .text(metadata), .int64(Int64(self.ruleVersion))])
+                try self.bumpLocalRevision()
                 if case .skip(let keys) = decision {
                     guard Set(keys) == Set(candidates.map(\.key)), keys.count == candidates.count else {
                         throw SyncStoreError.invalidTransition("Skipped files require the complete compared candidate snapshots.")
@@ -224,7 +226,7 @@ public final class SyncStore: @unchecked Sendable {
     public func removeConfirmedAbsentPending(fileID: UUID) async throws -> Bool {
         try await perform {
             try self.transaction {
-                guard let row = try self.one("SELECT state, submitted_at, definitely_not_committed FROM file_record WHERE id = ?",
+                guard let row = try self.one("SELECT state, submitted_at, definitely_not_committed FROM file_record WHERE id = ? AND success_id IS NULL",
                                              [.text(fileID.uuidString)]),
                       try self.fileState(row[0]) == .pending else {
                     return false
@@ -248,7 +250,12 @@ public final class SyncStore: @unchecked Sendable {
                         """, [.text(id), .text(SkipReason.suspectedDuplicate.rawValue)])
                     try self.execute("DELETE FROM match_evidence WHERE file_id = ?", [.text(id)])
                 }
+                try self.reopenDependents(candidateID: fileID)
+                try self.execute("DELETE FROM dedup_dependency WHERE file_id = ?", [.text(fileID.uuidString)])
+                try self.execute("DELETE FROM advanced_match_evidence WHERE file_id = ?", [.text(fileID.uuidString)])
+                try self.execute("DELETE FROM file_fingerprint WHERE file_id = ?", [.text(fileID.uuidString)])
                 try self.execute("DELETE FROM match_evidence WHERE file_id = ?", [.text(fileID.uuidString)])
+                try self.bumpLocalRevision()
                 try self.requireChange("DELETE FROM file_record WHERE id = ? AND state = 'pending'", [.text(fileID.uuidString)])
                 return true
             }
@@ -263,9 +270,10 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     public func beginAttempt(fileID: UUID, attemptID: UUID) async throws {
-        try await perform {
-            try self.requireChange("UPDATE file_record SET state = 'importing', attempt_id = ?, placeholder_id = NULL, submitted_at = ?, definitely_not_committed = 0, last_error = NULL WHERE id = ? AND state = 'pending'", [.text(attemptID.uuidString), .double(Date().timeIntervalSince1970), .text(fileID.uuidString)])
-        }
+        try await perform { try self.transaction {
+            try self.beginAttemptSync(fileID: fileID, attemptID: attemptID)
+            try self.bumpLocalRevision()
+        } }
     }
 
     public func checkpointPlaceholder(fileID: UUID, attemptID: UUID, identifier: String) throws {
@@ -275,9 +283,34 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     public func markImported(fileID: UUID, attemptID: UUID, identifier: String) async throws {
-        try await perform {
+        try await markImported(fileID: fileID, attemptID: attemptID, identifier: identifier, sourceFingerprint: nil)
+    }
+
+    public func markImported(fileID: UUID, attemptID: UUID, identifier: String, sourceFingerprint: PreparedSource?) async throws {
+        try await perform { try self.transaction {
+            guard let record = try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.id = ?", [.text(fileID.uuidString)]),
+                  record.state == .importing, record.attemptID == attemptID, record.successID == nil else {
+                throw SyncStoreError.invalidTransition("Success must resolve the active attempt.")
+            }
+            // An immutable attempt wins over a later caller/cache value. Never consult
+            // Photos/index readiness here: the successful callback is durable evidence.
+            let attempt = try self.one("SELECT 1 FROM file_fingerprint WHERE file_id = ? AND purpose = 'attempt' AND attempt_id = ?", [.text(fileID.uuidString), .text(attemptID.uuidString)])
+            if attempt != nil {
+                try self.execute("INSERT INTO file_fingerprint (file_id, size, modified_ns, fingerprint_version, purpose, attempt_id, width, height, vector) SELECT file_id, size, modified_ns, fingerprint_version, 'success', '', width, height, vector FROM file_fingerprint WHERE file_id = ? AND purpose = 'attempt' AND attempt_id = ?", [.text(fileID.uuidString), .text(attemptID.uuidString)])
+            } else if try self.one("SELECT 1 FROM advanced_match_evidence WHERE file_id = ?", [.text(fileID.uuidString)]) == nil,
+                      let sourceFingerprint, record.file.metadata.kind == .image,
+                      sourceFingerprint.fileID == fileID, sourceFingerprint.file.sourceID == record.file.sourceID,
+                      sourceFingerprint.file.relativePath == record.file.relativePath, sourceFingerprint.file.stamp == record.file.stamp,
+                      sourceFingerprint.file.metadata == record.file.metadata {
+                // Only legacy attempts accept this fallback. An advanced admission without
+                // an attempt vector is conservative and must never acquire one at success.
+                try self.writeFingerprint(sourceFingerprint, purpose: "success")
+            }
             try self.requireChange("UPDATE file_record SET state = 'imported', success_id = ?, success_metadata_json = metadata_json, succeeded_at = ?, attempt_id = NULL, placeholder_id = NULL, retry_count = 0, next_retry_at = NULL, last_error = NULL WHERE id = ? AND state = 'importing' AND attempt_id = ?", [.text(identifier), .double(Date().timeIntervalSince1970), .text(fileID.uuidString), .text(attemptID.uuidString)])
-        }
+            try self.execute("DELETE FROM file_fingerprint WHERE file_id = ? AND purpose = 'attempt'", [.text(fileID.uuidString)])
+            try self.execute("DELETE FROM dedup_dependency WHERE candidate_file_id = ?", [.text(fileID.uuidString)])
+            try self.bumpLocalRevision()
+        } }
     }
 
     @discardableResult
@@ -291,6 +324,9 @@ public final class SyncStore: @unchecked Sendable {
                     return false
                 }
                 try self.requireChange("UPDATE file_record SET size = ?, modified_ns = ?, state = 'skipped', skip_reason = ?, attempt_id = NULL, placeholder_id = NULL WHERE id = ? AND state <> 'importing'", [.int64(stamp.size), .int64(stamp.modifiedNanoseconds), .text(SkipReason.sourceChanged.rawValue), .text(fileID.uuidString)])
+                try self.reopenDependents(candidateID: fileID)
+                try self.execute("DELETE FROM dedup_dependency WHERE file_id = ?", [.text(fileID.uuidString)])
+                try self.bumpLocalRevision()
                 return true
             }
         }
@@ -477,6 +513,194 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    public func commitAdvancedSkip(_ admission: AdvancedAdmission) async throws -> Bool {
+        guard admission.evidence.evaluation.action == .skip else { return false }
+        return try await commitAdvanced(fileID: admission.source.fileID, file: admission.source.file,
+            evidence: admission.evidence, validity: admission.validity, prepared: admission.source, attemptID: nil)
+    }
+
+    public func beginAdvancedAttempt(_ admission: AdvancedAdmission, attemptID: UUID) async throws -> Bool {
+        guard admission.evidence.evaluation.action == .importFile else { return false }
+        return try await commitAdvanced(fileID: admission.source.fileID, file: admission.source.file,
+            evidence: admission.evidence, validity: admission.validity, prepared: admission.source, attemptID: attemptID)
+    }
+
+    public func beginAdvancedAttempt(_ admission: ConservativeSourceAdmission, attemptID: UUID) async throws -> Bool {
+        let evaluation = admission.evidence.evaluation
+        guard evaluation.action == .importFile, evaluation.content == .notCompared,
+              evaluation.reason == .nonComparableSource, evaluation.matchedKeys.isEmpty,
+              evaluation.coveringKeys.isEmpty, admission.evidence.decisiveCandidates.isEmpty,
+              admission.evidence.diagnostics.isEmpty else { return false }
+        return try await commitAdvanced(fileID: admission.fileID, file: admission.file,
+            evidence: admission.evidence, validity: admission.validity, prepared: nil, attemptID: attemptID)
+    }
+
+    /// Checks only the store/index portion of the post-attempt receipt. Admission
+    /// saves pre-attempt revision R and advances it EXACTLY ONCE to R+1 in the same
+    /// transaction. Never adopt an observed newer revision here: another write is
+    /// new evidence that was not scored. P6 must still guard pause/source/stamp and
+    /// Photos validity at physical create, including any intervening await.
+    public func advancedAttemptIsCurrent(fileID: UUID, attemptID: UUID) async throws -> Bool {
+        try await perform { try self.transaction {
+            guard let receipt = try self.one("""
+                SELECT e.token_json, e.size, e.modified_ns, f.size, f.modified_ns
+                FROM file_record f JOIN source s ON s.id = f.source_id
+                JOIN advanced_match_evidence e ON e.file_id = f.id
+                WHERE f.id = ? AND f.attempt_id = ? AND f.state = 'importing'
+                    AND f.success_id IS NULL AND s.enabled = 1 AND s.removed = 0 AND e.action = 'importFile'
+                """, [.text(fileID.uuidString), .text(attemptID.uuidString)]),
+                  try self.int64(receipt[1]) == self.int64(receipt[3]),
+                  try self.int64(receipt[2]) == self.int64(receipt[4]) else { return false }
+            let original = try self.decode(IndexToken.self, from: self.text(receipt[0]))
+            let (revision, overflow) = original.localRevision.addingReportingOverflow(1)
+            guard !overflow else { return false }
+            let expected = IndexToken(context: original.context, photosGeneration: original.photosGeneration,
+                indexGeneration: original.indexGeneration, localRevision: revision, fingerprintVersion: original.fingerprintVersion)
+            guard let state = try self.indexStateRow(), try self.indexToken(state) == expected,
+                  self.optionalInteger(state[3]) == expected.indexGeneration,
+                  let published = self.publishedIndexToken, self.samePhotosIndex(published, expected) else { return false }
+            return try self.indexFactsComplete(state)
+        } }
+    }
+
+    private enum AdmissionFailure: Error { case stale }
+
+    /// The Photos gate is acquired before BEGIN and held through COMMIT. All work is
+    /// synchronous on the existing SQLite queue; no Photos I/O occurs under the lock.
+    private func commitAdvanced(fileID: UUID, file: SourceFile, evidence: AdvancedEvidence,
+                                validity: any PhotosCandidateValidity, prepared: PreparedSource?, attemptID: UUID?) async throws -> Bool {
+        try await perform {
+            do {
+                return try validity.commitIfCurrent {
+                    try self.transaction {
+                        guard evidence.fileID == fileID, evidence.stamp == file.stamp, file.metadata.kind == .image,
+                              let state = try self.indexStateRow(), try self.indexToken(state) == evidence.token,
+                              self.optionalInteger(state[3]) == evidence.token.indexGeneration,
+                              let published = self.publishedIndexToken, self.samePhotosIndex(published, evidence.token),
+                              try self.indexFactsComplete(state),
+                              let record = try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.id = ? AND source.enabled = 1 AND source.removed = 0 AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(fileID.uuidString)]),
+                              record.state == .pending, record.successID == nil, record.file.sourceID == file.sourceID,
+                              record.file.relativePath == file.relativePath, record.file.stamp == file.stamp,
+                              record.file.metadata == file.metadata,
+                              evidence.evaluation.matchedKeys == evidence.decisiveCandidates.map(\.key),
+                              evidence.evaluation.coveringKeys.allSatisfy({ evidence.evaluation.matchedKeys.contains($0) }) else {
+                            throw AdmissionFailure.stale
+                        }
+                        if let prepared {
+                            guard prepared.fingerprint.version == evidence.token.fingerprintVersion,
+                                  evidence.evaluation.content != .notCompared else { throw AdmissionFailure.stale }
+                        }
+                        for candidate in evidence.decisiveCandidates {
+                            guard try self.advancedCandidateIsCurrent(candidate, incoming: record, token: evidence.token) else {
+                                throw AdmissionFailure.stale
+                            }
+                        }
+                        // Replace the previous decision's relationships together with its
+                        // state/evidence, including legacy evidence left by a recheck.
+                        try self.execute("DELETE FROM match_evidence WHERE file_id = ?", [.text(fileID.uuidString)])
+                        try self.execute("DELETE FROM dedup_dependency WHERE file_id = ?", [.text(fileID.uuidString)])
+                        if attemptID == nil {
+                            guard let candidate = evidence.decisiveCandidates.first,
+                                  evidence.evaluation.content == .duplicate, evidence.evaluation.reason == .covered,
+                                  evidence.evaluation.coveringKeys == [candidate.key],
+                                  let sourceSize = prepared?.size, let size = candidate.size,
+                                  min(size.width, size.height) >= min(sourceSize.width, sourceSize.height),
+                                  max(size.width, size.height) >= max(sourceSize.width, sourceSize.height) else { throw AdmissionFailure.stale }
+                            try self.requireChange("UPDATE file_record SET state = 'skipped', skip_reason = ?, attempt_id = NULL, placeholder_id = NULL WHERE id = ? AND state = 'pending'", [.text(SkipReason.suspectedDuplicate.rawValue), .text(fileID.uuidString)])
+                            try self.reopenDependents(candidateID: fileID)
+                            if candidate.origin == .localPending || candidate.origin == .localImporting {
+                                let candidateID = String(candidate.key.dropFirst(5))
+                                try self.execute("INSERT INTO dedup_dependency (file_id, candidate_file_id, candidate_revision) VALUES (?, ?, ?)",
+                                    [.text(fileID.uuidString), .text(candidateID), .text(try self.encode(evidence.token))])
+                            }
+                        } else if let attemptID {
+                            try self.beginAttemptSync(fileID: fileID, attemptID: attemptID)
+                            if let prepared { try self.writeFingerprint(prepared, purpose: "attempt", attemptID: attemptID.uuidString) }
+                        }
+                        try self.execute("DELETE FROM advanced_match_evidence WHERE file_id = ?", [.text(fileID.uuidString)])
+                        try self.execute("INSERT INTO advanced_match_evidence (event_id, file_id, size, modified_ns, token_json, policy_version, action, evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [.text(evidence.eventID.uuidString), .text(fileID.uuidString), .int64(file.stamp.size), .int64(file.stamp.modifiedNanoseconds),
+                             .text(try self.encode(evidence.token)), .text(evidence.policyVersion), .text(evidence.evaluation.action.rawValue),
+                             .text(try self.encode(evidence)), .double(Date().timeIntervalSince1970)])
+                        // EXACTLY ONE increment: advancedAttemptIsCurrent derives the
+                        // immutable post-attempt receipt as evidence.token.R + 1.
+                        try self.bumpLocalRevision()
+                    }
+                }
+            } catch AdmissionFailure.stale { return false }
+        }
+    }
+
+    private func advancedCandidateIsCurrent(_ candidate: ScoredCandidate, incoming: StoredFile, token: IndexToken) throws -> Bool {
+        guard candidate.fingerprintVersion == token.fingerprintVersion, candidate.score.isFinite else { return false }
+        let row: [Value]?
+        switch candidate.origin {
+        case .photosOriginal, .photosCurrent:
+            let kind = candidate.origin == .photosOriginal ? "original" : "current"
+            row = try one("""
+                SELECT width, height FROM photos_representation WHERE context_id = ? AND context_epoch = ?
+                AND seen_generation = ? AND tombstoned = 0 AND state = 'ready' AND vector IS NOT NULL
+                AND fingerprint_version = ? AND kind = ?
+                AND ('photos:' || length(CAST(asset_id AS BLOB)) || ':' || asset_id || ':' || kind) = ?
+                """, [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration),
+                       .text(token.fingerprintVersion), .text(kind), .text(candidate.key)])
+        case .localPending, .localImporting, .successHistory:
+            guard candidate.key.hasPrefix("file:"), let id = UUID(uuidString: String(candidate.key.dropFirst(5))), id != incoming.id else { return false }
+            var sql = "SELECT v.width, v.height FROM file_record f JOIN source s ON s.id = f.source_id JOIN file_fingerprint v ON v.file_id = f.id WHERE f.id = ? AND v.fingerprint_version = ?"
+            var bindings: [Binding] = [.text(id.uuidString), .text(token.fingerprintVersion)]
+            if candidate.origin == .successHistory {
+                sql += " AND f.success_id IS NOT NULL AND v.purpose = 'success'"
+            } else {
+                sql += " AND f.success_id IS NULL AND f.state = ? AND f.created_order < ? AND s.enabled = 1 AND s.removed = 0 AND v.purpose = 'current' AND v.size = f.size AND v.modified_ns = f.modified_ns"
+                bindings += [.text(candidate.origin == .localPending ? "pending" : "importing"), .int64(incoming.createdOrder)]
+            }
+            row = try one(sql, bindings)
+        }
+        guard let row else { return false }
+        return try pixelSize(width: row[0], height: row[1]) == candidate.size
+    }
+
+    private func writeFingerprint(_ source: PreparedSource, purpose: String, attemptID: String = "") throws {
+        try execute("INSERT INTO file_fingerprint (file_id, size, modified_ns, fingerprint_version, purpose, attempt_id, width, height, vector) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [.text(source.fileID.uuidString), .int64(source.file.stamp.size), .int64(source.file.stamp.modifiedNanoseconds),
+             .text(source.fingerprint.version), .text(purpose), .text(attemptID), source.size.map { .int64(Int64($0.width)) } ?? .null,
+             source.size.map { .int64(Int64($0.height)) } ?? .null, .blob(source.fingerprint.littleEndianFloat32)])
+    }
+
+    private func bumpLocalRevision() throws {
+        try execute("UPDATE dedup_index_state SET local_revision = local_revision + 1 WHERE id = 1")
+    }
+
+    /// Only an unsubmitted duplicate may reopen. Confirmed success and unresolved
+    /// submissions never become new pending work, even when their source retires.
+    private func reopenDependents(candidateID: UUID) throws {
+        let key = candidateID.uuidString
+        guard try one("SELECT 1 FROM file_record WHERE id = ? AND success_id IS NOT NULL", [.text(key)]) == nil else { return }
+        let dependents = try rows("SELECT file_id FROM dedup_dependency WHERE candidate_file_id = ?", [.text(key)])
+        for dependent in dependents {
+            let id = try text(dependent[0])
+            try execute("""
+                UPDATE file_record SET state = 'pending', skip_reason = NULL, attempt_id = NULL, placeholder_id = NULL,
+                    submitted_at = NULL, definitely_not_committed = 0, retry_count = 0, next_retry_at = NULL, last_error = NULL
+                WHERE id = ? AND state = 'skipped' AND skip_reason = ? AND success_id IS NULL
+                    AND (submitted_at IS NULL OR definitely_not_committed = 1)
+                """, [.text(id), .text(SkipReason.suspectedDuplicate.rawValue)])
+        }
+        try execute("DELETE FROM dedup_dependency WHERE candidate_file_id = ?", [.text(key)])
+    }
+
+    private func retireSourceSync(id: UUID, removed: Bool) throws {
+        try requireChange("UPDATE source SET enabled = 0, removed = ? WHERE id = ? AND removed = 0", [.int64(removed ? 1 : 0), .text(id.uuidString)])
+        for row in try rows("SELECT id FROM file_record WHERE source_id = ? AND success_id IS NULL", [.text(id.uuidString)]) {
+            try reopenDependents(candidateID: uuid(row[0]))
+        }
+        try bumpLocalRevision()
+    }
+
+    private func beginAttemptSync(fileID: UUID, attemptID: UUID) throws {
+        try requireChange("UPDATE file_record SET state = 'importing', attempt_id = ?, placeholder_id = NULL, submitted_at = ?, definitely_not_committed = 0, last_error = NULL WHERE id = ? AND state = 'pending' AND success_id IS NULL AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(attemptID.uuidString), .double(Date().timeIntervalSince1970), .text(fileID.uuidString)])
+    }
+
     public func candidates(filename: String, excludingID: UUID?, olderPendingOnly: Bool = false) async throws -> [MatchCandidate] {
         try await perform {
             var sql = "SELECT id, state, metadata_json, success_id, success_metadata_json FROM file_record WHERE filename = ?"
@@ -526,7 +750,7 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     public func recordRetry(fileID: UUID, attemptID: UUID?, nextRetry: Date, error: String, definitelyNotCommitted: Bool) async throws {
-        try await perform {
+        try await perform { try self.transaction {
             let sql: String
             var bindings: [Binding] = [.double(nextRetry.timeIntervalSince1970), .text(error), .int64(definitelyNotCommitted ? 1 : 0), .text(fileID.uuidString)]
             if let attemptID {
@@ -540,7 +764,11 @@ public final class SyncStore: @unchecked Sendable {
                 sql = "UPDATE file_record SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, definitely_not_committed = ? WHERE id = ? AND state = 'pending'"
             }
             try self.requireChange(sql, bindings)
-        }
+            if definitelyNotCommitted, let attemptID {
+                try self.execute("DELETE FROM file_fingerprint WHERE file_id = ? AND purpose = 'attempt' AND attempt_id = ?", [.text(fileID.uuidString), .text(attemptID.uuidString)])
+            }
+            try self.bumpLocalRevision()
+        } }
     }
 
     public func beginScan(sourceID: UUID, now: Date) async throws -> UUID {
@@ -585,16 +813,26 @@ public final class SyncStore: @unchecked Sendable {
         if let source = existing.first(where: { $0.url.path == path }) {
             if !source.enabled || source.removed {
                 try requireChange("UPDATE source SET enabled = 1, removed = 0 WHERE id = ?", [.text(source.id.uuidString)])
+                try bumpLocalRevision()
             }
             return source.id
         }
         let id = UUID()
         try requireChange("INSERT INTO source (id, path, enabled, removed) VALUES (?, ?, 1, 0)", [.text(id.uuidString), .text(path)])
+        try bumpLocalRevision()
         return id
     }
 
     private func markSkippedSync(fileID: UUID, reason: SkipReason, candidates: [MatchCandidate]) throws {
-        try requireChange("UPDATE file_record SET state = 'skipped', skip_reason = ?, attempt_id = NULL, placeholder_id = NULL WHERE id = ?", [.text(reason.rawValue), .text(fileID.uuidString)])
+        try requireChange("""
+            UPDATE file_record SET state = 'skipped', skip_reason = ?, attempt_id = NULL, placeholder_id = NULL
+            WHERE id = ? AND (
+                (state = 'pending' AND success_id IS NULL AND (submitted_at IS NULL OR definitely_not_committed = 1)) OR
+                (? = 'sourceChanged' AND success_id IS NOT NULL AND state IN ('imported', 'skipped')))
+            """, [.text(reason.rawValue), .text(fileID.uuidString), .text(reason.rawValue)])
+        try reopenDependents(candidateID: fileID)
+        try execute("DELETE FROM dedup_dependency WHERE file_id = ?", [.text(fileID.uuidString)])
+        try bumpLocalRevision()
         try execute("DELETE FROM match_evidence WHERE file_id = ?", [.text(fileID.uuidString)])
         for candidate in candidates {
             try execute("INSERT INTO match_evidence (file_id, candidate_key, candidate_json, rule_version, compared_at) VALUES (?, ?, ?, ?, ?)", [.text(fileID.uuidString), .text(candidate.key), .text(try encode(candidate)), .int64(Int64(ruleVersion)), .double(Date().timeIntervalSince1970)])
@@ -959,6 +1197,14 @@ public final class SyncStore: @unchecked Sendable {
                 let columns = try rows("PRAGMA table_info(dedup_index_state)", []).map { try text($0[1]) }
                 if !columns.contains("resume_checkpoint") { try execute("ALTER TABLE dedup_index_state ADD COLUMN resume_checkpoint BLOB") }
                 if !columns.contains("excluded_assets") { try execute("ALTER TABLE dedup_index_state ADD COLUMN excluded_assets INTEGER NOT NULL DEFAULT 0") }
+                let fingerprintColumns = try rows("PRAGMA table_info(file_fingerprint)", []).map { try text($0[1]) }
+                if !fingerprintColumns.contains("attempt_id") {
+                    try execute("ALTER TABLE file_fingerprint RENAME TO old_file_fingerprint")
+                    try execute(Self.fingerprintSchema)
+                    try execute("INSERT INTO file_fingerprint (file_id, size, modified_ns, fingerprint_version, purpose, width, height, vector) SELECT file_id, size, modified_ns, fingerprint_version, purpose, width, height, vector FROM old_file_fingerprint")
+                    try execute("DROP TABLE old_file_fingerprint")
+                }
+                try execute("CREATE INDEX IF NOT EXISTS advanced_evidence_file ON advanced_match_evidence(file_id)")
             }
             return
         }
@@ -1096,6 +1342,17 @@ public final class SyncStore: @unchecked Sendable {
     private func uuid(_ value: Value) throws -> UUID { guard let uuid = UUID(uuidString: try text(value)) else { throw SyncStoreError.sqlite("Invalid UUID.") }; return uuid }
     private func optionalUUID(_ value: Value) -> UUID? { optionalText(value).flatMap(UUID.init(uuidString:)) }
 
+    private static let fingerprintSchema = """
+    CREATE TABLE file_fingerprint (
+     file_id TEXT NOT NULL REFERENCES file_record(id), size INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
+     fingerprint_version TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('current','success','attempt')),
+     width INTEGER, height INTEGER, vector BLOB NOT NULL CHECK(length(vector) = 4096),
+     attempt_id TEXT NOT NULL DEFAULT '',
+     PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose, attempt_id),
+     CHECK((purpose = 'attempt' AND attempt_id <> '') OR (purpose <> 'attempt' AND attempt_id = ''))
+    );
+    """
+
     private static let advancedSchema = """
     CREATE TABLE dedup_index_state (
      id INTEGER PRIMARY KEY CHECK(id = 1), context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL,
@@ -1123,17 +1380,13 @@ public final class SyncStore: @unchecked Sendable {
      FOREIGN KEY(context_id, context_epoch, asset_id, kind) REFERENCES photos_representation(context_id, context_epoch, asset_id, kind)
     );
     CREATE INDEX fingerprint_task_due ON fingerprint_task(generation, next_retry_at);
-    CREATE TABLE file_fingerprint (
-     file_id TEXT NOT NULL REFERENCES file_record(id), size INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
-     fingerprint_version TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('current','success')),
-     width INTEGER, height INTEGER, vector BLOB NOT NULL CHECK(length(vector) = 4096),
-     PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose)
-    );
+    \(fingerprintSchema)
     CREATE TABLE advanced_match_evidence (
      event_id TEXT PRIMARY KEY, file_id TEXT NOT NULL REFERENCES file_record(id),
      size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, token_json TEXT NOT NULL,
      policy_version TEXT NOT NULL, action TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at REAL NOT NULL
     );
+    CREATE INDEX advanced_evidence_file ON advanced_match_evidence(file_id);
     CREATE TABLE dedup_dependency (
      file_id TEXT NOT NULL REFERENCES file_record(id), candidate_file_id TEXT NOT NULL REFERENCES file_record(id),
      candidate_revision TEXT NOT NULL, PRIMARY KEY(file_id, candidate_file_id), CHECK(file_id <> candidate_file_id)
