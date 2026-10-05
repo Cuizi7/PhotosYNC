@@ -258,6 +258,19 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertIn("timed out", str(raised.exception))
         self.assertTrue(log_path.exists())
 
+    def test_packager_disables_lfs_smudge_before_exact_pointer_hydration(self) -> None:
+        # A real configured LFS filter may hydrate during git archive itself.
+        # The packager must override an inherited opt-in before that boundary.
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        self.fixture._write_tool(
+            "git",
+            '#!/bin/sh\nif [ "$1" = archive ] && [ "${GIT_LFS_SKIP_SMUDGE:-}" != 1 ]; then exit 86; fi\n'
+            f'exec "{real_git}" "$@"\n',
+        )
+        result = self.fixture.run_packager(GIT_LFS_SKIP_SMUDGE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_packager_validates_archived_snapshot_before_release_build_and_publishes_evidence(self) -> None:
         result = self.fixture.run_packager()
 

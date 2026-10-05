@@ -52,8 +52,9 @@ validation_derived_data="$build_dir/ValidationDerivedData"
 mkdir -p "$source_dir"
 print "Build evidence: $build_dir"
 
-git archive "$source_commit" | tar -x -C "$source_dir"
-# Git archives contain pointers. Hydrate only this immutable commit's local LFS
+# Keep archive creation offline and pointer-only even when Git applies LFS filters.
+GIT_LFS_SKIP_SMUDGE=1 git archive "$source_commit" | tar -x -C "$source_dir"
+# The controlled archive contains pointers. Hydrate only this immutable commit's local LFS
 # object and verify the complete approved package before any build or validation.
 env -u RQDATAC2_CONF python3 "$source_dir/scripts/advanced-dedup/release.py" \
   --hydrate-from "$PWD" --commit "$source_commit" --archive "$source_dir" \
