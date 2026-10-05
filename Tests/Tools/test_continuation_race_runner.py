@@ -30,6 +30,9 @@ class ContinuationRaceRunnerTests(unittest.TestCase):
         shutil.copy2(RUNNER, self.script)
         shutil.copy2(FIXTURE, self.fixture)
         self.engine.write_text(self.engine_source(), encoding="utf-8")
+        profile = self.repository / "docs/research/advanced-dedup/integration-profile.json"
+        profile.parent.mkdir(parents=True)
+        profile.write_text("{}", encoding="utf-8")
         self.write_fake_xcrun()
 
     def tearDown(self) -> None:
@@ -53,6 +56,30 @@ class ContinuationRaceRunnerTests(unittest.TestCase):
         repeated = self.run_runner(output)
         self.assertNotEqual(repeated.returncode, 0)
         self.assertEqual((output / "result.json").read_bytes(), preserved)
+
+    def test_scenarios_instrument_and_mutate_only_the_selected_branch(self) -> None:
+        source = self.engine_source()
+        for scenario in ("stamp", "advanced-preparation"):
+            with self.subTest(scenario=scenario):
+                output = self.root / scenario
+                result = self.run_runner(output, scenario=scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                evidence = json.loads((output / "result.json").read_text(encoding="utf-8"))
+                self.assertEqual(evidence["scenario"], scenario)
+                green = (output / "green/PhotoSyncCore/Sync/SyncEngine.swift").read_text()
+                red = (output / "red/PhotoSyncCore/Sync/SyncEngine.swift").read_text()
+                guard = "guard pendingStampFailureID == record.id else { continue }"
+                self.assertEqual(green.count(guard), 2)
+                self.assertEqual(red.count(guard), 1)
+                self.assertIn("private var pendingStampFailureID: UUID?", red)
+                self.assertIn("pendingStampFailureID == fileID", red)
+                selected_method = "func retry(" if scenario == "stamp" else "func advancedRetry("
+                selected = red.split(selected_method, 1)[1].split("\n    }", 1)[0]
+                self.assertIn("await integrationRetryGate.wait()", selected)
+                self.assertNotIn(guard, selected)
+                self.assertEqual(self.engine.read_text(), source)
+                command = json.loads((output / "green/run-command.json").read_text())
+                self.assertEqual(command[-2:], ["--scenario", scenario])
 
     def test_anchor_mismatch_fails_without_pass_marker(self) -> None:
         self.engine.write_text("actor SyncEngine {}\n", encoding="utf-8")
@@ -112,14 +139,14 @@ class ContinuationRaceRunnerTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
     def run_runner(
-        self, output: Path, *, mode: str = "success", timeout_seconds: str = "2"
+        self, output: Path, *, mode: str = "success", timeout_seconds: str = "2", scenario: str = "stamp"
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["PATH"] = f"{self.fake_bin}{os.pathsep}{environment['PATH']}"
         environment["FAKE_XCRUN_MODE"] = mode
         environment.pop("RQDATAC2_CONF", None)
         return subprocess.run(
-            [sys.executable, str(self.script), "--output-dir", str(output), "--timeout-seconds", timeout_seconds],
+            [sys.executable, str(self.script), "--output-dir", str(output), "--timeout-seconds", timeout_seconds, "--scenario", scenario],
             cwd=self.repository,
             env=environment,
             text=True,
@@ -187,7 +214,22 @@ actor SyncEngine {
                         } catch let error as SyncStoreError {
                         }
                         guard pendingStampFailureID == record.id else { continue }
+                        recordRoundFailure(context.roundID)
     }
+
+    func advancedRetry(record: Record, error: Error) async {
+                        pendingStampFailureID = record.id
+                        defer { pendingStampFailureID = nil }
+                        do {
+                            try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record),
+                                                        error: error.localizedDescription, definitelyNotCommitted: true)
+                        } catch let storeError as SyncStoreError {
+                        }
+                        guard pendingStampFailureID == record.id else { continue }
+                        recordRoundFailure(context.roundID)
+    }
+
+    private func recordRoundFailure(_ roundID: UUID, fileLevel: Bool = false) {}
 
     private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil) {
         if let fileID, key == issueKey(for: fileID), pendingStampFailureID == fileID {

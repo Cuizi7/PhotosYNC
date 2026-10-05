@@ -774,6 +774,10 @@ public actor SyncEngine {
                     catch let error as SyncStoreError { throw error }
                     catch {
                         // Preparation is still known not to have sent a Photos request.
+                        // Share the single drain reservation so source-change resolution
+                        // during retry persistence cancels this failure publication too.
+                        pendingStampFailureID = record.id
+                        defer { pendingStampFailureID = nil }
                         do {
                             try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record),
                                                         error: error.localizedDescription, definitelyNotCommitted: true)
@@ -782,6 +786,7 @@ public actor SyncEngine {
                                   try await pendingRecordWasSuperseded(record) else { throw storeError }
                             continue
                         }
+                        guard pendingStampFailureID == record.id else { continue }
                         guard canSubmit(sourceID: record.file.sourceID) else { continue }
                         recordRoundFailure(context.roundID)
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
