@@ -443,7 +443,11 @@ final class PhotosRepresentationTests: XCTestCase {
         for width in [1, 2] {
             let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: 32,
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                colorSpaceName: .deviceRGB, bytesPerRow: 512, bitsPerPixel: 32))
+                colorSpaceName: .deviceRGB, bytesPerRow: 256, bitsPerPixel: 32))
+            let single = RecordingDrawImage(size: image.size)
+            single.addRepresentation(representation)
+            XCTAssertNoThrow(try PhotosBitmapNormalizer.normalize(single, targetSide: 32))
+            XCTAssertEqual(single.drawCount, 1, "each 8 KiB backing fits the 12 KiB input allowance")
             image.addRepresentation(representation)
         }
         XCTAssertEqual(image.representations.count, 2)
@@ -478,6 +482,31 @@ final class PhotosRepresentationTests: XCTestCase {
         XCTAssertLessThanOrEqual(normalized.bytesPerRow * normalized.height, 32 * 32 * 4)
     }
 
+    func testPublicRasterDimensionsAreIndependentOfRepresentationDisplayScale() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 24, height: 16))
+        let raw = try XCTUnwrap(CGContext(data: nil, width: 24, height: 16, bitsPerComponent: 8, bytesPerRow: 96,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.makeImage())
+        // NSImage(cgImage:size:) can expose 2x display-derived rep dimensions
+        // while its public accessor still returns the original 24x16 raster.
+        image.addRepresentation(AccountingRasterRepresentation(raster: raw, width: 48, height: 32))
+        let normalized = try PhotosBitmapNormalizer.normalize(image, targetSide: 32)
+        XCTAssertEqual(normalized.width, 32)
+        XCTAssertEqual(normalized.height, 21)
+        XCTAssertEqual(image.drawCount, 1)
+    }
+
+    func testOversizedBitmapBackingRejectsBeforeNativeImageDrawing() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 24, height: 16))
+        let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 48, pixelsHigh: 32,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 192, bitsPerPixel: 32))
+        image.addRepresentation(representation)
+        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32)) { error in
+            XCTAssertEqual(error as? PhotosRepresentationError, .oversized(width: 48, height: 32))
+        }
+        XCTAssertEqual(image.drawCount, 0)
+    }
+
     func testPublicRasterActualDimensionsOverrideSmallRepresentationHints() throws {
         let image = RecordingDrawImage(size: NSSize(width: 8, height: 8))
         image.addRepresentation(AccountingRasterRepresentation(raster: try largeBitmap(), width: 8, height: 8))
@@ -491,13 +520,19 @@ final class PhotosRepresentationTests: XCTestCase {
         let image = RecordingDrawImage(size: NSSize(width: 2, height: 32))
         let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 32,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 512, bitsPerPixel: 32))
+            colorSpaceName: .deviceRGB, bytesPerRow: 256, bitsPerPixel: 32))
         image.addRepresentation(bitmap)
-        let provider = try XCTUnwrap(CGDataProvider(data: Data(repeating: 0, count: 512 * 32) as CFData))
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(repeating: 0, count: 256 * 32) as CFData))
         let raster = try XCTUnwrap(CGImage(width: 2, height: 32, bitsPerComponent: 8, bitsPerPixel: 32,
-            bytesPerRow: 512, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            bytesPerRow: 256, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
         image.addRepresentation(AccountingRasterRepresentation(raster: raster, width: 2, height: 32))
+        for representation in image.representations {
+            let single = RecordingDrawImage(size: image.size)
+            single.addRepresentation(representation)
+            XCTAssertNoThrow(try PhotosBitmapNormalizer.normalize(single, targetSide: 32))
+            XCTAssertEqual(single.drawCount, 1, "each 8 KiB backing fits the 12 KiB input allowance")
+        }
         XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
         XCTAssertEqual(image.drawCount, 0)
     }

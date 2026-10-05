@@ -195,11 +195,14 @@ enum PhotosBitmapNormalizer {
         var materializations: [CGImage] = []
         for representation in image.representations {
             let width = representation.pixelsWide, height = representation.pixelsHigh
-            guard width > 0, height > 0, width <= targetSide, height <= targetSide else {
+            guard width > 0, height > 0 else {
                 throw PhotosRepresentationError.oversized(width: width, height: height)
             }
             let backingBytes: Int64
             if let bitmap = representation as? NSBitmapImageRep {
+                guard width <= targetSide, height <= targetSide else {
+                    throw PhotosRepresentationError.oversized(width: width, height: height)
+                }
                 // Count every existing bitmap plane/stride rather than replacing
                 // its padded storage with an estimate from a smaller conversion.
                 guard bitmap.bytesPerRow > 0, bitmap.bytesPerPlane > 0, bitmap.numberOfPlanes > 0 else {
@@ -212,6 +215,9 @@ enum PhotosBitmapNormalizer {
                 guard !planeOverflow else { throw PhotosRepresentationError.invalidImage }
                 backingBytes = storage
             } else {
+                // Non-bitmap rep dimensions can reflect display scaling rather
+                // than backing pixels (including NSImage(cgImage:size:)). Use
+                // the public raster's actual dimensions for the same bound.
                 // Accounting only: extraction does not establish orientation.
                 // Hints are not a framework-allocation guarantee; validate the
                 // exposed raster, and still use native drawing for final pixels.
