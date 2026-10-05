@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "status": "closed_with_user_selected_configuration",
+  "date": "2026-10-05",
+  "approvedForProductIntegration": true,
+  "productImplementationStarted": false,
+  "decisionFile": "integration-decision.json",
+  "decisionSHA256": "5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
+  "profileFile": "integration-profile.json",
+  "profileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
+  "acceptanceID": "user-decision:5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
+  "threshold": 0.98,
+  "thresholdBasis": "explicit_user_choice",
+  "computeUnits": "cpuOnly",
+  "backend": "exact-f32-v1",
+  "fingerprintVersion": "d7412709d47be7d1f56529adda4956f555feafd86843ca38f408a8dda87dacf6",
+  "policyVersion": "42a811d97844de4a0e2223060178ee1136ef74775a31d2d12a56f9007eff6570",
+  "modelSHA256": "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
+  "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
+  "regression": {
+    "file": "2026-10-05-threshold-098-regression.json",
+    "sha256": "a61f1e9485a56e4d3bdad2505aa060960e15ccdf235002ccf49af40552e75724",
+    "caseCount": 33,
+    "passCount": 33,
+    "contentFailures": [],
+    "actionFailures": [],
+    "sameImagePairsAndVectors": true,
+    "positiveCount": 14,
+    "negativeCount": 19,
+    "skipCount": 11,
+    "importCount": 22,
+    "resolutionUpgradeCount": 3,
+    "independent": false,
+    "newImageInference": false
+  },
+  "profileDeserialization": {
+    "tool": "existing Swift DedupConfiguration / validate-profile",
+    "status": "passed",
+    "reportSHA256": "364d06d8849e3ddc58941e0caef1924fba5b6826c853d193a9f63c6c804af627"
+  },
+  "statisticalAcceptance": {
+    "status": "not_performed",
+    "historicalProtocolSHA256": "ea0060bb4839fe25f3fe30f781c4c51470adad19ed684cc6630ef05d8be25ae8",
+    "falseSkipUpperBoundClaimed": false,
+    "recallConfidenceClaimed": false,
+    "continuationDeferredByUser": true
+  },
+  "performanceEvidence": {
+    "status": "historical_synthetic_baseline_only",
+    "thresholdUsedInHistoricalRuns": 0.8,
+    "remeasuredAt098": false,
+    "real100kCatalogVerified": false,
+    "modelAndFingerprintUnchanged": true,
+    "reports": [
+      {
+        "path": "work/R4-final-combined-0/combined-benchmark.json",
+        "sha256": "82fc17834e64330470fc61c0f61a5fa4adfa954dba98233a06a1886e641777a3"
+      },
+      {
+        "path": "work/R4-final-combined-50/combined-benchmark.json",
+        "sha256": "86c619cd74ace577631348b4be9293f7e86a79c65df3a9f03f79bee879af8c24"
+      },
+      {
+        "path": "work/R4-final-combined-100/combined-benchmark.json",
+        "sha256": "95bbdae91bd23f67f53496f6fac84af426dd2df7808373845da7b5947136d38c"
+      }
+    ]
+  },
+  "remainingProductChecks": [
+    "normal automated correctness and current 33-case regression",
+    "PhotoKit original/current representation and iCloud system behavior",
+    "full-app bounded resources and supported-platform execution",
+    "model and fixture distribution permission before distributing assets"
+  ],
+  "supersedesForIntegration": "The original R4 statistical pass requirement is replaced by the explicit user decision plus bound 0.98 configuration and current regression. Original R4 artifacts remain historical and are not relabeled passed.",
+  "scopeOfThisCompletion": "Research handoff artifacts and product-plan revision only; no production App, Photos, database, packaging or product-task execution."
+}

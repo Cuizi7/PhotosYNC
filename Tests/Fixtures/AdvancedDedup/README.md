@@ -8,7 +8,7 @@
 
 `manifest.json`、`expected-results.json`、`human-review.json` 和全部 63 张 v1 图片继续原样保留，以便复核旧研究；被停用的图片也不得改作独立校准或封存样本。当前用例须以 `active-suite.json` 的保留 ID 从冻结底本取出；底本自身仍完整校验 44 例。当前审阅页展示 33 例。旧研究 `evaluate` / `accept` 入口尚未支持修订后的范围绑定，必须明确拒绝新研究，不能把旧 44 例协议当成新 33 例验收。
 
-复用和后续研究安排见 [范围修订评估](../../../docs/research/advanced-dedup/2026-10-04-scope-reassessment.md)。
+2026-10-05 用户选定 0.98 并结束进一步独立研究；当前 33 例已经用保存的指纹和同一 Swift scorer 实际重放，内容及动作 33/33 通过。记录见 [研究收尾](../../../docs/research/advanced-dedup/2026-10-05-research-closeout.md)。这不是独立统计验收，也没有改写底本；旧 `evaluate` / `accept` 的协议保护继续保留，产品计划改用单独的用户决策绑定。先前的复用分析见 [范围修订评估](../../../docs/research/advanced-dedup/2026-10-04-scope-reassessment.md)。
 
 ## v1 历史冻结记录
 

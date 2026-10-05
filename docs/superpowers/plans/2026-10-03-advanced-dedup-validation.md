@@ -1,5 +1,7 @@
 # PhotosYNC 0.2.0 判重研究与配置冻结 Implementation Plan
 
+> **2026-10-05 最终收尾：** 用户明确选择初始阈值 **0.98**，结束进一步独立校准/封存研究，先推进产品集成准备。当前 33 例已用共享 Swift scorer 重放并全部通过；独立统计目标未验证。详见[研究收尾](../../research/advanced-dedup/2026-10-05-research-closeout.md)及已修订的[产品计划](2026-10-03-advanced-dedup-integration.md)。以下 R1–R4 保留历史研究流程和证据，不重跑，不以未完成的统计验收继续阻挡集成，也不将其改写为通过。本次没有执行产品集成。
+
 > **2026-10-04 范围修订：** 本文件记录第一轮按 v1 全部 44 例执行的研究，已按失败结果收尾。用户现已通过 `Tests/Fixtures/AdvancedDedup/active-suite.json` 停用 11 个信息看板用例，当前为 33 例。不要重跑下面整套已完成步骤，也不要把旧协议或旧 44 例结论改写为新范围验收。下一轮仅补范围绑定、独立校准/封存和真实图库性能证据，具体复用边界见 [范围修订评估](../../research/advanced-dedup/2026-10-04-scope-reassessment.md)。本次没有授权执行这些后续研究或产品集成。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

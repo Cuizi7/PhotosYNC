@@ -1,27 +1,28 @@
 # PhotosYNC 0.2.0 高级照片判重集成 Implementation Plan
 
-> **2026-10-04 当前状态：** 产品集成仍未开始，继续等待用户指示及研究验收。用户已停用 11 个信息看板用例，当前 active suite 为 33 例，v1 的 44 例底本仍保留。下方 P9 的回归数量已同步新范围；这不代表已经得到有效阈值或成功 R4 配置。
+> **2026-10-05 当前状态：** 用户明确选定初始阈值 **0.98**，结束进一步独立校准/封存研究，进入产品集成准备。固定配置及当前 33 例的共享 Swift scorer 重放（33/33 内容和动作通过）见[研究收尾](../../research/advanced-dedup/2026-10-05-research-closeout.md)。这是用户决策与固定回归证据，未证明原协议的统计目标。旧 44 例及 0.8 失败报告保留。本次仅修订计划，**P1–P9 尚未执行**。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将经过验收的 SSCD 判重接入 Photos 持续索引、SQLite 恢复、串行导入及生产日志，保持来源只读和成功历史保护。
+**Goal:** 将用户选定的 SSCD Large / 0.98 配置接入 Photos 持续索引、SQLite 恢复、串行导入及生产日志，保持来源只读和成功历史保护。
 
-**Architecture:** SQLite 保存可恢复的表示、向量与决定证据，精确向量索引是同代次的派生视图；一个 Photos gateway 负责变化失效与最终提交检查。索引协调器负责增量维护，判重服务负责准备来源和取得有一致性令牌的决定，SyncEngine 保留既有单提交/unknown 恢复语义。本计划消费[研究计划](2026-10-03-advanced-dedup-validation.md) R4 的已批准配置，不重新选择阈值。
+**Architecture:** SQLite 保存可恢复的表示、向量与决定证据，精确向量索引是同代次的派生视图；一个 Photos gateway 负责变化失效与最终提交检查。索引协调器负责增量维护，判重服务负责准备来源和取得有一致性令牌的决定，SyncEngine 保留既有单提交/unknown 恢复语义。复用研究 R2/R3 实现，消费 `docs/research/advanced-dedup/integration-profile.json` 和相互绑定的用户决策、回归及收尾记录，不在集成中重新选阈值。
 
 **Tech Stack:** Swift / Foundation / PhotoKit / ImageIO / Core ML / Accelerate / SQLite / SwiftUI，macOS 13、Universal arm64/x86_64，XCTest 与现有 Python 验收入口。
 
-**Spec:** `docs/superpowers/specs/2026-09-28-photosync-0.2.0-advanced-dedup-design.md`；并读 `docs/specs/2026-09-18-runtime-state-and-recovery.md` 和 `Design/Validation.md`。计划基线 `a855367`；现有 schema v3。
+**Spec:** `docs/superpowers/specs/2026-09-28-photosync-0.2.0-advanced-dedup-design.md`；并读 `docs/specs/2026-09-18-runtime-state-and-recovery.md` 和 `Design/Validation.md`。本次修订代码基线 `a6d3750`；现有 schema v3。
 
 ## Global Constraints
 
 - “只读来源；Photos 只新增，不修改、替换、删除已有资产。”导入原始 URL，`shouldMoveFile = false`。
 - “保留四种文件状态 `pending`、`importing`、`imported`、`skipped`”；不加产品人工审核环节。
 - “视频保持 0.1 的文件名与 metadata 策略”，不增加 RAW 来源、视频抽帧或 Live Photo 配对。
-- “不加入 pHash、第二个核验模型、服务端模型或独立向量数据库服务。”本计划只实现 R4 通过的 `exact-f32-v1`；如果研究转向 ANN，先补具体后端计划，不暗换架构。
+- “不加入 pHash、第二个核验模型、服务端模型或独立向量数据库服务。”固定 SSCD Large FP32、Core ML `.cpuOnly`、全画面 stretch 320×320、sRGB、1024 维 L2 Float32、`exact-f32-v1` 和 `score >= 0.98`；不暗换 FP16、GPU/ANE 或 ANN。
 - “应用运行时每 30 分钟”核对 Photos 清单；现有 `ScanSchedule.interval = 1_800`，不叠加、不补跑所有过期周期。
 - “读取失败、索引未完成等属于未知，等待恢复，不能等同于‘不是重复’。”已观察到新增/变化立即挡住新提交。
 - “不得持数据库锁等待 Photos、下载或模型。”任意 await 后重新核对暂停、来源状态、stamp、图库和索引代次。
-- “取消与超时不能绕过仍占用的实际资源槽位”；模型物理并发 1、batch 1，其他上限使用 R4 配置，不自填默认值。
+- “取消与超时不能绕过仍占用的实际资源槽位”；模型物理并发 1、batch 1，其他上限使用固定 integration profile，不自填默认值。
+- 每次启动只加载一份不可变配置并注入全部组件。阈值从 decision/profile 读取（本版 0.98），各组件只消费 `configuration.threshold`，不另设阈值常量。以后显式更新配置、重启生效；只改阈值会改变 policyVersion，复用同 fingerprintVersion 的向量，不加入热更新、阈值滑杆或自动调参。
 - “旧已提交结果和成功历史不得因此重新导入”；未知高版本 schema 拒绝打开，不清库重置。
 - 现有日志轮转“10 × 10 MiB”；不记原图、完整向量或 metadata 全量转储，不自动上传。
 - 保持 macOS 13、Universal、现有 bundle identity、数据目录 `Application Support/PhotoSync` 和本地 ad-hoc 发布契约。
@@ -39,7 +40,16 @@
 
 ## 执行门槛与文件边界
 
-P1 起执行前，必须存在 R4 通过的 `accepted-profile.json` 及相互绑定的成功证据，并已完成协议数值审阅。若 SSCD 无法同时通过已批准编辑反例与副本召回，不执行产品启用；回到研究阶段报告限制，不能把本计划理解为“无论效果怎样都先上”。本次只写计划，不修改生产库、不启动生产 App。
+P1 起使用下面四份已提交、相互绑定的记录。用户在 2026-10-05 明确变更了“先取得 R4 独立统计 pass”这一前置条件；不再补独立校准/封存研究，也不伪造 `accepted-profile.json` 或统计通过。
+
+| 源记录（`docs/research/advanced-dedup/`） | Bundle 文件名 | 校验责任 |
+| --- | --- | --- |
+| `integration-decision.json` | `decision.json` | 用户决策依据、0.98、模型/预处理/运行配置及 active suite；原始字节 SHA 为 decision ID |
+| `integration-profile.json` | `profile.json` | 合法 DedupConfiguration；`acceptanceID = user-decision:<decision SHA>`；阈值、fingerprintVersion、policyVersion 和后端一致 |
+| `2026-10-05-threshold-098-regression.json` | `regression.json` | 固定 33 例内容/动作全部通过，绑定决策、配置、真值及输入向量；不是独立验收 |
+| `research-closeout.json` | `closeout.json` | `closed_with_user_selected_configuration`、`approvedForProductIntegration=true`，绑定前三份；`statisticalAcceptance.status=not_performed` 如实保留 |
+
+四份文件按原字节复制，不重新序列化改变哈希。加载器按上表固定文件名解析引用，不追随研究记录里的 `work/` 路径；不能把旧 `research:` 配置误作生产配置。原协议和旧研究 `evaluate` / `accept` 保持历史拒绝逻辑。模型分发许可、产品回归、资源/系统/平台验收仍由 P9 核实；选定阈值不代表这些已通过。本次不修改生产库、不启动生产 App。
 
 现有接点（行号是 `a855367` 的定位提示，实际按符号核对）：
 
@@ -60,7 +70,7 @@ P1 起执行前，必须存在 R4 通过的 `accepted-profile.json` 及相互绑
 | `Sources/PhotoSyncCore/Sync/LegacySkipReevaluation.swift` | keyset 批处理符合条件的旧疑似重复项 |
 | `Sources/PhotoSyncCore/Logging/DedupDecisionLog.swift` | 有界结构化决定字段，复用 RunLogger 轮转 |
 | `Sources/PhotoSyncCore/Sync/SyncEngine.swift`、`ScanSchedule.swift`、`GlobalStatus.swift`；`Sources/PhotoSyncApp/SyncRuntime.swift`、`AppModel.swift`、`SyncStatusPresentation.swift`、`StatusMenu.swift`、`SourceSettings.swift` | 串行导入、调度、暂停与聚合 UI 接线，不扩来源规则 |
-| `Sources/PhotoSyncCore/Resources/AdvancedDedup/`、`PhotoSync.xcodeproj/project.pbxproj` | 已验收模型、配置、MIT 声明的 framework 资源成员关系 |
+| `Sources/PhotoSyncCore/Resources/AdvancedDedup/`、`PhotoSync.xcodeproj/project.pbxproj` | 固定模型、配置/决策证据及实际适用许可的 framework 资源成员关系 |
 | `Tests/PhotoSyncCoreTests/`、`Tests/Tools/`、`scripts/validate.py`、`scripts/package-release.sh` | fixture/fake/临时库回归与正式包校验，不自动读个人图库 |
 
 ### 跨任务值类型（P1 定义，其他任务按此使用）
@@ -73,7 +83,8 @@ P1 起执行前，必须存在 R4 通过的 `accepted-profile.json` 及相互绑
 - `IndexState = preparing | updating | ready | waiting | paused`；`IndexProgress { state: IndexState, totalsKnown: Bool, totalAssets: Int, readyAssets: Int, totalRepresentations: Int, readyRepresentations: Int, excludedAssets: Int, issue: String? }`。未知总数用 `totalsKnown=false`，不以 0 冒充已扫描为空。
 - `RepresentationTask { descriptor: RepresentationDescriptor, retryCount: Int, nextRetryAt: Date?, fingerprintVersion: String }`；`IndexPublication { token: IndexToken, entries: [VectorEntry] }`。
 - `PreparedSource { fileID: UUID, file: SourceFile, fingerprint: Fingerprint, size: PixelSize? }`。
-- `AdvancedEvidence { eventID: UUID, fileID: UUID, stamp: FileStamp, token: IndexToken, policyVersion: String, evaluation: DuplicateEvaluation, decisiveCandidates: [ScoredCandidate], diagnostics: [ScoredCandidate], timingsMS: [String: Double] }`。decisiveCandidates 只保留实际导致跳过的一个覆盖候选，或导入时最相关的一个命中；diagnostics 受配置上限约束，不把全部匹配 pair 持久化。
+- `VectorSearchResult { matches: [ScoredCandidate], diagnostics: [ScoredCandidate] }`：matches 含全部达阈值候选；diagnostics 是有界最近候选，包含阈值以下分数，不参与跳过判定。
+- `AdvancedEvidence { eventID: UUID, fileID: UUID, stamp: FileStamp, token: IndexToken, policyVersion: String, evaluation: DuplicateEvaluation, decisiveCandidates: [ScoredCandidate], diagnostics: [ScoredCandidate], timingsMS: [String: Double] }`。decisiveCandidates 只保留实际导致跳过的一个覆盖候选，或导入时最相关的一个命中；diagnostics 全部候选来源合并后最多 10 条，不把全部匹配 pair 持久化，不使用研究容量 `evidenceCandidateLimit=200000` 作为日志上限。
 - `AdvancedAdmission { source: PreparedSource, evidence: AdvancedEvidence, validity: any PhotosCandidateValidity }`；`AdvancedPreparation = ready(AdvancedAdmission) | waiting(reason: String)`。
 
 图像字节/CGImage 不进入 Codable 存储类型。`LoadedRepresentation`（P2）只在物理预算租约内存在，持有 `image: CGImage`, `orientation: CGImagePropertyOrientation`, `descriptor: RepresentationDescriptor`, `lease: ImageLease`；尺寸未知保留 nil，不用模型输入尺寸补齐。
@@ -86,17 +97,17 @@ P1 起执行前，必须存在 R4 通过的 `accepted-profile.json` 及相互绑
 
 **Files:** Modify `Storage/SyncStore.swift`, `Storage/Schema.sql`, `Matching/AdvancedDedupTypes.swift`, `PhotoSync.xcodeproj/project.pbxproj`; Create `Tests/PhotoSyncCoreTests/AdvancedDedupStoreTests.swift`。
 
-**Interfaces:** Produces `DedupConfiguration.loadValidated(resourceDirectory: URL) throws -> DedupConfiguration`（校验 R4 的 acceptanceID/pass/profile SHA/模型版本，缺失即抛错，资源路径来自注入）；`SyncStore.beginIndexReconciliation(context: LibraryContext, photosGeneration: Int, fingerprintVersion: String) async throws -> Int64`、`upsertRepresentations(_ descriptors: [RepresentationDescriptor], generation: Int64) async throws`、`finishIndexReconciliation(generation: Int64) async throws`、`nextRepresentationTasks(now: Date, limit: Int) async throws -> [RepresentationTask]`、`completeRepresentation(_ task: RepresentationTask, fingerprint: Fingerprint) async throws -> Bool`、`failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws`、`indexPublication() async throws -> IndexPublication?`、`markIndexPublished(token: IndexToken) async throws -> Bool`。`false` 代表修订/代次已过期，不能强制发布。
+**Interfaces:** Produces `DedupConfiguration.loadValidated(resourceDirectory: URL) throws -> DedupConfiguration`（校验上表的 decision/profile/regression/closeout 原始字节绑定、用户选择依据、0.98 与模型/策略/运行配置一致；缺失或不符即抛错，资源路径来自注入）；`SyncStore.beginIndexReconciliation(context: LibraryContext, photosGeneration: Int, fingerprintVersion: String) async throws -> Int64`、`upsertRepresentations(_ descriptors: [RepresentationDescriptor], generation: Int64) async throws`、`finishIndexReconciliation(generation: Int64) async throws`、`nextRepresentationTasks(now: Date, limit: Int) async throws -> [RepresentationTask]`、`completeRepresentation(_ task: RepresentationTask, fingerprint: Fingerprint) async throws -> Bool`、`failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws`、`indexPublication() async throws -> IndexPublication?`、`markIndexPublished(token: IndexToken) async throws -> Bool`。`false` 代表修订/代次已过期，不能强制发布。
 
-- [ ] **Step 1 — 写失败测试。** `testV3MigrationPreservesSuccessAndUnknown` 比较临时 v3 数据库迁移前后 success_id、success_metadata_json、attempt_id、placeholder_id、submitted_at、definitely_not_committed 原样；`testMigrationRollbackAndFutureSchemaRejection`：注入 DDL 失败后仍 v3，v5 拒绝打开；`testStaleTaskCannotPublish`：revision A 返回时库已是 B，complete=false；`testPartialReconciliationDoesNotDeleteUnseenAssets`：只有完整枚举结束才 tombstone 未见资产；`testUnacceptedConfigurationCannotLoad`：缺成功 acceptance 或哈希不符不能构造发行配置。
+- [ ] **Step 1 — 写失败测试。** `testV3MigrationPreservesSuccessAndUnknown` 比较临时 v3 数据库迁移前后 success_id、success_metadata_json、attempt_id、placeholder_id、submitted_at、definitely_not_committed 原样；`testMigrationRollbackAndFutureSchemaRejection`：注入 DDL 失败后仍 v3，v5 拒绝打开；`testStaleTaskCannotPublish`：revision A 返回时库已是 B，complete=false；`testPartialReconciliationDoesNotDeleteUnseenAssets`：只有完整枚举结束才 tombstone 未见资产；`testUserSelectedConfigurationLoadsWithoutStatisticalPass`：当前用户决策及 33/33 回归有效，即使 statisticalAcceptance=not_performed 也可加载；`testMissingOrTamperedDecisionRejectsConfiguration`：缺任一绑定文件、旧 research profile 或哈希不符拒绝；`testThresholdMustMatchDecisionAndPolicyVersion`：单改阈值或复用旧 policyVersion 拒绝。
 ```swift
 let published = try await store.completeRepresentation(staleTask, fingerprint: fingerprint)
 XCTAssertFalse(published)
 ```
 
 - [ ] **Step 2 — 跑 P1 红阶段命令。** 预期缺表/新 API 或新断言失败。
-- [ ] **Step 3 — 实现 v4 事务迁移及接口。** 新表固定为 `dedup_index_state`（context/epoch/generation/published_generation/fingerprint_version/reconcile_cursor）、`photos_representation`（context+asset+kind 主键、revision、尺寸、equivalence、seen_generation、ready/pending/failed、vector BLOB）、`fingerprint_task`（表示键+revision+version 唯一、重试期限）、`file_fingerprint`（file_id+stamp+version+purpose 联合主键，purpose=current/success）、`advanced_match_evidence`（event/file/token/策略/动作/关键匹配）、`dedup_dependency`（file_id→candidate_file_id、candidate revision）、`dedup_recheck_progress`（目标策略、游标）。不新增成功历史表；success 指纹引用现有 file_record 成功记录且不级联丢失。扩 SQL Value/bind/read 支持 BLOB 并严格验证 Float32 little-endian 1024 项。在 AdvancedDedupTypes 实现配置验证加载入口，沿用 R4 无循环的 profile/acceptance 绑定；生产入口不得对错误资源回退旧图片规则。
-- [ ] **Step 4 — 验证重建与版本失配。** 增加断言：SQLite 已提交而派生索引未发布时 publication 可重建但 ready=false；旧向量版本不参与新查询；新 profile 不能重置 imported/unknown；历史不可补齐不计入 Photos 必需任务。跑 P1 绿阶段，确认代码迁移和 `Schema.sql` 等价。
+- [ ] **Step 3 — 实现 v4 事务迁移及接口。** 新表固定为 `dedup_index_state`（context/epoch/generation/published_generation/fingerprint_version/reconcile_cursor）、`photos_representation`（context+asset+kind 主键、revision、尺寸、equivalence、seen_generation、ready/pending/failed、vector BLOB）、`fingerprint_task`（表示键+revision+version 唯一、重试期限）、`file_fingerprint`（file_id+stamp+version+purpose 联合主键，purpose=current/success）、`advanced_match_evidence`（event/file/token/策略/动作/关键匹配）、`dedup_dependency`（file_id→candidate_file_id、candidate revision）、`dedup_recheck_progress`（目标策略、游标）。不新增成功历史表；success 指纹引用现有 file_record 成功记录且不级联丢失。扩 SQL Value/bind/read 支持 BLOB 并严格验证 Float32 little-endian 1024 项。在 AdvancedDedupTypes 实现配置验证加载入口，使用上表的单向绑定（decision → profile → regression → closeout，箭头表示后一项绑定前项）；生产入口不得对错误资源回退旧图片规则。
+- [ ] **Step 4 — 验证重建与版本失配。** 增加断言：SQLite 已提交而派生索引未发布时 publication 可重建但 ready=false；旧向量版本不参与新查询；新 profile 不能重置 imported/unknown；只改阈值时保留相同 fingerprintVersion 的向量、失效旧策略决定；历史不可补齐不计入 Photos 必需任务。跑 P1 绿阶段，确认代码迁移和 `Schema.sql` 等价。
 - [ ] **Step 5 — 提交。** `git add` 本任务列出的文件，`git commit -m "feat: persist recoverable advanced dedup index state"`。
 
 ### Task 2 (P2): PhotoKit 指定表示读取与共享物理预算
@@ -137,17 +148,17 @@ XCTAssertEqual(secondUnchangedRoundInferenceCount, 0)
 
 **Files:** Create `Matching/AdvancedDedupService.swift`, `Tests/PhotoSyncCoreTests/AdvancedDedupServiceTests.swift`; Modify `Storage/SyncStore.swift`, `Sources/MetadataReader.swift`, `Matching/ExactVectorIndex.swift`, `PhotoSync.xcodeproj/project.pbxproj`。
 
-**Interfaces:** `actor AdvancedDedupService { init(store: SyncStore, photos: any PhotosIndexGateway, coordinator: PhotosIndexCoordinator, fingerprinter: any ImageFingerprinting, index: ExactVectorIndex, configuration: DedupConfiguration, executor: ReadExecutor, budget: ImageWorkBudget); func prepare(fileID: UUID, file: SourceFile) async throws -> AdvancedPreparation }`。Store 提供 `fingerprint(fileID: UUID, stamp: FileStamp, version: String) async throws -> Fingerprint?`、`cacheFingerprint(_ source: PreparedSource) async throws -> Bool`、`localVectorCandidates(beforeOrder: Int64, excluding: UUID, version: String) async throws -> (revision: Int64, entries: [VectorEntry])`。beforeOrder 来自现有 `StoredFile.createdOrder`，不来自路径排序。
+**Interfaces:** `actor AdvancedDedupService { init(store: SyncStore, photos: any PhotosIndexGateway, coordinator: PhotosIndexCoordinator, fingerprinter: any ImageFingerprinting, index: ExactVectorIndex, configuration: DedupConfiguration, executor: ReadExecutor, budget: ImageWorkBudget); func prepare(fileID: UUID, file: SourceFile) async throws -> AdvancedPreparation }`。Store 提供 `fingerprint(fileID: UUID, stamp: FileStamp, version: String) async throws -> Fingerprint?`、`cacheFingerprint(_ source: PreparedSource) async throws -> Bool`、`localVectorCandidates(beforeOrder: Int64, excluding: UUID, version: String) async throws -> (revision: Int64, entries: [VectorEntry])`。beforeOrder 来自现有 `StoredFile.createdOrder`，不来自路径排序。增加 `ExactVectorIndex.searchWithDiagnostics(query: Fingerprint, minimumScore: Double, generation: Int64, diagnosticLimit: Int) throws -> VectorSearchResult`（actor）及 `static scoreWithDiagnostics(query: Fingerprint, entries: [VectorEntry], minimumScore: Double, diagnosticLimit: Int) throws -> VectorSearchResult`；同一次精确评分取得全部匹配及有界近邻，不为日志重复扫描。原 score/search 可保留兼容入口。
 
-- [ ] **Step 1 — 写失败测试。** `testDifferentFilenameStillMatches`：改名不缩小候选域；`testSameFilenameCannotForceImageSkip`：异图同名仍由向量决定；`testReadFailureIsWaitingNotNoMatch`：未就绪/读取失败不能形成 `.importFile`；`testStampChangesDuringFingerprintDiscardsResult`：await 后 stamp 不同则拒缓存/决定；`testCurrentMatchCannotBorrowOriginalDimensions`：命中小编辑表示不得借大原图尺寸跳过；`testMissingOldHistoryFingerprintDoesNotBlockLibraryReady`：旧成功仍受身份保护但不假造向量匹配。
+- [ ] **Step 1 — 写失败测试。** `testDifferentFilenameStillMatches`：改名不缩小候选域；`testSameFilenameCannotForceImageSkip`：异图同名仍由向量决定；`testReadFailureIsWaitingNotNoMatch`：未就绪/读取失败不能形成 `.importFile`；`testStampChangesDuringFingerprintDiscardsResult`：await 后 stamp 不同则拒缓存/决定；`testCurrentMatchCannotBorrowOriginalDimensions`：命中小编辑表示不得借大原图尺寸跳过；`testMissingOldHistoryFingerprintDoesNotBlockLibraryReady`：旧成功仍受身份保护但不假造向量匹配；`testBelowThresholdNearestIsDiagnosticOnly`：没有命中时仍记录最近分数且导入；`testCoveringMatchBeyondDiagnosticLimitStillSkips`：第 11 个以上的达阈值高清候选仍能决定跳过；`testThresholdChangeReusesFingerprintButNotOldDecision`：复用指纹，按新策略重新评分。
 ```swift
 guard case .waiting = result else { return XCTFail("Unknown index must wait") }
 XCTAssertEqual(createCount, 0)
 ```
 
 - [ ] **Step 2 — 跑 P4 红阶段命令。** fake Photos/向量，不靠模型分数碰巧触发分支。
-- [ ] **Step 3 — 实现 prepare。** 先查既有成功/unknown 保护；准备来源指纹时前后核对 stamp，方向/颜色共用 R2。读取图库 ready token 与其 validity，合并同版本 Photos、较早的有效 pending/importing、成功历史向量；对所有达阈值结果用持久化规范化向量精确重评分，调用 R3 策略。来源损坏等明确读取错误向上抛出沿用文件级重试；就绪不足返回 waiting。不可读旧历史只能沿旧身份保护，正常授权可读关联资源才补齐，绝不扫描停用来源。
-- [ ] **Step 4 — 构造一致性证据。** AdvancedEvidence 记录表示 kind、原尺寸、实际 threshold、所有关键 covering key 及有界最近候选，不缓存“无候选”跨代次。读取到未知尺寸但有效图像/候选时保守导入；未知读取错误不能走此分支。图库 readyToken 与 candidateSnapshot.generation 必须一致；localVectorCandidates 返回的 revision 写入本次 IndexToken，局部候选用 R3 的 static score 评分。localRevision 只保护该次本地候选决定，不因普通本地插入触发全库 Photos 重建。任一 await 后重新核对 token/stamp/暂停，失效返回 waiting 或重新准备，不能复用前一轮分数。
+- [ ] **Step 3 — 实现 prepare。** 先查既有成功/unknown 保护；准备来源指纹时前后核对 stamp，方向/颜色共用 R2。读取图库 ready token 与其 validity，合并同版本 Photos、较早的有效 pending/importing、成功历史向量；用持久化规范化向量精确评分，对所有达阈值结果调用 R3 策略；不得用最多 10 条诊断候选限制决策候选。来源损坏等明确读取错误向上抛出沿用文件级重试；就绪不足返回 waiting。不可读旧历史只能沿旧身份保护，正常授权可读关联资源才补齐，绝不扫描停用来源。
+- [ ] **Step 4 — 构造一致性证据。** AdvancedEvidence 记录表示 kind、原尺寸、实际 threshold、决定跳过的覆盖候选及有界最近候选。Photos 和本地候选分别取最近 10 条再合并为全局最近 10 条，含低于阈值的分数；关键决定候选另存，不受诊断上限截断。不缓存“无候选”跨代次或 policyVersion。读取到未知尺寸但有效图像/候选时保守导入；未知读取错误不能走此分支。图库 readyToken 与 candidateSnapshot.generation 必须一致；localVectorCandidates 返回的 revision 写入本次 IndexToken，局部候选用上述 static scoreWithDiagnostics 评分。localRevision 只保护该次本地候选决定，不因普通本地插入触发全库 Photos 重建。任一 await 后重新核对 token/stamp/暂停，失效返回 waiting 或重新准备，不能复用前一轮分数。
 - [ ] **Step 5 — 绿阶段与提交。** 跑 P4 命令，`git commit -m "feat: prepare consistent advanced duplicate admissions"`。
 
 ### Task 5 (P5): 本地依赖、成功指纹和决定原子性
@@ -185,29 +196,29 @@ XCTAssertEqual(secondIdenticalFileState, .skipped)
 - [ ] **Step 4 — 保护恢复契约。** importing/unknown 先按既有 ImportRecovery 处理，不被重新指纹计算触发重提；placeholder 检查点失败仍未知。成功已确认但新索引失败时仍保存成功。保持单个 gateway 和一个实际提交；索引不可用不是重建 gateway 的理由。运行现有恢复/受控续体竞态测试，修正 harness 锚点时保留同一个“retry 已写入、旧错误尚未发布”的窗口。
 - [ ] **Step 5 — 绿阶段与提交。** P6 通过并核对静态照片无旧规则旁路，`git commit -m "feat: gate photo imports on current advanced dedup evidence"`。
 
-### Task 7 (P7): 可中断的历史疑似重复重判
+### Task 7 (P7): 可中断的旧策略疑似重复重判
 
 **Files:** Create `Sync/LegacySkipReevaluation.swift`, `Tests/PhotoSyncCoreTests/LegacySkipReevaluationTests.swift`; Modify `Storage/SyncStore.swift`, `Sync/SyncEngine.swift`, `PhotoSync.xcodeproj/project.pbxproj`。
 
-**Interfaces:** `struct LegacySkipCandidate { file: StoredFile, skipReason: SkipReason, submittedAt: Date?, definitelyNotCommitted: Bool }`；`SyncStore.legacySkipPage(afterOrder: Int64, limit: Int, policyVersion: String) async throws -> [LegacySkipCandidate]`、`reopenLegacySkip(fileID: UUID, expectedStamp: FileStamp, policyVersion: String) async throws -> Bool`；`actor LegacySkipReevaluation { init(store: SyncStore, stamp: @escaping @Sendable (SourceFile) async throws -> FileStamp, policyVersion: String); func processBatch(limit: Int) async throws -> Int }`。progress 表保存目标 policy 和游标，批量限制沿配置，单项事务结束才推进游标。
+**Interfaces:** `struct LegacySkipCandidate { file: StoredFile, skipReason: SkipReason, submittedAt: Date?, definitelyNotCommitted: Bool, decisionPolicyVersion: String? }`；`SyncStore.legacySkipPage(afterOrder: Int64, limit: Int, policyVersion: String) async throws -> [LegacySkipCandidate]`、`reopenLegacySkip(fileID: UUID, expectedStamp: FileStamp, policyVersion: String) async throws -> Bool`；`actor LegacySkipReevaluation { init(store: SyncStore, stamp: @escaping @Sendable (SourceFile) async throws -> FileStamp, policyVersion: String); func processBatch(limit: Int) async throws -> Int }`。Legacy 在这里包含 0.1 及所有旧判定策略，不仅指文件名策略；nil decisionPolicyVersion 表示 0.1。progress 表保存目标 policy 和游标，批量限制沿配置，单项事务结束才推进游标。目标策略变化启动新的重判进度，同一版本重复执行幂等。
 
-- [ ] **Step 1 — 写失败测试。** `testOnlyEligibleEnabledImageSkipsReopen`：只有启用/未移除来源、image、suspectedDuplicate、无 success_id、无 unknown/importing、stamp 未变且仍存在者重开；视频、sourceChanged、unsupportedFormat、停用来源逐项保持原状；`testCrashAfterReopenResumesIdempotently`：重启不重复计数；`testSourceMutationOrSuccessWinsOverReopen`：并发成功/stamp变化不得被批处理覆盖。
+- [ ] **Step 1 — 写失败测试。** `testOnlyEligibleEnabledImageSkipsReopen`：只有启用/未移除来源、image、suspectedDuplicate、无 success_id、无 unknown/importing、stamp 未变且仍存在、决定策略为 nil 或不同于目标版本者重开；视频、sourceChanged、unsupportedFormat、停用来源逐项保持原状；`testCrashAfterReopenResumesIdempotently`：重启不重复计数；`testSourceMutationOrSuccessWinsOverReopen`：并发成功/stamp变化不得被批处理覆盖；`testNewThresholdRechecksOldAdvancedSkipsWithoutInference`：提高阈值后符合条件的旧高级 skip 重开并用已有指纹重判，既有 imported/unknown 不动；`testSamePolicyDoesNotReopenAgain`：同目标策略已完成项不反复重判。
 ```swift
 XCTAssertEqual(reopenedIDs, Set([eligibleImageID]))
 XCTAssertEqual(importedCountAfterReopen, importedCountBeforeReopen)
 ```
 
 - [ ] **Step 2 — 跑 P7 红阶段命令。** 普通扫描 stamp 未变的 continue 路径不能代替此测试。
-- [ ] **Step 3 — 实现筛选、stamp 检查和重开。** 不为全部 skipped 清标记；SQL 条件保留 success_metadata 与提交恢复信息。来源读取通过现有只读入口，离线/未知不推进该项为已完成；用 keyset cursor+单项待重试记录避免一个失败阻塞其他项或被永久越过。重开仅回 pending 交 P6，不能直接创造成功或增加 imported。
-- [ ] **Step 4 — 验证与提交。** P7 测试绿，再断言停止/恢复、批尾新加入来源与重复策略版本请求均可收敛；`git commit -m "feat: reevaluate eligible legacy duplicate skips resumably"`。
+- [ ] **Step 3 — 实现筛选、stamp 检查和重开。** 不为全部 skipped 清标记；SQL 条件校验旧决定策略、保留 success_metadata 与提交恢复信息；只改阈值不清理指纹、不触发全库下载或模型推理。来源读取通过现有只读入口，离线/未知不推进该项为已完成；用 keyset cursor+单项待重试记录避免一个失败阻塞其他项或被永久越过。重开仅回 pending 交 P6，不能直接创造成功或增加 imported。
+- [ ] **Step 4 — 验证来源恢复与提交。** 来源重新启用或重新添加时，将当前目标策略的重判重新排入现有进度流程，补扫已越过游标的旧项；可复用现有进度表从头扫描，以决定 policyVersion 排除已完成项，不新增服务或表。重新排入与在途批次的游标提交必须串行协调，启动时也核对是否存在当前启用来源中尚未应用目标策略的 skip，避免中断后遗漏。增加 `testReenabledSourceBeforeCompletedCursorIsReevaluated`：游标已完成后启用旧来源，旧策略 skip 用缓存指纹重判，同策略 skip、success/unknown 不重开；并覆盖来源重新添加及重新排入时退出恢复。P7 测试绿，再断言停止/恢复、批尾新加入来源与重复策略版本请求均可收敛；`git commit -m "feat: reevaluate eligible legacy duplicate skips resumably"`。
 
 ### Task 8 (P8): runtime 调度、聚合界面与诊断日志
 
 **Files:** Create `Logging/DedupDecisionLog.swift`, `Tests/PhotoSyncCoreTests/DedupLoggingTests.swift`; Modify `Sync/ScanSchedule.swift`, `Sync/GlobalStatus.swift`, `Sync/SyncEngine.swift`, `Logging/RunLogger.swift`, `Sources/PhotoSyncApp/SyncRuntime.swift`, `Sources/PhotoSyncApp/AppModel.swift`, `Sources/PhotoSyncApp/SyncStatusPresentation.swift`, `Sources/PhotoSyncApp/StatusMenu.swift`, `Sources/PhotoSyncApp/SourceSettings.swift`; Test `ScheduleTests.swift`, `AppModelTests.swift`, `AppViewTests.swift`, `SyncStatusPresentationTests.swift`。
 
-**Interfaces:** `DedupDecisionLog.fields(evidence: AdvancedEvidence, configuration: DedupConfiguration) -> [String: String]`；`EngineSnapshot.indexProgress: IndexProgress?`。Runtime 通过 P1 loadValidated 装载配置，持有一个 gateway/coordinator/fingerprinter/index/budget/service，pause/resume/stop 转发；P9 装入正式资源之前测试使用显式注入资源目录，正常启动缺资源显示配置不可用并禁止静态照片新提交；`ScanSchedule` 增加 Photos 对账到期状态，仍 `interval=1800`，与来源扫描 tick 合并。
+**Interfaces:** `DedupDecisionLog.maxDiagnosticCandidates = 10`，`DedupDecisionLog.fields(evidence: AdvancedEvidence, configuration: DedupConfiguration) -> [String: String]`；`EngineSnapshot.indexProgress: IndexProgress?`。Runtime 启动时通过 P1 loadValidated 装载一份不可变配置并注入全部组件，持有一个 gateway/coordinator/fingerprinter/index/budget/service，pause/resume/stop 转发；P9 装入正式资源之前测试使用显式注入资源目录，正常启动缺资源显示配置不可用并禁止静态照片新提交；`ScanSchedule` 增加 Photos 对账到期状态，仍 `interval=1800`，与来源扫描 tick 合并。
 
-- [ ] **Step 1 — 写失败测试。** `testThirtyMinuteReconcileDoesNotOverlapOrCatchUp`：注入时钟 1800s 触发、忙时合并、休眠不补跑过期轮；`testIndexProgressCountsAssetsAndRepresentationsSeparately`：100000资产/200000表示不能显示成20万照片；`testWaitingIndexIsNotFinishedOrFileError`：索引阻断显示原因；`testLogsImportsAsWellAsSkipsAndDeduplicatesSameEvidence`：同stamp/profile/token只一条，变化后新event；`testDiagnosticCapNeverDropsDecisiveCandidate`；`testLogFailureIsWarningButEvidenceFailureBlocksDecision`。
+- [ ] **Step 1 — 写失败测试。** `testThirtyMinuteReconcileDoesNotOverlapOrCatchUp`：注入时钟 1800s 触发、忙时合并、休眠不补跑过期轮；`testIndexProgressCountsAssetsAndRepresentationsSeparately`：100000资产/200000表示不能显示成20万照片；`testWaitingIndexIsNotFinishedOrFileError`：索引阻断显示原因；`testLogsImportsAsWellAsSkipsAndDeduplicatesSameEvidence`：同stamp/profile/token只一条，变化后新event；`testDiagnosticCapNeverDropsDecisiveCandidate`；`testLogsBelowThresholdScoreAndSignedMarginWithoutRounding`：记录近邻原始分数及 score-threshold，不四舍五入成 0.98；`testNoCandidateIsAbsentNotZeroScore`；`testPolicyChangeCreatesNewDiagnosticEvent`；`testLogFailureIsWarningButEvidenceFailureBlocksDecision`。
 ```swift
 XCTAssertEqual(ScanSchedule.interval, 1800)
 XCTAssertEqual(progress.totalAssets, 100000)
@@ -216,25 +227,25 @@ XCTAssertEqual(progress.totalRepresentations, 200000)
 
 - [ ] **Step 2 — 跑 P8 红阶段命令。** 日志用临时目录和 flushForTesting；UI 仅 injected runtime/offscreen。
 - [ ] **Step 3 — 实现 scheduling/UI。** 启动、恢复、撤权/图库变化、PhotoKit事件、每30分钟和导入前触发对账；无源启用时不新开昂贵任务。状态为“首次准备／更新中／已就绪／等待 iCloud/重试／已暂停”，首次解释“完成图库分析后开始导入”。`SyncStatusPresentation` 集中推导索引状态与文案，`StatusMenu`/`SourceSettings` 消费聚合字段，避免分别计算。批量建设只节流发布聚合进度；显示资产和表示两个口径，不引入人工照片审核、概率或阈值滑杆。UI summary 用中文说明，底层详情仅tooltip/log；macOS13设置窗口和--demo继续无生产副作用。
-- [ ] **Step 4 — 实现日志字段。** 包含 event/file/stamp、context/index/local revisions、model/preprocess/policy/threshold 版本与实际阈值、source/representation尺寸、动作原因、关键匹配和有界精确分数、分段耗时、索引触发/新增/更改/删除/失败/等待计数。完整embedding/图片/metadata禁止序列化；保留10×10MiB轮转与失败warning。关键DB证据不随日志轮转删除；日志不能自动调阈值。
+- [ ] **Step 4 — 实现日志字段。** 包含 event/file/stamp、context/index/local revisions、model/preprocess/policy 版本、acceptanceID（用户决策 ID）与实际阈值、source/representation尺寸、动作原因、关键匹配和最近候选精确分数、每个分数与阈值的有符号差（score-threshold）、分段耗时、索引触发/新增/更改/删除/失败/等待计数。全局最多 10 个诊断候选加 1 个独立关键候选，包含未命中的最近分数；使用可往返的 Double 精度，不能用仅两三位小数掩盖边界。确实没有候选时记录空值及原因，不造 0 分。完整embedding/图片/metadata禁止序列化；保留10×10MiB轮转与失败warning。关键DB证据不随日志轮转删除；日志不能自动调阈值。
 - [ ] **Step 5 — 绿阶段与提交。** P8 测试绿，离屏验证准备/更新/iCloud等待/暂停/真实错误文案；`git commit -m "feat: expose advanced index progress and decision diagnostics"`。
 
 ### Task 9 (P9): 固定回归、系统边界与发行资源验收
 
-**Files:** Create `Tests/PhotoSyncCoreTests/AdvancedDedupRegressionTests.swift`, `Tests/Tools/test_advanced_dedup_release.py`, `docs/release/0.2.0-advanced-dedup-validation.md`, `Sources/PhotoSyncCore/Resources/AdvancedDedup/{profile.json,acceptance.json,model-provenance.json,LICENSE-SSCD.txt,SSCDLarge.mlpackage}`; Modify `scripts/validate.py`, `scripts/package-release.sh`, `PhotoSync.xcodeproj/project.pbxproj`, `Design/Validation.md`, `README.md`。
+**Files:** Create `Tests/PhotoSyncCoreTests/AdvancedDedupRegressionTests.swift`, `Tests/Tools/test_advanced_dedup_release.py`, `docs/release/0.2.0-advanced-dedup-validation.md`, `Sources/PhotoSyncCore/Resources/AdvancedDedup/{profile.json,decision.json,regression.json,closeout.json,model-provenance.json,LICENSE-SSCD.txt,SSCDLarge.mlpackage}`; Modify `scripts/validate.py`, `scripts/package-release.sh`, `PhotoSync.xcodeproj/project.pbxproj`, `Design/Validation.md`, `README.md`。
 
-**Interfaces:** Consumes P1 的 `DedupConfiguration.loadValidated(resourceDirectory: URL) throws -> DedupConfiguration`，本任务用真实 Bundle 资源验证该入口，不再新增另一个加载器。Bundle 通过 `Bundle(for:)` 的Core资源定位模型，不能指向work研究路径。以文件夹资源原样复制已批准 .mlpackage，不让Xcode自动替换成另一哈希的 .mlmodelc；R2 加载器验证包后在后台编译/缓存当前平台产物。发行 provenance 绑定源模型包和转换身份，系统验收另记录当时编译缓存的哈希，不误当成跨SDK永恒相同。冷启动预算包含首次编译。
+**Interfaces:** Consumes P1 的 `DedupConfiguration.loadValidated(resourceDirectory: URL) throws -> DedupConfiguration`，本任务用真实 Bundle 资源验证该入口，不再新增另一个加载器。Bundle 通过 `Bundle(for:)` 的Core资源定位模型，不能指向work研究路径。以文件夹资源原样复制已固定且获准分发的 .mlpackage，不让Xcode自动替换成另一哈希的 .mlmodelc；R2 加载器验证包后在后台编译/缓存当前平台产物。发行 provenance 绑定源模型包和转换身份，系统验收另记录当时编译缓存的哈希，不误当成跨SDK永恒相同。冷启动预算包含首次编译。
 
-- [ ] **Step 1 — 写失败测试。** `testFrozenCorpusContentAndActions`：先验证固定素材、真值及 active suite 哈希，再用发行预处理、模型、策略断言当前33例，明确14/19及11/22；`testReleaseRejectsMissingModelProfileOrLicense`：缺一项、错误SHA、未通过研究配置、backend不符均拒绝；`testNoImagesOrResearchCorpusInAppBundle`：包无测试图片/原片/研究数据。普通自动单测只用自制图；本地完整33例回归可使用已授权六附件，未获公开许可前不得将其推到公共CI。不得用旧44例协议身份替代当前scope绑定。
+- [ ] **Step 1 — 写失败测试。** `testFrozenCorpusContentAndActions`：先验证固定素材、真值及 active suite 哈希，再用发行预处理、模型、策略断言当前33例，明确14/19及11/22；`testReleaseRejectsMissingModelProfileOrLicense`：缺一项、错误 SHA、未绑定用户决策、阈值/策略/CPU 执行配置不符均拒绝；`testNoImagesOrResearchCorpusInAppBundle`：包无测试图片/原片/完整向量/原始研究数据；仅允许上表列出的紧凑配置与结果证据。普通自动单测只用自制图；本地完整33例回归可使用已授权六附件，未获公开许可前不得将其推到公共CI。不得用旧44例协议身份替代当前scope绑定。
 ```swift
 XCTAssertEqual(results.count, 33)
 XCTAssertEqual(results.filter { $0.content == .duplicate }.count, 14)
 XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 ```
 
-- [ ] **Step 2 — 跑红阶段并装入已验收资源。** 初次因无resource/未接线失败；复制R4批准的模型包与MIT记录入Core资源，绑定profile。让 `scripts/validate.py` 执行fixture `--require-approved`、工具测试和模型回归，不能只核对文件存在或跳过模型；保留完整 XCTest、Tests/Tools、continuation race 门槛。
+- [ ] **Step 2 — 跑红阶段并装入固定资源。** 初次因无 resource/未接线失败；按上表原样复制 4 份交接记录，核对模型包、转换身份、FP32/CPU-only 配置。分别核实代码和权重的实际再分发许可；代码 MIT 不自动授权权重打包，若仍未解决则暂停分发资源装入并报告，P1–P8 可用本地研究资源和 fake 继续开发。具备分发依据后复制模型及适用许可记录入 Core 资源，绑定 profile。让 `scripts/validate.py` 执行fixture `--require-approved`、工具测试和模型回归，不能只核对文件存在或跳过模型；保留完整 XCTest、Tests/Tools、continuation race 门槛。
 - [ ] **Step 3 — 做针对性系统验收。** 在用户授权的独立测试图库/账号验证原始与当前表示、编辑/撤销、第三方新增/删除、撤权、iCloud-only离线/下载/取消、重启及source不变性；iCloud有单独流量/耗时记录，不切换系统图库或设置来规避授权。若当前无此测试授权或设备，记录缺口并停止相应发行通过声明。保留测试fixture说明；不能把mock或本地JPEG实验当作真实PhotoKit证据。
-- [ ] **Step 4 — 全应用与平台验收。** 用批准的10万资产0/50/100%编辑比例验证端到端分段耗时、P50/P95/P99、RSS、持久存储、CPU/GPU与资源上限，无变化轮不得下载/推理，单项改变只重算相关表示。macOS13与Intel/arm64分别验证CoreML可加载及运行后端；只构建Universal不算实机通过。预算/R4精度不满足则不启用发行配置。
+- [ ] **Step 4 — 全应用与平台验收。** 复用历史 100k/150k/200k 合成向量基线，记录其旧 0.8、研究进程和本地输入的适用边界；不重启已停止的独立准确率/36,887 负例收集。集成后用受控应用负载验证分段耗时、P50/P95/P99、RSS、持久存储与资源上限，工程目标仍为 M2 Pro 热查询 P95 ≤250 ms、单张本地增量 P95 ≤2 秒、峰值 RSS ≤4 GiB；以实际输入和测量范围报告。无变化轮不得下载/推理，单项改变只重算相关表示。十万真实资产（0/50/100% 编辑比例）、真实 iCloud 若没有实际执行则列为未验证，不把合成基线写成实测；不将其补做为当前进入 P1 的前置。macOS13与Intel/arm64分别验证CoreML加载和固定 CPU-only 后端；只构建Universal不算实机通过。实际产品回归或资源预算不满足须修复/报告后再判定发行，不能以本次用户阈值决策掩盖。
 - [ ] **Step 5 — 完整自动门槛与分支审阅。** 执行本文件开头的 `scripts/validate.py` 全量入口并保存源码树身份；独立 reviewer 检查集成、持久化和并发风险。修复仅重验受影响部分后，再跑覆盖最终行为的全量验收；等价只读审阅不触发重复测试。`git commit -m "feat: validate and package PhotosYNC advanced dedup resources"`，精确记录最后源码提交与系统证据。
 - [ ] **Step 6 — 授权范围内的交付。** 只有版本/channel/build已明确、源码已提交且上述门槛通过，才执行 `scripts/package-release.sh` 的正常本地归档路径；不覆盖旧产物，不手工绕过归档内验收。没有本轮打包/合并/安装授权时交付验证记录与待发布源码，不自行执行推送、安装、启动生产App、Developer ID、公证或公开发布。六张用户照片许可问题与系统验收缺口分别列出，不以功能完成掩盖。
 
@@ -249,11 +260,11 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 | 4 清单/双表示/一致性 | P1/P2/P3/P6/P8 |
 | 5 iCloud/预算/取消 | R1/R2、P2/P3、P9 |
 | 6 v3迁移/恢复/旧skip重判 | P1/P5/P7 |
-| 7/7.1 校准与固定真值 | 研究计划R1–R4、P9 |
+| 7/7.1 用户选定配置、历史研究与固定真值 | 收尾记录、P1/P9 |
 | 8 性能与十万/二十万表示 | R4、P3/P8/P9 |
-| 9/10 日志和UI | P8 |
+| 9/10 阈值调整、近邻日志和UI | P4/P7/P8 |
 | 11 自动/系统/平台/交付 | P6/P9 |
 
-任务顺序：研究 R1–R4 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → P8 → P9。P2 的SDK/fake实现可与P1的存储工作分开评审，但共享类型与文件必须由单一所有者串行整合，不并发改SyncStore/SyncEngine。持续用最小相关检查；非最终任务不重复平台或真实图库全验收。
+任务顺序：研究已按 2026-10-05 用户决策收尾 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → P8 → P9。P2 的SDK/fake实现可与P1的存储工作分开评审，但共享类型与文件必须由单一所有者串行整合，不并发改SyncStore/SyncEngine。持续用最小相关检查；非最终任务不重复平台或真实图库全验收。
 
-当前仅完成计划。执行方式由用户选定：subagent-driven 每任务独立实现/评审，或 native 本会话实施后整体独立评审。因本功能涉及成功历史、unknown提交和增量索引一致性，推荐 subagent-driven；同范围等价深度评审不再重复quick review。
+当前仅完成研究收尾与计划修订。用户此前已选择 subagent-driven；收到后续产品实施指令后沿用该方式，每项任务按风险安排实现、深度评审和相关验证，同范围等价深度评审不再重复 quick review。本次不执行 P1–P9。
