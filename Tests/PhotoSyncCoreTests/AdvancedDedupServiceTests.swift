@@ -248,6 +248,33 @@ final class AdvancedDedupServiceTests: XCTestCase {
         let fingerprint = try await f.store.fingerprint(fileID: id, stamp: file.stamp, version: c.fingerprint.version)
         XCTAssertNil(fingerprint)
     }
+    func testFinalSynchronousValidityRejectsRegularAdmission() async throws {
+        let f = try await fixture(); try await ready(f, candidates: [])
+        f.photos.validity.invalidateAtNextCheck()
+        let result = try await f.service.prepare(fileID: f.id, file: f.file)
+        XCTAssertEqual(f.photos.validity.checkCount, 1, "Must reach the final synchronous snapshot gate")
+        XCTAssertEqual(f.photos.validity.invalidations, 1, "Library validity changes after the final await")
+        XCTAssertEqual(f.photos.validity.commitCount, 0)
+        let inferenceCount = await f.model.count; XCTAssertEqual(inferenceCount, 1)
+        let createCount = await f.photos.createCount; XCTAssertEqual(createCount, 0)
+        guard case .waiting = result else { return XCTFail("Invalid final snapshot cannot escape as no-match import/ready") }
+    }
+    func testFinalSynchronousValidityRejectsConservativeAdmission() async throws {
+        let f = try await fixture(); try await ready(f, candidates: [])
+        let url = f.file.url.deletingLastPathComponent().appendingPathComponent("final-gate.gif")
+        try writeImage(url, type: "com.compuserve.gif", frames: 2)
+        let file = SourceFile(sourceID: f.file.sourceID, relativePath: url.lastPathComponent, url: url,
+            stamp: try await DirectoryReader().stamp(of: url), metadata: f.file.metadata)
+        let id = try await f.store.save(file, decision: .importNew)
+        f.photos.validity.invalidateAtNextCheck()
+        let result = try await f.service.prepare(fileID: id, file: file)
+        XCTAssertEqual(f.photos.validity.checkCount, 1, "Conservative import reaches the same final snapshot gate")
+        XCTAssertEqual(f.photos.validity.invalidations, 1)
+        XCTAssertEqual(f.photos.validity.commitCount, 0)
+        let inferenceCount = await f.model.count; XCTAssertEqual(inferenceCount, 0)
+        let createCount = await f.photos.createCount; XCTAssertEqual(createCount, 0)
+        guard case .waiting = result else { return XCTFail("Invalid final snapshot cannot escape as conservative import") }
+    }
     private struct Fixture {
         let store: SyncStore; let photos: AdmissionPhotos; let model: AdmissionModel; let index: ExactVectorIndex
         let coordinator: PhotosIndexCoordinator; let service: AdvancedDedupService; let configuration: DedupConfiguration
@@ -321,6 +348,7 @@ private actor AdmissionModel: ImageFingerprinting {
 }
 private actor AdmissionPhotos: PhotosIndexGateway {
     nonisolated let context = LibraryContext(id: UUID(), epoch: 1)
+    nonisolated let validity = AdmissionValidity()
     private var generation = 1; private var descriptors: [RepresentationDescriptor] = []
     private(set) var createCount = 0
     private var gate: AdmissionGate?, snapshots = 0
@@ -330,11 +358,31 @@ private actor AdmissionPhotos: PhotosIndexGateway {
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
         snapshots += 1
         if snapshots == 2, let gate { self.gate = nil; await gate.hold() }
-        return .init(generation: generation, candidates: [])
+        return .init(generation: generation, candidates: [], validity: validity)
     }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { _ in } }
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage { .init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil) }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation { throw PhotoKitGatewayError.libraryUnavailable }
     func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String { createCount += 1; return "never" }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
+}
+
+/// Invalidates the captured snapshot at the public synchronous validity boundary,
+/// after every async producer check has finished. No production gate is injected.
+private final class AdmissionValidity: PhotosCandidateValidity, @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true, invalidateOnCheck = false
+    private var checks = 0, invalidationCount = 0, commits = 0
+    func invalidateAtNextCheck() { lock.lock(); invalidateOnCheck = true; lock.unlock() }
+    var checkCount: Int { lock.lock(); defer { lock.unlock() }; return checks }
+    var invalidations: Int { lock.lock(); defer { lock.unlock() }; return invalidationCount }
+    var commitCount: Int { lock.lock(); defer { lock.unlock() }; return commits }
+    func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        checks += 1
+        if invalidateOnCheck { valid = false; invalidateOnCheck = false; invalidationCount += 1 }
+        guard valid else { return false }
+        try commit(); commits += 1
+        return true
+    }
 }
