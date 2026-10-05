@@ -1205,6 +1205,7 @@ public final class SyncStore: @unchecked Sendable {
                     try execute("DROP TABLE old_file_fingerprint")
                 }
                 try execute("CREATE INDEX IF NOT EXISTS advanced_evidence_file ON advanced_match_evidence(file_id)")
+                try execute("CREATE INDEX IF NOT EXISTS dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id)")
             }
             return
         }
@@ -1391,6 +1392,7 @@ public final class SyncStore: @unchecked Sendable {
      file_id TEXT NOT NULL REFERENCES file_record(id), candidate_file_id TEXT NOT NULL REFERENCES file_record(id),
      candidate_revision TEXT NOT NULL, PRIMARY KEY(file_id, candidate_file_id), CHECK(file_id <> candidate_file_id)
     );
+    CREATE INDEX dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id);
     CREATE TABLE dedup_recheck_progress (
      target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0
     );

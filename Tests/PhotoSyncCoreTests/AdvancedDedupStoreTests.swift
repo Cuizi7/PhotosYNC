@@ -717,6 +717,54 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: root))
     }
 
+    func testFreshDependencyReverseQueriesUseIndexedLookup() throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try assertReverseDependencyLookup(at: db)
+        withExtendedLifetime(store) {}
+    }
+
+    func testV4ExtensionAddsReverseIndexWithoutLosingEdges() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let candidate = try await prepared(store, source, root, "candidate.jpg")
+        let dependent = try await prepared(store, source, root, "dependent.jpg")
+        try await publishEmpty(store)
+        try await assertTrue(try await store.commitAdvancedSkip(admission(store, dependent, candidate: candidate)))
+        // Reproduce the previous unreleased integration-v4 shape without its reverse index.
+        try injectEngineSQL("DROP INDEX IF EXISTS dedup_dependency_candidate;", at: db)
+        let migrated = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 4)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
+        try await assertEqual(try await migrated.state(of: dependent.fileID), .skipped)
+        try assertReverseDependencyLookup(at: db)
+        // The preserved edge still points to the original candidate after extension.
+        try await assertTrue(try await migrated.removeConfirmedAbsentPending(fileID: candidate.fileID))
+        try await assertEqual(try await migrated.state(of: dependent.fileID), .pending)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 0)
+    }
+
+    private func assertReverseDependencyLookup(at db: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+        var handle: OpaquePointer?
+        guard sqlite3_open(db.path, &handle) == SQLITE_OK else { throw FixtureError.unavailable("sqlite") }
+        defer { sqlite3_close(handle) }
+        for sql in ["SELECT file_id FROM dedup_dependency WHERE candidate_file_id = ?",
+                    "DELETE FROM dedup_dependency WHERE candidate_file_id = ?"] {
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, "EXPLAIN QUERY PLAN " + sql, -1, &statement, nil) == SQLITE_OK else {
+                throw FixtureError.unavailable("dependency query plan")
+            }
+            defer { sqlite3_finalize(statement) }
+            var plan = [String]()
+            while sqlite3_step(statement) == SQLITE_ROW {
+                plan.append(String(cString: sqlite3_column_text(statement, 3)))
+            }
+            XCTAssertTrue(plan.contains { $0.contains("SEARCH dedup_dependency") && $0.contains("candidate_file_id=?") },
+                          "Reverse lookup must search by candidate, not scan all edges: \(sql): \(plan)", file: file, line: line)
+        }
+    }
+
     func testFreshSchemaMatchesSQLAndMigratedSchema() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
