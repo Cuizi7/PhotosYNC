@@ -61,6 +61,10 @@ public struct PhotosCandidateSnapshot: Equatable, Sendable {
     }
 }
 
+/// Proof supplied only when a guarded gateway did not create any asset request.
+/// Timeout, cancellation, and an in-flight/unknown request must never use this.
+struct PhotosAdmissionDeferred: Error, Sendable {}
+
 public protocol PhotosGateway: Sendable {
     /// Returns an immutable candidate view and its admission generation.
     ///
@@ -79,10 +83,21 @@ public protocol PhotosGateway: Sendable {
         expectedGeneration: Int,
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> String
+    /// The predicate is checked synchronously at the actual mutation boundary,
+    /// after all gateway awaits. A default implementation fails closed.
+    func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int,
+                beforeMutation: @escaping @Sendable () throws -> Bool,
+                onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String
     func reconcile(placeholder: String?) async throws -> ImportEvidence
 }
 
 public extension PhotosGateway {
+    func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int,
+                beforeMutation: @escaping @Sendable () throws -> Bool,
+                onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+        throw PhotosAdmissionDeferred()
+    }
+
     func loadCandidates() async throws -> [MatchCandidate] {
         try await candidateSnapshot().allCandidates
     }

@@ -69,6 +69,7 @@ public enum SyncStoreError: Error, LocalizedError {
 
 public final class SyncStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "PhotoSync.SyncStore.sqlite")
+    private let queueKey = DispatchSpecificKey<Bool>()
     private let database: OpaquePointer
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -83,6 +84,7 @@ public final class SyncStore: @unchecked Sendable {
     public init(url: URL, readExecutor: ReadExecutor = .shared,
                 validateSource: @escaping @Sendable (URL) throws -> URL = { try SourceRegistry.normalizedURL($0) },
                 decodeObserver: @escaping @Sendable () -> Void = {}) throws {
+        queue.setSpecific(key: queueKey, value: true)
         self.readExecutor = readExecutor
         self.validateSource = validateSource
         self.decodeObserver = decodeObserver
@@ -541,7 +543,20 @@ public final class SyncStore: @unchecked Sendable {
     /// new evidence that was not scored. P6 must still guard pause/source/stamp and
     /// Photos validity at physical create, including any intervening await.
     public func advancedAttemptIsCurrent(fileID: UUID, attemptID: UUID) async throws -> Bool {
-        try await perform { try self.transaction {
+        try await perform { try self.advancedAttemptReceipt(fileID: fileID, attemptID: attemptID) }
+    }
+
+    /// Only call without any Photos-validity or engine-state lock held. The queue
+    /// check avoids reentrant sync deadlock; source/Photos I/O never enters here.
+    public func advancedAttemptIsCurrentSynchronously(fileID: UUID, attemptID: UUID) throws -> Bool {
+        if DispatchQueue.getSpecific(key: queueKey) == true {
+            return try advancedAttemptReceipt(fileID: fileID, attemptID: attemptID)
+        }
+        return try queue.sync { try advancedAttemptReceipt(fileID: fileID, attemptID: attemptID) }
+    }
+
+    private func advancedAttemptReceipt(fileID: UUID, attemptID: UUID) throws -> Bool {
+        try transaction {
             guard let receipt = try self.one("""
                 SELECT e.token_json, e.size, e.modified_ns, f.size, f.modified_ns
                 FROM file_record f JOIN source s ON s.id = f.source_id
@@ -560,7 +575,7 @@ public final class SyncStore: @unchecked Sendable {
                   self.optionalInteger(state[3]) == expected.indexGeneration,
                   let published = self.publishedIndexToken, self.samePhotosIndex(published, expected) else { return false }
             return try self.indexFactsComplete(state)
-        } }
+        }
     }
 
     private enum AdmissionFailure: Error { case stale }
@@ -747,6 +762,26 @@ public final class SyncStore: @unchecked Sendable {
                 throw error
             }
         }
+    }
+
+    /// The caller must have physical proof of prevention before mutation (or must
+    /// not have called create). Logical cancellation/timeout is not such proof.
+    /// Restrict cleanup to the matching, uncheckpointed advanced attempt. Preserve
+    /// retry_count; normal admission deferral is not a failed file.
+    func deferAdvancedAttempt(fileID: UUID, attemptID: UUID, nextRetry: Date) async throws {
+        try await perform { try self.transaction {
+            try self.requireChange("""
+                UPDATE file_record SET state = 'pending', attempt_id = NULL, placeholder_id = NULL,
+                    submitted_at = NULL, definitely_not_committed = 1, next_retry_at = ?
+                WHERE id = ? AND state = 'importing' AND attempt_id = ? AND success_id IS NULL
+                    AND placeholder_id IS NULL AND last_error IS NULL
+                    AND EXISTS (SELECT 1 FROM advanced_match_evidence e
+                                WHERE e.file_id = file_record.id AND e.action = 'importFile')
+                """, [.double(nextRetry.timeIntervalSince1970), .text(fileID.uuidString), .text(attemptID.uuidString)])
+            try self.execute("DELETE FROM file_fingerprint WHERE file_id = ? AND purpose = 'attempt' AND attempt_id = ?",
+                             [.text(fileID.uuidString), .text(attemptID.uuidString)])
+            try self.bumpLocalRevision()
+        } }
     }
 
     public func recordRetry(fileID: UUID, attemptID: UUID?, nextRetry: Date, error: String, definitelyNotCommitted: Bool) async throws {

@@ -214,25 +214,46 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         expectedGeneration: Int,
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> String {
+        try await create(fileURL: fileURL, kind: kind, expectedGeneration: expectedGeneration,
+                         beforeMutation: { true }, guarded: false, onPlaceholder: onPlaceholder)
+    }
+
+    public func create(
+        fileURL: URL,
+        kind: MediaKind,
+        expectedGeneration: Int,
+        beforeMutation: @escaping @Sendable () throws -> Bool,
+        onPlaceholder: @escaping @Sendable (String) throws -> Void
+    ) async throws -> String {
+        try await create(fileURL: fileURL, kind: kind, expectedGeneration: expectedGeneration,
+                         beforeMutation: beforeMutation, guarded: true, onPlaceholder: onPlaceholder)
+    }
+
+    private func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int,
+                        beforeMutation: @escaping @Sendable () throws -> Bool, guarded: Bool,
+                        onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
         let generation = try await usableGeneration()
         guard generation == expectedGeneration else {
+            if guarded { throw PhotosAdmissionDeferred() }
             throw PhotoKitGatewayError.definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
         }
         do {
             try requireAdmission(generation: generation)
         } catch PhotoKitGatewayError.libraryChanged {
+            if guarded { throw PhotosAdmissionDeferred() }
             throw PhotoKitGatewayError.definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
         }
         guard fileURL.isFileURL, FileManager.default.fileExists(atPath: fileURL.path) else {
             throw PhotoKitGatewayError.definitelyNotCommitted("The source file was unavailable before PhotoKit submission.")
         }
 
+        let guardCheck = PhotoKitMutationGuard(beforeMutation)
         let result: PhotoKitSubmissionResult
         do {
             result = try await lifecycle.submit(
                 PhotoKitCreateCommand(fileURL: fileURL, kind: kind, shouldMoveFile: false),
                 beforeMutation: { [state, lifecycle] in
-                    lifecycle.currentAccess() == .authorized && lifecycle.isAvailable() && state.isReady(generation: generation)
+                    guardCheck.check() && lifecycle.currentAccess() == .authorized && lifecycle.isAvailable() && state.isReady(generation: generation)
                 },
                 onPlaceholder: onPlaceholder
             )
@@ -246,6 +267,11 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
         switch result {
         case .preventedBeforeMutation:
+            if let error = guardCheck.failure {
+                if let storageError = error as? SyncStoreError { throw storageError }
+                throw PhotoKitGatewayError.definitelyNotCommitted(error.localizedDescription)
+            }
+            if guarded { throw PhotosAdmissionDeferred() }
             throw PhotoKitGatewayError.definitelyNotCommitted("The Photos submission was prevented before mutation.")
         case .checkpointFailed:
             state.blockAdditions(.checkpointFailed)
@@ -671,4 +697,18 @@ private final class PhotoKitGenerationValidity: PhotosCandidateValidity, @unchec
     func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
         try state.commitIfCurrent(generation: generation, commit)
     }
+}
+
+/// Stores only a synchronous predicate failure. It never holds its lock while
+/// calling the engine, reading the source, or entering the store queue.
+private final class PhotoKitMutationGuard: @unchecked Sendable {
+    private let predicate: @Sendable () throws -> Bool
+    private let lock = NSLock()
+    private var error: Error?
+    init(_ predicate: @escaping @Sendable () throws -> Bool) { self.predicate = predicate }
+    func check() -> Bool {
+        do { return try predicate() }
+        catch { lock.lock(); self.error = error; lock.unlock(); return false }
+    }
+    var failure: Error? { lock.lock(); defer { lock.unlock() }; return error }
 }

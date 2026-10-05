@@ -297,6 +297,64 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertTrue(lifecycle.events.isEmpty)
     }
 
+    func testGuardedProtocolDefaultCannotInvokeLegacyCreate() async throws {
+        let fake = FakePhotosGateway()
+        let gateway: any PhotosGateway = fake
+        await assertThrows({ try await gateway.create(fileURL: URL(fileURLWithPath: "/never-read"), kind: .image,
+            expectedGeneration: 0, beforeMutation: { true }, onPlaceholder: { _ in XCTFail("No legacy checkpoint") }) }, verify: { error in
+            XCTAssertTrue(error is PhotosAdmissionDeferred)
+        })
+        let count = await fake.createCount
+        XCTAssertEqual(count, 0)
+    }
+
+    func testNativeGuardStorageErrorRemainsStorageError() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle)
+        let root = try sourceFixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let snapshot = try await gateway.candidateSnapshot()
+        await assertThrows({ try await gateway.create(fileURL: root.appendingPathComponent("normal.jpg"), kind: .image,
+            expectedGeneration: snapshot.generation, beforeMutation: { throw SyncStoreError.sqlite("controlled receipt failure") },
+            onPlaceholder: { _ in XCTFail("No checkpoint") }) }, verify: { error in
+            guard case .sqlite(let message) = error as? SyncStoreError else { return XCTFail("Storage failure must stay typed") }
+            XCTAssertEqual(message, "controlled receipt failure")
+        })
+        XCTAssertTrue(lifecycle.commands.isEmpty)
+    }
+
+    func testGuardedProtocolCreateChecksInsideNativeMutationBoundary() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway: any PhotosGateway = PhotoKitGateway(lifecycle: lifecycle)
+        let root = try sourceFixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let predicate = NativeAdmissionSwitch()
+        lifecycle.beforeMutation = { predicate.reject() }
+        let snapshot = try await gateway.candidateSnapshot()
+        await assertThrows({ try await gateway.create(fileURL: root.appendingPathComponent("normal.jpg"), kind: .image,
+            expectedGeneration: snapshot.generation, beforeMutation: { predicate.allowed }, onPlaceholder: { _ in XCTFail("No checkpoint before mutation") }) }, verify: { error in
+            XCTAssertTrue(error is PhotosAdmissionDeferred)
+        })
+        XCTAssertTrue(lifecycle.commands.isEmpty)
+        XCTAssertEqual(lifecycle.events, ["beforeMutation"])
+    }
+
+    func testGuardedProtocolCreatePreservesSourceFailureDiagnostics() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway: any PhotosGateway = PhotoKitGateway(lifecycle: lifecycle)
+        let root = try sourceFixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let snapshot = try await gateway.candidateSnapshot()
+        await assertThrows({ try await gateway.create(fileURL: root.appendingPathComponent("normal.jpg"), kind: .image,
+            expectedGeneration: snapshot.generation, beforeMutation: {
+                throw NSError(domain: "PhysicalStamp", code: 7, userInfo: [NSLocalizedDescriptionKey: "controlled source failure"])
+            }, onPlaceholder: { _ in XCTFail("No checkpoint") }) }, verify: { error in
+            XCTAssertEqual((error as? PhotoKitGatewayError)?.recoveryEvidence, .definitelyNotCommitted)
+            XCTAssertTrue(error.localizedDescription.contains("controlled source failure"))
+        })
+        XCTAssertTrue(lifecycle.commands.isEmpty)
+    }
+
     func testPhotosGatewayProtocolDispatchesGenerationBoundCreate() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         let concrete = PhotoKitGateway(lifecycle: lifecycle)
@@ -430,4 +488,11 @@ private func candidate(key: String) -> MatchCandidate {
             duration: nil
         )
     )
+}
+
+private final class NativeAdmissionSwitch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = true
+    func reject() { lock.lock(); value = false; lock.unlock() }
+    var allowed: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
