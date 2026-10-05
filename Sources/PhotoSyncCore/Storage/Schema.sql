@@ -37,7 +37,8 @@ CREATE TABLE dedup_index_state (
  id INTEGER PRIMARY KEY CHECK(id = 1), context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL,
  generation INTEGER NOT NULL, published_generation INTEGER, fingerprint_version TEXT NOT NULL,
  photos_generation INTEGER NOT NULL, local_revision INTEGER NOT NULL DEFAULT 0,
- reconcile_cursor TEXT, reconciliation_complete INTEGER NOT NULL DEFAULT 0
+ reconcile_cursor TEXT, reconciliation_complete INTEGER NOT NULL DEFAULT 0,
+ resume_checkpoint BLOB, excluded_assets INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE photos_representation (
  context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,

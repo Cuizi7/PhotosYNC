@@ -48,6 +48,11 @@ public actor ExactVectorIndex {
         self.generation = generation
     }
 
+    /// Publication must match both the installed generation and its full vector count.
+    public func containsGeneration(_ generation: Int64, entryCount: Int) -> Bool {
+        self.generation == generation && metadata.count == entryCount && vectors.count == entryCount * 1024
+    }
+
     public func search(query: Fingerprint, minimumScore: Double, generation: Int64) throws -> [ScoredCandidate] {
         guard self.generation == generation, query.version == version else {
             throw AdvancedDedupError.modelMismatch

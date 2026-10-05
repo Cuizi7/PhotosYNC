@@ -571,6 +571,7 @@ public final class SyncStore: @unchecked Sendable {
                     ON CONFLICT(id) DO UPDATE SET context_id = excluded.context_id, context_epoch = excluded.context_epoch,
                     generation = excluded.generation, fingerprint_version = excluded.fingerprint_version,
                     photos_generation = excluded.photos_generation, published_generation = NULL,
+                    resume_checkpoint = CASE WHEN context_id = excluded.context_id AND context_epoch = excluded.context_epoch THEN resume_checkpoint ELSE NULL END,
                     reconciliation_complete = 0, reconcile_cursor = NULL
                     """, [.text(context.id.uuidString), .int64(context.epoch), .int64(generation), .text(fingerprintVersion), .int64(Int64(photosGeneration))])
                 return generation
@@ -631,24 +632,121 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    public func finishIndexReconciliation(generation: Int64) async throws {
+    public func finishIndexReconciliation(generation: Int64, checkpoint: LibraryResumeCheckpoint? = nil, excludedAssets: Int = 0) async throws {
+        guard excludedAssets >= 0 else { throw AdvancedDedupError.invalidConfiguration }
         try await perform {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
                       try self.int64(state[7]) == 0 else { return }
                 let context = try self.libraryContext(state)
+                if let checkpoint, checkpoint.context != context { throw AdvancedDedupError.invalidConfiguration }
                 let key: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .int64(generation)]
+                // A proven equivalent current slot shares the original vector. Only
+                // coalesce when that original is eligible in this complete inventory.
+                try self.execute("""
+                    UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ?
+                    AND kind = 'current' AND equivalent_to_original = 1 AND seen_generation = ?
+                    AND EXISTS (SELECT 1 FROM photos_representation original WHERE original.context_id = photos_representation.context_id
+                    AND original.context_epoch = photos_representation.context_epoch AND original.asset_id = photos_representation.asset_id
+                    AND original.kind = 'original' AND original.seen_generation = photos_representation.seen_generation AND original.tombstoned = 0)
+                    """, key)
                 try self.execute("UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ? AND seen_generation <> ?", key)
                 try self.execute("""
                     DELETE FROM fingerprint_task WHERE EXISTS (SELECT 1 FROM photos_representation r
                     WHERE r.context_id = fingerprint_task.context_id AND r.context_epoch = fingerprint_task.context_epoch
                     AND r.asset_id = fingerprint_task.asset_id AND r.kind = fingerprint_task.kind AND r.tombstoned = 1)
                     """)
-                try self.execute("UPDATE dedup_index_state SET reconciliation_complete = 1, reconcile_cursor = NULL WHERE id = 1")
+                let data = try checkpoint.map { try JSONEncoder().encode($0) }
+                try self.execute("UPDATE dedup_index_state SET reconciliation_complete = 1, reconcile_cursor = NULL, resume_checkpoint = ?, excluded_assets = ? WHERE id = 1",
+                                 [data.map(Binding.blob) ?? .null, .int64(Int64(excludedAssets))])
             }
         }
     }
 
+    /// Durable history cursor belongs to a completed inventory, not vector readiness.
+    public func libraryResumeCheckpoint() async throws -> LibraryResumeCheckpoint? {
+        try await perform {
+            guard let row = try self.one("SELECT resume_checkpoint FROM dedup_index_state WHERE id = 1", []),
+                  case .blob(let data) = row[0] else { return nil }
+            return try JSONDecoder().decode(LibraryResumeCheckpoint.self, from: data)
+        }
+    }
+
+    /// Page invalidation is authoritative even when a reliable metadata revision
+    /// matches. Invalidate before upsert; an all-invalid page also covers earlier pages.
+    public func invalidateRepresentations(assetIDs: [String]?, generation: Int64) async throws {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
+                      try self.int64(state[7]) == 0 else { throw SyncStoreError.invalidTransition("Stale reconciliation invalidation.") }
+                let context = try self.libraryContext(state)
+                let base: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
+                let ids: [String?] = assetIDs.map { $0.map(Optional.some) } ?? [nil]
+                for asset in ids {
+                    let filter = "context_id = ? AND context_epoch = ?" + (asset == nil ? "" : " AND asset_id = ?")
+                    let bindings = base + (asset.map { [Binding.text($0)] } ?? [])
+                    try self.execute("UPDATE photos_representation SET state = 'pending', vector = NULL WHERE " + filter, bindings)
+                    try self.execute("DELETE FROM fingerprint_task WHERE " + filter, bindings)
+                    // Earlier pages may already have been upserted in this generation.
+                    try self.execute("""
+                        INSERT INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation)
+                        SELECT context_id, context_epoch, asset_id, kind, revision, fingerprint_version, seen_generation
+                        FROM photos_representation WHERE
+                        """ + " " + filter + " AND seen_generation = ? AND tombstoned = 0", bindings + [.int64(generation)])
+                }
+            }
+        }
+    }
+
+    /// Read-only counters from the same durable facts used by publication.
+    public func indexProgress() async throws -> IndexProgress {
+        try await perform {
+            guard let state = try self.indexStateRow() else {
+                return IndexProgress(state: .preparing, totalsKnown: false, totalAssets: 0, readyAssets: 0,
+                                     totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
+            }
+            let context = try self.libraryContext(state)
+            let bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .int64(try self.int64(state[2]))]
+            let row = try self.one("""
+                SELECT COUNT(*), COALESCE(SUM(state = 'ready'), 0), COALESCE(SUM(state = 'failed'), 0), COUNT(DISTINCT asset_id)
+                FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND seen_generation = ? AND tombstoned = 0
+                """, bindings)!
+            let ready = try self.one("""
+                SELECT COUNT(*) FROM (SELECT asset_id FROM photos_representation WHERE context_id = ? AND context_epoch = ?
+                AND seen_generation = ? AND tombstoned = 0 GROUP BY asset_id HAVING MIN(state = 'ready') = 1)
+                """, bindings)!
+            let excludedRow = try self.one("SELECT excluded_assets FROM dedup_index_state WHERE id = 1", [])!
+            let excluded = Int(try self.int64(excludedRow[0]))
+            return IndexProgress(state: try self.int64(row[2]) > 0 ? .waiting : .updating,
+                totalsKnown: try self.int64(state[7]) != 0, totalAssets: Int(try self.int64(row[3])) + excluded,
+                readyAssets: Int(try self.int64(ready[0])), totalRepresentations: Int(try self.int64(row[0])),
+                readyRepresentations: Int(try self.int64(row[1])), excludedAssets: excluded, issue: nil)
+        }
+    }
+
+    /// Lightweight admission metadata: never materialize all vector BLOBs just
+    /// to render progress or validate a token. Publication still decodes every vector.
+    public func indexReadiness() async throws -> (token: IndexToken, entryCount: Int)? {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
+                let token = try self.indexToken(state)
+                let row = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ?",
+                    [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)])!
+                return (token, Int(try self.int64(row[0])))
+            }
+        }
+    }
+
+    public func invalidateIndexPublication() async throws {
+        try await perform {
+            try self.execute("UPDATE dedup_index_state SET published_generation = NULL WHERE id = 1")
+            self.publishedIndexToken = nil
+        }
+    }
+
+    /// Polling does not claim work. One coordinator must deduplicate and retain
+    /// its physical in-flight ownership until each consumer has actually finished.
     public func nextRepresentationTasks(now: Date, limit: Int) async throws -> [RepresentationTask] {
         guard limit > 0 else { return [] }
         return try await perform {
@@ -675,6 +773,7 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// A stale store-issued task returns false and cannot revive old facts.
     public func completeRepresentation(_ task: RepresentationTask, fingerprint: Fingerprint) async throws -> Bool {
         guard fingerprint.version == task.fingerprintVersion else { throw AdvancedDedupError.modelMismatch }
         return try await perform {
@@ -687,6 +786,7 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// Stale failures are no-ops; retry scheduling never crosses a generation.
     public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws {
         try await perform {
             try self.transaction {
@@ -722,6 +822,8 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// The caller must first install the complete immutable derived generation.
+    /// This transaction validates facts/token, but cannot inspect an external index.
     public func markIndexPublished(token: IndexToken) async throws -> Bool {
         try await perform {
             try self.transaction {
@@ -784,7 +886,16 @@ public final class SyncStore: @unchecked Sendable {
     private func migrate() throws {
         let version = try pragmaUserVersion()
         guard version <= 4 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 4 else { return }
+        guard version < 4 else {
+            // P1/P2 integration snapshots already use v4. Extend that unpublished
+            // schema transactionally without resetting any previously stored facts.
+            try transaction {
+                let columns = try rows("PRAGMA table_info(dedup_index_state)", []).map { try text($0[1]) }
+                if !columns.contains("resume_checkpoint") { try execute("ALTER TABLE dedup_index_state ADD COLUMN resume_checkpoint BLOB") }
+                if !columns.contains("excluded_assets") { try execute("ALTER TABLE dedup_index_state ADD COLUMN excluded_assets INTEGER NOT NULL DEFAULT 0") }
+            }
+            return
+        }
         try transaction {
             if version == 0 {
                 try execute(Self.schema)
@@ -924,7 +1035,8 @@ public final class SyncStore: @unchecked Sendable {
      id INTEGER PRIMARY KEY CHECK(id = 1), context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL,
      generation INTEGER NOT NULL, published_generation INTEGER, fingerprint_version TEXT NOT NULL,
      photos_generation INTEGER NOT NULL, local_revision INTEGER NOT NULL DEFAULT 0,
-     reconcile_cursor TEXT, reconciliation_complete INTEGER NOT NULL DEFAULT 0
+     reconcile_cursor TEXT, reconciliation_complete INTEGER NOT NULL DEFAULT 0,
+     resume_checkpoint BLOB, excluded_assets INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE photos_representation (
      context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
