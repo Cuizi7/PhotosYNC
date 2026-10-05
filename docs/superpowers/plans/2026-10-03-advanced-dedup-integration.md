@@ -2,6 +2,8 @@
 
 > **2026-10-05 当前状态：** 用户明确选定初始阈值 **0.98**，结束进一步独立校准/封存研究，进入产品集成准备。固定配置及当前 33 例的共享 Swift scorer 重放（33/33 内容和动作通过）见[研究收尾](../../research/advanced-dedup/2026-10-05-research-closeout.md)。这是用户决策与固定回归证据，未证明原协议的统计目标。旧 44 例及 0.8 失败报告保留。本次仅修订计划，**P1–P9 尚未执行**。
 
+> **同日产品交互补充：** 用户已确认仅在点击菜单栏图标后的下拉面板展示图库分析，就绪时隐藏；首次自动分析，完成后静默进入同步；iCloud 等待提示与基础同步统计各占一行。用户明确要求实际实现继续使用原生控件。具体约束与验收见 P8，浏览器草图仅用于设计审阅。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将用户选定的 SSCD Large / 0.98 配置接入 Photos 持续索引、SQLite 恢复、串行导入及生产日志，保持来源只读和成功历史保护。
@@ -10,7 +12,7 @@
 
 **Tech Stack:** Swift / Foundation / PhotoKit / ImageIO / Core ML / Accelerate / SQLite / SwiftUI，macOS 13、Universal arm64/x86_64，XCTest 与现有 Python 验收入口。
 
-**Spec:** `docs/superpowers/specs/2026-09-28-photosync-0.2.0-advanced-dedup-design.md`；并读 `docs/specs/2026-09-18-runtime-state-and-recovery.md` 和 `Design/Validation.md`。本次修订代码基线 `a6d3750`；现有 schema v3。
+**Spec:** `docs/superpowers/specs/2026-09-28-photosync-0.2.0-advanced-dedup-design.md`；并读 `docs/specs/2026-09-18-runtime-state-and-recovery.md` 和 `Design/Validation.md`。本次修订代码基线 `7937a9c`；现有 schema v3。
 
 ## Global Constraints
 
@@ -26,6 +28,7 @@
 - “旧已提交结果和成功历史不得因此重新导入”；未知高版本 schema 拒绝打开，不清库重置。
 - 现有日志轮转“10 × 10 MiB”；不记原图、完整向量或 metadata 全量转储，不自动上传。
 - 保持 macOS 13、Universal、现有 bundle identity、数据目录 `Application Support/PhotoSync` 和本地 ad-hoc 发布契约。
+- 界面沿用 SwiftUI / AppKit 原生控件。浏览器原型只表达信息层级和交互，不嵌入 App、不用 WebView 重现页面，也不照搬网页的 CSS、阴影、颜色或像素尺寸。
 - 当前 33 个固定回归用例不等于封存阈值集；历史 v1 的 44 例仍须保留为已见样本；用户附件的公开分发许可仍未补全，不打包这些图片进 App、不自行推送。
 
 ## Review Focus
@@ -218,7 +221,24 @@ XCTAssertEqual(importedCountAfterReopen, importedCountBeforeReopen)
 
 **Interfaces:** `DedupDecisionLog.maxDiagnosticCandidates = 10`，`DedupDecisionLog.fields(evidence: AdvancedEvidence, configuration: DedupConfiguration) -> [String: String]`；`EngineSnapshot.indexProgress: IndexProgress?`。Runtime 启动时通过 P1 loadValidated 装载一份不可变配置并注入全部组件，持有一个 gateway/coordinator/fingerprinter/index/budget/service，pause/resume/stop 转发；P9 装入正式资源之前测试使用显式注入资源目录，正常启动缺资源显示配置不可用并禁止静态照片新提交；`ScanSchedule` 增加 Photos 对账到期状态，仍 `interval=1800`，与来源扫描 tick 合并。
 
+**已确认的产品交互与原生实现约束（2026-10-05）：**
+
+| 项目 | 实现要求 |
+| --- | --- |
+| 菜单栏入口 | 保持 `PhotoSyncApp.swift` 现有 `MenuBarExtra` + `.menuBarExtraStyle(.window)`。菜单栏 label 只放状态 `Image(systemName:)`，保留辅助功能标签；不增加可见摘要、文字或进度数字。 |
+| 分析区域位置 | 在点击图标后的 `StatusMenu` 下拉面板中，放于状态标题和来源同步信息之间；设置页保持既有来源/登录启动/通知职责，不另建图库分析页或独立窗口。 |
+| 显示与隐藏 | 首次准备、更新、等待时显示；未完成分析被暂停时保留进度。图库就绪后整块移除，不留下“图库已就绪”一行或空白占位；就绪后仅暂停同步也不能让分析区域重新出现。后续确有分析工作/等待时重新展示。 |
+| 首次使用/升级 | 已授权 Photos、至少一个来源启用且未暂停时自动开始分析，不增加“开始分析”确认步骤。首次说明“完成图库分析后开始导入”，以及部分照片可能从 iCloud 下载。就绪后在既有暂停/授权/提交条件允许时自动继续同步。 |
+| 通知与暂停 | 不单独发送“图库分析完成”通知，保留既有同步通知设置及规则。沿用“暂停同步／继续同步”控制新分析与新导入；在途工作按既有规则收尾，保留已完成进度，不增加独立分析暂停开关。 |
+| 分析进度 | 主进度按照片计数，原片与编辑版不算两张照片；表示级任务数仍保留在内部进度和日志。总数已知时使用原生进度条与“已分析 N / M 张”；总数未知时显示读取图库阶段，不编造总数或百分比。 |
+| 两处单行文案 | iCloud 等待提示为“正在等待 iCloud 图像，连接恢复后自动继续”；基础统计为“已导入 N · 已跳过 M · 待处理 K”，各占一行、不手动插入换行。待重试、提交中/待确认及退役历史等既有附注可另行呈现，不能因压成一行丢失这些信息。 |
+| 原生布局 | 用现有 SwiftUI `Text`、`Label`、`ProgressView`、`Button`、`Divider`、`ScrollView` 组织内容，保留系统字号、控件反馈、键盘和辅助功能行为。沿用现有 320pt 下拉面板与有界状态滚动区、固定操作区；通过原生布局核对单行完整性，不用缩小字号或省略关键计数换取单行。macOS 13 的既有 AppKit 设置窗口兼容路径保留。 |
+
+以上文字是持久化的实现要求；本地网页仅辅助审阅，示例数字、桌面装饰和场景切换按钮均不进入产品。浏览器检查不能代替下面的原生布局与交互验收。
+
 - [ ] **Step 1 — 写失败测试。** `testThirtyMinuteReconcileDoesNotOverlapOrCatchUp`：注入时钟 1800s 触发、忙时合并、休眠不补跑过期轮；`testIndexProgressCountsAssetsAndRepresentationsSeparately`：100000资产/200000表示不能显示成20万照片；`testWaitingIndexIsNotFinishedOrFileError`：索引阻断显示原因；`testLogsImportsAsWellAsSkipsAndDeduplicatesSameEvidence`：同stamp/profile/token只一条，变化后新event；`testDiagnosticCapNeverDropsDecisiveCandidate`；`testLogsBelowThresholdScoreAndSignedMarginWithoutRounding`：记录近邻原始分数及 score-threshold，不四舍五入成 0.98；`testNoCandidateIsAbsentNotZeroScore`；`testPolicyChangeCreatesNewDiagnosticEvent`；`testLogFailureIsWarningButEvidenceFailureBlocksDecision`。
+
+  UI/runtime 另覆盖 `testLibraryAnalysisVisibility`（准备/更新/等待/未完成时暂停可见，就绪及就绪后暂停时整块隐藏）；`testAnalysisStartsAutomaticallyOnlyWhenEligible`（授权、启用来源、暂停条件）；`testAnalysisReadyDoesNotEmitExtraNotification`（单独的分析完成事件不发通知，既有同步通知不变）；`testCompactAnalysisAndCountersFitNativeMenu`（320pt 原生面板、系统字体，iCloud 提示及基础三项含六位数计数仍各占一行、信息完整，附加状态保留）。沿用现有 UI 测试核对菜单栏仅图标、暂停/继续入口及固定操作区，不为网页草图建立产品依赖。
 ```swift
 XCTAssertEqual(ScanSchedule.interval, 1800)
 XCTAssertEqual(progress.totalAssets, 100000)
@@ -226,9 +246,9 @@ XCTAssertEqual(progress.totalRepresentations, 200000)
 ```
 
 - [ ] **Step 2 — 跑 P8 红阶段命令。** 日志用临时目录和 flushForTesting；UI 仅 injected runtime/offscreen。
-- [ ] **Step 3 — 实现 scheduling/UI。** 启动、恢复、撤权/图库变化、PhotoKit事件、每30分钟和导入前触发对账；无源启用时不新开昂贵任务。状态为“首次准备／更新中／已就绪／等待 iCloud/重试／已暂停”，首次解释“完成图库分析后开始导入”。`SyncStatusPresentation` 集中推导索引状态与文案，`StatusMenu`/`SourceSettings` 消费聚合字段，避免分别计算。批量建设只节流发布聚合进度；显示资产和表示两个口径，不引入人工照片审核、概率或阈值滑杆。UI summary 用中文说明，底层详情仅tooltip/log；macOS13设置窗口和--demo继续无生产副作用。
+- [ ] **Step 3 — 实现 scheduling/UI。** 启动、恢复、撤权/图库变化、PhotoKit事件、每30分钟和导入前触发对账；无源启用时不新开昂贵任务。内部保留 preparing/updating/ready/waiting/paused 状态，按上表决定分析区域可见性，不将内部 ready 状态显示为常驻一行。`SyncStatusPresentation` 集中推导状态、可见性与文案，`StatusMenu` 只消费聚合字段并用原生控件渲染；`SourceSettings` 不增加图库分析区域。批量建设只节流发布聚合进度；照片数用于用户进度、表示数用于内部工作量和日志，两者不混算。不增加额外完成通知、人工照片审核、概率或阈值滑杆。UI summary 用中文说明，底层详情仅 tooltip/log；macOS 13 设置窗口和 --demo 继续无生产副作用。
 - [ ] **Step 4 — 实现日志字段。** 包含 event/file/stamp、context/index/local revisions、model/preprocess/policy 版本、acceptanceID（用户决策 ID）与实际阈值、source/representation尺寸、动作原因、关键匹配和最近候选精确分数、每个分数与阈值的有符号差（score-threshold）、分段耗时、索引触发/新增/更改/删除/失败/等待计数。全局最多 10 个诊断候选加 1 个独立关键候选，包含未命中的最近分数；使用可往返的 Double 精度，不能用仅两三位小数掩盖边界。确实没有候选时记录空值及原因，不造 0 分。完整embedding/图片/metadata禁止序列化；保留10×10MiB轮转与失败warning。关键DB证据不随日志轮转删除；日志不能自动调阈值。
-- [ ] **Step 5 — 绿阶段与提交。** P8 测试绿，离屏验证准备/更新/iCloud等待/暂停/真实错误文案；`git commit -m "feat: expose advanced index progress and decision diagnostics"`。
+- [ ] **Step 5 — 绿阶段与提交。** P8 测试绿，用原生离屏/GUI QA 验证准备、更新、iCloud 等待、暂停及错误文案，重点核对两处单行文字、就绪后整块隐藏及底部操作不被裁切。用 demo/injected runtime 检查键盘焦点和辅助功能标签，不启动生产同步。浏览器原型或其截图不作为原生验收通过证据；`git commit -m "feat: expose advanced index progress and decision diagnostics"`。
 
 ### Task 9 (P9): 固定回归、系统边界与发行资源验收
 
@@ -236,7 +256,7 @@ XCTAssertEqual(progress.totalRepresentations, 200000)
 
 **Interfaces:** Consumes P1 的 `DedupConfiguration.loadValidated(resourceDirectory: URL) throws -> DedupConfiguration`，本任务用真实 Bundle 资源验证该入口，不再新增另一个加载器。Bundle 通过 `Bundle(for:)` 的Core资源定位模型，不能指向work研究路径。以文件夹资源原样复制已固定且获准分发的 .mlpackage，不让Xcode自动替换成另一哈希的 .mlmodelc；R2 加载器验证包后在后台编译/缓存当前平台产物。发行 provenance 绑定源模型包和转换身份，系统验收另记录当时编译缓存的哈希，不误当成跨SDK永恒相同。冷启动预算包含首次编译。
 
-- [ ] **Step 1 — 写失败测试。** `testFrozenCorpusContentAndActions`：先验证固定素材、真值及 active suite 哈希，再用发行预处理、模型、策略断言当前33例，明确14/19及11/22；`testReleaseRejectsMissingModelProfileOrLicense`：缺一项、错误 SHA、未绑定用户决策、阈值/策略/CPU 执行配置不符均拒绝；`testNoImagesOrResearchCorpusInAppBundle`：包无测试图片/原片/完整向量/原始研究数据；仅允许上表列出的紧凑配置与结果证据。普通自动单测只用自制图；本地完整33例回归可使用已授权六附件，未获公开许可前不得将其推到公共CI。不得用旧44例协议身份替代当前scope绑定。
+- [ ] **Step 1 — 写失败测试。** `testFrozenCorpusContentAndActions`：先验证固定素材、真值及 active suite 哈希，再用发行预处理、模型、策略断言当前33例，明确14/19及11/22；`testReleaseRejectsMissingModelProfileOrLicense`：缺一项、错误 SHA、未绑定用户决策、阈值/策略/CPU 执行配置不符均拒绝；`testNoImagesOrResearchCorpusInAppBundle`：包无测试图片/原片/完整向量/原始研究数据，也不含网页原型及预览服务；仅允许上表列出的紧凑配置与结果证据。普通自动单测只用自制图；本地完整33例回归可使用已授权六附件，未获公开许可前不得将其推到公共CI。不得用旧44例协议身份替代当前scope绑定。
 ```swift
 XCTAssertEqual(results.count, 33)
 XCTAssertEqual(results.filter { $0.content == .duplicate }.count, 14)
