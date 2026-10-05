@@ -155,10 +155,10 @@ public struct ScoredCandidate: Codable, Equatable, Sendable {
     }
 }
 
-public enum ContentResult: String, Codable, Sendable { case duplicate, notDuplicate }
+public enum ContentResult: String, Codable, Sendable { case duplicate, notDuplicate, notCompared }
 public enum ImportAction: String, Codable, Sendable { case importFile, skip }
 public enum DecisionReason: String, Codable, Sendable {
-    case noMatch, covered, resolutionUpgrade, insufficientSizeEvidence
+    case noMatch, covered, resolutionUpgrade, insufficientSizeEvidence, nonComparableSource
 }
 
 public struct DuplicateEvaluation: Codable, Equatable, Sendable {
@@ -412,7 +412,21 @@ public struct AdvancedAdmission: Sendable {
         self.source = source; self.evidence = evidence; self.validity = validity
     }
 }
-public enum AdvancedPreparation: Sendable { case ready(AdvancedAdmission), waiting(reason: String) }
+public struct ConservativeSourceAdmission: Sendable {
+    public let fileID: UUID
+    public let file: SourceFile
+    public let reason: RepresentationConservativeReason
+    public let evidence: AdvancedEvidence
+    public let validity: any PhotosCandidateValidity
+    public init(fileID: UUID, file: SourceFile, reason: RepresentationConservativeReason,
+                evidence: AdvancedEvidence, validity: any PhotosCandidateValidity) {
+        self.fileID = fileID; self.file = file; self.reason = reason
+        self.evidence = evidence; self.validity = validity
+    }
+}
+public enum AdvancedPreparation: Sendable {
+    case ready(AdvancedAdmission), conservative(ConservativeSourceAdmission), waiting(reason: String)
+}
 
 extension DedupConfiguration {
     /// Four fixed resource names and raw-byte hashes bind the user decision to its regression evidence.

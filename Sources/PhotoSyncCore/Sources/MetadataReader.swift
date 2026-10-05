@@ -12,6 +12,12 @@ public enum MetadataError: Error {
     case unsupported
 }
 
+struct SourceImage: @unchecked Sendable {
+    let image: CGImage
+    let orientation: CGImagePropertyOrientation
+    let eligibility: RepresentationEligibility
+}
+
 public struct MetadataReader: MetadataReading {
     private let sourceID: UUID
     private let executor: ReadExecutor
@@ -32,6 +38,68 @@ public struct MetadataReader: MetadataReading {
         }
         return try await executor.execute(sourceID: sourceID) {
             try readImage(url: url, filename: filename)
+        }
+    }
+
+    /// Decode original source pixels, with a conservative full allowance held
+    /// before ImageIO can materialize them. R2 alone resizes/orients/colors the
+    /// comparable image; an extra thumbnail resample would change its version.
+    func readForFingerprint(url: URL, configuration: DedupConfiguration, budget: ImageWorkBudget) async throws -> ImageWorkResult<SourceImage> {
+        let allowance = configuration.resources.maxDecodedBytes
+        return try await executor.executeImage(sourceID: sourceID, budget: budget,
+            bytes: allowance, limits: configuration.resources) {
+            _ = try SourceRegistry.normalizedURL(url.deletingLastPathComponent())
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else { throw MetadataError.unreadable }
+            let options = [kCGImageSourceShouldCache: false] as CFDictionary
+            guard Self.classification(url) == "image", let source = CGImageSourceCreateWithURL(url as CFURL, options),
+                  CGImageSourceGetStatus(source) == .statusComplete, CGImageSourceGetCount(source) > 0,
+                  let type = CGImageSourceGetType(source) as String?,
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any] else {
+                throw MetadataError.unreadable
+            }
+            let eligibility: RepresentationEligibility
+            if CGImageSourceGetCount(source) != 1 { eligibility = .conservative(.multiFrameOrCompound) }
+            else if ["public.jpeg", "public.png", "public.heic", "public.heif"].contains(type) { eligibility = .safeSingleFrame }
+            else { eligibility = .conservative(.unverifiedContainer) }
+            let image: CGImage
+            switch eligibility {
+            case .safeSingleFrame:
+                // Header facts precede eager decode. Four channels, component
+                // storage rounded up to bytes, and aligned rows conservatively
+                // estimate native backing; opaque ImageIO storage is measured
+                // separately by release resource validation.
+                guard let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                      let height = properties[kCGImagePropertyPixelHeight] as? Int,
+                      let depth = properties[kCGImagePropertyDepth] as? Int,
+                      width > 0, height > 0, (1...16).contains(depth) else { throw MetadataError.unreadable }
+                let (rowBytes, rowOverflow) = Int64(width).multipliedReportingOverflow(by: Int64(((depth + 7) / 8) * 4))
+                let (padded, paddingOverflow) = rowBytes.addingReportingOverflow(127)
+                let (estimate, sizeOverflow) = (padded / 128 * 128).multipliedReportingOverflow(by: Int64(height))
+                guard !rowOverflow, !paddingOverflow, !sizeOverflow, estimate > 0, estimate <= allowance else {
+                    throw ImageWorkBudgetError.invalidReservation
+                }
+                guard let decoded = CGImageSourceCreateImageAtIndex(source, 0,
+                    [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { throw MetadataError.unreadable }
+                image = decoded
+            case .conservative:
+                // Validate readability without inference. A complete image
+                // container with explicitly unverified content is imported as
+                // original bytes; it never enters the comparable vector cache.
+                guard let decoded = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: false,
+                    kCGImageSourceThumbnailMaxPixelSize: configuration.fingerprint.inputSide,
+                    kCGImageSourceShouldCacheImmediately: true
+                ] as CFDictionary) else { throw MetadataError.unreadable }
+                image = decoded
+            }
+            guard CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+                  image.height > 0, image.bytesPerRow > 0,
+                  Int64(image.bytesPerRow) <= allowance / Int64(image.height) else { throw MetadataError.unreadable }
+            let orientation = (properties[kCGImagePropertyOrientation] as? UInt32)
+                .flatMap(CGImagePropertyOrientation.init(rawValue:)) ?? .up
+            return SourceImage(image: image, orientation: orientation, eligibility: eligibility)
         }
     }
 

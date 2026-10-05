@@ -411,6 +411,72 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    public func fingerprint(fileID: UUID, stamp: FileStamp, version: String) async throws -> Fingerprint? {
+        try await perform {
+            guard let row = try self.one("SELECT vector FROM file_fingerprint WHERE file_id = ? AND size = ? AND modified_ns = ? AND fingerprint_version = ? AND purpose = 'current'",
+                [.text(fileID.uuidString), .int64(stamp.size), .int64(stamp.modifiedNanoseconds), .text(version)]) else { return nil }
+            guard case .blob(let bytes) = row[0] else { throw AdvancedDedupError.invalidFingerprint }
+            return try Fingerprint(version: version, littleEndianFloat32: bytes)
+        }
+    }
+
+    /// A current vector is admitted only for the exact observed source stamp. No
+    /// successful/unknown submission is replaced by a late source preparation.
+    public func cacheFingerprint(_ source: PreparedSource) async throws -> Bool {
+        try await perform {
+            try self.transaction {
+                guard let row = try self.one("SELECT size, modified_ns, state, success_id, enabled, removed FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.id = ? AND source_id = ? AND relative_path = ?",
+                    [.text(source.fileID.uuidString), .text(source.file.sourceID.uuidString), .text(source.file.relativePath)]),
+                    try self.int64(row[0]) == source.file.stamp.size, try self.int64(row[1]) == source.file.stamp.modifiedNanoseconds,
+                    try self.text(row[2]) != "importing", try self.text(row[2]) != "imported", self.optionalText(row[3]) == nil,
+                    try self.int(row[4]) == 1, try self.int(row[5]) == 0 else { return false }
+                let bindings: [Binding] = [.text(source.fileID.uuidString), .int64(source.file.stamp.size),
+                    .int64(source.file.stamp.modifiedNanoseconds), .text(source.fingerprint.version)]
+                let previous = try self.one("SELECT width, height, vector FROM file_fingerprint WHERE file_id = ? AND size = ? AND modified_ns = ? AND fingerprint_version = ? AND purpose = 'current'", bindings)
+                let bytes = source.fingerprint.littleEndianFloat32
+                if let previous, self.optionalInteger(previous[0]) == source.size.map({ Int64($0.width) }),
+                    self.optionalInteger(previous[1]) == source.size.map({ Int64($0.height) }), case .blob(let old) = previous[2], old == bytes { return true }
+                try self.execute("INSERT OR REPLACE INTO file_fingerprint (file_id, size, modified_ns, fingerprint_version, purpose, width, height, vector) VALUES (?, ?, ?, ?, 'current', ?, ?, ?)",
+                    bindings + [source.size.map { .int64(Int64($0.width)) } ?? .null,
+                                source.size.map { .int64(Int64($0.height)) } ?? .null, .blob(bytes)])
+                try self.execute("UPDATE dedup_index_state SET local_revision = local_revision + 1 WHERE id = 1")
+                return true
+            }
+        }
+    }
+
+    /// Candidate facts and their admission revision are read in one transaction.
+    /// Filename never restricts advanced comparison. Only older active queue
+    /// records participate; successful facts survive disabled/removed sources.
+    public func localVectorCandidates(beforeOrder: Int64, excluding: UUID, version: String) async throws -> (revision: Int64, entries: [VectorEntry]) {
+        try await perform {
+            try self.transaction {
+                let revision = try self.indexStateRow().map { try self.int64($0[6]) } ?? 0
+                let rows = try self.rows("""
+                    SELECT f.id, f.state, f.success_id, v.width, v.height, v.vector FROM file_record f
+                    JOIN source s ON s.id = f.source_id JOIN file_fingerprint v ON v.file_id = f.id
+                    WHERE f.id <> ? AND v.fingerprint_version = ? AND (
+                        (f.success_id IS NOT NULL AND v.purpose = 'success') OR
+                        (f.success_id IS NULL AND f.state IN ('pending', 'importing') AND f.created_order < ?
+                         AND s.enabled = 1 AND s.removed = 0 AND v.purpose = 'current'
+                         AND v.size = f.size AND v.modified_ns = f.modified_ns)) ORDER BY f.created_order
+                    """, [.text(excluding.uuidString), .text(version), .int64(beforeOrder)])
+                let entries = try rows.map { row -> VectorEntry in
+                    guard case .blob(let data) = row[5] else { throw AdvancedDedupError.invalidFingerprint }
+                    let size: PixelSize?
+                    if let width = self.optionalInteger(row[3]), let height = self.optionalInteger(row[4]) {
+                        size = try PixelSize(width: Int(width), height: Int(height))
+                    } else { size = nil }
+                    let origin: CandidateOrigin = self.optionalText(row[2]) != nil ? .successHistory :
+                        (try self.text(row[1]) == "importing" ? .localImporting : .localPending)
+                    return VectorEntry(key: "file:\(try self.text(row[0]))", origin: origin,
+                        fingerprint: try Fingerprint(version: version, littleEndianFloat32: data), size: size)
+                }
+                return (revision, entries)
+            }
+        }
+    }
+
     public func candidates(filename: String, excludingID: UUID?, olderPendingOnly: Bool = false) async throws -> [MatchCandidate] {
         try await perform {
             var sql = "SELECT id, state, metadata_json, success_id, success_metadata_json FROM file_record WHERE filename = ?"
