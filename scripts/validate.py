@@ -242,7 +242,10 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             raise ValidationError(f"Scale {count} did not finish its one selected XCTest")
         report = output_dir / f"scale-{sample}.json"
         result = json.loads(report.read_text())
-        if result.get("representations") != count or result.get("success_history_vectors") != history_count or result.get("budget_pass") is not True:
+        if (result.get("representations") != count
+                or result.get("success_history_vectors") != history_count
+                or result.get("budget_pass") is not True
+                or result.get("index_change_ready_within_2s") is not True):
             raise ValidationError(f"Scale {count} failed current runtime/resource budgets")
         if count == 200000 and len(result.get("large_source_samples", [])) != 2:
             raise ValidationError("Maximum scale lacks both representative large-source measurements")

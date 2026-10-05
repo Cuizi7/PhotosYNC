@@ -186,6 +186,24 @@ class ReleaseValidationTests(unittest.TestCase):
             ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcrun", "xcrun", "xcrun", "continuation", "continuation"],
         )
 
+    def test_validator_rejects_false_or_missing_index_change_readiness(self) -> None:
+        for mode in ("false", "missing"):
+            with self.subTest(mode=mode):
+                output_dir = Path(self.temporary_directory.name) / f"validation-readiness-{mode}"
+                result = self.fixture.run_validator(
+                    output_dir,
+                    Path(self.temporary_directory.name) / f"derived-readiness-{mode}",
+                    FAKE_SCALE_READINESS=mode,
+                )
+                scale = json.loads((output_dir / "scale-100000.json").read_text())
+                self.assertIs(scale["budget_pass"], True)
+                self.assertLessEqual(scale["hot_preparation_ms"]["p95"], 250)
+                self.assertLessEqual(scale["source_incremental_ms"]["p95"], 2000)
+                self.assertLessEqual(scale["rss_peak_bytes"], 4 * 1024**3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((output_dir / "validation.json").exists())
+                self.assertFalse((output_dir / "validation-report.md").exists())
+
     def test_validator_build_failure_stops_before_xctest_and_never_marks_success(self) -> None:
         output_dir = Path(self.temporary_directory.name) / "validation"
         result = self.fixture.run_validator(
@@ -429,7 +447,12 @@ if [ "${1:-}" != 'xctest' ]; then exit 19; fi
 if [ -n "${PHOTOSYNC_SCALE_REPRESENTATIONS:-}" ]; then
   sample="$PHOTOSYNC_SCALE_REPRESENTATIONS"
   if [ "${PHOTOSYNC_SCALE_HISTORY:-0}" != 0 ]; then sample="$sample-history-$PHOTOSYNC_SCALE_HISTORY"; fi
-  printf '{"representations":%s,"success_history_vectors":%s,"budget_pass":true,"large_source_samples":[{},{}]}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  readiness=',"index_change_ready_within_2s":true'
+  case "${FAKE_SCALE_READINESS:-true}" in
+    false) readiness=',"index_change_ready_within_2s":false' ;;
+    missing) readiness='' ;;
+  esac
+  printf '{"representations":%s,"success_history_vectors":%s,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}]%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
   printf "Test Suite 'Selected tests' passed at fixture.\\n"
   printf 'Executed 1 test, with 0 failures\\n'
   exit 0

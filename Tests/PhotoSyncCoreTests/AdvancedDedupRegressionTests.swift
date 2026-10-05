@@ -325,9 +325,9 @@ extension AdvancedDedupRegressionTests {
             executor: executor, budget: budget, directory: { DirectoryReader(sourceID: $0, executor: executor) }, now: { Date() }, logger: logger)
         let publishStart = ProcessInfo.processInfo.systemUptime
         try await graph.coordinator.reconcile()
+        let initialEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
+            expectedPhotosGeneration: 1, expectedRepresentations: count)
         let publishMS = (ProcessInfo.processInfo.systemUptime - publishStart) * 1000
-        let readyToken = try await graph.coordinator.readyToken()
-        XCTAssertNotNil(readyToken)
         let readsBefore = await photos.reads, callsBefore = await model.calls
         XCTAssertEqual(readsBefore, 0); XCTAssertEqual(callsBefore, 1)
         var cold = [Double](), hot = [Double](), stages = [String: [Double]](), hotStages = [String: [Double]]()
@@ -359,23 +359,31 @@ extension AdvancedDedupRegressionTests {
         await photos.changeOne()
         try await graph.coordinator.reconcile()
         await graph.coordinator.processDueWork(now: Date())
+        let changedEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
+            expectedPhotosGeneration: 2, expectedRepresentations: count)
         let changeMS = (ProcessInfo.processInfo.systemUptime - changeStart) * 1000
         let changedReads = await photos.reads, changedCalls = await model.calls
         XCTAssertEqual(changedReads, 1); XCTAssertEqual(changedCalls, 22)
         let addStart = ProcessInfo.processInfo.systemUptime
         await photos.addOne()
         try await graph.coordinator.reconcile(); await graph.coordinator.processDueWork(now: Date())
+        let addedEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
+            expectedPhotosGeneration: 3, expectedRepresentations: count + 1)
         let addMS = (ProcessInfo.processInfo.systemUptime - addStart) * 1000
         let addedReads = await photos.reads, addedCalls = await model.calls
         XCTAssertEqual(addedReads, 2); XCTAssertEqual(addedCalls, 23)
         let deleteStart = ProcessInfo.processInfo.systemUptime
         await photos.removeAdded()
         try await graph.coordinator.reconcile(); await graph.coordinator.processDueWork(now: Date())
+        let deletedEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
+            expectedPhotosGeneration: 4, expectedRepresentations: count)
         let deleteMS = (ProcessInfo.processInfo.systemUptime - deleteStart) * 1000
         let deletedReads = await photos.reads, deletedCalls = await model.calls
         XCTAssertEqual(deletedReads, 2); XCTAssertEqual(deletedCalls, 23)
         let stableStart = ProcessInfo.processInfo.systemUptime
         try await graph.coordinator.reconcile()
+        let stableEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
+            expectedPhotosGeneration: 4, expectedRepresentations: count)
         let stableMS = (ProcessInfo.processInfo.systemUptime - stableStart) * 1000
         let stableReads = await photos.reads, stableCalls = await model.calls
         XCTAssertEqual(stableReads, deletedReads); XCTAssertEqual(stableCalls, deletedCalls)
@@ -413,6 +421,7 @@ extension AdvancedDedupRegressionTests {
         XCTAssertLessThanOrEqual(logFiles.count, 10)
         let leases = await budget.snapshot(); XCTAssertEqual(leases.images, 0); XCTAssertEqual(leases.bytes, 0)
         let peak = p9PeakRSS(), hot95 = p9Percentiles(hot)["p95"]!, cold95 = p9Percentiles(cold)["p95"]!
+        let changeWithinBudget = max(changeMS, addMS, deleteMS) <= 2000
         // Record even a failed budget so it cannot be laundered as a missing sample.
         try p9WriteEvidence("\(sampleName).json", ["representations": count, "synthetic_assets": 100000, "success_history_vectors": historyCount,
             "build_configuration": ProcessInfo.processInfo.environment["PHOTOSYNC_SCALE_BUILD_CONFIGURATION"] ?? "Debug",
@@ -423,25 +432,85 @@ extension AdvancedDedupRegressionTests {
             "stages_ms": stages.mapValues(p9Percentiles), "hot_stages_ms": hotStages.mapValues(p9Percentiles),
             "one_changed_catalog_inference_publication_ms": changeMS,
             "one_added_catalog_inference_publication_ms": addMS, "one_deleted_catalog_publication_ms": deleteMS,
-            "index_change_ready_within_2s": max(changeMS, addMS, deleteMS) <= 2000,
+            "index_change_ready_within_2s": changeWithinBudget,
+            "index_change_sample_count_per_operation": 1, "index_change_percentile_claim": false,
+            "readiness_endpoints": ["initial": initialEndpoint, "edited": changedEndpoint,
+                "added": addedEndpoint, "deleted": deletedEndpoint, "unchanged": stableEndpoint],
             "unchanged_catalog_publication_ms": stableMS, "one_changed_inferences": 1, "unchanged_inferences": stableCalls - deletedCalls,
             "large_source_samples": largeSamples, "logger_unique_files": 100000, "logger_flush_interval": 128, "persistent_fixture_bytes": bytes,
-            "rss_peak_bytes": peak, "budget_pass": peak <= 4 * 1024 * 1024 * 1024 && hot95 <= 250 && cold95 <= 2000,
+            "rss_peak_bytes": peak, "budget_pass": peak <= 4 * 1024 * 1024 * 1024 && hot95 <= 250 && cold95 <= 2000 && changeWithinBudget,
             "real_photos": false, "real_100k_assets": false])
         XCTAssertLessThanOrEqual(peak, 4 * 1024 * 1024 * 1024)
         XCTAssertLessThanOrEqual(hot95, 250)
         XCTAssertLessThanOrEqual(cold95, 2000)
+        XCTAssertTrue(changeWithinBudget, "At least one verified Photos change-to-ready observation exceeds 2 seconds")
     }
+
+    func testReadinessEndpointRejectsAcknowledgementFailureAfterCompletedInference() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
+        let executor = ReadExecutor(), budget = ImageWorkBudget(limits: configuration.resources)
+        let store = try SyncStore(url: root.appendingPathComponent("endpoint.sqlite"), readExecutor: executor)
+        let photos = P9ScalePhotos(count: 1, image: try p9Image(style: 1), budget: budget)
+        let model = P9MeasuredModel(CoreMLFingerprinter(configuration: configuration.fingerprint,
+            predict: { _ in [1] + [Float](repeating: 0, count: 1023) }))
+        let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
+            index: ExactVectorIndex(version: configuration.fingerprint.version), configuration: configuration)
+        await photos.setAcknowledgementFailure(true)
+        // processDueWork deliberately catches publication/acknowledgement errors.
+        await coordinator.processDueWork(now: Date())
+        let firstCalls = await model.calls, firstReads = await photos.reads
+        XCTAssertEqual(firstCalls, 1); XCTAssertEqual(firstReads, 1)
+        do {
+            _ = try await p9RequireReadyEndpoint(coordinator, store: store, expectedPhotosGeneration: 1, expectedRepresentations: 1)
+            XCTFail("Normal work-loop return and completed inference did not establish readiness")
+        } catch FixtureError.unavailable {}
+        await photos.setAcknowledgementFailure(false)
+        await coordinator.processDueWork(now: Date())
+        _ = try await p9RequireReadyEndpoint(coordinator, store: store, expectedPhotosGeneration: 1, expectedRepresentations: 1)
+        for (generation, count) in [(2, 1), (1, 2)] {
+            do {
+                _ = try await p9RequireReadyEndpoint(coordinator, store: store, expectedPhotosGeneration: generation, expectedRepresentations: count)
+                XCTFail("Readiness must match both expected generation and representation count")
+            } catch FixtureError.unavailable {}
+        }
+        await photos.changeOne(); await photos.setAcknowledgementFailure(true)
+        try await coordinator.reconcile()
+        await coordinator.processDueWork(now: Date())
+        let changedCalls = await model.calls, changedReads = await photos.reads
+        XCTAssertEqual(changedCalls, 2); XCTAssertEqual(changedReads, 2)
+        do {
+            _ = try await p9RequireReadyEndpoint(coordinator, store: store, expectedPhotosGeneration: 2, expectedRepresentations: 1)
+            XCTFail("Completed changed-asset inference cannot substitute for acknowledgement")
+        } catch FixtureError.unavailable {}
+    }
+}
+
+private func p9RequireReadyEndpoint(_ coordinator: PhotosIndexCoordinator, store: SyncStore,
+                                   expectedPhotosGeneration: Int, expectedRepresentations: Int) async throws -> [String: Int64] {
+    guard let token = try await coordinator.readyToken(),
+          token.photosGeneration == expectedPhotosGeneration,
+          let publication = try await store.indexReadiness(), publication.token == token,
+          publication.entryCount == expectedRepresentations else {
+        throw FixtureError.unavailable("Timed endpoint lacks the expected published, acknowledged generation/count")
+    }
+    return ["photos_generation": Int64(token.photosGeneration), "index_generation": token.indexGeneration,
+            "representation_count": Int64(publication.entryCount)]
 }
 
 private actor P9ScalePhotos: PhotosIndexGateway {
     let context = LibraryContext(id: UUID(), epoch: 1), count: Int, image: CGImage, budget: ImageWorkBudget
-    var generation = 1, originalRevision = 1, reads = 0, hasAdded = false
+    var generation = 1, originalRevision = 1, reads = 0, hasAdded = false, acknowledgementFails = false
     init(count: Int, image: CGImage, budget: ImageWorkBudget) { self.count = count; self.image = image; self.budget = budget }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { _ in } }
     func changeOne() { generation += 1; originalRevision += 1 }
     func addOne() { generation += 1; hasAdded = true }
     func removeAdded() { generation += 1; hasAdded = false }
+    func setAcknowledgementFailure(_ fails: Bool) { acknowledgementFails = fails }
+    func acknowledgeReconciliation(expectedGeneration: Int) async throws {
+        guard !acknowledgementFails, expectedGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
+    }
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot { .init(generation: generation, candidates: []) }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { .init(context: context, archivedChangeToken: Data([9])) }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool { checkpoint.context == context }
