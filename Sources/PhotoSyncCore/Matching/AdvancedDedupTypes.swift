@@ -85,7 +85,7 @@ public struct FingerprintConfiguration: Codable, Equatable, Sendable {
     }
 }
 
-public struct Fingerprint: Equatable, Sendable {
+public struct Fingerprint: Codable, Equatable, Sendable {
     public let version: String
     public let values: [Float]
 
@@ -97,6 +97,35 @@ public struct Fingerprint: Equatable, Sendable {
         guard norm.isFinite, norm > 0 else { throw AdvancedDedupError.invalidFingerprint }
         self.version = version
         self.values = values.map { Float(Double($0) / norm) }
+    }
+
+    /// Stored vectors are normalized Float32 facts; decoding must preserve their exact bytes.
+    public init(version: String, littleEndianFloat32 data: Data) throws {
+        guard !version.isEmpty, data.count == 4096 else { throw AdvancedDedupError.invalidFingerprint }
+        var values = [Float]()
+        values.reserveCapacity(1024)
+        for offset in stride(from: 0, to: data.count, by: 4) {
+            let bits = UInt32(data[offset]) | UInt32(data[offset + 1]) << 8
+                | UInt32(data[offset + 2]) << 16 | UInt32(data[offset + 3]) << 24
+            values.append(Float(bitPattern: bits))
+        }
+        let norm = values.reduce(0.0) { $0 + Double($1) * Double($1) }
+        guard values.allSatisfy(\.isFinite), norm.isFinite, abs(norm - 1) <= 0.00001 else {
+            throw AdvancedDedupError.invalidFingerprint
+        }
+        self.version = version; self.values = values
+    }
+
+    private enum CodingKeys: String, CodingKey { case version, littleEndianFloat32 }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(version: c.decode(String.self, forKey: .version),
+                      littleEndianFloat32: c.decode(Data.self, forKey: .littleEndianFloat32))
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version)
+        try c.encode(littleEndianFloat32, forKey: .littleEndianFloat32)
     }
 
     public var littleEndianFloat32: Data {
@@ -113,7 +142,7 @@ public enum CandidateOrigin: String, Codable, Sendable {
     case photosOriginal, photosCurrent, localPending, localImporting, successHistory
 }
 
-public struct ScoredCandidate: Equatable, Sendable {
+public struct ScoredCandidate: Codable, Equatable, Sendable {
     public let key: String
     public let origin: CandidateOrigin
     public let score: Double
@@ -126,13 +155,13 @@ public struct ScoredCandidate: Equatable, Sendable {
     }
 }
 
-public enum ContentResult: String, Sendable { case duplicate, notDuplicate }
-public enum ImportAction: String, Sendable { case importFile, skip }
-public enum DecisionReason: String, Sendable {
+public enum ContentResult: String, Codable, Sendable { case duplicate, notDuplicate }
+public enum ImportAction: String, Codable, Sendable { case importFile, skip }
+public enum DecisionReason: String, Codable, Sendable {
     case noMatch, covered, resolutionUpgrade, insufficientSizeEvidence
 }
 
-public struct DuplicateEvaluation: Equatable, Sendable {
+public struct DuplicateEvaluation: Codable, Equatable, Sendable {
     public let content: ContentResult
     public let action: ImportAction
     public let reason: DecisionReason
@@ -146,7 +175,7 @@ public struct DuplicateEvaluation: Equatable, Sendable {
     }
 }
 
-public struct ResourceLimits: Codable, Sendable {
+public struct ResourceLimits: Codable, Equatable, Sendable {
     public let decodeConcurrency: Int
     public let photoRequestConcurrency: Int
     public let maxDecodedBytes: Int64
@@ -197,7 +226,7 @@ public struct ResourceLimits: Codable, Sendable {
     }
 }
 
-public struct DedupConfiguration: Codable, Sendable {
+public struct DedupConfiguration: Codable, Equatable, Sendable {
     public let fingerprint: FingerprintConfiguration
     public let policyVersion: String
     public let threshold: Double
@@ -251,4 +280,248 @@ public struct DedupConfiguration: Codable, Sendable {
                       evidenceCandidateLimit: c.decode(Int.self, forKey: .evidenceCandidateLimit),
                       acceptanceID: c.decode(String.self, forKey: .acceptanceID))
     }
+}
+
+public struct LibraryContext: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let epoch: Int64
+    public init(id: UUID, epoch: Int64) { self.id = id; self.epoch = epoch }
+}
+public enum RepresentationKind: String, Codable, Sendable { case original, current }
+public struct RepresentationKey: Codable, Equatable, Sendable {
+    public let assetID: String
+    public let kind: RepresentationKind
+    public init(assetID: String, kind: RepresentationKind) { self.assetID = assetID; self.kind = kind }
+}
+public struct RepresentationDescriptor: Codable, Equatable, Sendable {
+    public let key: RepresentationKey
+    public let context: LibraryContext
+    public let revision: String
+    public let size: PixelSize?
+    public let equivalentToOriginal: Bool
+    public let revisionIsReliable: Bool
+    public init(key: RepresentationKey, context: LibraryContext, revision: String, size: PixelSize?,
+                equivalentToOriginal: Bool, revisionIsReliable: Bool) {
+        self.key = key; self.context = context; self.revision = revision; self.size = size
+        self.equivalentToOriginal = equivalentToOriginal; self.revisionIsReliable = revisionIsReliable
+    }
+}
+public struct IndexToken: Codable, Equatable, Sendable {
+    public let context: LibraryContext
+    public let photosGeneration: Int
+    public let indexGeneration: Int64
+    public let localRevision: Int64
+    public let fingerprintVersion: String
+    public init(context: LibraryContext, photosGeneration: Int, indexGeneration: Int64,
+                localRevision: Int64, fingerprintVersion: String) {
+        self.context = context; self.photosGeneration = photosGeneration
+        self.indexGeneration = indexGeneration; self.localRevision = localRevision
+        self.fingerprintVersion = fingerprintVersion
+    }
+}
+public enum IndexState: String, Codable, Sendable { case preparing, updating, ready, waiting, paused }
+public struct IndexProgress: Codable, Equatable, Sendable {
+    public let state: IndexState
+    public let totalsKnown: Bool
+    public let totalAssets: Int
+    public let readyAssets: Int
+    public let totalRepresentations: Int
+    public let readyRepresentations: Int
+    public let excludedAssets: Int
+    public let issue: String?
+    public init(state: IndexState, totalsKnown: Bool, totalAssets: Int, readyAssets: Int,
+                totalRepresentations: Int, readyRepresentations: Int, excludedAssets: Int, issue: String?) {
+        self.state = state; self.totalsKnown = totalsKnown; self.totalAssets = totalAssets
+        self.readyAssets = readyAssets; self.totalRepresentations = totalRepresentations
+        self.readyRepresentations = readyRepresentations; self.excludedAssets = excludedAssets; self.issue = issue
+    }
+}
+public struct RepresentationTask: Codable, Equatable, Sendable {
+    public let descriptor: RepresentationDescriptor
+    public let retryCount: Int
+    public let nextRetryAt: Date?
+    public let fingerprintVersion: String
+    /// Store-issued generation prevents a late completion from crossing a reconciliation boundary.
+    public let indexGeneration: Int64
+    public init(descriptor: RepresentationDescriptor, retryCount: Int, nextRetryAt: Date?,
+                fingerprintVersion: String, indexGeneration: Int64) {
+        self.descriptor = descriptor; self.retryCount = retryCount; self.nextRetryAt = nextRetryAt
+        self.fingerprintVersion = fingerprintVersion; self.indexGeneration = indexGeneration
+    }
+}
+public struct IndexPublication: Codable, Equatable, Sendable {
+    public let token: IndexToken
+    public let entries: [VectorEntry]
+    public init(token: IndexToken, entries: [VectorEntry]) { self.token = token; self.entries = entries }
+}
+// VectorEntry's declaration stays with ExactVectorIndex; these conformances enable persisted publications.
+extension VectorEntry: Equatable, Codable {
+    public static func == (lhs: VectorEntry, rhs: VectorEntry) -> Bool {
+        lhs.key == rhs.key && lhs.origin == rhs.origin && lhs.fingerprint == rhs.fingerprint && lhs.size == rhs.size
+    }
+    private enum CodingKeys: String, CodingKey { case key, origin, fingerprint, size }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(key: c.decode(String.self, forKey: .key), origin: c.decode(CandidateOrigin.self, forKey: .origin),
+                  fingerprint: c.decode(Fingerprint.self, forKey: .fingerprint), size: c.decodeIfPresent(PixelSize.self, forKey: .size))
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(key, forKey: .key); try c.encode(origin, forKey: .origin)
+        try c.encode(fingerprint, forKey: .fingerprint); try c.encodeIfPresent(size, forKey: .size)
+    }
+}
+public struct PreparedSource: Codable, Equatable, Sendable {
+    public let fileID: UUID
+    public let file: SourceFile
+    public let fingerprint: Fingerprint
+    public let size: PixelSize?
+    public init(fileID: UUID, file: SourceFile, fingerprint: Fingerprint, size: PixelSize?) {
+        self.fileID = fileID; self.file = file; self.fingerprint = fingerprint; self.size = size
+    }
+}
+public struct VectorSearchResult: Codable, Equatable, Sendable {
+    public let matches: [ScoredCandidate]
+    public let diagnostics: [ScoredCandidate]
+    public init(matches: [ScoredCandidate], diagnostics: [ScoredCandidate]) { self.matches = matches; self.diagnostics = diagnostics }
+}
+public struct AdvancedEvidence: Codable, Equatable, Sendable {
+    public let eventID: UUID
+    public let fileID: UUID
+    public let stamp: FileStamp
+    public let token: IndexToken
+    public let policyVersion: String
+    public let evaluation: DuplicateEvaluation
+    public let decisiveCandidates: [ScoredCandidate]
+    public let diagnostics: [ScoredCandidate]
+    public let timingsMS: [String: Double]
+    public init(eventID: UUID, fileID: UUID, stamp: FileStamp, token: IndexToken, policyVersion: String,
+                evaluation: DuplicateEvaluation, decisiveCandidates: [ScoredCandidate],
+                diagnostics: [ScoredCandidate], timingsMS: [String: Double]) {
+        self.eventID = eventID; self.fileID = fileID; self.stamp = stamp; self.token = token
+        self.policyVersion = policyVersion; self.evaluation = evaluation
+        self.decisiveCandidates = Array(decisiveCandidates.prefix(1))
+        self.diagnostics = Array(diagnostics.prefix(10)); self.timingsMS = timingsMS
+    }
+}
+public struct AdvancedAdmission: Sendable {
+    public let source: PreparedSource
+    public let evidence: AdvancedEvidence
+    public let validity: any PhotosCandidateValidity
+    public init(source: PreparedSource, evidence: AdvancedEvidence, validity: any PhotosCandidateValidity) {
+        self.source = source; self.evidence = evidence; self.validity = validity
+    }
+}
+public enum AdvancedPreparation: Sendable { case ready(AdvancedAdmission), waiting(reason: String) }
+
+extension DedupConfiguration {
+    /// Four fixed resource names and raw-byte hashes bind the user decision to its regression evidence.
+    /// Research paths embedded in records are explanatory only and are never followed here.
+    public static func loadValidated(resourceDirectory: URL) throws -> DedupConfiguration {
+        let decoder = JSONDecoder()
+        let decisionBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("decision.json"))
+        let profileBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("profile.json"))
+        let regressionBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("regression.json"))
+        let closeoutBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("closeout.json"))
+        let decision = try decoder.decode(IntegrationDecision.self, from: decisionBytes)
+        let profile = try decoder.decode(DedupConfiguration.self, from: profileBytes)
+        let regression = try decoder.decode(IntegrationRegression.self, from: regressionBytes)
+        let closeout = try decoder.decode(IntegrationCloseout.self, from: closeoutBytes)
+        func hash(_ bytes: Data) -> String { SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined() }
+        let decisionID = hash(decisionBytes), profileID = hash(profileBytes), regressionID = hash(regressionBytes)
+        let d = decision.configuration
+        guard decision.schemaVersion == 1, decision.basis == "explicit_user_selected_threshold",
+              decision.decision == "close_research_and_select_configuration_for_integration",
+              !decision.userInstruction.isEmpty, decision.selectedThreshold == 0.98,
+              decision.comparison == "score >= threshold",
+              d.computeUnits == "cpuOnly", d.weightPrecision == "float32",
+              d.resources.decodeConcurrency == 1, d.resources.photoRequestConcurrency == 1,
+              d.resources.maxDecodedBytes == 134217728, d.resources.requestTimeoutSeconds == 30,
+              d.resources.retryDelaysSeconds == [5, 15, 30, 60], d.resources.catalogBatchSize == 128,
+              d.resources.maxInFlightTasks == 2, d.resources.progressPublishIntervalSeconds == 1,
+              d.resources.inferenceConcurrency == 1, d.resources.batchSize == 1,
+              d.evidenceCandidateLimit == 200000,
+              d.fingerprint.modelSHA256 == "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
+              d.fingerprint.inputSide == 320, d.fingerprint.resizeMode == .stretchFullFrame,
+              d.fingerprint.colorSpace == "sRGB", d.fingerprint.mean == [0.485, 0.456, 0.406],
+              d.fingerprint.std == [0.229, 0.224, 0.225], d.backend == "exact-f32-v1",
+              profile.threshold == decision.selectedThreshold, profile.fingerprint == d.fingerprint,
+              profile.policyVersion == d.policyVersion, profile.backend == d.backend,
+              profile.resources == d.resources, profile.evidenceCandidateLimit == d.evidenceCandidateLimit,
+              profile.acceptanceID == "user-decision:" + decisionID,
+              regression.schemaVersion == 1, regression.kind == "fixed_user_threshold_replay_of_existing_vectors",
+              regression.thresholdBasis == "explicit_user_choice_not_independent_calibration",
+              regression.decisionSHA256 == decisionID, regression.integrationProfileSHA256 == profileID,
+              regression.threshold == profile.threshold, regression.policyVersion == profile.policyVersion,
+              regression.fingerprintVersion == profile.fingerprint.version, regression.backend == profile.backend,
+              regression.activeSuiteSHA256 == decision.activeSuite.sha256,
+              regression.expectedResultsSHA256 == decision.activeSuite.expectedResultsSHA256,
+              isSHA256(regression.sourceVectorManifestSHA256), isSHA256(regression.sourceReportSHA256),
+              !regression.newImageInference, !regression.independentValidation,
+              decision.activeSuite.caseCount == 33, regression.caseCount == 33, regression.passCount == 33,
+              regression.cases.count == 33, Set(regression.cases.map(\.id)).count == 33,
+              regression.contentFailures.isEmpty, regression.actionFailures.isEmpty,
+              regression.cases.allSatisfy({ $0.pass && $0.contentPass && $0.actionPass &&
+                  $0.expectedContent == $0.observed.content && $0.expectedAction == $0.observed.action &&
+                  isSHA256($0.observed.queryVectorSHA256) && !$0.gallery.isEmpty &&
+                  $0.observed.candidates.allSatisfy({ isSHA256($0.vectorSHA256) && $0.score.isFinite }) }),
+              closeout.schemaVersion == 1, closeout.status == "closed_with_user_selected_configuration",
+              closeout.approvedForProductIntegration, closeout.decisionSHA256 == decisionID,
+              closeout.profileSHA256 == profileID, closeout.regression.sha256 == regressionID,
+              closeout.acceptanceID == profile.acceptanceID, closeout.threshold == profile.threshold,
+              closeout.thresholdBasis == "explicit_user_choice", closeout.computeUnits == "cpuOnly",
+              closeout.backend == profile.backend, closeout.fingerprintVersion == profile.fingerprint.version,
+              closeout.policyVersion == profile.policyVersion, closeout.modelSHA256 == profile.fingerprint.modelSHA256,
+              closeout.activeSuiteSHA256 == regression.activeSuiteSHA256,
+              closeout.regression.caseCount == 33, closeout.regression.passCount == 33,
+              closeout.regression.contentFailures.isEmpty, closeout.regression.actionFailures.isEmpty,
+              closeout.regression.sameImagePairsAndVectors, !closeout.regression.independent,
+              !closeout.regression.newImageInference, closeout.statisticalAcceptance.status == "not_performed",
+              !closeout.statisticalAcceptance.falseSkipUpperBoundClaimed,
+              !closeout.statisticalAcceptance.recallConfidenceClaimed
+        else { throw AdvancedDedupError.invalidConfiguration }
+        return profile
+    }
+    private static func isSHA256(_ string: String) -> Bool { string.count == 64 && string.allSatisfy(\.isHexDigit) }
+}
+private struct IntegrationDecision: Decodable {
+    let schemaVersion: Int, basis: String, userInstruction: String, decision: String
+    let selectedThreshold: Double, comparison: String
+    let configuration: Selection
+    let activeSuite: Suite
+    struct Selection: Decodable {
+        let fingerprint: FingerprintConfiguration
+        let policyVersion: String, backend: String, computeUnits: String, weightPrecision: String
+        let resources: ResourceLimits
+        let evidenceCandidateLimit: Int
+    }
+    struct Suite: Decodable { let sha256: String, expectedResultsSHA256: String; let caseCount: Int }
+}
+private struct IntegrationRegression: Decodable {
+    let schemaVersion: Int, kind: String, thresholdBasis: String
+    let decisionSHA256: String, integrationProfileSHA256: String, activeSuiteSHA256: String, expectedResultsSHA256: String
+    let sourceVectorManifestSHA256: String, sourceReportSHA256: String
+    let fingerprintVersion: String, policyVersion: String, backend: String
+    let threshold: Double, newImageInference: Bool, independentValidation: Bool, caseCount: Int, passCount: Int
+    let contentFailures: [String], actionFailures: [String], cases: [ReplayCase]
+    struct ReplayCase: Decodable {
+        let id: String, gallery: [String], expectedContent: ContentResult, expectedAction: ImportAction
+        let pass: Bool, contentPass: Bool, actionPass: Bool
+        let observed: Observation
+    }
+    struct Observation: Decodable {
+        let content: ContentResult, action: ImportAction, queryVectorSHA256: String, candidates: [Candidate]
+    }
+    struct Candidate: Decodable { let vectorSHA256: String, score: Double }
+}
+private struct IntegrationCloseout: Decodable {
+    let schemaVersion: Int, status: String, approvedForProductIntegration: Bool
+    let decisionSHA256: String, profileSHA256: String, acceptanceID: String, thresholdBasis: String, computeUnits: String
+    let backend: String, fingerprintVersion: String, policyVersion: String, modelSHA256: String, activeSuiteSHA256: String
+    let threshold: Double, regression: Regression, statisticalAcceptance: Statistical
+    struct Regression: Decodable {
+        let sha256: String, caseCount: Int, passCount: Int, contentFailures: [String], actionFailures: [String]
+        let sameImagePairsAndVectors: Bool, independent: Bool, newImageInference: Bool
+    }
+    struct Statistical: Decodable { let status: String, falseSkipUpperBoundClaimed: Bool, recallConfidenceClaimed: Bool }
 }

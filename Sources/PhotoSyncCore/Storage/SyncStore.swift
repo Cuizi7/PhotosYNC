@@ -76,6 +76,9 @@ public final class SyncStore: @unchecked Sendable {
     private let readExecutor: ReadExecutor
     private let validateSource: @Sendable (URL) throws -> URL
     private let decodeObserver: @Sendable () -> Void
+    /// A durable published marker cannot prove that this instance rebuilt its derived index.
+    /// Accessed only on the database queue. Local candidate revisions do not change that index.
+    private var publishedIndexToken: IndexToken?
 
     public init(url: URL, readExecutor: ReadExecutor = .shared,
                 validateSource: @escaping @Sendable (URL) throws -> URL = { try SourceRegistry.normalizedURL($0) },
@@ -555,10 +558,233 @@ public final class SyncStore: @unchecked Sendable {
         return true
     }
 
+    /// Starts a fresh complete-inventory barrier. Existing facts remain intact until a full finish.
+    public func beginIndexReconciliation(context: LibraryContext, photosGeneration: Int, fingerprintVersion: String) async throws -> Int64 {
+        guard !fingerprintVersion.isEmpty else { throw AdvancedDedupError.invalidConfiguration }
+        return try await perform {
+            try self.transaction {
+                let previous = try self.indexStateRow()
+                let generation = try previous.map { try self.int64($0[2]) + 1 } ?? 1
+                try self.execute("""
+                    INSERT INTO dedup_index_state (id, context_id, context_epoch, generation, fingerprint_version, photos_generation)
+                    VALUES (1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET context_id = excluded.context_id, context_epoch = excluded.context_epoch,
+                    generation = excluded.generation, fingerprint_version = excluded.fingerprint_version,
+                    photos_generation = excluded.photos_generation, published_generation = NULL,
+                    reconciliation_complete = 0, reconcile_cursor = NULL
+                    """, [.text(context.id.uuidString), .int64(context.epoch), .int64(generation), .text(fingerprintVersion), .int64(Int64(photosGeneration))])
+                return generation
+            }
+        }
+    }
+
+    public func upsertRepresentations(_ descriptors: [RepresentationDescriptor], generation: Int64) async throws {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
+                      try self.int64(state[7]) == 0 else { throw SyncStoreError.invalidTransition("Stale or finished reconciliation.") }
+                let context = try self.libraryContext(state)
+                let version = try self.text(state[4])
+                for descriptor in descriptors {
+                    guard descriptor.context == context, !descriptor.key.assetID.isEmpty, !descriptor.revision.isEmpty else {
+                        throw AdvancedDedupError.invalidConfiguration
+                    }
+                    let key = self.representationBindings(descriptor)
+                    let previous = try self.one("SELECT revision, width, height, equivalent_to_original, revision_is_reliable, fingerprint_version, state, seen_generation FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                    let unchanged = try previous.map { row in
+                        try descriptor.revisionIsReliable && self.int64(row[4]) != 0 &&
+                        self.text(row[0]) == descriptor.revision &&
+                        self.optionalInteger(row[1]) == descriptor.size.map { Int64($0.width) } &&
+                        self.optionalInteger(row[2]) == descriptor.size.map { Int64($0.height) } &&
+                        self.int64(row[3]) == (descriptor.equivalentToOriginal ? 1 : 0) &&
+                        self.text(row[5]) == version
+                    } ?? false
+                    if unchanged {
+                        try self.execute("UPDATE photos_representation SET seen_generation = ?, tombstoned = 0 WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.int64(generation)] + key)
+                    } else {
+                        try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                        try self.execute("""
+                            INSERT INTO photos_representation (context_id, context_epoch, asset_id, kind, revision, width, height,
+                            equivalent_to_original, revision_is_reliable, seen_generation, state, fingerprint_version)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                            ON CONFLICT(context_id, context_epoch, asset_id, kind) DO UPDATE SET revision = excluded.revision,
+                            width = excluded.width, height = excluded.height, equivalent_to_original = excluded.equivalent_to_original,
+                            revision_is_reliable = excluded.revision_is_reliable, seen_generation = excluded.seen_generation,
+                            state = 'pending', fingerprint_version = excluded.fingerprint_version, vector = NULL, tombstoned = 0
+                            """, key + [.text(descriptor.revision), descriptor.size.map { .int64(Int64($0.width)) } ?? .null,
+                                         descriptor.size.map { .int64(Int64($0.height)) } ?? .null,
+                                         .int64(descriptor.equivalentToOriginal ? 1 : 0), .int64(descriptor.revisionIsReliable ? 1 : 0),
+                                         .int64(generation), .text(version)])
+                    }
+                    // Retried work remains a fact; move it to the newly issued generation only after it was seen.
+                    let ready = try self.one("SELECT state FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                    if try ready.map({ try self.text($0[0]) }) != "ready" {
+                        try self.execute("""
+                            INSERT INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(context_id, context_epoch, asset_id, kind, revision, fingerprint_version)
+                            DO UPDATE SET generation = excluded.generation
+                            """, key + [.text(descriptor.revision), .text(version), .int64(generation)])
+                    }
+                }
+            }
+        }
+    }
+
+    public func finishIndexReconciliation(generation: Int64) async throws {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
+                      try self.int64(state[7]) == 0 else { return }
+                let context = try self.libraryContext(state)
+                let key: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .int64(generation)]
+                try self.execute("UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ? AND seen_generation <> ?", key)
+                try self.execute("""
+                    DELETE FROM fingerprint_task WHERE EXISTS (SELECT 1 FROM photos_representation r
+                    WHERE r.context_id = fingerprint_task.context_id AND r.context_epoch = fingerprint_task.context_epoch
+                    AND r.asset_id = fingerprint_task.asset_id AND r.kind = fingerprint_task.kind AND r.tombstoned = 1)
+                    """)
+                try self.execute("UPDATE dedup_index_state SET reconciliation_complete = 1, reconcile_cursor = NULL WHERE id = 1")
+            }
+        }
+    }
+
+    public func nextRepresentationTasks(now: Date, limit: Int) async throws -> [RepresentationTask] {
+        guard limit > 0 else { return [] }
+        return try await perform {
+            guard let state = try self.indexStateRow() else { return [] }
+            let context = try self.libraryContext(state), generation = try self.int64(state[2]), version = try self.text(state[4])
+            let rows = try self.rows("""
+                SELECT r.asset_id, r.kind, r.revision, r.width, r.height, r.equivalent_to_original, r.revision_is_reliable,
+                t.retry_count, t.next_retry_at FROM fingerprint_task t JOIN photos_representation r
+                ON r.context_id = t.context_id AND r.context_epoch = t.context_epoch AND r.asset_id = t.asset_id AND r.kind = t.kind
+                AND r.revision = t.revision AND r.fingerprint_version = t.fingerprint_version
+                WHERE t.context_id = ? AND t.context_epoch = ? AND t.generation = ? AND t.fingerprint_version = ?
+                AND r.tombstoned = 0 AND r.seen_generation = ? AND r.state <> 'ready'
+                AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?) ORDER BY r.asset_id, r.kind LIMIT ?
+                """, [.text(context.id.uuidString), .int64(context.epoch), .int64(generation), .text(version), .int64(generation), .double(now.timeIntervalSince1970), .int64(Int64(limit))])
+            return try rows.map { row in
+                guard let kind = RepresentationKind(rawValue: try self.text(row[1])) else { throw AdvancedDedupError.invalidConfiguration }
+                let descriptor = RepresentationDescriptor(key: RepresentationKey(assetID: try self.text(row[0]), kind: kind),
+                    context: context, revision: try self.text(row[2]), size: try self.pixelSize(width: row[3], height: row[4]),
+                    equivalentToOriginal: try self.int64(row[5]) != 0, revisionIsReliable: try self.int64(row[6]) != 0)
+                return RepresentationTask(descriptor: descriptor, retryCount: Int(try self.int64(row[7])),
+                    nextRetryAt: self.optionalDouble(row[8]).map(Date.init(timeIntervalSince1970:)),
+                    fingerprintVersion: version, indexGeneration: generation)
+            }
+        }
+    }
+
+    public func completeRepresentation(_ task: RepresentationTask, fingerprint: Fingerprint) async throws -> Bool {
+        guard fingerprint.version == task.fingerprintVersion else { throw AdvancedDedupError.modelMismatch }
+        return try await perform {
+            try self.transaction {
+                guard try self.representationTaskIsCurrent(task) else { return false }
+                try self.execute("UPDATE photos_representation SET state = 'ready', vector = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.blob(fingerprint.littleEndianFloat32)] + self.representationBindings(task.descriptor))
+                try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", self.representationBindings(task.descriptor))
+                return true
+            }
+        }
+    }
+
+    public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws {
+        try await perform {
+            try self.transaction {
+                guard try self.representationTaskIsCurrent(task) else { return }
+                let key = self.representationBindings(task.descriptor)
+                try self.execute("UPDATE photos_representation SET state = 'failed' WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                try self.execute("UPDATE fingerprint_task SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.double(nextRetryAt.timeIntervalSince1970), .text(detail)] + key)
+            }
+        }
+    }
+
+    /// A reconstructible immutable snapshot. Returning it does not make it ready for admission.
+    public func indexPublication() async throws -> IndexPublication? {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
+                let token = try self.indexToken(state)
+                let rows = try self.rows("SELECT asset_id, kind, width, height, fingerprint_version, vector FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ? ORDER BY asset_id, kind", [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)])
+                let entries = try rows.map { row -> VectorEntry in
+                    guard let kind = RepresentationKind(rawValue: try self.text(row[1])),
+                          try self.text(row[4]) == token.fingerprintVersion, case .blob(let data) = row[5] else {
+                        throw AdvancedDedupError.invalidFingerprint
+                    }
+                    // Length framing keeps opaque asset IDs, including separators, collision-free.
+                    let asset = try self.text(row[0])
+                    return VectorEntry(key: "photos:\(asset.utf8.count):\(asset):\(kind.rawValue)",
+                        origin: kind == .original ? .photosOriginal : .photosCurrent,
+                        fingerprint: try Fingerprint(version: token.fingerprintVersion, littleEndianFloat32: data),
+                        size: try self.pixelSize(width: row[2], height: row[3]))
+                }
+                return IndexPublication(token: token, entries: entries)
+            }
+        }
+    }
+
+    public func markIndexPublished(token: IndexToken) async throws -> Bool {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.indexToken(state) == token,
+                      try self.indexFactsComplete(state) else { return false }
+                try self.execute("UPDATE dedup_index_state SET published_generation = generation WHERE id = 1")
+                self.publishedIndexToken = token
+                return true
+            }
+        }
+    }
+
+    public func indexIsReady(token: IndexToken) async throws -> Bool {
+        try await perform {
+            guard let state = try self.indexStateRow(), try self.indexToken(state) == token,
+                  self.optionalInteger(state[3]) == token.indexGeneration,
+                  let published = self.publishedIndexToken, self.samePhotosIndex(published, token) else { return false }
+            return try self.indexFactsComplete(state)
+        }
+    }
+
+    private func samePhotosIndex(_ lhs: IndexToken, _ rhs: IndexToken) -> Bool {
+        lhs.context == rhs.context && lhs.photosGeneration == rhs.photosGeneration &&
+            lhs.indexGeneration == rhs.indexGeneration && lhs.fingerprintVersion == rhs.fingerprintVersion
+    }
+    private func representationBindings(_ descriptor: RepresentationDescriptor) -> [Binding] {
+        [.text(descriptor.context.id.uuidString), .int64(descriptor.context.epoch), .text(descriptor.key.assetID), .text(descriptor.key.kind.rawValue)]
+    }
+    private func indexStateRow() throws -> [Value]? {
+        try one("SELECT context_id, context_epoch, generation, published_generation, fingerprint_version, photos_generation, local_revision, reconciliation_complete FROM dedup_index_state WHERE id = 1", [])
+    }
+    private func libraryContext(_ row: [Value]) throws -> LibraryContext { LibraryContext(id: try uuid(row[0]), epoch: try int64(row[1])) }
+    private func indexToken(_ row: [Value]) throws -> IndexToken {
+        IndexToken(context: try libraryContext(row), photosGeneration: Int(try int64(row[5])),
+                   indexGeneration: try int64(row[2]), localRevision: try int64(row[6]), fingerprintVersion: try text(row[4]))
+    }
+    private func indexFactsComplete(_ row: [Value]) throws -> Bool {
+        guard try int64(row[7]) != 0 else { return false }
+        let context = try libraryContext(row)
+        let incomplete = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <> ? OR state <> 'ready' OR fingerprint_version <> ? OR vector IS NULL) LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))])
+        guard incomplete == nil else { return false }
+        return try one("SELECT 1 FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND generation = ? AND fingerprint_version = ? LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))]) == nil
+    }
+    private func representationTaskIsCurrent(_ task: RepresentationTask) throws -> Bool {
+        guard let state = try indexStateRow(), try libraryContext(state) == task.descriptor.context,
+              try int64(state[2]) == task.indexGeneration, try text(state[4]) == task.fingerprintVersion else { return false }
+        let row = try one("SELECT r.revision, r.seen_generation, r.tombstoned, r.width, r.height, r.equivalent_to_original, r.revision_is_reliable FROM photos_representation r JOIN fingerprint_task t ON r.context_id = t.context_id AND r.context_epoch = t.context_epoch AND r.asset_id = t.asset_id AND r.kind = t.kind AND r.revision = t.revision AND r.fingerprint_version = t.fingerprint_version WHERE r.context_id = ? AND r.context_epoch = ? AND r.asset_id = ? AND r.kind = ? AND t.generation = ?", representationBindings(task.descriptor) + [.int64(task.indexGeneration)])
+        guard let row else { return false }
+        return try text(row[0]) == task.descriptor.revision && int64(row[1]) == task.indexGeneration && int64(row[2]) == 0 &&
+            pixelSize(width: row[3], height: row[4]) == task.descriptor.size &&
+            (int64(row[5]) != 0) == task.descriptor.equivalentToOriginal &&
+            (int64(row[6]) != 0) == task.descriptor.revisionIsReliable
+    }
+    private func optionalInteger(_ value: Value) -> Int64? { if case .int64(let integer) = value { return integer }; return nil }
+    private func pixelSize(width: Value, height: Value) throws -> PixelSize? {
+        if case .null = width, case .null = height { return nil }
+        return try PixelSize(width: Int(int64(width)), height: Int(int64(height)))
+    }
+
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 3 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 3 else { return }
+        guard version <= 4 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 4 else { return }
         try transaction {
             if version == 0 {
                 try execute(Self.schema)
@@ -570,7 +796,8 @@ public final class SyncStore: @unchecked Sendable {
                     try execute("ALTER TABLE source ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
                 }
             }
-            try execute("PRAGMA user_version = 3")
+            try execute(Self.advancedSchema)
+            try execute("PRAGMA user_version = 4")
         }
     }
 
@@ -605,8 +832,8 @@ public final class SyncStore: @unchecked Sendable {
         return Int32(value)
     }
 
-    private enum Binding { case text(String), int64(Int64), double(Double), null }
-    private enum Value { case text(String), int64(Int64), double(Double), null }
+    private enum Binding { case text(String), int64(Int64), double(Double), blob(Data), null }
+    private enum Value { case text(String), int64(Int64), double(Double), blob(Data), null }
 
     private func execute(_ sql: String, _ bindings: [Binding] = []) throws {
         if bindings.isEmpty {
@@ -644,6 +871,10 @@ public final class SyncStore: @unchecked Sendable {
                     case SQLITE_INTEGER: return .int64(sqlite3_column_int64(statement, Int32(index)))
                     case SQLITE_FLOAT: return .double(sqlite3_column_double(statement, Int32(index)))
                     case SQLITE_NULL: return .null
+                    case SQLITE_BLOB:
+                        let count = Int(sqlite3_column_bytes(statement, Int32(index)))
+                        guard let bytes = sqlite3_column_blob(statement, Int32(index)) else { return .blob(Data()) }
+                        return .blob(Data(bytes: bytes, count: count))
                     default: return .text(String(cString: sqlite3_column_text(statement, Int32(index))))
                     }
                 })
@@ -658,6 +889,8 @@ public final class SyncStore: @unchecked Sendable {
         case .text(let text): result = sqlite3_bind_text(statement, index, text, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         case .int64(let integer): result = sqlite3_bind_int64(statement, index, integer)
         case .double(let double): result = sqlite3_bind_double(statement, index, double)
+        case .blob(let data):
+            result = data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32(data.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
         case .null: result = sqlite3_bind_null(statement, index)
         }
         guard result == SQLITE_OK else { throw databaseError() }
@@ -685,6 +918,52 @@ public final class SyncStore: @unchecked Sendable {
     private func optionalDouble(_ value: Value) -> Double? { if case .double(let double) = value { return double }; if case .int64(let integer) = value { return Double(integer) }; return nil }
     private func uuid(_ value: Value) throws -> UUID { guard let uuid = UUID(uuidString: try text(value)) else { throw SyncStoreError.sqlite("Invalid UUID.") }; return uuid }
     private func optionalUUID(_ value: Value) -> UUID? { optionalText(value).flatMap(UUID.init(uuidString:)) }
+
+    private static let advancedSchema = """
+    CREATE TABLE dedup_index_state (
+     id INTEGER PRIMARY KEY CHECK(id = 1), context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL,
+     generation INTEGER NOT NULL, published_generation INTEGER, fingerprint_version TEXT NOT NULL,
+     photos_generation INTEGER NOT NULL, local_revision INTEGER NOT NULL DEFAULT 0,
+     reconcile_cursor TEXT, reconciliation_complete INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE photos_representation (
+     context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
+     kind TEXT NOT NULL CHECK(kind IN ('original','current')), revision TEXT NOT NULL,
+     width INTEGER, height INTEGER, equivalent_to_original INTEGER NOT NULL,
+     revision_is_reliable INTEGER NOT NULL, seen_generation INTEGER NOT NULL,
+     state TEXT NOT NULL CHECK(state IN ('ready','pending','failed')), fingerprint_version TEXT NOT NULL,
+     vector BLOB, tombstoned INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY(context_id, context_epoch, asset_id, kind),
+     CHECK((width IS NULL AND height IS NULL) OR (width > 0 AND height > 0)),
+     CHECK(vector IS NULL OR length(vector) = 4096)
+    );
+    CREATE TABLE fingerprint_task (
+     context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
+     kind TEXT NOT NULL, revision TEXT NOT NULL, fingerprint_version TEXT NOT NULL,
+     generation INTEGER NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT,
+     PRIMARY KEY(context_id, context_epoch, asset_id, kind, revision, fingerprint_version),
+     FOREIGN KEY(context_id, context_epoch, asset_id, kind) REFERENCES photos_representation(context_id, context_epoch, asset_id, kind)
+    );
+    CREATE INDEX fingerprint_task_due ON fingerprint_task(generation, next_retry_at);
+    CREATE TABLE file_fingerprint (
+     file_id TEXT NOT NULL REFERENCES file_record(id), size INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
+     fingerprint_version TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('current','success')),
+     width INTEGER, height INTEGER, vector BLOB NOT NULL CHECK(length(vector) = 4096),
+     PRIMARY KEY(file_id, size, modified_ns, fingerprint_version, purpose)
+    );
+    CREATE TABLE advanced_match_evidence (
+     event_id TEXT PRIMARY KEY, file_id TEXT NOT NULL REFERENCES file_record(id),
+     size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, token_json TEXT NOT NULL,
+     policy_version TEXT NOT NULL, action TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at REAL NOT NULL
+    );
+    CREATE TABLE dedup_dependency (
+     file_id TEXT NOT NULL REFERENCES file_record(id), candidate_file_id TEXT NOT NULL REFERENCES file_record(id),
+     candidate_revision TEXT NOT NULL, PRIMARY KEY(file_id, candidate_file_id), CHECK(file_id <> candidate_file_id)
+    );
+    CREATE TABLE dedup_recheck_progress (
+     target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0
+    );
+    """
 
     private static let schema = """
     CREATE TABLE source (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0, last_scan_at REAL, last_error TEXT);
