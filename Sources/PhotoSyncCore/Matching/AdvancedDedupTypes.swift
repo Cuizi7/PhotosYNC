@@ -552,3 +552,19 @@ private struct IntegrationCloseout: Decodable {
     }
     struct Statistical: Decodable { let status: String, falseSkipUpperBoundClaimed: Bool, recallConfidenceClaimed: Bool }
 }
+
+public extension DedupConfiguration {
+    /// Folder resource copied into PhotoSyncCore by the package step. Never search work/research paths.
+    static func bundledResourceDirectory() throws -> URL {
+        guard let root = Bundle(for: PhotoKitGateway.self).resourceURL else { throw AdvancedDedupError.invalidConfiguration }
+        return root.appendingPathComponent("AdvancedDedup", isDirectory: true)
+    }
+}
+
+/// Committed representation-row mutations, not photo counts. A batch may later abort.
+public struct IndexMutationCounts: Sendable, Equatable {
+    public var added = 0
+    public var changed = 0
+    public var deleted = 0
+    public init() {}
+}

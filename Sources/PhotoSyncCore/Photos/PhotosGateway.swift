@@ -63,7 +63,9 @@ public struct PhotosCandidateSnapshot: Equatable, Sendable {
 
 /// Proof supplied only when a guarded gateway did not create any asset request.
 /// Timeout, cancellation, and an in-flight/unknown request must never use this.
-struct PhotosAdmissionDeferred: Error, Sendable {}
+public struct PhotosAdmissionDeferred: Error, Sendable {
+    public init() {}
+}
 
 public protocol PhotosGateway: Sendable {
     /// Returns an immutable candidate view and its admission generation.
@@ -84,7 +86,14 @@ public protocol PhotosGateway: Sendable {
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> String
     /// The predicate is checked synchronously at the actual mutation boundary,
-    /// after all gateway awaits. A default implementation fails closed.
+    /// after all gateway awaits. False must throw `PhotosAdmissionDeferred` only
+    /// before any asset request is created. A thrown predicate error propagates
+    /// as a diagnostic; it must not be rewritten as normal deferral. After dispatch,
+    /// timeout/cancellation is unknown, never deferral. `onPlaceholder` is a durable
+    /// checkpoint, not success; a checkpoint failure preserves unknown submission
+    /// evidence. Return an identifier only after the system confirms successful
+    /// commit. External conformers must implement all these guarantees; the default
+    /// implementation fails closed without invoking a mutation.
     func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int,
                 beforeMutation: @escaping @Sendable () throws -> Bool,
                 onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String

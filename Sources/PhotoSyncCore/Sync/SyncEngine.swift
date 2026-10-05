@@ -219,6 +219,7 @@ public struct EngineSnapshot: Sendable {
     public var deferredSources: Set<UUID> = []
     /// Current advanced preparation wait, separate from source read failures.
     public var advancedWaitingReasons: [UUID: String] = [:]
+    public var indexProgress: IndexProgress?
     /// Raw engine-level failure, kept for the journal and the menu tooltip.
     public var blockingError: String?
     /// Plain-language headline for `blockingError`, and the text a notification carries.
@@ -238,6 +239,7 @@ public actor SyncEngine {
     private let advancedDedup: AdvancedDedupService?
     private let indexCoordinator: PhotosIndexCoordinator?
     private let requiresAdvancedDedup: Bool
+    private let dedupConfiguration: DedupConfiguration?
     private let submissionState = EngineSubmissionState()
     private let policy: DuplicatePolicy
     private let logger: RunLogger?
@@ -288,13 +290,14 @@ public actor SyncEngine {
                 metadata: @escaping MetadataFactory = { MetadataReader(sourceID: $0) },
                 policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
                 advancedDedup: AdvancedDedupService? = nil, indexCoordinator: PhotosIndexCoordinator? = nil,
-                requiresAdvancedDedup: Bool = false, legacySkipReevaluation: LegacySkipReevaluation? = nil,
+                requiresAdvancedDedup: Bool = false, dedupConfiguration: DedupConfiguration? = nil, legacySkipReevaluation: LegacySkipReevaluation? = nil,
                 notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in },
                 notifyIssue: @escaping @Sendable (String) -> Void = { _ in },
                 notifySourceIssue: @escaping @Sendable (UUID, Bool, SourceIssue?) -> Void = { _, _, _ in },
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.advancedDedup = advancedDedup; self.indexCoordinator = indexCoordinator
         self.requiresAdvancedDedup = requiresAdvancedDedup
+        self.dedupConfiguration = dedupConfiguration
         self.legacySkipReevaluation = legacySkipReevaluation
         self.store = store; self.photos = photos; self.directory = directory
         self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
@@ -330,6 +333,7 @@ public actor SyncEngine {
     }
     /// P8 supplies the validated profile's batch limit and schedules this on its existing tick.
     /// Reopened rows enter the ordinary P6 drain; this operation never calls Photos create.
+    /// Zero counts actual reopens, not completion: later bounded ticks must continue retries.
     @discardableResult
     public func processLegacySkips(limit: Int) async throws -> Int {
         guard !status.isPaused, !storageFailed, let legacySkipReevaluation else { return 0 }
@@ -813,7 +817,9 @@ public actor SyncEngine {
                         continue
                     case .ready(let admission):
                         if admission.evidence.evaluation.action == .skip {
+                            let admissionStarted = ProcessInfo.processInfo.systemUptime
                             if try await store.commitAdvancedSkip(admission) {
+                                logAdvancedDecision(.ready(admission), timings: ["databaseAdmission": (ProcessInfo.processInfo.systemUptime - admissionStarted) * 1000])
                                 resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
                             } else { recordAdvancedWait("照片判重依据已变化，稍后继续。", record: record, context: context) }
                             continue
@@ -885,6 +891,7 @@ public actor SyncEngine {
                 let attempt = UUID()
                 activeAttempt = attempt
                 do {
+                    let admissionStarted = ProcessInfo.processInfo.systemUptime
                     let admitted: Bool
                     switch advanced {
                     case .ready(let admission): admitted = try await store.beginAdvancedAttempt(admission, attemptID: attempt)
@@ -893,6 +900,7 @@ public actor SyncEngine {
                         try await store.beginAttempt(fileID: record.id, attemptID: attempt)
                         admitted = true
                     }
+                    if admitted, let advanced { logAdvancedDecision(advanced, timings: ["databaseAdmission": (ProcessInfo.processInfo.systemUptime - admissionStarted) * 1000]) }
                     guard admitted else {
                         activeAttempt = nil
                         recordAdvancedWait("照片判重依据已变化，稍后继续。", record: record, context: context)
@@ -916,6 +924,13 @@ public actor SyncEngine {
                     break
                 }
                 do {
+                    let submissionStarted = ProcessInfo.processInfo.systemUptime
+                    defer {
+                        if advanced != nil {
+                            logger?.log(["phase": "advanced-submission-timing", "file": record.id.uuidString,
+                                "attempt": attempt.uuidString, "timingMS.nativeSubmissionWait": String((ProcessInfo.processInfo.systemUptime - submissionStarted) * 1000)])
+                        }
+                    }
                     let store = self.store
                     status.sourcePhases[record.file.sourceID] = "新增到照片"
                     defer { status.sourcePhases.removeValue(forKey: record.file.sourceID) }
@@ -1025,11 +1040,25 @@ public actor SyncEngine {
         guard canScan(sourceID: record.file.sourceID) else { return }
         recordDeferral(context.roundID, sourceID: record.file.sourceID)
         status.advancedWaitingReasons[record.file.sourceID] = reason
-        let key = "advanced-wait|\(record.id.uuidString)"
+        let key = "\(record.file.sourceID.uuidString)|advanced-wait|\(record.id.uuidString)"
         if lastFailureLogSignatures[key] != reason {
             lastFailureLogSignatures[key] = reason
             logEvent(phase: "advanced-dedup", result: "waiting", sourceID: record.file.sourceID,
                      runID: context.runID, fileID: record.id, detail: reason)
+        }
+    }
+
+    private func logAdvancedDecision(_ preparation: AdvancedPreparation, timings: [String: Double]) {
+        guard let dedupConfiguration else { return }
+        switch preparation {
+        case .ready(let admission):
+            logger?.logDecision(admission.evidence, configuration: dedupConfiguration, sourceSize: admission.source.size, additionalTimingsMS: timings)
+        case .conservative(let admission):
+            let m = admission.file.metadata
+            let size = m.width.flatMap { width in m.height.flatMap { try? PixelSize(width: width, height: $0) } }
+            logger?.logDecision(admission.evidence, configuration: dedupConfiguration,
+                sourceSize: size, conservativeReason: admission.reason, additionalTimingsMS: timings)
+        case .waiting: break
         }
     }
 
@@ -1071,6 +1100,7 @@ public actor SyncEngine {
 
     private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil,
                                     attemptID: UUID? = nil, announceRecovery: Bool = true) {
+        if let fileID, key == issueKey(for: fileID) { lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|advanced-wait|\(fileID.uuidString)") }
         if let fileID, key == issueKey(for: fileID), pendingStampFailureID == fileID {
             pendingStampFailureID = nil
         }
@@ -1162,12 +1192,14 @@ public actor SyncEngine {
         status.advancedWaitingReasons.removeValue(forKey: sourceID)
         sourceIssues.removeValue(forKey: sourceID)
         reportedWaitingSources.remove(sourceID)
-        clearFailureLogSignatures(sourceID)
+        clearFailureLogSignatures(sourceID, includeAdvanced: true)
     }
 
-    private func clearFailureLogSignatures(_ sourceID: UUID) {
+    private func clearFailureLogSignatures(_ sourceID: UUID, includeAdvanced: Bool = false) {
         let prefix = "\(sourceID.uuidString)|"
-        lastFailureLogSignatures = lastFailureLogSignatures.filter { !$0.key.hasPrefix(prefix) }
+        lastFailureLogSignatures = lastFailureLogSignatures.filter {
+            !$0.key.hasPrefix(prefix) || (!includeAdvanced && $0.key.hasPrefix(prefix + "advanced-wait|"))
+        }
     }
 
     /// Journals a failure only while its signature changes. Every attempt still persists its own

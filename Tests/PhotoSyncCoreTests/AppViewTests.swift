@@ -139,3 +139,48 @@ final class AppViewTests: XCTestCase {
         throw FixtureError.unavailable("Offscreen layout did not converge: \(previous)")
     }
 }
+
+extension AppViewTests {
+    func testCompactAnalysisAndCountersFitNativeMenu() async throws {
+        let model = try await makeModel(sourceCount: 1)
+        model.state.snapshot.waitingSources = [:]
+        model.state.snapshot.summary = SyncStatusSummary(imported: 999999, skipped: 999999,
+            pending: 999999, importing: 3, retryPending: 4, retainedImported: 5)
+        let cloud = "正在等待 iCloud 图像，连接恢复后自动继续"
+        for text in [model.counters, cloud] {
+            let row = NSHostingView(rootView: StatusMenuSingleLine(text: text))
+            let size = row.fittingSize
+            XCTAssertLessThanOrEqual(size.width, 292, "Critical row must fit at native caption size: \(text)")
+            XCTAssertLessThanOrEqual(size.height, 16, "Critical row must remain a single native line")
+        }
+        XCTAssertEqual(model.counterNotes.count, 3)
+        for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
+            model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
+                totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
+                readyRepresentations: 100000, excludedAssets: 0, issue: state == .waiting ? cloud : nil)
+            let size = try measure(StatusMenu(model: model), width: 320)
+            XCTAssertEqual(size.width, 320, accuracy: 1)
+            XCTAssertLessThanOrEqual(size.height, 680)
+            XCTAssertEqual(model.analysis == nil, state == .ready)
+            if state == .waiting || state == .ready { try renderMenu(model, name: state.rawValue) }
+        }
+    }
+
+    private func renderMenu(_ model: AppModel, name: String) throws {
+        guard let directory = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] else { return }
+        let host = NSHostingView(rootView: StatusMenu(model: model)
+            .environment(\.colorScheme, .light).background(Color(nsColor: .windowBackgroundColor)))
+        host.appearance = NSAppearance(named: .aqua)
+        host.frame = NSRect(x: 0, y: 0, width: 320, height: 680)
+        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        for _ in 0..<10 { RunLoop.current.run(until: Date().addingTimeInterval(0.02)); host.layoutSubtreeIfNeeded() }
+        host.setFrameSize(host.fittingSize); host.layoutSubtreeIfNeeded()
+        XCTAssertFalse(window.isVisible)
+        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("native-\(name).png"))
+    }
+}

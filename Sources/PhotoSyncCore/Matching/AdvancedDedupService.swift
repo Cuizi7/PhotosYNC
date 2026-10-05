@@ -41,14 +41,17 @@ public actor AdvancedDedupService {
     }
 
     private func prepareCurrent(fileID: UUID, file: SourceFile) async throws -> AdvancedPreparation {
-        let started = Date()
+        let started = ProcessInfo.processInfo.systemUptime
+        var timings: [String: Double] = [:]
         guard !paused, file.metadata.kind == .image,
               let record = try await eligibleRecord(fileID: fileID, file: file), !paused else { return waiting() }
         guard let initialToken = await readyToken(), !paused else { return waiting() }
         guard try await stamp(file) == file.stamp, !paused else { return waiting() }
         let size = sourceSize(file)
+        let cacheStarted = ProcessInfo.processInfo.systemUptime
         var fingerprint = try await store.fingerprint(fileID: fileID, stamp: file.stamp,
                                                        version: configuration.fingerprint.version)
+        timings["cacheLookup"] = (ProcessInfo.processInfo.systemUptime - cacheStarted) * 1000
         guard !paused else { return waiting() }
         var conservativeReason: RepresentationConservativeReason?
         if fingerprint == nil {
@@ -56,40 +59,51 @@ public actor AdvancedDedupService {
             // completion, even if the preparing caller is canceled or paused.
             let reader = MetadataReader(sourceID: file.sourceID, executor: executor)
             let model = fingerprinter, configuration = configuration, budget = budget
-            let work = Task { () throws -> (Fingerprint?, RepresentationConservativeReason?) in
+            let work = Task { () throws -> (Fingerprint?, RepresentationConservativeReason?, [String: Double]) in
+                var physicalTimings: [String: Double] = [:]
+                let readStarted = ProcessInfo.processInfo.systemUptime
                 var loaded: ImageWorkResult<SourceImage>? = try await reader.readForFingerprint(
                     url: file.url, configuration: configuration, budget: budget)
+                physicalTimings["sourceReadDecodeWait"] = (ProcessInfo.processInfo.systemUptime - readStarted) * 1000
                 let lease = loaded!.lease
                 do {
                     let result: (Fingerprint?, RepresentationConservativeReason?)
                     switch loaded!.value.eligibility {
                     case .safeSingleFrame:
+                        let fingerprintStarted = ProcessInfo.processInfo.systemUptime
                         result = (try await model.fingerprint(image: loaded!.value.image,
                             orientation: loaded!.value.orientation), nil)
+                        physicalTimings["fingerprintPreprocessInference"] = (ProcessInfo.processInfo.systemUptime - fingerprintStarted) * 1000
                     case .conservative(let reason): result = (nil, reason)
                     }
                     loaded = nil; await lease.finishPhysicalWork()
-                    return result
+                    return (result.0, result.1, physicalTimings)
                 } catch {
                     loaded = nil; await lease.finishPhysicalWork(); throw error
                 }
             }
-            (fingerprint, conservativeReason) = try await work.value
+            let physical = try await work.value
+            (fingerprint, conservativeReason) = (physical.0, physical.1)
+            timings.merge(physical.2) { _, latest in latest }
             guard !paused, !Task.isCancelled, try await stamp(file) == file.stamp, !paused,
                   try await eligibleRecord(fileID: fileID, file: file) != nil, !paused,
                   let current = await readyToken(), samePhotosIndex(initialToken, current), !paused else { return waiting() }
             if let fingerprint {
                 guard fingerprint.version == configuration.fingerprint.version else { throw AdvancedDedupError.modelMismatch }
+                let writeStarted = ProcessInfo.processInfo.systemUptime
                 guard try await store.cacheFingerprint(.init(fileID: fileID, file: file,
                     fingerprint: fingerprint, size: size)), !paused else { return waiting() }
+                timings["cacheWrite"] = (ProcessInfo.processInfo.systemUptime - writeStarted) * 1000
             }
         }
         guard let token = await readyToken(), samePhotosIndex(initialToken, token), !paused else { return waiting() }
         let snapshot: PhotosCandidateSnapshot
         do { snapshot = try await photos.candidateSnapshot() } catch { return waiting() }
         guard !paused, snapshot.generation == token.photosGeneration else { return waiting() }
+        let localReadStarted = ProcessInfo.processInfo.systemUptime
         let local = try await store.localVectorCandidates(beforeOrder: record.createdOrder, excluding: fileID,
                                                           version: configuration.fingerprint.version)
+        timings["localCandidateRead"] = (ProcessInfo.processInfo.systemUptime - localReadStarted) * 1000
         guard !paused, local.revision == token.localRevision else { return waiting() }
         let matches: [ScoredCandidate], diagnostics: [ScoredCandidate]
         let evaluation: DuplicateEvaluation
@@ -99,14 +113,18 @@ public actor AdvancedDedupService {
                                matchedKeys: [], coveringKeys: [])
         } else {
             guard let fingerprint else { return waiting() }
+            let searchStarted = ProcessInfo.processInfo.systemUptime
             let photosResult: VectorSearchResult
             do {
                 photosResult = try await index.searchWithDiagnostics(query: fingerprint,
                     minimumScore: configuration.threshold, generation: token.indexGeneration, diagnosticLimit: 10)
             } catch { return waiting() }
+            timings["photosSearch"] = (ProcessInfo.processInfo.systemUptime - searchStarted) * 1000
             guard !paused else { return waiting() }
+            let localSearchStarted = ProcessInfo.processInfo.systemUptime
             let localResult = try ExactVectorIndex.scoreWithDiagnostics(query: fingerprint, entries: local.entries,
                 minimumScore: configuration.threshold, diagnosticLimit: 10)
+            timings["localSearch"] = (ProcessInfo.processInfo.systemUptime - localSearchStarted) * 1000
             matches = (photosResult.matches + localResult.matches).sorted(by: Self.ranked)
             diagnostics = Array((photosResult.diagnostics + localResult.diagnostics).sorted(by: Self.ranked).prefix(10))
             evaluation = try AdvancedDuplicatePolicy.evaluate(sourceSize: size, candidates: matches, configuration: configuration)
@@ -123,10 +141,11 @@ public actor AdvancedDedupService {
         let boundedEvaluation = DuplicateEvaluation(content: evaluation.content, action: evaluation.action,
             reason: evaluation.reason, matchedKeys: decisive.map { [$0.key] } ?? [],
             coveringKeys: decisive.flatMap { coveringKeys.contains($0.key) ? [$0.key] : nil } ?? [])
+        timings["preparation"] = (ProcessInfo.processInfo.systemUptime - started) * 1000
         let evidence = AdvancedEvidence(eventID: UUID(), fileID: fileID, stamp: file.stamp, token: token,
             policyVersion: configuration.policyVersion, evaluation: boundedEvaluation,
             decisiveCandidates: decisive.map { [$0] } ?? [], diagnostics: diagnostics,
-            timingsMS: ["preparation": Date().timeIntervalSince(started) * 1000])
+            timingsMS: timings)
         if let conservativeReason {
             return .conservative(.init(fileID: fileID, file: file, reason: conservativeReason,
                                        evidence: evidence, validity: snapshot.candidateValidity))

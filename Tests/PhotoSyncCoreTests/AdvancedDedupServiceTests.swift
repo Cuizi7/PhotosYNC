@@ -469,3 +469,26 @@ private final class AdmissionValidity: PhotosCandidateValidity, @unchecked Senda
         return true
     }
 }
+
+extension AdvancedDedupServiceTests {
+    func testSegmentedTimingReportsOnlyExecutedStages() async throws {
+        let f = try await fixture(); try await ready(f, candidates: [])
+        let first = try await admission(f)
+        for key in ["sourceReadDecodeWait", "fingerprintPreprocessInference", "photosSearch", "localSearch", "cacheLookup", "localCandidateRead", "preparation"] {
+            XCTAssertNotNil(first.evidence.timingsMS[key], key)
+            XCTAssertGreaterThanOrEqual(first.evidence.timingsMS[key] ?? -1, 0)
+        }
+        let cached = try await admission(f)
+        XCTAssertNil(cached.evidence.timingsMS["sourceReadDecodeWait"])
+        XCTAssertNil(cached.evidence.timingsMS["fingerprintPreprocessInference"])
+        XCTAssertNotNil(cached.evidence.timingsMS["photosSearch"])
+        let (oversize, service, _, _) = try await resourceFixture()
+        guard case .conservative(let admission) = try await service.prepare(fileID: oversize.id, file: oversize.file) else {
+            return XCTFail("Expected conservative admission")
+        }
+        XCTAssertNotNil(admission.evidence.timingsMS["sourceReadDecodeWait"])
+        XCTAssertNil(admission.evidence.timingsMS["fingerprintPreprocessInference"])
+        XCTAssertNil(admission.evidence.timingsMS["photosSearch"])
+        XCTAssertNil(admission.evidence.timingsMS["localSearch"])
+    }
+}

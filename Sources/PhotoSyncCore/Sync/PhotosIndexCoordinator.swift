@@ -16,19 +16,31 @@ public actor PhotosIndexCoordinator {
     private var reconciledGeneration: Int?
     private var acknowledgedGeneration: Int?
     private var issue: String?
+    private var cloudWaiting = Set<String>()
+    private let diagnostics: @Sendable ([String: String]) -> Void
 
     public init(store: SyncStore, photos: any PhotosIndexGateway, fingerprinter: any ImageFingerprinting,
-                index: ExactVectorIndex, configuration: DedupConfiguration) {
+                index: ExactVectorIndex, configuration: DedupConfiguration,
+                diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         self.store = store; self.photos = photos; self.fingerprinter = fingerprinter
-        self.index = index; self.configuration = configuration
+        self.index = index; self.configuration = configuration; self.diagnostics = diagnostics
     }
 
     deinit { observer?.cancel() }
 
     public func reconcile() async throws {
+        guard !paused else { throw CancellationError() }
         guard !reconciling else { throw PhotoKitGatewayError.libraryChanged }
         reconciling = true; acknowledgedGeneration = nil
-        defer { reconciling = false }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        var counts = IndexMutationCounts()
+        var complete = false
+        defer {
+            reconciling = false
+            diagnostics(["phase": "index-reconcile", "unit": "representationRows", "batch": complete ? "completed" : "aborted",
+                "added": String(counts.added), "changed": String(counts.changed), "deleted": String(counts.deleted),
+                "timingMS.catalogReconciliation": String((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)])
+        }
         do {
             if !started {
                 started = true
@@ -54,6 +66,9 @@ public actor PhotosIndexCoordinator {
             var context: LibraryContext?
             var allInvalidated = false
             repeat {
+                // Pause may arrive while the previous page/transaction was in flight.
+                // Preserve that page, but do not start another catalog request.
+                guard !paused else { throw CancellationError() }
                 let page = try await photos.representationCatalog(offset: offset,
                     limit: configuration.resources.catalogBatchSize, expectedGeneration: snapshot.generation)
                 guard page.generation == snapshot.generation, context == nil || context == page.context,
@@ -74,7 +89,8 @@ public actor PhotosIndexCoordinator {
                 } else if !allInvalidated && !page.invalidatedAssetIDs.isEmpty {
                     try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: current)
                 }
-                try await store.upsertRepresentations(page.descriptors, generation: current)
+                let mutations = try await store.upsertRepresentations(page.descriptors, generation: current)
+                counts.added += mutations.added; counts.changed += mutations.changed
                 eligibleAssets.formUnion(page.descriptors.map { $0.key.assetID })
                 excludedAssets.formUnion(page.exclusions.map { $0.descriptor.key.assetID })
                 if let next = page.nextOffset {
@@ -86,12 +102,14 @@ public actor PhotosIndexCoordinator {
             guard latest.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
             // Commit continuity even when the long initial fingerprint build is
             // unfinished; this checkpoint proves inventory history, never readiness.
-            try await store.finishIndexReconciliation(generation: generation!, checkpoint: checkpoint,
-                excludedAssets: excludedAssets.subtracting(eligibleAssets).count)
+            guard let finish = try await store.finishIndexReconciliation(generation: generation!, checkpoint: checkpoint,
+                excludedAssets: excludedAssets.subtracting(eligibleAssets).count) else { throw PhotoKitGatewayError.libraryChanged }
+            counts.deleted += finish.deleted
+            complete = true
             let after = try await photos.candidateSnapshot()
             guard after.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
             needsReconciliation = false; forceCacheInvalidation = false
-            reconciledGeneration = snapshot.generation; issue = nil
+            reconciledGeneration = snapshot.generation; issue = nil; cloudWaiting.removeAll()
             try await publishIfComplete()
         } catch {
             needsReconciliation = true; issue = "图库索引正在等待重新核对。"
@@ -103,7 +121,14 @@ public actor PhotosIndexCoordinator {
     public func processDueWork(now: Date) async {
         guard !processing, !paused else { return }
         processing = true
-        defer { processing = false }
+        var completed = 0, failed = 0
+        defer {
+            processing = false
+            if completed > 0 || failed > 0 {
+                diagnostics(["phase": "index-work", "unit": "representationTasks", "completed": String(completed),
+                             "failed": String(failed), "batch": paused || needsReconciliation ? "interrupted" : "completed"])
+            }
+        }
         do {
             if needsReconciliation { try await reconcile() }
             guard !paused, !needsReconciliation, !reconciling else { return }
@@ -124,14 +149,29 @@ public actor PhotosIndexCoordinator {
                     guard snapshot.generation == expected else { needsReconciliation = true; acknowledgedGeneration = nil; break }
                     // An unstructured owned Task does not inherit later caller
                     // cancellation. Pause cannot cancel already-started consumers.
-                    let photos = photos, model = fingerprinter
+                    let photos = photos, model = fingerprinter, diagnostics = diagnostics
                     let work = Task { () throws -> Fingerprint in
+                        var fields = ["phase": "index-representation-timing", "asset": task.descriptor.key.assetID,
+                                      "representation": task.descriptor.key.kind.rawValue]
+                        let readStarted = ProcessInfo.processInfo.systemUptime
+                        defer {
+                            if fields["timingMS.representationReadWait"] == nil {
+                                fields["timingMS.representationReadWait"] = String((ProcessInfo.processInfo.systemUptime - readStarted) * 1000)
+                            }
+                            diagnostics(fields)
+                        }
                         var loaded: LoadedRepresentation? = try await photos.readRepresentation(task.descriptor)
+                        fields["timingMS.representationReadWait"] = String((ProcessInfo.processInfo.systemUptime - readStarted) * 1000)
                         let lease = loaded!.lease
                         do {
                             guard loaded?.descriptor == task.descriptor,
                                   loaded?.eligibility == .safeSingleFrame else { throw PhotoKitGatewayError.libraryChanged }
-                            let fingerprint = try await model.fingerprint(image: loaded!.image, orientation: loaded!.orientation)
+                            let fingerprintStarted = ProcessInfo.processInfo.systemUptime
+                            let fingerprint: Fingerprint
+                            do {
+                                defer { fields["timingMS.fingerprintPreprocessInference"] = String((ProcessInfo.processInfo.systemUptime - fingerprintStarted) * 1000) }
+                                fingerprint = try await model.fingerprint(image: loaded!.image, orientation: loaded!.orientation)
+                            }
                             // Release the last owned bitmap reference before making
                             // its physical budget slot available to another consumer.
                             loaded = nil
@@ -143,13 +183,17 @@ public actor PhotosIndexCoordinator {
                             throw error
                         }
                     }
+                    let waitKey = "\(task.descriptor.key.assetID.utf8.count):\(task.descriptor.key.assetID):\(task.descriptor.key.kind.rawValue)"
                     do {
                         let fingerprint = try await work.value
                         let latest = try await photos.candidateSnapshot()
                         guard !needsReconciliation, !reconciling, latest.generation == expected else {
                             needsReconciliation = true; acknowledgedGeneration = nil; continue
                         }
-                        _ = try await store.completeRepresentation(task, fingerprint: fingerprint)
+                        if try await store.completeRepresentation(task, fingerprint: fingerprint) {
+                            completed += 1; cloudWaiting.remove(waitKey)
+                            if cloudWaiting.isEmpty && issue == "正在等待 iCloud 图像，连接恢复后自动继续" { issue = nil }
+                        }
                     } catch {
                         let latest = try? await photos.candidateSnapshot()
                         if needsReconciliation || reconciling || latest?.generation != expected {
@@ -157,8 +201,15 @@ public actor PhotosIndexCoordinator {
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
                             let delay = delays[min(task.retryCount, delays.count - 1)]
-                            try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay), detail: String(describing: error))
-                            issue = "部分图库图像暂时无法读取，正在等待重试。"
+                            if try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay), detail: String(describing: error)) {
+                                failed += 1
+                                diagnostics(["phase": "index-representation", "result": "waiting", "asset": task.descriptor.key.assetID,
+                                    "representation": task.descriptor.key.kind.rawValue, "error": String(describing: error)])
+                                if case .iCloudUnavailable = error as? PhotosRepresentationError { cloudWaiting.insert(waitKey) }
+                                else { cloudWaiting.remove(waitKey) }
+                                issue = cloudWaiting.isEmpty ? "部分图库图像暂时无法读取，正在等待重试。"
+                                    : "正在等待 iCloud 图像，连接恢复后自动继续"
+                            }
                         }
                     }
                 }

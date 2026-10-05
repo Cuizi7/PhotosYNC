@@ -1066,19 +1066,21 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    public func upsertRepresentations(_ descriptors: [RepresentationDescriptor], generation: Int64) async throws {
+    @discardableResult
+    public func upsertRepresentations(_ descriptors: [RepresentationDescriptor], generation: Int64) async throws -> IndexMutationCounts {
         try await perform {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
                       try self.int64(state[7]) == 0 else { throw SyncStoreError.invalidTransition("Stale or finished reconciliation.") }
                 let context = try self.libraryContext(state)
                 let version = try self.text(state[4])
+                var counts = IndexMutationCounts()
                 for descriptor in descriptors {
                     guard descriptor.context == context, !descriptor.key.assetID.isEmpty, !descriptor.revision.isEmpty else {
                         throw AdvancedDedupError.invalidConfiguration
                     }
                     let key = self.representationBindings(descriptor)
-                    let previous = try self.one("SELECT revision, width, height, equivalent_to_original, revision_is_reliable, fingerprint_version, state, seen_generation FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                    let previous = try self.one("SELECT revision, width, height, equivalent_to_original, revision_is_reliable, fingerprint_version, state, seen_generation, tombstoned FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
                     let unchanged = try previous.map { row in
                         try descriptor.revisionIsReliable && self.int64(row[4]) != 0 &&
                         self.text(row[0]) == descriptor.revision &&
@@ -1087,6 +1089,10 @@ public final class SyncStore: @unchecked Sendable {
                         self.int64(row[3]) == (descriptor.equivalentToOriginal ? 1 : 0) &&
                         self.text(row[5]) == version
                     } ?? false
+                    let previouslyRemoved = try previous.map { try self.int64($0[8]) != 0 } ?? false
+                    if previous == nil || previouslyRemoved {
+                        counts.added += 1
+                    } else if !unchanged { counts.changed += 1 }
                     if unchanged {
                         try self.execute("UPDATE photos_representation SET seen_generation = ?, tombstoned = 0 WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.int64(generation)] + key)
                     } else {
@@ -1115,16 +1121,19 @@ public final class SyncStore: @unchecked Sendable {
                             """, key + [.text(descriptor.revision), .text(version), .int64(generation)])
                     }
                 }
+                return counts
             }
         }
     }
 
-    public func finishIndexReconciliation(generation: Int64, checkpoint: LibraryResumeCheckpoint? = nil, excludedAssets: Int = 0) async throws {
+    @discardableResult
+    public func finishIndexReconciliation(generation: Int64, checkpoint: LibraryResumeCheckpoint? = nil, excludedAssets: Int = 0) async throws -> IndexMutationCounts? {
         guard excludedAssets >= 0 else { throw AdvancedDedupError.invalidConfiguration }
-        try await perform {
+        return try await perform {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
-                      try self.int64(state[7]) == 0 else { return }
+                      try self.int64(state[7]) == 0 else { return nil }
+                var counts = IndexMutationCounts()
                 let context = try self.libraryContext(state)
                 if let checkpoint, checkpoint.context != context { throw AdvancedDedupError.invalidConfiguration }
                 let key: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .int64(generation)]
@@ -1132,12 +1141,14 @@ public final class SyncStore: @unchecked Sendable {
                 // coalesce when that original is eligible in this complete inventory.
                 try self.execute("""
                     UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ?
-                    AND kind = 'current' AND equivalent_to_original = 1 AND seen_generation = ?
+                    AND tombstoned = 0 AND kind = 'current' AND equivalent_to_original = 1 AND seen_generation = ?
                     AND EXISTS (SELECT 1 FROM photos_representation original WHERE original.context_id = photos_representation.context_id
                     AND original.context_epoch = photos_representation.context_epoch AND original.asset_id = photos_representation.asset_id
                     AND original.kind = 'original' AND original.seen_generation = photos_representation.seen_generation AND original.tombstoned = 0)
                     """, key)
-                try self.execute("UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ? AND seen_generation <> ?", key)
+                counts.deleted += Int(sqlite3_changes(self.database))
+                try self.execute("UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ? AND seen_generation <> ? AND tombstoned = 0", key)
+                counts.deleted += Int(sqlite3_changes(self.database))
                 try self.execute("""
                     DELETE FROM fingerprint_task WHERE EXISTS (SELECT 1 FROM photos_representation r
                     WHERE r.context_id = fingerprint_task.context_id AND r.context_epoch = fingerprint_task.context_epoch
@@ -1146,6 +1157,7 @@ public final class SyncStore: @unchecked Sendable {
                 let data = try checkpoint.map { try JSONEncoder().encode($0) }
                 try self.execute("UPDATE dedup_index_state SET reconciliation_complete = 1, reconcile_cursor = NULL, resume_checkpoint = ?, excluded_assets = ? WHERE id = 1",
                                  [data.map(Binding.blob) ?? .null, .int64(Int64(excludedAssets))])
+                return counts
             }
         }
     }
@@ -1274,13 +1286,15 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     /// Stale failures are no-ops; retry scheduling never crosses a generation.
-    public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws {
+    @discardableResult
+    public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws -> Bool {
         try await perform {
             try self.transaction {
-                guard try self.representationTaskIsCurrent(task) else { return }
+                guard try self.representationTaskIsCurrent(task) else { return false }
                 let key = self.representationBindings(task.descriptor)
                 try self.execute("UPDATE photos_representation SET state = 'failed' WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
                 try self.execute("UPDATE fingerprint_task SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.double(nextRetryAt.timeIntervalSince1970), .text(detail)] + key)
+                return true
             }
         }
     }

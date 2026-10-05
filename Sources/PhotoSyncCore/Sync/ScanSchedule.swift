@@ -3,6 +3,8 @@ import Foundation
 public struct ScanSchedule: Sendable {
     public static let interval: TimeInterval = 1_800
 
+    private var photosReconciling = false
+    public private(set) var nextPhotosReconcileAt: Date?
     private var running = false
     private var paused = false
     private var lastObservedAt: Date?
@@ -15,6 +17,19 @@ public struct ScanSchedule: Sendable {
     public private(set) var nextRecoveryAt: Date?
 
     public init() {}
+
+    public mutating func requestPhotosReconciliation(now: Date, force: Bool = false) -> Bool {
+        observeClock(now)
+        guard !paused else { return false }
+        guard force || nextPhotosReconcileAt == nil || now >= nextPhotosReconcileAt! else { return false }
+        // Observe and drop overdue periods even while busy: no catch-up burst.
+        nextPhotosReconcileAt = now.addingTimeInterval(Self.interval)
+        guard !photosReconciling else { return false }
+        photosReconciling = true
+        return true
+    }
+
+    public mutating func finishedPhotosReconciliation() { photosReconciling = false }
 
     public mutating func startup(now: Date) -> Bool {
         requestNow(now: now)
@@ -119,6 +134,7 @@ public struct ScanSchedule: Sendable {
     private mutating func observeClock(_ now: Date) {
         if let lastObservedAt, now < lastObservedAt {
             nextScanAt = now.addingTimeInterval(Self.interval)
+            nextPhotosReconcileAt = now.addingTimeInterval(Self.interval)
             recoveryPollAt = now.addingTimeInterval(60)
             sourceFailureRetryAt = sourceFailureRetryAt.mapValues { _ in now.addingTimeInterval(60) }
             sourceDeferralRetryAt = sourceDeferralRetryAt.mapValues { _ in now.addingTimeInterval(60) }

@@ -258,7 +258,7 @@ final class AdvancedDedupEngineTests: XCTestCase {
         let engine: SyncEngine; let store: SyncStore; let photos: EngineIndexPhotos
         let coordinator: PhotosIndexCoordinator; let model: EngineIndexModel; let budget: ImageWorkBudget; let configuration: DedupConfiguration; let source: UUID; let root: URL; let clock: EngineIndexClock
     }
-    private func fixture(second: Bool = false, maximumDecodedBytes: Int64? = nil) async throws -> Fixture {
+    private func fixture(second: Bool = false, maximumDecodedBytes: Int64? = nil, logger: RunLogger? = nil) async throws -> Fixture {
         let root = try temporaryDirectory()
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let sourceURL = root.appendingPathComponent("source")
@@ -288,7 +288,7 @@ final class AdvancedDedupEngineTests: XCTestCase {
         let service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator, fingerprinter: model,
             index: index, configuration: c, executor: ReadExecutor(maxConcurrentOperations: c.resources.maxInFlightTasks), budget: budget)
         let clock = EngineIndexClock()
-        let engine = SyncEngine(store: store, photos: photos, advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, now: { clock.now })
+        let engine = SyncEngine(store: store, photos: photos, logger: logger, advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, dedupConfiguration: c, now: { clock.now })
         return Fixture(engine: engine, store: store, photos: photos, coordinator: coordinator, model: model, budget: budget, configuration: c, source: source, root: sourceURL, clock: clock)
     }
     private func writeImage(_ url: URL, type: String = "public.png", frames: Int = 1, width: Int = 2, height: Int = 2) throws {
@@ -376,4 +376,50 @@ private final class EngineIndexClock: @unchecked Sendable {
     private var value = Date()
     var now: Date { lock.lock(); defer { lock.unlock() }; return value }
     func advance(_ seconds: TimeInterval) { lock.lock(); value = value.addingTimeInterval(seconds); lock.unlock() }
+}
+
+
+extension AdvancedDedupEngineTests {
+    func testAdvancedWaitLogsOnceUntilSourceActuallyRecoversOrIsDisabled() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logger = try RunLogger(directory: root)
+        let f = try await fixture(logger: logger)
+        await f.engine.scanEnabledSources()
+        await f.engine.scanEnabledSources()
+        logger.flushForTesting()
+        let url = root.appendingPathComponent("photo-sync.jsonl")
+        func waits() throws -> Int {
+            try String(contentsOf: url, encoding: .utf8).split(separator: "\n")
+                .filter { $0.contains("advanced-dedup") && $0.contains("waiting") }.count
+        }
+        XCTAssertEqual(try waits(), 1)
+        try await f.engine.disableSource(id: f.source)
+        _ = try await f.engine.addSource(url: f.root)
+        await f.engine.scanEnabledSources()
+        logger.flushForTesting()
+        XCTAssertEqual(try waits(), 2)
+    }
+}
+
+
+extension AdvancedDedupEngineTests {
+    func testDecisionLogsFollowPersistedImportsAndSkips() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logger = try RunLogger(directory: root)
+        let f = try await fixture(second: true, logger: logger)
+        try await ready(f)
+        await f.engine.scanEnabledSources()
+        logger.flushForTesting()
+        let lines = try String(contentsOf: root.appendingPathComponent("photo-sync.jsonl"), encoding: .utf8).split(separator: "\n")
+        let decisions = try lines.map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: String] }
+            .filter { $0["phase"] == "advanced-decision" }
+        XCTAssertEqual(decisions.count, 2)
+        XCTAssertEqual(Set(decisions.compactMap { $0["action"] }), ["skip", "importFile"])
+        XCTAssertTrue(decisions.allSatisfy { $0["timingMS.databaseAdmission"] != nil })
+        let a = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+        let b = try await f.store.file(sourceID: f.source, relativePath: "b.png")
+        XCTAssertEqual(a?.state, .imported); XCTAssertEqual(b?.state, .skipped)
+    }
 }

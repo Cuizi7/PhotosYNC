@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 
 public enum PhotosRepresentationError: Error, Equatable, Sendable {
     case unavailable
+    case iCloudUnavailable(String)
     case invalidPage
     case unsupportedRAW
     case invalidImage
@@ -330,6 +331,15 @@ struct PhotoKitRepresentationAsset: Sendable {
 final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting, @unchecked Sendable {
     private let manager: PHImageManager
     init(manager: PHImageManager = PHImageManager()) { self.manager = manager }
+    static func classifyUnavailable(error: Error, inCloud: Bool) -> Error {
+        let native = error as NSError
+        let networkCodes = [NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorCannotConnectToHost]
+        if inCloud || (native.domain == NSURLErrorDomain && networkCodes.contains(native.code)) {
+            return PhotosRepresentationError.iCloudUnavailable(String(describing: error))
+        }
+        return error
+    }
+
     func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
                  completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [descriptor.key.assetID], options: nil).firstObject,
@@ -352,9 +362,17 @@ final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting,
             let cancelled = (info?[PHImageCancelledKey] as? Bool) == true
             if error == nil, !cancelled, (info?[PHImageResultIsDegradedKey] as? Bool) == true { completion(.degraded); return }
             guard finalGate.take() else { return }
-            if let error { completion(.failure(error)); return }
+            if let error {
+                completion(.failure(Self.classifyUnavailable(error: error,
+                    inCloud: (info?[PHImageResultIsInCloudKey] as? Bool) == true)))
+                return
+            }
             if cancelled { completion(.cancelled); return }
-            guard let image else { completion(.failure(PhotosRepresentationError.invalidImage)); return }
+            guard let image else {
+                completion(.failure(Self.classifyUnavailable(error: PhotosRepresentationError.invalidImage,
+                    inCloud: (info?[PHImageResultIsInCloudKey] as? Bool) == true)))
+                return
+            }
             do { completion(.image(try PhotosBitmapNormalizer.normalize(image, targetSide: targetSide), orientation: .up, eligibility: eligibility)) }
             catch { completion(.failure(error)) }
         }
