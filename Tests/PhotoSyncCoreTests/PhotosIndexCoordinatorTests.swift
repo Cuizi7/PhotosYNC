@@ -408,6 +408,106 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
+    func testWaitingClassificationSurvivesReconciliationBeforeRetryDeadline() async throws {
+        for cloud in [true, false] {
+            let f = try fixture()
+            let image = descriptor(f.photos.context)
+            await f.photos.set([image])
+            await f.photos.setReadFailures([image.key.assetID: cloud ? .iCloudUnavailable("offline") : .invalidImage])
+            try await f.coordinator.reconcile()
+            await f.coordinator.processDueWork(now: now)
+            let expected = cloud ? "正在等待 iCloud 图像，连接恢复后自动继续" : "部分图库图像暂时无法读取，正在等待重试。"
+            let failed = await f.coordinator.progress()
+            XCTAssertEqual(failed.issue, expected)
+            let before = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(5), limit: 10)
+            XCTAssertEqual(before.first?.retryCount, 1)
+            XCTAssertEqual(before.first?.nextRetryAt, now.addingTimeInterval(5))
+            await f.photos.resetReads()
+            try await f.coordinator.reconcile()
+            await f.coordinator.processDueWork(now: now.addingTimeInterval(1))
+            let retained = await f.coordinator.progress()
+            XCTAssertEqual(retained.state, .waiting)
+            XCTAssertEqual(retained.issue, expected)
+            await assertEqual(await f.photos.readCount, 0)
+            let after = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(5), limit: 10)
+            XCTAssertEqual(after.first?.retryCount, before.first?.retryCount)
+            XCTAssertEqual(after.first?.nextRetryAt, before.first?.nextRetryAt)
+            await f.photos.setReadFailures([:])
+            await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
+            let recovered = await f.coordinator.progress()
+            XCTAssertEqual(recovered.state, .ready); XCTAssertNil(recovered.issue)
+        }
+    }
+
+    func testLastCloudRecoveryPreservesOtherGenericFailureAndDeadline() async throws {
+        let f = try fixture()
+        await f.photos.set([descriptor(f.photos.context, asset: "a-generic"), descriptor(f.photos.context, asset: "z-cloud")])
+        await f.photos.setReadFailures(["a-generic": .invalidImage, "z-cloud": .iCloudUnavailable("offline")])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.setReadFailures(["a-generic": .invalidImage])
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
+        let progress = await f.coordinator.progress()
+        XCTAssertEqual(progress.state, .waiting); XCTAssertEqual(progress.readyAssets, 1)
+        XCTAssertEqual(progress.issue, "部分图库图像暂时无法读取，正在等待重试。")
+        let retry = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(20), limit: 10)
+        XCTAssertEqual(retry.map { $0.descriptor.key.assetID }, ["a-generic"])
+        XCTAssertEqual(retry.first?.retryCount, 2); XCTAssertEqual(retry.first?.nextRetryAt, now.addingTimeInterval(20))
+        await f.photos.resetReads()
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(6))
+        let waiting = await f.coordinator.progress()
+        XCTAssertEqual(waiting.issue, progress.issue)
+        await assertEqual(await f.photos.readCount, 0)
+        await f.photos.setReadFailures([:]); await f.coordinator.processDueWork(now: now.addingTimeInterval(20))
+        let ready = await f.coordinator.progress(); XCTAssertEqual(ready.state, .ready); XCTAssertNil(ready.issue)
+    }
+
+    func testNewGenericFailureReplacesCloudClassificationForSameRepresentation() async throws {
+        let f = try fixture(), asset = "cloud"
+        await f.photos.set([descriptor(f.photos.context, asset: asset)])
+        await f.photos.setReadFailures([asset: .iCloudUnavailable("offline")])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.setReadFailures([asset: .invalidImage])
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
+        let reclassified = await f.coordinator.progress()
+        XCTAssertEqual(reclassified.state, .waiting)
+        XCTAssertEqual(reclassified.issue, "部分图库图像暂时无法读取，正在等待重试。")
+        try await f.coordinator.reconcile()
+        let afterReconcile = await f.coordinator.progress()
+        XCTAssertEqual(afterReconcile.issue, reclassified.issue)
+        let retry = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(20), limit: 1)
+        XCTAssertEqual(retry.first?.retryCount, 2); XCTAssertEqual(retry.first?.nextRetryAt, now.addingTimeInterval(20))
+    }
+
+    func testCloudClassificationPrunesOnlyReplacedOrRemovedFailureFacts() async throws {
+        for change in ["removal", "revision", "invalidation", "context", "coalescing"] {
+            let f = try fixture()
+            let cloud = descriptor(f.photos.context, asset: "cloud", kind: change == "coalescing" ? .current : .original,
+                equivalent: change == "coalescing")
+            let generic = descriptor(f.photos.context, asset: "generic")
+            await f.photos.set([cloud, generic])
+            await f.photos.setReadFailures(["cloud": .iCloudUnavailable("offline"), "generic": .invalidImage])
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            let failed = await f.coordinator.progress()
+            XCTAssertEqual(failed.issue, "正在等待 iCloud 图像，连接恢复后自动继续", change)
+            switch change {
+            case "removal": await f.photos.set([generic])
+            case "revision": await f.photos.set([descriptor(f.photos.context, asset: "cloud", revision: "r2"), generic])
+            case "invalidation":
+                await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [cloud, generic],
+                    nextOffset: nil, invalidatedAssetIDs: ["cloud"])])
+            case "coalescing": await f.photos.set([cloud, descriptor(f.photos.context, asset: "cloud"), generic])
+            default:
+                let replacement = LibraryContext(id: UUID(), epoch: 2)
+                await f.photos.replaceContext(replacement, descriptors: [descriptor(replacement, asset: "generic")])
+            }
+            try await f.coordinator.reconcile()
+            if change == "context" { await f.coordinator.processDueWork(now: now.addingTimeInterval(1)) }
+            let pruned = await f.coordinator.progress()
+            XCTAssertEqual(pruned.state, .waiting, change)
+            XCTAssertEqual(pruned.issue, "部分图库图像暂时无法读取，正在等待重试。", change)
+        }
+    }
+
     private struct Fixture {
         let db: URL; let store: SyncStore; let photos: CoordinatorPhotos; let model: CoordinatorModel
         let configuration: DedupConfiguration; let coordinator: PhotosIndexCoordinator
@@ -467,6 +567,13 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     nonisolated let budget: ImageWorkBudget
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 128)
     private var pages: [RepresentationPage] = []
+    private var readFailures: [String: PhotosRepresentationError] = [:]
+    private var replacementContext: LibraryContext?
+    func setReadFailures(_ failures: [String: PhotosRepresentationError]) { readFailures = failures }
+    func replaceContext(_ context: LibraryContext, descriptors: [RepresentationDescriptor]) {
+        replacementContext = context; generation += 1
+        pages = [.init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil)]
+    }
     private var generation = 0, failedAsset: String?, conservative = false, resumeSuccess = true, changeOnAck = false
     private(set) var readCount = 0, resumeCount = 0, acknowledgementCount = 0
     private(set) var readKinds: [RepresentationKind] = [], requestedLimits: [Int] = []
@@ -499,7 +606,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? {
         checkpointCaptured = true
-        return .init(context: context, archivedChangeToken: Data([UInt8(generation)]))
+        return .init(context: replacementContext ?? context, archivedChangeToken: Data([UInt8(generation)]))
     }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool {
         resumeCount += 1
@@ -516,6 +623,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         readCount += 1; readKinds.append(descriptor.key.kind)
+        if let error = readFailures[descriptor.key.assetID] { throw error }
         if failedAsset == descriptor.key.assetID { throw PhotoKitGatewayError.libraryUnavailable }
         let lease = try await budget.acquire(bytes: 256)
         let occupied = await budget.snapshot(); maxImagesObserved = max(maxImagesObserved, occupied.images)

@@ -16,7 +16,9 @@ public actor PhotosIndexCoordinator {
     private var reconciledGeneration: Int?
     private var acknowledgedGeneration: Int?
     private var issue: String?
-    private var cloudWaiting = Set<String>()
+    // A successful catalog does not resolve failed reads. Retain explicit cloud
+    // classification only while the same descriptor remains a current failed fact.
+    private var cloudWaiting: [String: RepresentationDescriptor] = [:]
     private let diagnostics: @Sendable ([String: String]) -> Void
 
     public init(store: SyncStore, photos: any PhotosIndexGateway, fingerprinter: any ImageFingerprinting,
@@ -106,10 +108,14 @@ public actor PhotosIndexCoordinator {
                 excludedAssets: excludedAssets.subtracting(eligibleAssets).count) else { throw PhotoKitGatewayError.libraryChanged }
             counts.deleted += finish.deleted
             complete = true
+            let retainedCloudFailures = try await store.currentFailedRepresentations(Array(cloudWaiting.values),
+                fingerprintVersion: configuration.fingerprint.version)
+            guard !paused else { throw CancellationError() }
             let after = try await photos.candidateSnapshot()
             guard after.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
             needsReconciliation = false; forceCacheInvalidation = false
-            reconciledGeneration = snapshot.generation; issue = nil; cloudWaiting.removeAll()
+            reconciledGeneration = snapshot.generation; issue = nil
+            cloudWaiting = Dictionary(uniqueKeysWithValues: retainedCloudFailures.map { (Self.waitKey($0), $0) })
             try await publishIfComplete()
         } catch {
             needsReconciliation = true; issue = "图库索引正在等待重新核对。"
@@ -183,7 +189,7 @@ public actor PhotosIndexCoordinator {
                             throw error
                         }
                     }
-                    let waitKey = "\(task.descriptor.key.assetID.utf8.count):\(task.descriptor.key.assetID):\(task.descriptor.key.kind.rawValue)"
+                    let waitKey = Self.waitKey(task.descriptor)
                     do {
                         let fingerprint = try await work.value
                         let latest = try await photos.candidateSnapshot()
@@ -191,8 +197,7 @@ public actor PhotosIndexCoordinator {
                             needsReconciliation = true; acknowledgedGeneration = nil; continue
                         }
                         if try await store.completeRepresentation(task, fingerprint: fingerprint) {
-                            completed += 1; cloudWaiting.remove(waitKey)
-                            if cloudWaiting.isEmpty && issue == "正在等待 iCloud 图像，连接恢复后自动继续" { issue = nil }
+                            completed += 1; cloudWaiting.removeValue(forKey: waitKey)
                         }
                     } catch {
                         let latest = try? await photos.candidateSnapshot()
@@ -205,10 +210,8 @@ public actor PhotosIndexCoordinator {
                                 failed += 1
                                 diagnostics(["phase": "index-representation", "result": "waiting", "asset": task.descriptor.key.assetID,
                                     "representation": task.descriptor.key.kind.rawValue, "error": String(describing: error)])
-                                if case .iCloudUnavailable = error as? PhotosRepresentationError { cloudWaiting.insert(waitKey) }
-                                else { cloudWaiting.remove(waitKey) }
-                                issue = cloudWaiting.isEmpty ? "部分图库图像暂时无法读取，正在等待重试。"
-                                    : "正在等待 iCloud 图像，连接恢复后自动继续"
+                                if case .iCloudUnavailable = error as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
+                                else { cloudWaiting.removeValue(forKey: waitKey) }
                             }
                         }
                     }
@@ -228,12 +231,15 @@ public actor PhotosIndexCoordinator {
         do {
             let stored = try await store.indexProgress()
             let ready = try await readyToken() != nil
+            let representationIssue = stored.state == .waiting
+                ? (cloudWaiting.isEmpty ? stored.issue : "正在等待 iCloud 图像，连接恢复后自动继续") : nil
+            let aggregateIssue = issue ?? representationIssue
             let state: IndexState = ready ? .ready : (paused ? .paused :
-                (issue != nil || stored.state == .waiting ? .waiting : (stored.totalsKnown ? .updating : .preparing)))
+                (aggregateIssue != nil || stored.state == .waiting ? .waiting : (stored.totalsKnown ? .updating : .preparing)))
             return IndexProgress(state: state, totalsKnown: stored.totalsKnown && !needsReconciliation,
                 totalAssets: stored.totalAssets, readyAssets: stored.readyAssets,
                 totalRepresentations: stored.totalRepresentations, readyRepresentations: stored.readyRepresentations,
-                excludedAssets: stored.excludedAssets, issue: issue)
+                excludedAssets: stored.excludedAssets, issue: aggregateIssue)
         } catch {
             return IndexProgress(state: paused ? .paused : .waiting, totalsKnown: false, totalAssets: 0,
                 readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0,
@@ -258,6 +264,10 @@ public actor PhotosIndexCoordinator {
         return publication.token
     }
 
+    private static func waitKey(_ descriptor: RepresentationDescriptor) -> String {
+        "\(descriptor.key.assetID.utf8.count):\(descriptor.key.assetID):\(descriptor.key.kind.rawValue)"
+    }
+
     private func observe(_ event: PhotosIndexChange) async {
         changeSerial &+= 1; needsReconciliation = true; acknowledgedGeneration = nil
         try? await store.invalidateIndexPublication()
@@ -277,6 +287,6 @@ public actor PhotosIndexCoordinator {
         let latest = try await photos.candidateSnapshot()
         guard !needsReconciliation, latest.generation == publication.token.photosGeneration,
               try await store.indexIsReady(token: publication.token) else { throw PhotoKitGatewayError.libraryChanged }
-        acknowledgedGeneration = publication.token.photosGeneration; issue = nil
+        acknowledgedGeneration = publication.token.photosGeneration; issue = nil; cloudWaiting.removeAll()
     }
 }

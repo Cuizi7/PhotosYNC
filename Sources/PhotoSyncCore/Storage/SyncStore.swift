@@ -1197,6 +1197,31 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// Revalidates only known classified failures after catalog reconciliation.
+    /// Each input is a primary-key lookup; no inventory/vector materialization or
+    /// retry-deadline filtering is involved. Reconciliation can retain a failed
+    /// descriptor while moving it to a newer generation, so use current facts.
+    func currentFailedRepresentations(_ descriptors: [RepresentationDescriptor],
+                                      fingerprintVersion: String) async throws -> [RepresentationDescriptor] {
+        guard !descriptors.isEmpty else { return [] }
+        return try await perform {
+            guard let state = try self.indexStateRow(), try self.text(state[4]) == fingerprintVersion else { return [] }
+            let context = try self.libraryContext(state), generation = try self.int64(state[2])
+            return try descriptors.filter { descriptor in
+                guard descriptor.context == context else { return false }
+                guard let row = try self.one("""
+                    SELECT revision, width, height, equivalent_to_original, revision_is_reliable
+                    FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?
+                    AND seen_generation = ? AND fingerprint_version = ? AND tombstoned = 0 AND state = 'failed'
+                    """, self.representationBindings(descriptor) + [.int64(generation), .text(fingerprintVersion)]) else { return false }
+                return try self.text(row[0]) == descriptor.revision &&
+                    self.pixelSize(width: row[1], height: row[2]) == descriptor.size &&
+                    (self.int64(row[3]) != 0) == descriptor.equivalentToOriginal &&
+                    (self.int64(row[4]) != 0) == descriptor.revisionIsReliable
+            }
+        }
+    }
+
     /// Read-only counters from the same durable facts used by publication.
     public func indexProgress() async throws -> IndexProgress {
         try await perform {
@@ -1219,7 +1244,8 @@ public final class SyncStore: @unchecked Sendable {
             return IndexProgress(state: try self.int64(row[2]) > 0 ? .waiting : .updating,
                 totalsKnown: try self.int64(state[7]) != 0, totalAssets: Int(try self.int64(row[3])) + excluded,
                 readyAssets: Int(try self.int64(ready[0])), totalRepresentations: Int(try self.int64(row[0])),
-                readyRepresentations: Int(try self.int64(row[1])), excludedAssets: excluded, issue: nil)
+                readyRepresentations: Int(try self.int64(row[1])), excludedAssets: excluded,
+                issue: try self.int64(row[2]) > 0 ? "部分图库图像暂时无法读取，正在等待重试。" : nil)
         }
     }
 
