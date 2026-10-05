@@ -234,6 +234,7 @@ public actor SyncEngine {
     private let photos: any PhotosGateway
     private let directory: DirectoryFactory
     private let metadata: MetadataFactory
+    private let legacySkipReevaluation: LegacySkipReevaluation?
     private let advancedDedup: AdvancedDedupService?
     private let indexCoordinator: PhotosIndexCoordinator?
     private let requiresAdvancedDedup: Bool
@@ -287,13 +288,14 @@ public actor SyncEngine {
                 metadata: @escaping MetadataFactory = { MetadataReader(sourceID: $0) },
                 policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
                 advancedDedup: AdvancedDedupService? = nil, indexCoordinator: PhotosIndexCoordinator? = nil,
-                requiresAdvancedDedup: Bool = false,
+                requiresAdvancedDedup: Bool = false, legacySkipReevaluation: LegacySkipReevaluation? = nil,
                 notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in },
                 notifyIssue: @escaping @Sendable (String) -> Void = { _ in },
                 notifySourceIssue: @escaping @Sendable (UUID, Bool, SourceIssue?) -> Void = { _, _, _ in },
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.advancedDedup = advancedDedup; self.indexCoordinator = indexCoordinator
         self.requiresAdvancedDedup = requiresAdvancedDedup
+        self.legacySkipReevaluation = legacySkipReevaluation
         self.store = store; self.photos = photos; self.directory = directory
         self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
         self.notifyIssue = notifyIssue; self.notifySourceIssue = notifySourceIssue
@@ -326,12 +328,23 @@ public actor SyncEngine {
             throw error
         }
     }
+    /// P8 supplies the validated profile's batch limit and schedules this on its existing tick.
+    /// Reopened rows enter the ordinary P6 drain; this operation never calls Photos create.
+    @discardableResult
+    public func processLegacySkips(limit: Int) async throws -> Int {
+        guard !status.isPaused, !storageFailed, let legacySkipReevaluation else { return 0 }
+        let reopened = try await legacySkipReevaluation.processBatch(limit: limit)
+        await refreshSummary()
+        return reopened
+    }
+
     public func startupScan() async { await scanEnabledSources() }
     public func manualScan() async { await scanEnabledSources() }
     public func wakeScan() async { await scanEnabledSources() }
     public func setPaused(_ paused: Bool) async {
         status.isPaused = paused
-        await advancedDedup?.setPaused(paused)
+        await legacySkipReevaluation?.setPaused(paused)
+        await advancedDedup?.setPaused(status.isPaused)
     }
     public func pause() async {
         await setPaused(true)

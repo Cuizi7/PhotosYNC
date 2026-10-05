@@ -3,6 +3,25 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class AdvancedDedupEngineTests: XCTestCase {
+    func testReopenedLegacySkipReturnsToNormalAdvancedDrain() async throws {
+        let f = try await fixture()
+        await f.engine.scanEnabledSources()
+        let optional = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+        let record = try XCTUnwrap(optional)
+        try await f.store.markSkipped(fileID: record.id, reason: .suspectedDuplicate, candidates: [])
+        let worker = LegacySkipReevaluation(store: f.store,
+            stamp: { try await DirectoryReader(sourceID: $0.sourceID).stamp(of: $0.url) },
+            policyVersion: f.configuration.policyVersion, retryDelaysSeconds: f.configuration.resources.retryDelaysSeconds)
+        let reopened = try await worker.processBatch(limit: f.configuration.resources.catalogBatchSize)
+        XCTAssertEqual(reopened, 1)
+        let before = await f.photos.createCount; XCTAssertEqual(before, 0)
+        try await ready(f)
+        await f.engine.scanEnabledSources()
+        let imported = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+        let after = await f.photos.createCount
+        XCTAssertEqual(imported?.state, .imported); XCTAssertEqual(after, 1)
+    }
+
     func testInitialIndexBlocksCreateButAllowsScanPreparation() async throws {
         let f = try await fixture()
         await f.engine.scanEnabledSources()

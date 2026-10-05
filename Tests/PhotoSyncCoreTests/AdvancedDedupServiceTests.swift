@@ -5,6 +5,31 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupServiceTests: XCTestCase {
+    func testNewThresholdRechecksOldAdvancedSkipsWithoutInference() async throws {
+        let f = try await fixture(); try await ready(f, candidates: [("similar", .original, 0.97, 8)])
+        let c = f.configuration
+        let oldConfiguration = try DedupConfiguration(fingerprint: c.fingerprint,
+            policyVersion: DedupConfiguration.computePolicyVersion(fingerprintVersion: c.fingerprint.version, threshold: 0.90, backend: c.backend),
+            threshold: 0.90, backend: c.backend, resources: c.resources, evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
+        let oldService = AdvancedDedupService(store: f.store, photos: f.photos, coordinator: f.coordinator,
+            fingerprinter: f.model, index: f.index, configuration: oldConfiguration, executor: f.executor, budget: f.budget)
+        guard case .ready(let old) = try await oldService.prepare(fileID: f.id, file: f.file) else { return XCTFail("Old admission missing") }
+        XCTAssertEqual(old.evidence.evaluation.action, .skip)
+        let skipped = try await f.store.commitAdvancedSkip(old); XCTAssertTrue(skipped)
+        let inferredBefore = await f.model.count; XCTAssertEqual(inferredBefore, 1)
+        let worker = LegacySkipReevaluation(store: f.store,
+            stamp: { try await DirectoryReader(sourceID: $0.sourceID, executor: f.executor).stamp(of: $0.url) },
+            policyVersion: c.policyVersion, retryDelaysSeconds: c.resources.retryDelaysSeconds)
+        let reopened = try await worker.processBatch(limit: c.resources.catalogBatchSize); XCTAssertEqual(reopened, 1)
+        let reevaluated = try await admission(f)
+        XCTAssertEqual(reevaluated.evidence.policyVersion, c.policyVersion)
+        XCTAssertEqual(reevaluated.evidence.evaluation.action, .importFile)
+        let inferredAfter = await f.model.count; XCTAssertEqual(inferredAfter, inferredBefore)
+        let imports = try await f.store.countFiles(state: .imported), creates = await f.photos.createCount
+        XCTAssertEqual(imports, 0); XCTAssertEqual(creates, 0)
+        let sameAgain = try await worker.processBatch(limit: c.resources.catalogBatchSize); XCTAssertEqual(sameAgain, 0)
+    }
+
     func testDifferentFilenameStillMatches() async throws {
         let f = try await fixture(); try await ready(f, candidates: [("unrelated-name", .original, 1, 8)])
         let admission = try await admission(f)

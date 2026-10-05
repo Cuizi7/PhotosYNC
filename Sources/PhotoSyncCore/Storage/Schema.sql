@@ -14,6 +14,7 @@ CREATE TABLE file_record (
  definitely_not_committed INTEGER NOT NULL DEFAULT 0,
  success_id TEXT, success_metadata_json TEXT, succeeded_at REAL,
  retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT,
+ recheck_policy_version TEXT, recheck_retry_count INTEGER NOT NULL DEFAULT 0, recheck_next_retry_at REAL,
  UNIQUE(source_id, relative_path)
 );
 CREATE TABLE match_evidence (
@@ -30,6 +31,7 @@ CREATE TABLE scan_run (
 CREATE INDEX file_state_retry ON file_record(state, next_retry_at);
 CREATE INDEX file_name ON file_record(filename);
 CREATE INDEX file_state_created_order ON file_record(state, created_order);
+CREATE INDEX file_recheck_retry ON file_record(recheck_policy_version,recheck_next_retry_at,created_order) WHERE recheck_retry_count > 0;
 
 CREATE TABLE non_media_skip (source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, disposition TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'skipped'), skip_reason TEXT NOT NULL, PRIMARY KEY(source_id, relative_path));
 
@@ -79,5 +81,5 @@ CREATE TABLE dedup_dependency (
 );
 CREATE INDEX dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id);
 CREATE TABLE dedup_recheck_progress (
- target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0
+ target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0
 );

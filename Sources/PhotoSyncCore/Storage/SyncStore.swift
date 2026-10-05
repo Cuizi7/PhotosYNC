@@ -108,6 +108,152 @@ public final class SyncStore: @unchecked Sendable {
 
     deinit { sqlite3_close(database) }
 
+    public func legacySkipPage(afterOrder: Int64, limit: Int, policyVersion: String) async throws -> [LegacySkipCandidate] {
+        guard limit > 0 else { return [] }
+        return try await perform {
+            try self.rows(Self.legacySelect + " WHERE " + Self.legacyEligibility +
+                " AND file_record.created_order > ? ORDER BY file_record.created_order LIMIT ?",
+                [.text(policyVersion), .int64(afterOrder), .int64(Int64(limit))]).map { try self.decodeLegacyCandidate($0) }
+        }
+    }
+
+    /// Reopening preserves submission recovery and successful-history fields. It never imports.
+    public func reopenLegacySkip(fileID: UUID, expectedStamp: FileStamp, policyVersion: String) async throws -> Bool {
+        try await perform { try self.transaction {
+            try self.reopenLegacySkipSync(fileID: fileID, expectedStamp: expectedStamp, policyVersion: policyVersion)
+        } }
+    }
+
+    /// Run once per actor lifetime. Rediscover only unqueued eligible rows behind the saved cursor;
+    /// retries already have their own durable queue, so they must not reset the fresh cursor.
+    func beginLegacyRecheck(policyVersion: String) async throws {
+        try await perform { try self.transaction {
+            try self.execute("INSERT OR IGNORE INTO dedup_recheck_progress(target_policy_version,cursor,complete,revision) VALUES (?,0,0,0)", [.text(policyVersion)])
+            let progress = try self.legacyProgress(policyVersion)
+            if try self.one(Self.legacySelect + " WHERE " + Self.legacyEligibility + """
+                 AND file_record.created_order <= ?
+                 AND NOT (COALESCE(recheck_policy_version = ?, 0) AND recheck_retry_count > 0) LIMIT 1
+                """, [.text(policyVersion), .int64(progress.cursor), .text(policyVersion)]) != nil {
+                try self.updateLegacyProgress(policyVersion, cursor: 0, complete: false, revision: progress.revision)
+            }
+        } }
+    }
+
+    /// Each queue has its own indexed order. A persisted CAS version alternates their turns,
+    /// including limit=1 and process restarts. No unbounded candidate decoding is required.
+    func nextLegacyRecheck(policyVersion: String, now: Date) async throws -> LegacyRecheckWork? {
+        try await perform { try self.transaction {
+            var progress = try self.legacyProgress(policyVersion)
+            let fresh = try self.one(Self.legacySelect + " WHERE " + Self.legacyEligibility + """
+                 AND file_record.created_order > ?
+                 AND NOT (COALESCE(recheck_policy_version = ?, 0) AND recheck_retry_count > 0)
+                 ORDER BY file_record.created_order LIMIT 1
+                """, [.text(policyVersion), .int64(progress.cursor), .text(policyVersion)])
+            if fresh == nil {
+                // The complete eligible query (not a filtered finite page) is exhausted.
+                // Checkpoint this transaction's full keyset frontier so ineligible tail rows
+                // are not scanned again on every due retry. Reactivation resets this cursor.
+                let highWater = try self.int64(self.one("SELECT COALESCE(MAX(created_order),0) FROM file_record", [])![0])
+                if highWater > progress.cursor {
+                    try self.updateLegacyProgress(policyVersion, cursor: highWater,
+                        complete: progress.complete, revision: progress.revision)
+                    progress = try self.legacyProgress(policyVersion)
+                }
+            }
+            let retry = try self.one(Self.legacyRetrySelect + " WHERE " + Self.legacyEligibility + """
+                 AND recheck_policy_version = ? AND recheck_retry_count > 0 AND recheck_next_retry_at <= ?
+                 ORDER BY recheck_next_retry_at, file_record.created_order LIMIT 1
+                """, [.text(policyVersion), .text(policyVersion), .double(now.timeIntervalSince1970)])
+            let useRetry = retry != nil && (fresh == nil || progress.revision % 2 != 0)
+            if let row = useRetry ? retry : fresh {
+                return LegacyRecheckWork(candidate: try self.decodeLegacyCandidate(row), revision: progress.revision,
+                    isRetry: useRetry, retryCount: useRetry ? Int(try self.int64(row[18])) : 0)
+            }
+            let waiting = try self.one(Self.legacyRetrySelect + " WHERE " + Self.legacyEligibility +
+                " AND recheck_policy_version = ? AND recheck_retry_count > 0 LIMIT 1", [.text(policyVersion), .text(policyVersion)]) != nil
+            if progress.complete != !waiting {
+                try self.updateLegacyProgress(policyVersion, cursor: progress.cursor, complete: !waiting, revision: progress.revision)
+            }
+            return nil
+        } }
+    }
+
+    /// One transaction owns the outcome AND cursor. A source requeue while stamp is awaited
+    /// invalidates the version even for reset 0 -> 0; stale outcomes never mutate file rows.
+    func finishLegacyRecheck(_ work: LegacyRecheckWork, stamp: FileStamp?, policyVersion: String,
+                             nextRetryAt: Date) async throws -> Bool? {
+        try await perform { try self.transaction {
+            let progress = try self.legacyProgress(policyVersion)
+            guard progress.revision == work.revision else { return nil }
+            var reopened = false
+            if stamp == work.candidate.file.file.stamp {
+                reopened = try self.reopenLegacySkipSync(fileID: work.candidate.file.id,
+                    expectedStamp: work.candidate.file.file.stamp, policyVersion: policyVersion)
+            } else {
+                // Missing, unknown and mismatched physical stamps are retryable. Normal scanning
+                // alone owns source-change recording; a temporarily restored stamp must not be lost.
+                guard work.retryCount < Int.max else { throw SyncStoreError.constraint("Legacy retry count overflow.") }
+                try self.execute("""
+                    UPDATE file_record SET recheck_policy_version=?, recheck_retry_count=?, recheck_next_retry_at=?
+                    WHERE id IN (SELECT file_record.id FROM file_record JOIN source ON source.id=file_record.source_id
+                    WHERE \(Self.legacyEligibility) AND file_record.id=? AND size=? AND modified_ns=?)
+                    """, [.text(policyVersion), .int64(Int64(work.retryCount + 1)), .double(nextRetryAt.timeIntervalSince1970),
+                          .text(policyVersion), .text(work.candidate.file.id.uuidString),
+                          .int64(work.candidate.file.file.stamp.size), .int64(work.candidate.file.file.stamp.modifiedNanoseconds)])
+            }
+            try self.updateLegacyProgress(policyVersion,
+                cursor: work.isRetry ? progress.cursor : max(progress.cursor, work.candidate.file.createdOrder),
+                complete: false, revision: progress.revision)
+            return reopened
+        } }
+    }
+
+    private static let legacyDecisionPolicy = "(SELECT policy_version FROM advanced_match_evidence WHERE file_id=file_record.id ORDER BY created_at DESC LIMIT 1)"
+    private static let legacyEligibility = """
+        file_record.state='skipped' AND skip_reason='suspectedDuplicate'
+        AND source.enabled=1 AND source.removed=0 AND success_id IS NULL
+        AND (submitted_at IS NULL OR definitely_not_committed=1)
+        AND json_extract(metadata_json,'$.kind')='image'
+        AND COALESCE(\(legacyDecisionPolicy),'') <> ?
+        """
+    private static let legacyColumns = fileColumns + ", skip_reason, submitted_at, definitely_not_committed, " + legacyDecisionPolicy + ", recheck_retry_count"
+    private static let legacySelect = "SELECT " + legacyColumns + " FROM file_record JOIN source ON source.id=file_record.source_id"
+    private static let legacyRetrySelect = "SELECT " + legacyColumns + " FROM file_record INDEXED BY file_recheck_retry JOIN source ON source.id=file_record.source_id"
+
+    private func decodeLegacyCandidate(_ row: [Value]) throws -> LegacySkipCandidate {
+        LegacySkipCandidate(file: try decodeStoredFile(row), skipReason: .suspectedDuplicate,
+            submittedAt: optionalDouble(row[15]).map(Date.init(timeIntervalSince1970:)),
+            definitelyNotCommitted: try int64(row[16]) != 0, decisionPolicyVersion: optionalText(row[17]))
+    }
+    private func legacyProgress(_ policy: String) throws -> (cursor: Int64, complete: Bool, revision: Int64) {
+        guard let row = try one("SELECT COALESCE(cursor,0),complete,revision FROM dedup_recheck_progress WHERE target_policy_version=?", [.text(policy)]) else {
+            throw SyncStoreError.constraint("Legacy recheck progress is not initialized.")
+        }
+        return (try int64(row[0]), try int64(row[1]) != 0, try int64(row[2]))
+    }
+    private func updateLegacyProgress(_ policy: String, cursor: Int64, complete: Bool, revision: Int64) throws {
+        guard revision >= 0, revision < Int64.max else { throw SyncStoreError.constraint("Legacy recheck revision overflow.") }
+        try requireChange("UPDATE dedup_recheck_progress SET cursor=?,complete=?,revision=? WHERE target_policy_version=? AND revision=?",
+            [.int64(cursor), .int64(complete ? 1 : 0), .int64(revision + 1), .text(policy), .int64(revision)])
+    }
+    private func resetLegacyRechecks() throws {
+        for row in try rows("SELECT target_policy_version,revision FROM dedup_recheck_progress", []) {
+            try updateLegacyProgress(text(row[0]), cursor: 0, complete: false, revision: int64(row[1]))
+        }
+    }
+    private func reopenLegacySkipSync(fileID: UUID, expectedStamp: FileStamp, policyVersion: String) throws -> Bool {
+        try execute("""
+            UPDATE file_record SET state='pending',skip_reason=NULL,
+                recheck_policy_version=?,recheck_retry_count=0,recheck_next_retry_at=NULL
+            WHERE id IN (SELECT file_record.id FROM file_record JOIN source ON source.id=file_record.source_id
+                WHERE \(Self.legacyEligibility) AND file_record.id=? AND size=? AND modified_ns=?)
+            """, [.text(policyVersion), .text(policyVersion), .text(fileID.uuidString), .int64(expectedStamp.size), .int64(expectedStamp.modifiedNanoseconds)])
+        guard sqlite3_changes(database) == 1 else { return false }
+        try execute("DELETE FROM dedup_dependency WHERE file_id=?", [.text(fileID.uuidString)])
+        try bumpLocalRevision()
+        return true
+    }
+
     public func registerSource(url: URL) async throws -> UUID {
         let normalized = try await readExecutor.execute(sourceID: UUID()) { try self.validateSource(url) }
         try Task.checkCancellation()
@@ -848,12 +994,14 @@ public final class SyncStore: @unchecked Sendable {
         if let source = existing.first(where: { $0.url.path == path }) {
             if !source.enabled || source.removed {
                 try requireChange("UPDATE source SET enabled = 1, removed = 0 WHERE id = ?", [.text(source.id.uuidString)])
+                try resetLegacyRechecks()
                 try bumpLocalRevision()
             }
             return source.id
         }
         let id = UUID()
         try requireChange("INSERT INTO source (id, path, enabled, removed) VALUES (?, ?, 1, 0)", [.text(id.uuidString), .text(path)])
+        try resetLegacyRechecks()
         try bumpLocalRevision()
         return id
     }
@@ -1241,6 +1389,7 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 try execute("CREATE INDEX IF NOT EXISTS advanced_evidence_file ON advanced_match_evidence(file_id)")
                 try execute("CREATE INDEX IF NOT EXISTS dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id)")
+                try ensureLegacyRecheckSchema()
             }
             return
         }
@@ -1256,8 +1405,21 @@ public final class SyncStore: @unchecked Sendable {
                 }
             }
             try execute(Self.advancedSchema)
+            try ensureLegacyRecheckSchema()
             try execute("PRAGMA user_version = 4")
         }
+    }
+
+    private func ensureLegacyRecheckSchema() throws {
+        let columns = try rows("PRAGMA table_info(file_record)", []).map { try text($0[1]) }
+        for (name, definition) in [("recheck_policy_version", "TEXT"), ("recheck_retry_count", "INTEGER NOT NULL DEFAULT 0"), ("recheck_next_retry_at", "REAL")] where !columns.contains(name) {
+            try execute("ALTER TABLE file_record ADD COLUMN \(name) \(definition)")
+        }
+        let progressColumns = try rows("PRAGMA table_info(dedup_recheck_progress)", []).map { try text($0[1]) }
+        if !progressColumns.contains("revision") {
+            try execute("ALTER TABLE dedup_recheck_progress ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+        }
+        try execute("CREATE INDEX IF NOT EXISTS file_recheck_retry ON file_record(recheck_policy_version,recheck_next_retry_at,created_order) WHERE recheck_retry_count > 0")
     }
 
     private func sourceHasColumn(named name: String) throws -> Bool {
@@ -1429,13 +1591,13 @@ public final class SyncStore: @unchecked Sendable {
     );
     CREATE INDEX dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id);
     CREATE TABLE dedup_recheck_progress (
-     target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0
+     target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0
     );
     """
 
     private static let schema = """
     CREATE TABLE source (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0, last_scan_at REAL, last_error TEXT);
-    CREATE TABLE file_record (id TEXT PRIMARY KEY, created_order INTEGER NOT NULL UNIQUE, source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, metadata_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','importing','imported','skipped')), skip_reason TEXT, rule_version INTEGER NOT NULL, attempt_id TEXT, placeholder_id TEXT, submitted_at REAL, definitely_not_committed INTEGER NOT NULL DEFAULT 0, success_id TEXT, success_metadata_json TEXT, succeeded_at REAL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT, UNIQUE(source_id, relative_path));
+    CREATE TABLE file_record (id TEXT PRIMARY KEY, created_order INTEGER NOT NULL UNIQUE, source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, metadata_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','importing','imported','skipped')), skip_reason TEXT, rule_version INTEGER NOT NULL, attempt_id TEXT, placeholder_id TEXT, submitted_at REAL, definitely_not_committed INTEGER NOT NULL DEFAULT 0, success_id TEXT, success_metadata_json TEXT, succeeded_at REAL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT, recheck_policy_version TEXT, recheck_retry_count INTEGER NOT NULL DEFAULT 0, recheck_next_retry_at REAL, UNIQUE(source_id, relative_path));
     CREATE TABLE match_evidence (file_id TEXT NOT NULL REFERENCES file_record(id), candidate_key TEXT NOT NULL, candidate_json TEXT NOT NULL, rule_version INTEGER NOT NULL, compared_at REAL NOT NULL, PRIMARY KEY(file_id, candidate_key));
     CREATE TABLE scan_run (id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source(id), started_at REAL NOT NULL, ended_at REAL, complete INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, last_error TEXT);
     CREATE INDEX file_state_retry ON file_record(state, next_retry_at); CREATE INDEX file_name ON file_record(filename); CREATE INDEX file_state_created_order ON file_record(state, created_order);

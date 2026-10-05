@@ -861,13 +861,22 @@ extension StoreTests {
         let sourceID = UUID()
         let sourcePath = root.appendingPathComponent("photos").path
         try FileManager.default.createDirectory(atPath: sourcePath, withIntermediateDirectories: true)
-        try injectEngineSQL("CREATE TABLE source (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, last_scan_at REAL, last_error TEXT); INSERT INTO source (id, path, enabled) VALUES ('\(sourceID.uuidString)', '\(sourcePath)', 1); PRAGMA user_version = 2", at: database)
+        // A v2 database already has file_record; source-only fixtures conceal migration dependencies.
+        try injectEngineSQL("""
+            CREATE TABLE source (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, last_scan_at REAL, last_error TEXT);
+            CREATE TABLE file_record (id TEXT PRIMARY KEY, created_order INTEGER NOT NULL UNIQUE, source_id TEXT NOT NULL REFERENCES source(id), relative_path TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL, metadata_json TEXT NOT NULL, state TEXT NOT NULL, skip_reason TEXT, rule_version INTEGER NOT NULL, attempt_id TEXT, placeholder_id TEXT, submitted_at REAL, definitely_not_committed INTEGER NOT NULL DEFAULT 0, success_id TEXT, success_metadata_json TEXT, succeeded_at REAL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL, last_error TEXT);
+            INSERT INTO source (id, path, enabled) VALUES ('\(sourceID.uuidString)', '\(sourcePath)', 1);
+            INSERT INTO file_record(id,created_order,source_id,relative_path,filename,size,modified_ns,metadata_json,state,rule_version,success_id,success_metadata_json)
+                VALUES ('old-success',1,'\(sourceID.uuidString)','old.jpg','old.jpg',12,10,'{}','imported',1,'asset-success','{"history":"retained"}');
+            PRAGMA user_version = 2;
+            """, at: database)
 
         let migrated = try SyncStore(url: database)
         let sources = try await migrated.sources()
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 4)
         XCTAssertEqual(try engineSQLInteger("SELECT removed FROM source WHERE id = '\(sourceID.uuidString)'", at: database), 0)
         XCTAssertEqual(sources.map(\.id), [sourceID])
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record WHERE success_id='asset-success' AND success_metadata_json='{\"history\":\"retained\"}' AND recheck_retry_count=0", at: database), 1)
     }
 
     func testFreshSchemaLeavesLegacyAttributeTableEmpty() async throws {
