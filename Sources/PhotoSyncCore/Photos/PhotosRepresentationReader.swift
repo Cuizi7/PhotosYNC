@@ -43,7 +43,7 @@ public actor PhotosRepresentationReader {
                      isCurrent: @escaping @Sendable () -> Bool) async throws -> LoadedRepresentation {
         try Task.checkCancellation()
         guard occupied < limits.photoRequestConcurrency else { throw ReadExecutorError.resourceExhausted }
-        // Up to 16 B/px callback backing plus one 4 B/px normalized bitmap.
+        // Aggregate exposed input rasters plus two normalized RGBA footprints.
         let lease = try await budget.acquire(bytes: Int64(targetSide) * Int64(targetSide) * 20)
         guard occupied < limits.photoRequestConcurrency else {
             await lease.finishPhysicalWork(); throw ReadExecutorError.resourceExhausted
@@ -176,24 +176,63 @@ private final class RepresentationRequestState: @unchecked Sendable {
 /// backing representation. The destination has known sRGB/8-bit RGBA pixels.
 enum PhotosBitmapNormalizer {
     static func normalize(_ image: NSImage, targetSide: Int) throws -> CGImage {
-        guard image.size.width > 0, image.size.height > 0, !image.representations.isEmpty else {
+        try autoreleasepool { try normalizeCallbackImage(image, targetSide: targetSide) }
+    }
+
+    private static func normalizeCallbackImage(_ image: NSImage, targetSide: Int) throws -> CGImage {
+        guard image.size.width.isFinite, image.size.height.isFinite,
+              image.size.width > 0, image.size.height > 0, !image.representations.isEmpty else {
             throw PhotosRepresentationError.invalidImage
         }
-        var incomingPixels: Int64 = 0
+        let (targetPixels, pixelOverflow) = Int64(targetSide).multipliedReportingOverflow(by: Int64(targetSide))
+        // The existing 20 B/target-pixel lease includes both the 4 B/px
+        // CGContext and 4 B/px result: do not assume makeImage shares storage.
+        let (incomingLimit, limitOverflow) = targetPixels.multipliedReportingOverflow(by: 12)
+        guard targetSide > 0, !pixelOverflow, !limitOverflow else { throw PhotosRepresentationError.invalidImage }
+        var incomingBytes: Int64 = 0
+        // Public access can materialize an AppKit raster. Keep those accounted
+        // temporaries local; only the normalized result crosses the async boundary.
+        var materializations: [CGImage] = []
         for representation in image.representations {
             let width = representation.pixelsWide, height = representation.pixelsHigh
             guard width > 0, height > 0, width <= targetSide, height <= targetSide else {
                 throw PhotosRepresentationError.oversized(width: width, height: height)
             }
-            incomingPixels += Int64(width) * Int64(height)
-            guard incomingPixels <= Int64(targetSide) * Int64(targetSide) else {
+            let backingBytes: Int64
+            if let bitmap = representation as? NSBitmapImageRep {
+                // Count every existing bitmap plane/stride rather than replacing
+                // its padded storage with an estimate from a smaller conversion.
+                guard bitmap.bytesPerRow > 0, bitmap.bytesPerPlane > 0, bitmap.numberOfPlanes > 0 else {
+                    throw PhotosRepresentationError.invalidImage
+                }
+                let (rowSpan, rowOverflow) = Int64(bitmap.bytesPerRow).multipliedReportingOverflow(by: Int64(height))
+                guard !rowOverflow else { throw PhotosRepresentationError.invalidImage }
+                let planeSpan = max(rowSpan, Int64(bitmap.bytesPerPlane))
+                let (storage, planeOverflow) = planeSpan.multipliedReportingOverflow(by: Int64(bitmap.numberOfPlanes))
+                guard !planeOverflow else { throw PhotosRepresentationError.invalidImage }
+                backingBytes = storage
+            } else {
+                // Accounting only: extraction does not establish orientation.
+                // Hints are not a framework-allocation guarantee; validate the
+                // exposed raster, and still use native drawing for final pixels.
+                var proposed = NSRect(x: 0, y: 0, width: targetSide, height: targetSide)
+                guard let raster = representation.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
+                      raster.width > 0, raster.height > 0, raster.bytesPerRow > 0 else {
+                    throw PhotosRepresentationError.invalidImage
+                }
+                guard raster.width <= targetSide, raster.height <= targetSide else {
+                    throw PhotosRepresentationError.oversized(width: raster.width, height: raster.height)
+                }
+                let (storage, overflow) = Int64(raster.bytesPerRow).multipliedReportingOverflow(by: Int64(raster.height))
+                guard !overflow else { throw PhotosRepresentationError.invalidImage }
+                backingBytes = storage
+                materializations.append(raster)
+            }
+            let (totalBytes, totalOverflow) = incomingBytes.addingReportingOverflow(backingBytes)
+            guard !totalOverflow, totalBytes <= incomingLimit else {
                 throw PhotosRepresentationError.oversized(width: width, height: height)
             }
-            if let bitmap = representation as? NSBitmapImageRep {
-                guard bitmap.bytesPerRow <= targetSide * 16 else {
-                    throw PhotosRepresentationError.oversized(width: width, height: height)
-                }
-            }
+            incomingBytes = totalBytes
         }
         let scale = min(CGFloat(targetSide) / image.size.width, CGFloat(targetSide) / image.size.height)
         let width = max(1, Int((image.size.width * scale).rounded()))
@@ -204,7 +243,10 @@ enum PhotosBitmapNormalizer {
             throw PhotosRepresentationError.invalidImage
         }
         NSGraphicsContext.saveGraphicsState()
-        defer { NSGraphicsContext.restoreGraphicsState() }
+        defer {
+            NSGraphicsContext.restoreGraphicsState()
+            withExtendedLifetime(materializations) {}
+        }
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
         image.draw(in: CGRect(x: 0, y: 0, width: width, height: height), from: .zero,
                    operation: .copy, fraction: 1, respectFlipped: false,

@@ -9,6 +9,9 @@ public enum PhotosIndexChange: Equatable, Sendable {
     case contextInvalidated
 }
 
+/// One bounded page from a fixed Photos generation, including excluded version
+/// slots. Before upserting, invalidate matching cached facts for the listed IDs
+/// (or all cached representations when flagged), even if metadata revisions match.
 public struct RepresentationPage: Equatable, Sendable {
     public let context: LibraryContext
     public let generation: Int
@@ -33,6 +36,9 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// evidence, never a stable physical-library identity or an index-ready flag.
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint?
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool
+    /// Call only after full same-generation reconciliation, durable facts and
+    /// derived publication succeed. Keep ready admission unavailable until this
+    /// returns; stale/pending generations throw and retain invalidation evidence.
     func acknowledgeReconciliation(expectedGeneration: Int) async throws
 }
 
@@ -54,6 +60,23 @@ public struct LoadedRepresentation: @unchecked Sendable {
     public let lease: ImageLease
     public let eligibility: RepresentationEligibility
     public var returnedSize: PixelSize { try! PixelSize(width: image.width, height: image.height) }
+
+    /// Constructs a successful read of exactly `descriptor`'s asset/version.
+    /// This initializer does not transform pixels: use `.up` for already oriented
+    /// pixels, or the actual unapplied orientation, which consumers apply once.
+    /// `eligibility` records verified static-component safety; conservative output
+    /// must not become an ordinary ready/skippable fingerprint. Descriptor size
+    /// remains representation metadata, separate from this bitmap's returnedSize.
+    ///
+    /// The producer must reserve sufficient bytes before creating/retaining the
+    /// image. Ownership of that lease transfers with the result; the consumer
+    /// calls `await lease.finishPhysicalWork()` only after its last real image/
+    /// inference use. Logical cancellation or timeout never proves that use ended.
+    public init(image: CGImage, orientation: CGImagePropertyOrientation, descriptor: RepresentationDescriptor,
+                lease: ImageLease, eligibility: RepresentationEligibility) {
+        self.image = image; self.orientation = orientation; self.descriptor = descriptor
+        self.lease = lease; self.eligibility = eligibility
+    }
 }
 
 /// A bounded wake-up stream. Once any buffer overflows, every subsequent event

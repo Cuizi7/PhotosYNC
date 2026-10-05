@@ -438,6 +438,70 @@ final class PhotosRepresentationTests: XCTestCase {
         try await gateway.acknowledgeReconciliation(expectedGeneration: after.generation)
     }
 
+    func testPaddedMultipleBitmapBackingsRejectBeforeDrawing() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 2, height: 32))
+        for width in [1, 2] {
+            let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: 32,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 512, bitsPerPixel: 32))
+            image.addRepresentation(representation)
+        }
+        XCTAssertEqual(image.representations.count, 2)
+        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
+        XCTAssertEqual(image.drawCount, 0, "reject retained backing before normalized bitmap drawing")
+    }
+
+    func testPlanarBackingCountsEveryPlaneBeforeDrawing() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 8, height: 32))
+        let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 32,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: true,
+            colorSpaceName: .deviceRGB, bytesPerRow: 256, bitsPerPixel: 8))
+        XCTAssertEqual(representation.numberOfPlanes, 4)
+        image.addRepresentation(representation)
+        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
+        XCTAssertEqual(image.drawCount, 0)
+    }
+
+    func testUnavailablePublicRasterRejectsBeforeNativeImageDrawing() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 8, height: 8))
+        image.addRepresentation(AccountingRasterRepresentation(raster: nil, width: 8, height: 8))
+        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
+        XCTAssertEqual(image.drawCount, 0)
+    }
+
+    func testOrdinaryCGImageBackedNSImageRemainsSupported() throws {
+        let raw = try bitmap()
+        let image = NSImage(cgImage: raw, size: NSSize(width: raw.width, height: raw.height))
+        let normalized = try PhotosBitmapNormalizer.normalize(image, targetSide: 32)
+        XCTAssertEqual(normalized.width, 32)
+        XCTAssertEqual(normalized.height, 32)
+        XCTAssertLessThanOrEqual(normalized.bytesPerRow * normalized.height, 32 * 32 * 4)
+    }
+
+    func testPublicRasterActualDimensionsOverrideSmallRepresentationHints() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 8, height: 8))
+        image.addRepresentation(AccountingRasterRepresentation(raster: try largeBitmap(), width: 8, height: 8))
+        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32)) { error in
+            XCTAssertEqual(error as? PhotosRepresentationError, .oversized(width: 64, height: 64))
+        }
+        XCTAssertEqual(image.drawCount, 0)
+    }
+
+    func testPublicRasterAndBitmapBackingShareOneAggregateLimit() throws {
+        let image = RecordingDrawImage(size: NSSize(width: 2, height: 32))
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 32,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 512, bitsPerPixel: 32))
+        image.addRepresentation(bitmap)
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(repeating: 0, count: 512 * 32) as CFData))
+        let raster = try XCTUnwrap(CGImage(width: 2, height: 32, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: 512, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+        image.addRepresentation(AccountingRasterRepresentation(raster: raster, width: 2, height: 32))
+        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
+        XCTAssertEqual(image.drawCount, 0)
+    }
+
     private func limits(timeout: Double = 30) throws -> ResourceLimits {
         try ResourceLimits(decodeConcurrency: 1, photoRequestConcurrency: 1, maxDecodedBytes: 134217728,
                            requestTimeoutSeconds: timeout, retryDelaysSeconds: [5, 15, 30, 60], catalogBatchSize: 128,
@@ -540,4 +604,25 @@ private final class RepresentationLifecycle: PhotoKitLifecycle, @unchecked Senda
         for event in replayChanges { onChange(event) }
         return true
     }
+}
+
+private final class RecordingDrawImage: NSImage {
+    var drawCount = 0
+    override func draw(in rect: NSRect, from fromRect: NSRect, operation op: NSCompositingOperation,
+                       fraction delta: CGFloat, respectFlipped: Bool, hints: [NSImageRep.HintKey: Any]?) {
+        drawCount += 1
+    }
+}
+
+private final class AccountingRasterRepresentation: NSImageRep {
+    private let raster: CGImage?
+    init(raster: CGImage?, width: Int, height: Int) {
+        self.raster = raster
+        super.init()
+        pixelsWide = width; pixelsHigh = height
+        size = NSSize(width: width, height: height)
+    }
+    required init?(coder: NSCoder) { nil }
+    override func cgImage(forProposedRect proposedDestRect: UnsafeMutablePointer<NSRect>?,
+                          context: NSGraphicsContext?, hints: [NSImageRep.HintKey: Any]?) -> CGImage? { raster }
 }
