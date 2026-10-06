@@ -294,6 +294,55 @@ extension FingerprintTests {
         XCTAssertEqual(calls.current(), 1); XCTAssertEqual(loads.current(), 1)
         model.setExecutionEligible(true); try await model.prepareExecution(); XCTAssertEqual(loads.current(), 2)
     }
+    func testExhaustedGPUFailureWhileIneligibleRetainsManualAndAutomaticRecovery() async throws {
+        for revokeAuthorization in [false, true] {
+            for manual in [false, true] {
+                let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+                let loads = PhysicalStartCounter(), released = PhysicalStartCounter(), clock = PhysicalStartCounter()
+                let authorizationChanges = PhysicalStartCounter(), recoveredCalls = PhysicalStartCounter()
+                let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(),
+                    now: { Date(timeIntervalSince1970: Double(clock.current())) }, factory: { backend in
+                        let generation = loads.increment(), calls = PhysicalStartCounter()
+                        XCTAssertEqual(released.current(), generation - 1, "release the old physical instance before loading")
+                        return P12Session(prediction: { _ in
+                            let call = calls.increment()
+                            if generation == 1 { return [0, 1] + Array(repeating: 0, count: 1022) }
+                            if generation == 2 && call == 5 {
+                                XCTAssertEqual(backend, .cpuAndGPU)
+                                entered.signal(); release.wait()
+                                throw ModelExecutionUnavailable(detail: "selected GPU failed")
+                            }
+                            if generation == 3 { _ = recoveredCalls.increment() }
+                            return [1] + Array(repeating: 0, count: 1023)
+                        }, released: { _ = released.increment() })
+                    })
+                model.setExecutionAuthorization { authorizationChanges.current() % 2 == 0 }
+                try await model.prepareExecution()
+                let source = image(width: 1, height: 1, pixels: [0,0,0,255])
+                let task = Task { try await model.fingerprint(image: source, orientation: .up) }
+                XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+                if revokeAuthorization { _ = authorizationChanges.increment() }
+                else { model.setExecutionEligible(false) }
+                XCTAssertEqual(loads.current(), 2); XCTAssertEqual(released.current(), 1)
+                release.signal()
+                do { _ = try await task.value; XCTFail("ineligible failed prediction must defer") } catch is CancellationError { }
+                XCTAssertEqual(loads.current(), 2); XCTAssertEqual(released.current(), 2)
+                if revokeAuthorization { _ = authorizationChanges.increment() }
+                else { model.setExecutionEligible(true) }
+                if !manual {
+                    for _ in 0..<59 { _ = clock.increment() }
+                    do { try await model.prepareExecution(); XCTFail("automatic recovery must wait 60 seconds") }
+                    catch is ModelExecutionUnavailable { }
+                    XCTAssertEqual(loads.current(), 2)
+                    _ = clock.increment()
+                }
+                do { try await model.prepareExecution(forceRetry: manual) }
+                catch { XCTFail("exhausted GPU must start a fresh eligible attempt: \(error)") }
+                XCTAssertEqual(loads.current(), 3)
+                XCTAssertEqual(recoveredCalls.current(), 4, "fresh instance validates all golden tensors")
+            }
+        }
+    }
     func testBackendResourceCorruptionIsNotRetryableHardwareFailure() async throws {
         let resources = try DedupConfiguration.bundledResourceDirectory()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

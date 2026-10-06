@@ -269,8 +269,10 @@ final class PhysicalModelExecution: @unchecked Sendable {
             autoreleasepool { session = nil }
             log("prediction", result: "failed", detail: String(describing: error))
             unavailable = .init(detail: String(describing: error)); candidateIndex += 1
+            // Retain exhaustion even when eligibility revokes the next phase.
+            if candidateIndex >= candidates.count { retryAt = now().addingTimeInterval(60) }
             if cancelled() || !eligible() { throw CancellationError() }
-            guard candidateIndex < candidates.count else { retryAt = now().addingTimeInterval(60); throw unavailable }
+            guard candidateIndex < candidates.count else { throw unavailable }
             log("fallback", result: "requested")
             try select(cancelled: cancelled, eligible: eligible)
             // One fallback prediction, no recursive retry or third configuration.

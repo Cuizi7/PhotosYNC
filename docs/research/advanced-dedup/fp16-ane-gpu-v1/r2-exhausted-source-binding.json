@@ -1,0 +1,55 @@
+{
+  "evidenceLogsSHA256": {
+    "green-build.log": "c50ba01f42574eef7c17113ca9e361f4c775a413b7e04d653ec21dbfb78a4b2e",
+    "green-tests.log": "2883155a74bb93ac25e9e5377701d596ec48613cd431cc61ac726dabb4cb12a7",
+    "red-build.log": "d9c3ec1604b469c29341c053d63ebba552dbbdd46864275d92eabd96dfd02c51",
+    "red-tests.log": "7e08f19bd1b20e1dbc3423654e6640bb4ff6f3a29f7b20accad0da3d8c68d7e8"
+  },
+  "green": {
+    "exitCode": 0,
+    "failures": 0,
+    "log": "work/P12-R2-exhausted/green-tests.log",
+    "seconds": 4.595,
+    "testCount": 37
+  },
+  "historicalCorpusEvidence": "r1-r2-source-binding.json and r1-r2-cpuAndNeuralEngine.json/r1-r2-cpuAndGPU.json remain historical and unchanged; 33-case corpus was not rerun for this narrow state correction.",
+  "implementationBaseline": "e9db96c025f28c3d164912c11572bb55058f1ea8",
+  "nativeModelInstanceValidation": {
+    "configurations": [
+      {
+        "goldenCount": 4,
+        "maxAbs": 0.001927979290485382,
+        "minCosine": 0.9998410965377417,
+        "requested": "cpuAndNeuralEngine"
+      },
+      {
+        "goldenCount": 4,
+        "maxAbs": 0.0018768310546875,
+        "minCosine": 0.999840987868964,
+        "requested": "cpuAndGPU"
+      }
+    ],
+    "physicalAssignmentClaim": false,
+    "reportPath": "work/P12-R2-exhausted/final/model-execution.json",
+    "reportSHA256": "daabc93194a73f20b682babf08bc50772ffb3fabc2a9e24f270afff2a950e58c"
+  },
+  "preservedIdentities": {
+    "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+    "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+    "policyID": "fp16-ane-gpu-v1",
+    "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9"
+  },
+  "red": {
+    "exitCode": 1,
+    "failures": 12,
+    "log": "work/P12-R2-exhausted/red-tests.log",
+    "seconds": 4.928,
+    "testCount": 1
+  },
+  "regression": "testExhaustedGPUFailureWhileIneligibleRetainsManualAndAutomaticRecovery covers actual physical queue pause/live authorization revoke x manual/automatic retry. Holds selected GPU fifth prediction, releases recoverable failure, verifies no overlapping session, all four new golden validations and unchanged59/60 automatic boundary.",
+  "scope": "Narrow R2 exhausted selected-GPU recovery correction; record exhaustion deadline before eligibility cancellation. No model, resource, golden, math, policy, history or schema changes.",
+  "sourceFilesSHA256": {
+    "Sources/PhotoSyncCore/Fingerprinting/ModelExecution.swift": "7c4759e69a8fa6801e11ddf9d9c2e77a6ab3d6bd10be58b690549cc955ea7058",
+    "Tests/PhotoSyncCoreTests/FingerprintTests.swift": "7b0d17161d8c1808d431958542f222663b42b661f543f946f311ac96201fd6d2"
+  }
+}
