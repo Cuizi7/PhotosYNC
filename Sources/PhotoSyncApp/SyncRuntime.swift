@@ -49,9 +49,10 @@ struct AdvancedRuntimeGraph: Sendable {
 
     static func load(store: SyncStore, executor: ReadExecutor, directory: @escaping SyncEngine.DirectoryFactory,
                      now: @escaping @Sendable () -> Date, resourceDirectory: URL? = nil,
-                     configuration: DedupConfiguration? = nil, logger: RunLogger? = nil) async throws -> AdvancedRuntimeGraph {
+                     configuration: DedupConfiguration? = nil, logger: RunLogger? = nil,
+                     authorized: @escaping @Sendable () -> Bool = { true }) async throws -> AdvancedRuntimeGraph {
         // Compilation/model loading is synchronous Core ML work. Keep it off UI and runtime actors.
-        try await Task.detached(priority: .utility) {
+        try await loadInBackground {
             let root = try resourceDirectory ?? DedupConfiguration.bundledResourceDirectory()
             let configuration = try configuration ?? DedupConfiguration.loadValidated(resourceDirectory: root)
             let policy = try ModelExecutionPolicy.loadValidated(resourceDirectory: root)
@@ -59,12 +60,27 @@ struct AdvancedRuntimeGraph: Sendable {
             let model = try CoreMLFingerprinter(modelURL: root.appendingPathComponent("SSCDLarge.mlpackage"),
                 configuration: configuration.fingerprint, policy: policy, selfTest: selfTest, now: now,
                 diagnostics: { logger?.log($0) })
+            model.setExecutionAuthorization(authorized)
+            try Task.checkCancellation()
             try await model.prepareExecution()
+            try Task.checkCancellation()
             let budget = ImageWorkBudget(limits: configuration.resources)
             let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget)
             return AdvancedRuntimeGraph(store: store, photos: photos, model: model,
                 configuration: configuration, executor: executor, budget: budget, directory: directory, now: now, logger: logger)
-        }.value
+        }
+    }
+
+    /// Owns the off-actor startup task through actual completion.
+    static func loadInBackground(_ operation: @escaping @Sendable () async throws -> AdvancedRuntimeGraph) async throws -> AdvancedRuntimeGraph {
+        try Task.checkCancellation()
+        let task = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            return try await operation()
+        }
+        // Cancellation revokes new phases inside Core ML, but awaiting its result still
+        // retains ownership through physical return. A valid completed graph is retained.
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 }
 
@@ -86,6 +102,7 @@ actor SyncRuntime {
     private var advancedLoadAttempted = false
     private var modelRetryAt: Date?
     private var modelRecovery: Task<Void, Error>?
+    private var manualModelRetryPending = false
     private var changePending = false
     private var indexEventPending = false
     private var pendingAdvancedScan = false
@@ -139,8 +156,10 @@ actor SyncRuntime {
     }
 
     func waitForRound() async {
-        while loading != nil || advancedWork != nil || round != nil {
+        while loading != nil || modelRecovery != nil || advancedWork != nil || round != nil {
             await loading?.value
+            _ = await modelRecovery?.result
+            await Task.yield()
             await advancedWork?.value
             await round?.value
         }
@@ -196,9 +215,10 @@ actor SyncRuntime {
                 }.value
                 // Freeze the validated records once per process, even with no enabled
                 // source. Only expensive model/gateway construction waits for eligibility.
+                let authorization = authorized
                 advancedFactory = { store, executor, directory, now, logger in
                     try await AdvancedRuntimeGraph.load(store: store, executor: executor, directory: directory,
-                        now: now, resourceDirectory: root, configuration: configuration, logger: logger)
+                        now: now, resourceDirectory: root, configuration: configuration, logger: logger, authorized: authorization)
                 }
             } catch { advancedLoadFailed(error); return }
         }
@@ -258,6 +278,7 @@ actor SyncRuntime {
         }
         lastKnownAuthorization = granted
         state.authorized = granted
+        updateModelEligibility()
     }
 
     private func postNotification(title: String, body: String) {
@@ -325,7 +346,9 @@ actor SyncRuntime {
         schedule.pause()
         modelRecovery?.cancel()
         state.snapshot.isPaused = true
+        updateModelEligibility()
         await engine?.pause()
+        await applyAnalysisEligibility()
         await advancedGraph?.coordinator.setPaused(true)
         if let graph = advancedGraph { publishedProgress = await graph.coordinator.progress() }
     }
@@ -337,11 +360,12 @@ actor SyncRuntime {
         await engine?.setPaused(false)
         await applyAnalysisEligibility()
         if schedule.resume(now: now()) { schedule.finished(now: now()) }
-        await tick(force: true)
+        await tick(force: true, retryModel: true)
     }
 
     func stop() async {
         stopped = true
+        updateModelEligibility()
         changeObserver?.cancel(); changeObserver = nil
         schedule.pause()
         await engine?.pause()
@@ -349,24 +373,31 @@ actor SyncRuntime {
         // Do not cancel physical Photos submission: the engine persists its callback.
     }
 
-    func tick(force: Bool = false, includeAdvanced: Bool = true) async {
+    func tick(force: Bool = false, includeAdvanced: Bool = true, retryModel: Bool = false) async {
         guard !stopped else { return }
         refreshAuthorization()
         await applyAnalysisEligibility()
         guard eligibleForWork else { return }
-        if engine == nil { startAdvancedGraphIfNeeded(force: force); return }
+        if retryModel { manualModelRetryPending = true }
+        if engine == nil { startAdvancedGraphIfNeeded(); return }
         if let model = advancedGraph?.model as? any ModelExecutionRecovering {
             // Coalesce ticks while the single physical queue is loading/validating.
             guard modelRecovery == nil else { return }
-            let recovery = Task { try await model.prepareExecution(forceRetry: force) }
+            let retry = manualModelRetryPending
+            manualModelRetryPending = false
+            let recovery = Task { try await model.prepareExecution(forceRetry: retry) }
             modelRecovery = recovery
-            do { try await recovery.value }
-            catch is ModelExecutionUnavailable { modelRecovery = nil; return }
-            catch is CancellationError { modelRecovery = nil; return }
-            catch { modelRecovery = nil; advancedLoadFailed(error); return }
+            var failure: Error?
+            do { try await recovery.value } catch { failure = error }
             modelRecovery = nil
             refreshAuthorization()
-            guard eligibleForWork else { return }
+            if let failure, !(failure is ModelExecutionUnavailable) && !(failure is CancellationError) {
+                advancedLoadFailed(failure); return
+            }
+            if manualModelRetryPending && eligibleForWork {
+                await tick(force: true); return
+            }
+            guard failure == nil, eligibleForWork else { return }
         }
         guard let engine else { return }
         if includeAdvanced { scheduleAdvancedWork(force: force) }
@@ -463,18 +494,27 @@ actor SyncRuntime {
         !stopped && state.authorized && !state.snapshot.isPaused && state.sources.contains(where: \.enabled)
     }
 
+    private func updateModelEligibility() {
+        let eligible = eligibleForWork
+        (advancedGraph?.model as? any ModelExecutionRecovering)?.setExecutionEligible(eligible)
+        if !eligible { manualModelRetryPending = false; modelRecovery?.cancel(); loading?.cancel() }
+    }
+
     private func applyAnalysisEligibility() async {
-        if !eligibleForWork { modelRecovery?.cancel() }
+        updateModelEligibility()
         guard let graph = advancedGraph else { return }
         await graph.coordinator.setPaused(!eligibleForWork)
         await graph.service.setPaused(!eligibleForWork)
     }
 
-    private func startAdvancedGraphIfNeeded(force: Bool) {
+    private func startAdvancedGraphIfNeeded() {
         guard loading == nil, let store, let advancedFactory else { return }
-        if advancedLoadAttempted {
-            guard let modelRetryAt, force || now() >= modelRetryAt else { return }
-        }
+        // A hard resource failure remains one-shot. Ordinary scan urgency never grants
+        // the separate user-authorized exception to the model loading deadline.
+        guard !advancedLoadAttempted || modelRetryAt != nil else { return }
+        if let modelRetryAt, !manualModelRetryPending, now() < modelRetryAt { return }
+        manualModelRetryPending = false
+        modelRetryAt = now().addingTimeInterval(60)
         advancedLoadAttempted = true
         state.snapshot.indexProgress = IndexProgress(state: .preparing, totalsKnown: false, totalAssets: 0,
             readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
@@ -484,8 +524,19 @@ actor SyncRuntime {
             do {
                 let graph = try await advancedFactory(store, executor, directory, now, self?.logger)
                 await self?.install(graph, store: store, directory: directory)
-            } catch { await self?.advancedLoadFailed(error) }
+            } catch is CancellationError { await self?.advancedLoadCancelled() }
+            catch { await self?.advancedLoadFailed(error) }
         }
+    }
+
+    private func advancedLoadCancelled() async {
+        loading = nil; advancedLoadAttempted = false
+        state.message = nil; state.messageDetail = nil
+        state.snapshot.indexProgress = IndexProgress(state: state.snapshot.isPaused ? .paused : .waiting,
+            totalsKnown: false, totalAssets: 0, readyAssets: 0, totalRepresentations: 0,
+            readyRepresentations: 0, excludedAssets: 0, issue: nil)
+        refreshAuthorization()
+        if manualModelRetryPending && eligibleForWork { await tick(force: true) }
     }
 
     private func advancedLoadFailed(_ error: Error) {
@@ -510,6 +561,8 @@ actor SyncRuntime {
 
     private func install(_ graph: AdvancedRuntimeGraph, store: SyncStore, directory: @escaping SyncEngine.DirectoryFactory) async {
         advancedGraph = graph
+        (graph.model as? any ModelExecutionRecovering)?.setExecutionAuthorization(authorized)
+        updateModelEligibility()
         modelRetryAt = nil; state.message = nil; state.messageDetail = nil
         let executor = self.executor
         engine = SyncEngine(store: store, photos: graph.photos, directory: directory,

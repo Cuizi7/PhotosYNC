@@ -218,6 +218,11 @@ public actor PhotosIndexCoordinator {
                         if try await store.completeRepresentation(task, fingerprint: fingerprint) {
                             completed += 1; cloudWaiting.removeValue(forKey: waitKey); modelWaiting.removeValue(forKey: waitKey)
                         }
+                    } catch is CancellationError {
+                        // Eligibility revoked before a new model phase is deferred work,
+                        // not a damaged image. The owned task has returned and released
+                        // its lease; keep its existing durable issuance/deadline unchanged.
+                        return
                     } catch {
                         let latest = try? await photos.candidateSnapshot()
                         if needsReconciliation || reconciling || pendingDelta != nil || latest?.generation != reconciledGeneration {

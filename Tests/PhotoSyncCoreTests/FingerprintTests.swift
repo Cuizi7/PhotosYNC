@@ -249,6 +249,51 @@ extension FingerprintTests {
         do { _ = try await task.value; XCTFail("canceled prediction") } catch is CancellationError { }
         XCTAssertEqual(loads.current(), 1)
     }
+    func testIneligibleModelNeverStartsLazyRecovery() async throws {
+        let loads = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { _ in
+            _ = loads.increment(); return P12Session(prediction: { _ in [1] + Array(repeating: 0, count: 1023) })
+        })
+        model.setExecutionEligible(false)
+        do { _ = try await model.fingerprint(image: image(width: 1, height: 1, pixels: [0,0,0,255]), orientation: .up); XCTFail("no lazy recovery while ineligible") }
+        catch is CancellationError { }
+        XCTAssertEqual(loads.current(), 0)
+        model.setExecutionEligible(true); try await model.prepareExecution(); XCTAssertEqual(loads.current(), 1)
+    }
+    func testIneligibleQueuedPredictionDoesNotConsumePhysicalSlotAndCompletedResultSurvives() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), submitted = DispatchSemaphore(value: 0)
+        let calls = PhysicalStartCounter(), queued = PhysicalStartCounter()
+        let model = CoreMLFingerprinter(configuration: try configuration(), predict: { _ in
+            if calls.increment() == 1 { entered.signal(); release.wait() }
+            return [1] + Array(repeating: 0, count: 1023)
+        }, onSubmitted: { if queued.increment() == 2 { submitted.signal() } })
+        let source = image(width: 1, height: 1, pixels: [0,0,0,255])
+        let first = Task { try await model.fingerprint(image: source, orientation: .up) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        let second = Task { try await model.fingerprint(image: source, orientation: .up) }
+        XCTAssertEqual(submitted.wait(timeout: .now() + 5), .success)
+        model.setExecutionEligible(false); XCTAssertEqual(calls.current(), 1)
+        release.signal()
+        let completed = try await first.value; XCTAssertEqual(completed.values[0], 1, "successful physical work is retained")
+        do { _ = try await second.value; XCTFail("queued work must wait for eligibility") } catch is CancellationError { }
+        XCTAssertEqual(calls.current(), 1)
+    }
+    func testEligibilityLossStopsNewSelfTestsWithoutStartingFallback() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let calls = PhysicalStartCounter(), loads = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { _ in
+            _ = loads.increment(); return P12Session(prediction: { _ in
+                if calls.increment() == 1 { entered.signal(); release.wait() }
+                return [1] + Array(repeating: 0, count: 1023)
+            })
+        })
+        let task = Task { try await model.prepareExecution() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        model.setExecutionEligible(false); release.signal()
+        do { try await task.value; XCTFail("partial session cannot continue self-tests") } catch is CancellationError { }
+        XCTAssertEqual(calls.current(), 1); XCTAssertEqual(loads.current(), 1)
+        model.setExecutionEligible(true); try await model.prepareExecution(); XCTAssertEqual(loads.current(), 2)
+    }
     func testBackendResourceCorruptionIsNotRetryableHardwareFailure() async throws {
         let resources = try DedupConfiguration.bundledResourceDirectory()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

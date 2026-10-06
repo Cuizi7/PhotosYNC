@@ -26,6 +26,7 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
     public let configuration: FingerprintConfiguration
     private let predict: (@Sendable (MLMultiArray) throws -> [Float])?
     private let execution: PhysicalModelExecution?
+    private let eligibility = ModelExecutionEligibility()
     private let onSubmitted: (@Sendable () -> Void)?
     // A single queue retains the physical slot until prediction returns, even when its waiter cancels.
     private let physicalQueue = DispatchQueue(label: "PhotoSyncCore.SSCD.physicalInference")
@@ -76,13 +77,17 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
             }, diagnostics: diagnostics)
     }
 
+    public nonisolated func setExecutionEligible(_ eligible: Bool) { eligibility.set(eligible) }
+
+    public nonisolated func setExecutionAuthorization(_ authorized: @escaping @Sendable () -> Bool) { eligibility.setAuthorization(authorized) }
+
     public func prepareExecution(forceRetry: Bool = false) async throws {
         guard let execution else { return }
-        let flag = CancellationFlag(), queue = physicalQueue
+        let flag = CancellationFlag(), queue = physicalQueue, eligibility = eligibility
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 queue.async {
-                    do { try execution.prepare(forceRetry: forceRetry, cancelled: { flag.isCancelled }); continuation.resume() }
+                    do { try execution.prepare(forceRetry: forceRetry, cancelled: { flag.isCancelled }, eligible: { eligibility.isEligible }); continuation.resume() }
                     catch { continuation.resume(throwing: error) }
                 }
             }
@@ -118,6 +123,7 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
 
     public func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
         try Task.checkCancellation()
+        guard eligibility.isEligible else { throw CancellationError() }
         let tensor = try ImagePreprocessor.prepare(image: image, orientation: orientation,
                                                    configuration: configuration)
         return try await fingerprintPrepared(tensor)
@@ -132,20 +138,20 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
         guard tensor.shape.map(\.intValue) == [1, 3, configuration.inputSide, configuration.inputSide],
               tensor.dataType == .float32 else { throw AdvancedDedupError.invalidConfiguration }
         let flag = CancellationFlag()
-        let prediction = predict, execution = execution
+        let prediction = predict, execution = execution, eligibility = eligibility
         let queue = physicalQueue
         let submitted = onSubmitted
         let input = InferenceInput(tensor: tensor)
         let values: [Float] = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
-                    if flag.isCancelled {
+                    if flag.isCancelled || !eligibility.isEligible {
                         continuation.resume(throwing: CancellationError())
                         return
                     }
                     do {
                         let values: [Float]
-                        if let execution { values = try execution.predict(input.tensor, cancelled: { flag.isCancelled }) }
+                        if let execution { values = try execution.predict(input.tensor, cancelled: { flag.isCancelled }, eligible: { eligibility.isEligible }) }
                         else { values = try prediction!(input.tensor) }
                         if flag.isCancelled { continuation.resume(throwing: CancellationError()) }
                         else { continuation.resume(returning: values) }

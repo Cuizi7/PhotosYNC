@@ -133,9 +133,34 @@ func modelResourceBytes(root: URL, relative: String) throws -> Data {
     return try Data(contentsOf: url)
 }
 
+/// A synchronous admission signal, separate from Task cancellation and physical ownership.
+/// Revocation stops only new work; already-started successful prediction results remain valid.
+final class ModelExecutionEligibility: @unchecked Sendable {
+    private let lock = NSLock()
+    private var eligible = true
+    private var authorized: @Sendable () -> Bool = { true }
+    func set(_ value: Bool) { lock.lock(); eligible = value; lock.unlock() }
+    func setAuthorization(_ predicate: @escaping @Sendable () -> Bool) {
+        lock.lock(); authorized = predicate; lock.unlock()
+    }
+    var isEligible: Bool {
+        lock.lock(); let allowed = eligible, authorization = authorized; lock.unlock()
+        // The supplied synchronous provider is evaluated outside the lock. The model
+        // knows no Photos API and never captures the runtime actor or performs its I/O.
+        return allowed && authorization()
+    }
+}
+
 public protocol ModelExecutionRecovering: Sendable {
+    func setExecutionEligible(_ eligible: Bool)
+    func setExecutionAuthorization(_ authorized: @escaping @Sendable () -> Bool)
     /// The caller must enforce pause/source/authorization eligibility before requesting recovery.
     func prepareExecution(forceRetry: Bool) async throws
+}
+public extension ModelExecutionRecovering {
+    // Non-model injected implementations have no implicit physical recovery to gate.
+    func setExecutionEligible(_ eligible: Bool) {}
+    func setExecutionAuthorization(_ authorized: @escaping @Sendable () -> Bool) {}
 }
 
 /// All mutable state is confined to the fingerprinter's one physical queue.
@@ -160,14 +185,15 @@ final class PhysicalModelExecution: @unchecked Sendable {
         self.now = now; self.factory = factory; self.diagnostics = diagnostics
     }
 
-    func prepare(forceRetry: Bool, cancelled: () -> Bool) throws {
+    func prepare(forceRetry: Bool, cancelled: () -> Bool, eligible: () -> Bool) throws {
         if let hardFailure { throw hardFailure }
         if session != nil { return }
+        guard eligible() else { throw CancellationError() }
         if let retryAt {
             guard forceRetry || now() >= retryAt else { throw unavailable }
             self.retryAt = nil; candidateIndex = 0
         }
-        try select(cancelled: cancelled)
+        try select(cancelled: cancelled, eligible: eligible)
     }
 
     private func log(_ stage: String, result: String, detail: String? = nil) {
@@ -178,15 +204,15 @@ final class PhysicalModelExecution: @unchecked Sendable {
         diagnostics(fields)
     }
 
-    private func select(cancelled: () -> Bool) throws {
+    private func select(cancelled: () -> Bool, eligible: () -> Bool) throws {
         while candidateIndex < candidates.count {
-            if cancelled() { throw CancellationError() }
+            if cancelled() || !eligible() { throw CancellationError() }
             do {
                 try autoreleasepool {
                     session = try factory(candidates[candidateIndex])
                     log("load", result: "loaded")
                     for (i, golden) in selfTests.enumerated() {
-                        if cancelled() { throw CancellationError() }
+                        if cancelled() || !eligible() { throw CancellationError() }
                         let side = configuration.inputSide
                         guard golden.input.count == 3 * side * side * 4 else { throw AdvancedDedupError.invalidConfiguration }
                         let tensor = try MLMultiArray(shape: [1,3,NSNumber(value: side),NSNumber(value: side)], dataType: .float32)
@@ -229,8 +255,10 @@ final class PhysicalModelExecution: @unchecked Sendable {
         return values
     }
 
-    func predict(_ tensor: MLMultiArray, cancelled: () -> Bool) throws -> [Float] {
-        try prepare(forceRetry: false, cancelled: cancelled)
+    func predict(_ tensor: MLMultiArray, cancelled: () -> Bool, eligible: () -> Bool) throws -> [Float] {
+        guard eligible() else { throw CancellationError() }
+        try prepare(forceRetry: false, cancelled: cancelled, eligible: eligible)
+        guard eligible() else { throw CancellationError() }
         do {
             let values = try autoreleasepool { try prediction(tensor) }
             if cancelled() { throw CancellationError() }
@@ -241,11 +269,12 @@ final class PhysicalModelExecution: @unchecked Sendable {
             autoreleasepool { session = nil }
             log("prediction", result: "failed", detail: String(describing: error))
             unavailable = .init(detail: String(describing: error)); candidateIndex += 1
-            if cancelled() { throw CancellationError() }
+            if cancelled() || !eligible() { throw CancellationError() }
             guard candidateIndex < candidates.count else { retryAt = now().addingTimeInterval(60); throw unavailable }
             log("fallback", result: "requested")
-            try select(cancelled: cancelled)
+            try select(cancelled: cancelled, eligible: eligible)
             // One fallback prediction, no recursive retry or third configuration.
+            guard eligible() else { throw CancellationError() }
             do {
                 let values = try autoreleasepool { try prediction(tensor) }
                 if cancelled() { throw CancellationError() }

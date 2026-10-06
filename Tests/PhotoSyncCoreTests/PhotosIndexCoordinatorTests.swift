@@ -1,9 +1,35 @@
 import XCTest
+import CoreML
 import CoreGraphics
 import ImageIO
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testOwnedReadCompletedAfterPauseCannotStartLazyModelOrBecomeReadFailure() async throws {
+        let f = try fixture(), gate = CoordinatorGate(), calls = CoordinatorPhysicalCount()
+        let golden = (0..<4).map { _ in ModelSelfTestCase(input: Data(repeating: 0, count: 3 * 320 * 320 * 4),
+            reference: [1] + Array(repeating: 0, count: 1023)) }
+        let model = try CoreMLFingerprinter(configuration: f.configuration.fingerprint, selfTests: golden, factory: { _ in
+            calls.increment(); return CoordinatorPhysicalSession()
+        })
+        let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: model, configuration: f.configuration)
+        await f.photos.set([descriptor(f.photos.context)]); await f.photos.gateNextRead(gate)
+        try await coordinator.reconcile()
+        let work = Task { await coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered()
+        model.setExecutionEligible(false); await coordinator.setPaused(true)
+        let held = await f.photos.budget.snapshot(); XCTAssertEqual(held.images, 1)
+        XCTAssertEqual(calls.value, 0)
+        await gate.release(); await work.value
+        XCTAssertEqual(calls.value, 0, "read admitted before pause must not start a new session")
+        let released = await f.photos.budget.snapshot(); XCTAssertEqual(released.images, 0)
+        let tasks = try await f.store.nextRepresentationTasks(now: now, limit: 1)
+        XCTAssertEqual(tasks.count, 1); XCTAssertEqual(tasks.first?.retryCount, 0); XCTAssertNil(tasks.first?.nextRetryAt)
+        let paused = await coordinator.progress(); XCTAssertNil(paused.issue)
+        model.setExecutionEligible(true); await coordinator.setPaused(false); await coordinator.processDueWork(now: now)
+        let ready = await coordinator.progress(); XCTAssertEqual(ready.state, .ready)
+        XCTAssertEqual(calls.value, 1)
+    }
     func testModelWaitKeepsTaskUnreadyAcrossReconciliation() async throws {
         let f = try fixture()
         await f.photos.set([descriptor(f.photos.context)])
@@ -749,6 +775,8 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     private(set) var readCount = 0, resumeCount = 0, acknowledgementCount = 0
     private(set) var readKinds: [RepresentationKind] = [], requestedLimits: [Int] = []
     private var resumeThrows = false
+    private var readGate: CoordinatorGate?
+    func gateNextRead(_ gate: CoordinatorGate) { readGate = gate }
     private var snapshotCount = 0, snapshotGateAt: Int?, snapshotGate: CoordinatorGate?
     private(set) var maxImagesObserved = 0
     private var checkpointCaptured = false
@@ -817,6 +845,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
         let occupied = await budget.snapshot(); maxImagesObserved = max(maxImagesObserved, occupied.images)
         let image = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
+        if let gate = readGate { readGate = nil; await gate.hold() }
         return .init(image: image, orientation: .up, descriptor: descriptor, lease: lease,
             eligibility: conservative ? .conservative(.unverifiedContainer) : .safeSingleFrame)
     }
@@ -828,4 +857,13 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String { throw PhotoKitGatewayError.libraryUnavailable }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
+}
+
+private final class CoordinatorPhysicalSession: ModelPredictionSession, @unchecked Sendable {
+    func predict(_ input: MLMultiArray) throws -> [Float] { [1] + Array(repeating: 0, count: 1023) }
+}
+private final class CoordinatorPhysicalCount: @unchecked Sendable {
+    private let lock = NSLock(); private var count = 0
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
 }

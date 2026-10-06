@@ -1,0 +1,18 @@
+{
+  "execution_policy_id": "fp16-ane-gpu-v1",
+  "files": {
+    "LICENSE-SSCD.txt": "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93",
+    "ModelSelfTest/manifest.json": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+    "closeout.json": "6d15fd23ce895a43e1707e4b1afba51a7b2cc98a6fb724a960f48803fd5ebf79",
+    "decision.json": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+    "execution-policy.json": "03e34635df8a05e5b9e7d519dc4c1a0577a8f83ea771e237d2b085c9eb11e90e",
+    "model-provenance.json": "22f0e8b27ed5f7644831e5ec9de5dd2320457f319be29163a3dc757afcfcbf94",
+    "profile.json": "25749a222f56277607a85004edb43b594a7595406d4a63112631dd4cc00f00d8",
+    "regression.json": "17da760deff666a9328c15d2f65e22b1a49adc8f1151a72ce24c16605b6cf6e5"
+  },
+  "model_sha256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+  "self_test_manifest_sha256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+  "status": "passed",
+  "weight_bytes": 88329408,
+  "weight_sha256": "be1b28a5be24ca216884b6a04db291f58bd484328ac5307f9577fd27295cb338"
+}
