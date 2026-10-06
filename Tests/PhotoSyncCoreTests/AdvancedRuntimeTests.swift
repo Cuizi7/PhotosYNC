@@ -44,6 +44,20 @@ final class AdvancedRuntimeTests: XCTestCase {
         XCTAssertEqual(f.loads.value, 0)
     }
 
+    func testContinuousEmptyEventUsesDeltaWithoutForcingFullCatalog() async throws {
+        let f = try await fixture()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let before = await f.photos.catalogCount
+        let fetched = expectation(description: "runtime requested the bounded delta")
+        await f.photos.setDeltaHook { fetched.fulfill() }
+        await f.photos.advanceEmptyDelta()
+        await fulfillment(of: [fetched], timeout: 3)
+        await f.runtime.waitForRound()
+        let after = await f.photos.catalogCount
+        XCTAssertEqual(after, before)
+        let deltas = await f.photos.deltaCount; XCTAssertEqual(deltas, 1)
+    }
+
     func testRealMulticastEventDeliveryWakesReconciliationWithoutTimer() async throws {
         let f = try await fixture()
         await f.runtime.tick(force: true)
@@ -55,7 +69,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         let receipt = Task<PhotosIndexChange?, Never> { for await event in events { return event }; return nil }
         await f.photos.change()
         let received = await receipt.value
-        XCTAssertEqual(received, .assetsChanged(["edited"]))
+        XCTAssertEqual(received, fixtureIndexChange(changed: ["edited"]))
         await f.photos.waitForCatalog(after: before)
         await f.runtime.waitForRound()
         let after = await f.photos.catalogCount
@@ -192,7 +206,19 @@ private actor P8Photos: PhotosIndexGateway {
     private(set) var catalogCount = 0, createCount = 0
     private var catalogWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { subscribers.increment(); return channel.stream() }
-    func change() { generation += 1; channel.send(.assetsChanged(["edited"])) }
+    func change() { generation += 1; channel.send(fixtureIndexChange(changed: ["edited"])) }
+    private var deltaHook: (@Sendable () -> Void)?
+    private(set) var deltaCount = 0
+    func setDeltaHook(_ hook: @escaping @Sendable () -> Void) { deltaHook = hook }
+    func advanceEmptyDelta() {
+        let from = generation; generation += 1
+        channel.send(.incremental(.init(context: context, fromGeneration: from, toGeneration: generation, changedAssetIDs: [], deletedAssetIDs: [])))
+    }
+    func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        guard delta.context == context, delta.toGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
+        deltaCount += 1; deltaHook?()
+        return .init(context: context, generation: generation, descriptors: [], nextOffset: nil)
+    }
     func waitForCatalog(after count: Int) async {
         if catalogCount > count { return }
         await withCheckedContinuation { catalogWaiters.append((count, $0)) }

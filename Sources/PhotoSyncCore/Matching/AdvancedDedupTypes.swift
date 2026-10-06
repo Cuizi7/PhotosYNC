@@ -289,7 +289,7 @@ public struct LibraryContext: Codable, Equatable, Sendable {
     public init(id: UUID, epoch: Int64) { self.id = id; self.epoch = epoch }
 }
 public enum RepresentationKind: String, Codable, Sendable { case original, current }
-public struct RepresentationKey: Codable, Equatable, Sendable {
+public struct RepresentationKey: Codable, Hashable, Sendable {
     public let assetID: String
     public let kind: RepresentationKind
     public init(assetID: String, kind: RepresentationKind) { self.assetID = assetID; self.kind = kind }

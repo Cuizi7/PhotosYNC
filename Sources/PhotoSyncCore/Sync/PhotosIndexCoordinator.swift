@@ -9,6 +9,10 @@ public actor PhotosIndexCoordinator {
     private let configuration: DedupConfiguration
     private var observer: Task<Void, Never>?
     private var started = false, paused = false, reconciling = false, processing = false
+    private var pendingDelta: PhotosIndexDelta?
+    private var pendingReinsertedIDs = Set<String>()
+    private var reconciledContext: LibraryContext?
+    private var applyingDelta = false
     private var needsReconciliation = true
     private var forceCacheInvalidation = true
     private var changeSerial: UInt64 = 0
@@ -32,7 +36,7 @@ public actor PhotosIndexCoordinator {
     public func reconcile() async throws {
         guard !paused else { throw CancellationError() }
         guard !reconciling else { throw PhotoKitGatewayError.libraryChanged }
-        reconciling = true; acknowledgedGeneration = nil
+        reconciling = true; acknowledgedGeneration = nil; pendingDelta = nil; pendingReinsertedIDs.removeAll()
         let startedAt = ProcessInfo.processInfo.systemUptime
         var counts = IndexMutationCounts()
         var complete = false
@@ -51,7 +55,7 @@ public actor PhotosIndexCoordinator {
                 observer = Task { [weak self] in
                     for await event in events {
                         guard !Task.isCancelled else { break }
-                        await self?.observe(event)
+                        await self?.libraryChanged(event)
                     }
                 }
                 if let checkpoint = try await store.libraryResumeCheckpoint() {
@@ -64,6 +68,7 @@ public actor PhotosIndexCoordinator {
             var offset = 0
             var generation: Int64?
             var eligibleAssets = Set<String>(), excludedAssets = Set<String>()
+            var seenKeys = Set<RepresentationKey>()
             var context: LibraryContext?
             var allInvalidated = false
             repeat {
@@ -92,6 +97,7 @@ public actor PhotosIndexCoordinator {
                 }
                 let mutations = try await store.upsertRepresentations(page.descriptors, generation: current)
                 counts.added += mutations.added; counts.changed += mutations.changed
+                seenKeys.formUnion(page.descriptors.map(\.key))
                 eligibleAssets.formUnion(page.descriptors.map { $0.key.assetID })
                 excludedAssets.formUnion(page.exclusions.map { $0.descriptor.key.assetID })
                 if let next = page.nextOffset {
@@ -103,8 +109,8 @@ public actor PhotosIndexCoordinator {
             guard latest.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
             // Commit continuity even when the long initial fingerprint build is
             // unfinished; this checkpoint proves inventory history, never readiness.
-            guard let finish = try await store.finishIndexReconciliation(generation: generation!, checkpoint: checkpoint,
-                excludedAssets: excludedAssets.subtracting(eligibleAssets).count) else { throw PhotoKitGatewayError.libraryChanged }
+            guard let finish = try await store.finishIndexReconciliation(generation: generation!, seenKeys: seenKeys, checkpoint: checkpoint,
+                excludedAssetIDs: excludedAssets.subtracting(eligibleAssets)) else { throw PhotoKitGatewayError.libraryChanged }
             counts.deleted += finish.deleted
             complete = true
             let retainedCloudFailures = try await store.currentFailedRepresentations(Array(cloudWaiting.values),
@@ -113,7 +119,7 @@ public actor PhotosIndexCoordinator {
             let after = try await photos.candidateSnapshot()
             guard after.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
             needsReconciliation = false; forceCacheInvalidation = false
-            reconciledGeneration = snapshot.generation; issue = nil
+            reconciledGeneration = snapshot.generation; reconciledContext = context; issue = nil
             cloudWaiting = Dictionary(uniqueKeysWithValues: retainedCloudFailures.map { (Self.waitKey($0), $0) })
             try await publishIfComplete()
         } catch {
@@ -135,23 +141,29 @@ public actor PhotosIndexCoordinator {
             }
         }
         do {
-            if needsReconciliation { try await reconcile() }
+            try await updateInventory()
             guard !paused, !needsReconciliation, !reconciling else { return }
             while !paused && !needsReconciliation && !reconciling {
+                try await updateInventory()
+                guard !paused, !needsReconciliation, !reconciling, pendingDelta == nil else { break }
                 // Serial consumer keeps physical image/model concurrency at one,
                 // below every configured limit. Polling itself never claims work.
                 let tasks = try await store.nextRepresentationTasks(now: now,
                     limit: min(configuration.resources.catalogBatchSize, configuration.resources.maxInFlightTasks))
                 guard !tasks.isEmpty else { break }
+                let batchGeneration = reconciledGeneration
                 for task in tasks {
-                    guard !paused, !needsReconciliation, !reconciling else { break }
+                    guard !paused, !needsReconciliation, !reconciling, pendingDelta == nil, reconciledGeneration == batchGeneration else { break }
                     let expected = reconciledGeneration
                     let snapshot = try await photos.candidateSnapshot()
                     // Snapshot acquisition suspends this actor. Admit no new
                     // physical work if pause or reconciliation changed meanwhile.
                     guard !paused, !needsReconciliation, !reconciling,
                           reconciledGeneration == expected else { break }
-                    guard snapshot.generation == expected else { needsReconciliation = true; acknowledgedGeneration = nil; break }
+                    guard snapshot.generation == expected else {
+                        if pendingDelta == nil { needsReconciliation = true }
+                        acknowledgedGeneration = nil; break
+                    }
                     // An unstructured owned Task does not inherit later caller
                     // cancellation. Pause cannot cancel already-started consumers.
                     let photos = photos, model = fingerprinter, diagnostics = diagnostics
@@ -191,17 +203,21 @@ public actor PhotosIndexCoordinator {
                     let waitKey = Self.waitKey(task.descriptor)
                     do {
                         let fingerprint = try await work.value
+                        // Resolve observed changes before deciding whether this *task* is stale.
+                        // SQLite issuance/descriptor checks accept unaffected work across generations.
+                        if !paused { try await updateInventory() }
                         let latest = try await photos.candidateSnapshot()
-                        guard !needsReconciliation, !reconciling, latest.generation == expected else {
-                            needsReconciliation = true; acknowledgedGeneration = nil; continue
+                        guard !needsReconciliation, !reconciling, pendingDelta == nil,
+                              latest.generation == reconciledGeneration else {
+                            acknowledgedGeneration = nil; continue
                         }
                         if try await store.completeRepresentation(task, fingerprint: fingerprint) {
                             completed += 1; cloudWaiting.removeValue(forKey: waitKey)
                         }
                     } catch {
                         let latest = try? await photos.candidateSnapshot()
-                        if needsReconciliation || reconciling || latest?.generation != expected {
-                            needsReconciliation = true; acknowledgedGeneration = nil
+                        if needsReconciliation || reconciling || pendingDelta != nil || latest?.generation != reconciledGeneration {
+                            if pendingDelta == nil { needsReconciliation = true }; acknowledgedGeneration = nil
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
                             let delay = delays[min(task.retryCount, delays.count - 1)]
@@ -247,17 +263,17 @@ public actor PhotosIndexCoordinator {
     }
 
     public func readyToken() async throws -> IndexToken? {
-        guard !needsReconciliation, !reconciling, let acknowledgedGeneration else { return nil }
+        guard !needsReconciliation, !reconciling, !applyingDelta, pendingDelta == nil, let acknowledgedGeneration else { return nil }
         guard let publication = try await store.indexReadiness(),
               publication.token.photosGeneration == acknowledgedGeneration,
               try await store.indexIsReady(token: publication.token) else { return nil }
         let snapshot = try await photos.candidateSnapshot()
         if snapshot.generation != acknowledgedGeneration {
-            needsReconciliation = true; self.acknowledgedGeneration = nil
+            if pendingDelta == nil { needsReconciliation = true }; self.acknowledgedGeneration = nil
             try await store.invalidateIndexPublication()
             return nil
         }
-        guard !needsReconciliation, !reconciling,
+        guard !needsReconciliation, !reconciling, pendingDelta == nil,
               self.acknowledgedGeneration == acknowledgedGeneration else { return nil }
         return publication.token
     }
@@ -266,21 +282,84 @@ public actor PhotosIndexCoordinator {
         "\(descriptor.key.assetID.utf8.count):\(descriptor.key.assetID):\(descriptor.key.kind.rawValue)"
     }
 
-    private func observe(_ event: PhotosIndexChange) async {
-        changeSerial &+= 1; needsReconciliation = true; acknowledgedGeneration = nil
+    /// Both runtime wakeups and this actor's subscription may deliver the same event.
+    /// A fully covered incremental delivery is idempotent; gaps/overlap/overflow are full.
+    public func libraryChanged(_ event: PhotosIndexChange) async {
+        if case .incremental(let delta) = event, delta.isValid,
+           delta.changedAssetIDs.count + delta.deletedAssetIDs.count <= configuration.resources.catalogBatchSize {
+            let through = pendingDelta?.toGeneration ?? reconciledGeneration
+            if delta.context == reconciledContext, let through, delta.toGeneration <= through { return }
+        }
+        changeSerial &+= 1; acknowledgedGeneration = nil
+        switch event {
+        case .incremental(let delta):
+            if !needsReconciliation, !reconciling, delta.isValid, delta.context == reconciledContext,
+               delta.fromGeneration == (pendingDelta?.toGeneration ?? reconciledGeneration) {
+                pendingReinsertedIDs.formUnion(Set(pendingDelta?.deletedAssetIDs ?? []).intersection(delta.changedAssetIDs))
+                var changed = Set(pendingDelta?.changedAssetIDs ?? [])
+                var deleted = Set(pendingDelta?.deletedAssetIDs ?? [])
+                changed.subtract(delta.deletedAssetIDs); deleted.formUnion(delta.deletedAssetIDs)
+                deleted.subtract(delta.changedAssetIDs); changed.formUnion(delta.changedAssetIDs)
+                if changed.count + deleted.count <= configuration.resources.catalogBatchSize {
+                    pendingDelta = .init(context: delta.context, fromGeneration: pendingDelta?.fromGeneration ?? delta.fromGeneration,
+                        toGeneration: delta.toGeneration, changedAssetIDs: changed.sorted(), deletedAssetIDs: deleted.sorted())
+                } else { pendingDelta = nil; pendingReinsertedIDs.removeAll(); needsReconciliation = true }
+            } else { pendingDelta = nil; pendingReinsertedIDs.removeAll(); needsReconciliation = true }
+        case .fullReconcileRequired, .contextInvalidated:
+            pendingDelta = nil; pendingReinsertedIDs.removeAll(); needsReconciliation = true
+        }
         try? await store.invalidateIndexPublication()
+    }
+
+    private func updateInventory() async throws {
+        guard !paused, !applyingDelta else { return }
+        if needsReconciliation { try await reconcile(); return }
+        guard let delta = pendingDelta else { return }
+        applyingDelta = true
+        defer { applyingDelta = false }
+        let serial = changeSerial
+        let reinserted = pendingReinsertedIDs
+        do {
+            let checkpoint = try await photos.contextCheckpoint()
+            guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
+            let page = try await photos.representationDelta(delta)
+            guard !paused, serial == changeSerial,
+                  page.descriptors.count + page.exclusions.count <= configuration.resources.catalogBatchSize else { throw PhotoKitGatewayError.libraryChanged }
+            let effectivePage = RepresentationPage(context: page.context, generation: page.generation, descriptors: page.descriptors,
+                nextOffset: page.nextOffset, exclusions: page.exclusions,
+                invalidatedAssetIDs: Set(page.invalidatedAssetIDs).union(reinserted.intersection(delta.changedAssetIDs)).sorted(),
+                invalidateAllCachedRepresentations: page.invalidateAllCachedRepresentations)
+            _ = try await store.applyIndexDelta(delta, page: effectivePage,
+                fingerprintVersion: configuration.fingerprint.version, checkpoint: checkpoint)
+            guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
+            let snapshot = try await photos.candidateSnapshot()
+            guard !paused, serial == changeSerial, snapshot.generation == delta.toGeneration else { throw PhotoKitGatewayError.libraryChanged }
+            let affected = Set(delta.changedAssetIDs + delta.deletedAssetIDs)
+            let retained = try await store.currentFailedRepresentations(cloudWaiting.values.filter { affected.contains($0.key.assetID) },
+                fingerprintVersion: configuration.fingerprint.version)
+            guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
+            cloudWaiting = cloudWaiting.filter { !affected.contains($0.value.key.assetID) }
+            for descriptor in retained { cloudWaiting[Self.waitKey(descriptor)] = descriptor }
+            pendingDelta = nil; pendingReinsertedIDs.removeAll(); reconciledGeneration = delta.toGeneration; issue = nil
+        } catch {
+            pendingDelta = nil; pendingReinsertedIDs.removeAll(); needsReconciliation = true; acknowledgedGeneration = nil
+            try? await store.invalidateIndexPublication()
+            // Missing IDs, partial pages and racing generations never imply deletion.
+            // A bounded full pass is the authoritative recovery, including empty deltas.
+            if !paused { try await reconcile() } else { throw error }
+        }
     }
 
     private func publishIfComplete() async throws {
         if try await readyToken() != nil { return }
-        guard !needsReconciliation, let publication = try await store.indexPublication(),
+        guard !needsReconciliation, pendingDelta == nil, let publication = try await store.indexPublication(),
               publication.token.photosGeneration == reconciledGeneration else { return }
         let snapshot = try await photos.candidateSnapshot()
-        guard !needsReconciliation, snapshot.generation == publication.token.photosGeneration else { throw PhotoKitGatewayError.libraryChanged }
-        guard !needsReconciliation, try await store.markIndexPublished(token: publication.token) else { throw PhotoKitGatewayError.libraryChanged }
+        guard !needsReconciliation, pendingDelta == nil, snapshot.generation == publication.token.photosGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        guard !needsReconciliation, pendingDelta == nil, try await store.markIndexPublished(token: publication.token) else { throw PhotoKitGatewayError.libraryChanged }
         try await photos.acknowledgeReconciliation(expectedGeneration: publication.token.photosGeneration)
         let latest = try await photos.candidateSnapshot()
-        guard !needsReconciliation, latest.generation == publication.token.photosGeneration,
+        guard !needsReconciliation, pendingDelta == nil, latest.generation == publication.token.photosGeneration,
               try await store.indexIsReady(token: publication.token) else { throw PhotoKitGatewayError.libraryChanged }
         acknowledgedGeneration = publication.token.photosGeneration; issue = nil; cloudWaiting.removeAll()
     }

@@ -126,14 +126,14 @@ extension DedupLoggingTests {
         let first = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
         let initial = try await store.upsertRepresentations([descriptor("a"), descriptor("b")], generation: first)
         XCTAssertEqual(initial.added, 2); XCTAssertEqual(initial.changed, 0)
-        let firstEnd = try await store.finishIndexReconciliation(generation: first)
+        let firstEnd = try await store.finishIndexReconciliation(generation: first, seenKeys: Set(([descriptor("a"), descriptor("b")]).map(\.key)))
         XCTAssertEqual(firstEnd?.deleted, 0)
         let second = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
         let changes = try await store.upsertRepresentations([descriptor("a", revision: "two"), descriptor("c")], generation: second)
         XCTAssertEqual(changes.added, 1); XCTAssertEqual(changes.changed, 1)
-        let secondEnd = try await store.finishIndexReconciliation(generation: second)
+        let secondEnd = try await store.finishIndexReconciliation(generation: second, seenKeys: Set(([descriptor("a", revision: "two"), descriptor("c")]).map(\.key)))
         XCTAssertEqual(secondEnd?.deleted, 1)
-        let stale = try await store.finishIndexReconciliation(generation: first)
+        let stale = try await store.finishIndexReconciliation(generation: first, seenKeys: Set(([descriptor("a"), descriptor("b")]).map(\.key)))
         XCTAssertNil(stale, "Stale finalization must not manufacture committed zero counts")
     }
 }

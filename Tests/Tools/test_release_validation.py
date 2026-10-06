@@ -204,6 +204,18 @@ class ReleaseValidationTests(unittest.TestCase):
                 self.assertFalse((output_dir / "validation.json").exists())
                 self.assertFalse((output_dir / "validation-report.md").exists())
 
+    def test_validator_rejects_missing_or_false_delta_path_evidence(self) -> None:
+        for mode in ("false", "missing"):
+            with self.subTest(mode=mode):
+                output_dir = Path(self.temporary_directory.name) / f"delta-{mode}"
+                result = self.fixture.run_validator(
+                    output_dir,
+                    Path(self.temporary_directory.name) / f"delta-derived-{mode}",
+                    FAKE_SCALE_DELTA=mode,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((output_dir / "validation.json").exists())
+
     def test_validator_build_failure_stops_before_xctest_and_never_marks_success(self) -> None:
         output_dir = Path(self.temporary_directory.name) / "validation"
         result = self.fixture.run_validator(
@@ -452,7 +464,12 @@ if [ -n "${PHOTOSYNC_SCALE_REPRESENTATIONS:-}" ]; then
     false) readiness=',"index_change_ready_within_2s":false' ;;
     missing) readiness='' ;;
   esac
-  printf '{"representations":%s,"success_history_vectors":%s,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}]%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  delta=',"delta_path_verified":true'
+  case "${FAKE_SCALE_DELTA:-true}" in
+    false) delta=',"delta_path_verified":false' ;;
+    missing) delta='' ;;
+  esac
+  printf '{"representations":%s,"success_history_vectors":%s,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}],"index_change_sample_count_per_operation":5,"query_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":0},"unchanged_full_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":3},"idle_60s":{"elapsed_seconds":60,"after":{"footprint_bytes":1,"rss_bytes":1},"resume_query_ms":1}%s%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" "$delta" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
   printf "Test Suite 'Selected tests' passed at fixture.\\n"
   printf 'Executed 1 test, with 0 failures\\n'
   exit 0

@@ -80,6 +80,7 @@ actor SyncRuntime {
     private var changeObserver: Task<Void, Never>?
     private var advancedLoadAttempted = false
     private var changePending = false
+    private var indexEventPending = false
     private var pendingAdvancedScan = false
     private var nextProgressAt: Date?
     private var publishedProgress: IndexProgress?
@@ -502,13 +503,13 @@ actor SyncRuntime {
     }
 
     private func libraryChanged(_ event: PhotosIndexChange) async {
-        changePending = true
+        indexEventPending = true
+        await advancedGraph?.coordinator.libraryChanged(event)
         let name: String, count: Int?
         switch event {
-        case .assetsChanged(let ids): name = "assetsChanged"; count = ids.count
-        case .assetsDeleted(let ids): name = "assetsDeleted"; count = ids.count
-        case .fullReconcileRequired: name = "fullReconcileRequired"; count = nil
-        case .contextInvalidated: name = "contextInvalidated"; count = nil
+        case .incremental(let delta): name = "incremental"; count = delta.changedAssetIDs.count + delta.deletedAssetIDs.count
+        case .fullReconcileRequired: name = "fullReconcileRequired"; count = nil; changePending = true
+        case .contextInvalidated: name = "contextInvalidated"; count = nil; changePending = true
         }
         var fields = ["phase": "index-trigger", "trigger": "photos-event", "event": name, "unit": "eventAssetIDs"]
         fields["count"] = count.map(String.init)
@@ -527,6 +528,7 @@ actor SyncRuntime {
             return
         }
         if reconcile { changePending = false }
+        indexEventPending = false
         advancedWork = Task { await self.runAdvancedWork(graph, reconcile: reconcile) }
     }
 
@@ -567,7 +569,7 @@ actor SyncRuntime {
         advancedWork = nil
         // A change delivered while busy is coalesced into one fresh batch. Zero legacy
         // reopens never marks that durable queue complete; the next existing tick retries it.
-        if changePending { await tick() }
+        if changePending || indexEventPending { await tick() }
         else if pendingAdvancedScan && round == nil { await tick(includeAdvanced: false) }
     }
 }

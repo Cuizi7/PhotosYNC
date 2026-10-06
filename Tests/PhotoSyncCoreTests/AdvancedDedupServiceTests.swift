@@ -30,6 +30,30 @@ final class AdvancedDedupServiceTests: XCTestCase {
         let sameAgain = try await worker.processBatch(limit: c.resources.catalogBatchSize); XCTAssertEqual(sameAgain, 0)
     }
 
+    func testDeltaPublishesNewDimensionsAndRejectsPreviousAdmission() async throws {
+        let f = try await fixture(); try await ready(f, candidates: [("asset", .original, 1, 8)])
+        let previous = try await admission(f); XCTAssertEqual(previous.evidence.evaluation.action, .skip)
+        let smaller = RepresentationDescriptor(key: .init(assetID: "asset", kind: .original), context: f.photos.context,
+            revision: "r2", size: try PixelSize(width: 1, height: 1), equivalentToOriginal: false, revisionIsReliable: true)
+        let delta = await f.photos.advance([smaller], changed: ["asset"])
+        await f.coordinator.libraryChanged(.incremental(delta))
+        let stale = try await f.store.commitAdvancedSkip(previous); XCTAssertFalse(stale)
+        await f.coordinator.processDueWork(now: Date())
+        let tasks = try await f.store.nextRepresentationTasks(now: Date().addingTimeInterval(100), limit: 1)
+        let task = try XCTUnwrap(tasks.first)
+        XCTAssertEqual(task.descriptor.size, smaller.size)
+        let completed = try await f.store.completeRepresentation(task, fingerprint: fingerprint(f.configuration, score: 1)); XCTAssertTrue(completed)
+        await f.coordinator.processDueWork(now: Date())
+        let after = try await admission(f)
+        XCTAssertEqual(after.evidence.evaluation.action, .importFile)
+        XCTAssertEqual(after.evidence.decisiveCandidates.first?.size, smaller.size)
+        let deleted = await f.photos.advance([], deleted: ["asset"])
+        await f.coordinator.libraryChanged(.incremental(deleted)); await f.coordinator.processDueWork(now: Date())
+        let missing = try await admission(f)
+        XCTAssertEqual(missing.evidence.evaluation.reason, .noMatch)
+        XCTAssertEqual(missing.evidence.evaluation.action, .importFile)
+    }
+
     func testDifferentFilenameStillMatches() async throws {
         let f = try await fixture(); try await ready(f, candidates: [("unrelated-name", .original, 1, 8)])
         let admission = try await admission(f)
@@ -445,6 +469,13 @@ private actor AdmissionPhotos: PhotosIndexGateway {
     }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { _ in } }
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage { .init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil) }
+    func advance(_ descriptors: [RepresentationDescriptor], changed: [String] = [], deleted: [String] = []) -> PhotosIndexDelta {
+        let from = generation; generation += 1; self.descriptors = descriptors
+        return .init(context: context, fromGeneration: from, toGeneration: generation, changedAssetIDs: changed, deletedAssetIDs: deleted)
+    }
+    func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        .init(context: context, generation: generation, descriptors: descriptors.filter { delta.changedAssetIDs.contains($0.key.assetID) }, nextOffset: nil)
+    }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation { throw PhotoKitGatewayError.libraryUnavailable }
     func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String { createCount += 1; return "never" }
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }

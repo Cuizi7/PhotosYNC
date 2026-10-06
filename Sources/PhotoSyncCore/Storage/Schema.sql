@@ -53,7 +53,11 @@ CREATE TABLE photos_representation (
  CHECK((width IS NULL AND height IS NULL) OR (width > 0 AND height > 0)),
  CHECK(vector IS NULL OR length(vector) = 4096)
 );
-CREATE INDEX photos_representation_readiness ON photos_representation(context_id,context_epoch,seen_generation,state,fingerprint_version,(vector IS NULL)) WHERE tombstoned=0;
+CREATE INDEX photos_representation_readiness ON photos_representation(context_id,context_epoch,state,fingerprint_version,(vector IS NULL),seen_generation) WHERE tombstoned=0;
+CREATE TABLE photos_index_exclusion (
+ context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
+ PRIMARY KEY(context_id, context_epoch, asset_id)
+);
 CREATE TABLE fingerprint_task (
  context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
  kind TEXT NOT NULL, revision TEXT NOT NULL, fingerprint_version TEXT NOT NULL,

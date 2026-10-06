@@ -750,7 +750,7 @@ public final class SyncStore: @unchecked Sendable {
                 CASE kind WHEN 'original' THEN 'photosOriginal' WHEN 'current' THEN 'photosCurrent' ELSE '' END,
                 width, height, vector FROM photos_representation
             WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0
-                AND seen_generation = ? AND state = 'ready' AND fingerprint_version = ?
+                AND state = 'ready' AND fingerprint_version = ?
             UNION ALL
             SELECT 'file:' || f.id,
                 CASE WHEN f.success_id IS NOT NULL THEN 'successHistory'
@@ -764,7 +764,7 @@ public final class SyncStore: @unchecked Sendable {
                  AND v.size = f.size AND v.modified_ns = f.modified_ns))
             """
         let bindings: [Binding] = [.text(token.context.id.uuidString), .int64(token.context.epoch),
-            .int64(token.indexGeneration), .text(token.fingerprintVersion), .text(fileID.uuidString),
+            .text(token.fingerprintVersion), .text(fileID.uuidString),
             .text(query.version), .int64(try int64(incoming[0]))]
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
@@ -929,10 +929,10 @@ public final class SyncStore: @unchecked Sendable {
             let kind = candidate.origin == .photosOriginal ? "original" : "current"
             row = try one("""
                 SELECT width, height FROM photos_representation WHERE context_id = ? AND context_epoch = ?
-                AND seen_generation = ? AND tombstoned = 0 AND state = 'ready' AND vector IS NOT NULL
+                AND tombstoned = 0 AND state = 'ready' AND vector IS NOT NULL
                 AND fingerprint_version = ? AND kind = ?
                 AND ('photos:' || length(CAST(asset_id AS BLOB)) || ':' || asset_id || ':' || kind) = ?
-                """, [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration),
+                """, [.text(token.context.id.uuidString), .int64(token.context.epoch),
                        .text(token.fingerprintVersion), .text(kind), .text(candidate.key)])
         case .localPending, .localImporting, .successHistory:
             guard candidate.key.hasPrefix("file:"), let id = UUID(uuidString: String(candidate.key.dropFirst(5))), id != incoming.id else { return false }
@@ -1201,94 +1201,173 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
                       try self.int64(state[7]) == 0 else { throw SyncStoreError.invalidTransition("Stale or finished reconciliation.") }
+                return try self.upsertRepresentationsSync(descriptors, state: state, generation: generation)
+            }
+        }
+    }
+
+    private func upsertRepresentationsSync(_ descriptors: [RepresentationDescriptor], state: [Value], generation: Int64) throws -> IndexMutationCounts {
+        let context = try self.libraryContext(state)
+        let version = try self.text(state[4])
+        var counts = IndexMutationCounts()
+        for descriptor in descriptors {
+            guard descriptor.context == context, !descriptor.key.assetID.isEmpty, !descriptor.revision.isEmpty else {
+                throw AdvancedDedupError.invalidConfiguration
+            }
+            let key = self.representationBindings(descriptor)
+            let previous = try self.one("SELECT revision, width, height, equivalent_to_original, revision_is_reliable, fingerprint_version, state, seen_generation, tombstoned FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+            let unchanged = try previous.map { row in
+                try descriptor.revisionIsReliable && self.int64(row[4]) != 0 &&
+                self.text(row[0]) == descriptor.revision &&
+                self.optionalInteger(row[1]) == descriptor.size.map { Int64($0.width) } &&
+                self.optionalInteger(row[2]) == descriptor.size.map { Int64($0.height) } &&
+                self.int64(row[3]) == (descriptor.equivalentToOriginal ? 1 : 0) &&
+                self.text(row[5]) == version
+            } ?? false
+            let previouslyRemoved = try previous.map { try self.int64($0[8]) != 0 } ?? false
+            if previous == nil || previouslyRemoved {
+                counts.added += 1
+            } else if !unchanged { counts.changed += 1 }
+            if !unchanged {
+                try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                try self.execute("""
+                    INSERT INTO photos_representation (context_id, context_epoch, asset_id, kind, revision, width, height,
+                    equivalent_to_original, revision_is_reliable, seen_generation, state, fingerprint_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    ON CONFLICT(context_id, context_epoch, asset_id, kind) DO UPDATE SET revision = excluded.revision,
+                    width = excluded.width, height = excluded.height, equivalent_to_original = excluded.equivalent_to_original,
+                    revision_is_reliable = excluded.revision_is_reliable, seen_generation = excluded.seen_generation,
+                    state = 'pending', fingerprint_version = excluded.fingerprint_version, vector = NULL, tombstoned = 0
+                    """, key + [.text(descriptor.revision), descriptor.size.map { .int64(Int64($0.width)) } ?? .null,
+                                 descriptor.size.map { .int64(Int64($0.height)) } ?? .null,
+                                 .int64(descriptor.equivalentToOriginal ? 1 : 0), .int64(descriptor.revisionIsReliable ? 1 : 0),
+                                 .int64(generation), .text(version)])
+            }
+            // Unchanged tasks retain issuance identity and retry facts across publications.
+            let ready = try self.one("SELECT state FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+            if !unchanged || !previouslyRemoved, try ready.map({ try self.text($0[0]) }) != "ready" {
+                try self.execute("""
+                    INSERT INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(context_id, context_epoch, asset_id, kind, revision, fingerprint_version)
+                    DO NOTHING
+                    """, key + [.text(descriptor.revision), .text(version), .int64(generation)])
+            }
+        }
+        return counts
+    }
+
+
+    @discardableResult
+    public func finishIndexReconciliation(generation: Int64, seenKeys: Set<RepresentationKey>,
+                                          checkpoint: LibraryResumeCheckpoint? = nil,
+                                          excludedAssetIDs: Set<String> = []) async throws -> IndexMutationCounts? {
+        try await perform {
+            try self.transaction {
+                guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
+                      try self.int64(state[7]) == 0 else { return nil }
                 let context = try self.libraryContext(state)
-                let version = try self.text(state[4])
-                var counts = IndexMutationCounts()
-                for descriptor in descriptors {
-                    guard descriptor.context == context, !descriptor.key.assetID.isEmpty, !descriptor.revision.isEmpty else {
-                        throw AdvancedDedupError.invalidConfiguration
-                    }
-                    let key = self.representationBindings(descriptor)
-                    let previous = try self.one("SELECT revision, width, height, equivalent_to_original, revision_is_reliable, fingerprint_version, state, seen_generation, tombstoned FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
-                    let unchanged = try previous.map { row in
-                        try descriptor.revisionIsReliable && self.int64(row[4]) != 0 &&
-                        self.text(row[0]) == descriptor.revision &&
-                        self.optionalInteger(row[1]) == descriptor.size.map { Int64($0.width) } &&
-                        self.optionalInteger(row[2]) == descriptor.size.map { Int64($0.height) } &&
-                        self.int64(row[3]) == (descriptor.equivalentToOriginal ? 1 : 0) &&
-                        self.text(row[5]) == version
-                    } ?? false
-                    let previouslyRemoved = try previous.map { try self.int64($0[8]) != 0 } ?? false
-                    if previous == nil || previouslyRemoved {
-                        counts.added += 1
-                    } else if !unchanged { counts.changed += 1 }
-                    if unchanged {
-                        try self.execute("UPDATE photos_representation SET seen_generation = ?, tombstoned = 0 WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.int64(generation)] + key)
-                    } else {
-                        try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
-                        try self.execute("""
-                            INSERT INTO photos_representation (context_id, context_epoch, asset_id, kind, revision, width, height,
-                            equivalent_to_original, revision_is_reliable, seen_generation, state, fingerprint_version)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-                            ON CONFLICT(context_id, context_epoch, asset_id, kind) DO UPDATE SET revision = excluded.revision,
-                            width = excluded.width, height = excluded.height, equivalent_to_original = excluded.equivalent_to_original,
-                            revision_is_reliable = excluded.revision_is_reliable, seen_generation = excluded.seen_generation,
-                            state = 'pending', fingerprint_version = excluded.fingerprint_version, vector = NULL, tombstoned = 0
-                            """, key + [.text(descriptor.revision), descriptor.size.map { .int64(Int64($0.width)) } ?? .null,
-                                         descriptor.size.map { .int64(Int64($0.height)) } ?? .null,
-                                         .int64(descriptor.equivalentToOriginal ? 1 : 0), .int64(descriptor.revisionIsReliable ? 1 : 0),
-                                         .int64(generation), .text(version)])
-                    }
-                    // Retried work remains a fact; move it to the newly issued generation only after it was seen.
-                    let ready = try self.one("SELECT state FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
-                    if try ready.map({ try self.text($0[0]) }) != "ready" {
-                        try self.execute("""
-                            INSERT INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(context_id, context_epoch, asset_id, kind, revision, fingerprint_version)
-                            DO UPDATE SET generation = excluded.generation
-                            """, key + [.text(descriptor.revision), .text(version), .int64(generation)])
-                    }
-                }
+                try self.validateCheckpoint(checkpoint, context: context, photosGeneration: Int(self.int64(state[5])))
+                let counts = try self.finishRepresentationKeys(seenKeys, context: context, generation: generation, assetIDs: nil)
+                try self.updateExclusions(excludedAssetIDs, context: context, affectedIDs: nil)
+                try self.finishInventory(checkpoint: checkpoint, context: context)
                 return counts
             }
         }
     }
 
-    @discardableResult
-    public func finishIndexReconciliation(generation: Int64, checkpoint: LibraryResumeCheckpoint? = nil, excludedAssets: Int = 0) async throws -> IndexMutationCounts? {
-        guard excludedAssets >= 0 else { throw AdvancedDedupError.invalidConfiguration }
-        return try await perform {
+    /// Apply one complete, continuous Photos transaction; missing ID fetches never prove deletion.
+    public func applyIndexDelta(_ delta: PhotosIndexDelta, page: RepresentationPage,
+                                fingerprintVersion: String, checkpoint: LibraryResumeCheckpoint?) async throws -> Int64 {
+        try await perform {
             try self.transaction {
-                guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
-                      try self.int64(state[7]) == 0 else { return nil }
-                var counts = IndexMutationCounts()
-                let context = try self.libraryContext(state)
-                if let checkpoint, checkpoint.context != context { throw AdvancedDedupError.invalidConfiguration }
-                let key: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .int64(generation)]
-                // A proven equivalent current slot shares the original vector. Only
-                // coalesce when that original is eligible in this complete inventory.
-                try self.execute("""
-                    UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ?
-                    AND tombstoned = 0 AND kind = 'current' AND equivalent_to_original = 1 AND seen_generation = ?
-                    AND EXISTS (SELECT 1 FROM photos_representation original WHERE original.context_id = photos_representation.context_id
-                    AND original.context_epoch = photos_representation.context_epoch AND original.asset_id = photos_representation.asset_id
-                    AND original.kind = 'original' AND original.seen_generation = photos_representation.seen_generation AND original.tombstoned = 0)
-                    """, key)
-                counts.deleted += Int(sqlite3_changes(self.database))
-                try self.execute("UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ? AND seen_generation <> ? AND tombstoned = 0", key)
-                counts.deleted += Int(sqlite3_changes(self.database))
-                try self.execute("""
-                    DELETE FROM fingerprint_task WHERE EXISTS (SELECT 1 FROM photos_representation r
-                    WHERE r.context_id = fingerprint_task.context_id AND r.context_epoch = fingerprint_task.context_epoch
-                    AND r.asset_id = fingerprint_task.asset_id AND r.kind = fingerprint_task.kind AND r.tombstoned = 1)
-                    """)
-                let data = try checkpoint.map { try JSONEncoder().encode($0) }
-                try self.execute("UPDATE dedup_index_state SET reconciliation_complete = 1, reconcile_cursor = NULL, resume_checkpoint = ?, excluded_assets = ? WHERE id = 1",
-                                 [data.map(Binding.blob) ?? .null, .int64(Int64(excludedAssets))])
-                return counts
+                guard delta.isValid, let state = try self.indexStateRow(),
+                      try self.libraryContext(state) == delta.context, try self.int64(state[7]) != 0,
+                      try self.int64(state[5]) == Int64(delta.fromGeneration),
+                      try self.text(state[4]) == fingerprintVersion,
+                      page.context == delta.context, page.generation == delta.toGeneration,
+                      page.nextOffset == nil, !page.invalidateAllCachedRepresentations else {
+                    throw PhotoKitGatewayError.libraryChanged
+                }
+                let changed = Set(delta.changedAssetIDs)
+                let facts = page.descriptors + page.exclusions.map(\.descriptor)
+                guard facts.allSatisfy({ $0.context == delta.context && changed.contains($0.key.assetID) }),
+                      Set(facts.map { $0.key.assetID }) == changed,
+                      Set(facts.map(\.key)).count == facts.count,
+                      Set(page.invalidatedAssetIDs).isSubset(of: changed) else { throw PhotoKitGatewayError.libraryChanged }
+                try self.validateCheckpoint(checkpoint, context: delta.context, photosGeneration: delta.toGeneration)
+                let generation = try self.int64(state[2]) + 1
+                try self.execute("UPDATE dedup_index_state SET generation = ?, photos_generation = ?, published_generation = NULL WHERE id = 1",
+                                 [.int64(generation), .int64(Int64(delta.toGeneration))])
+                try self.invalidateRepresentationsSync(assetIDs: page.invalidatedAssetIDs, state: state, generation: generation)
+                _ = try self.upsertRepresentationsSync(page.descriptors, state: state, generation: generation)
+                let affected = changed.union(delta.deletedAssetIDs)
+                let seen = Set(page.descriptors.map(\.key))
+                _ = try self.finishRepresentationKeys(seen, context: delta.context, generation: generation, assetIDs: affected)
+                let excluded = Set(page.exclusions.map { $0.descriptor.key.assetID }).subtracting(seen.map(\.assetID))
+                try self.updateExclusions(excluded, context: delta.context, affectedIDs: affected)
+                try self.finishInventory(checkpoint: checkpoint, context: delta.context)
+                self.publishedIndexToken = nil
+                return generation
             }
         }
+    }
+
+    private func validateCheckpoint(_ checkpoint: LibraryResumeCheckpoint?, context: LibraryContext, photosGeneration: Int) throws {
+        if let checkpoint {
+            guard checkpoint.context == context, checkpoint.photosGeneration == photosGeneration else {
+                throw PhotoKitGatewayError.libraryChanged
+            }
+        }
+    }
+
+    /// Only lightweight keys/flags are visited, never vectors or a second durable inventory.
+    private func finishRepresentationKeys(_ seen: Set<RepresentationKey>, context: LibraryContext,
+                                          generation: Int64, assetIDs: Set<String>?) throws -> IndexMutationCounts {
+        let base: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
+        let sql = "SELECT asset_id, kind, equivalent_to_original, tombstoned FROM photos_representation WHERE context_id = ? AND context_epoch = ?"
+        let records = try assetIDs.map { ids in
+            try ids.sorted().flatMap { try rows(sql + " AND asset_id = ?", base + [.text($0)]) }
+        } ?? rows(sql, base)
+        var counts = IndexMutationCounts()
+        for row in records {
+            guard let kind = RepresentationKind(rawValue: try text(row[1])) else { throw AdvancedDedupError.invalidConfiguration }
+            let key = RepresentationKey(assetID: try text(row[0]), kind: kind)
+            let coalesced = try kind == .current && int64(row[2]) != 0 && seen.contains(.init(assetID: key.assetID, kind: .original))
+            let keep = seen.contains(key) && !coalesced
+            let tombstoned = try int64(row[3]) != 0
+            let bindings = base + [.text(key.assetID), .text(kind.rawValue)]
+            if keep && tombstoned {
+                // A formerly coalesced/excluded slot becomes independently eligible again.
+                try execute("UPDATE photos_representation SET tombstoned = 0, state = 'pending', vector = NULL, seen_generation = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.int64(generation)] + bindings)
+                try execute("INSERT OR REPLACE INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation) SELECT context_id, context_epoch, asset_id, kind, revision, fingerprint_version, seen_generation FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", bindings)
+            } else if !keep && !tombstoned {
+                try execute("UPDATE photos_representation SET tombstoned = 1 WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", bindings)
+                try execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", bindings)
+                counts.deleted += 1
+            }
+        }
+        return counts
+    }
+
+    private func updateExclusions(_ excluded: Set<String>, context: LibraryContext, affectedIDs: Set<String>?) throws {
+        let base: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
+        let sql = "SELECT asset_id FROM photos_index_exclusion WHERE context_id = ? AND context_epoch = ?"
+        let existing = try Set((affectedIDs.map { ids in
+            try ids.sorted().flatMap { try rows(sql + " AND asset_id = ?", base + [.text($0)]) }
+        } ?? rows(sql, base)).map { try text($0[0]) })
+        for id in existing.subtracting(excluded) {
+            try execute("DELETE FROM photos_index_exclusion WHERE context_id = ? AND context_epoch = ? AND asset_id = ?", base + [.text(id)])
+        }
+        for id in excluded.subtracting(existing) {
+            try execute("INSERT INTO photos_index_exclusion (context_id, context_epoch, asset_id) VALUES (?, ?, ?)", base + [.text(id)])
+        }
+    }
+
+    private func finishInventory(checkpoint: LibraryResumeCheckpoint?, context: LibraryContext) throws {
+        let data = try checkpoint.map { try JSONEncoder().encode($0) }
+        try execute("UPDATE dedup_index_state SET reconciliation_complete = 1, reconcile_cursor = NULL, resume_checkpoint = ?, excluded_assets = (SELECT COUNT(*) FROM photos_index_exclusion WHERE context_id = ? AND context_epoch = ?) WHERE id = 1",
+                    [data.map(Binding.blob) ?? .null, .text(context.id.uuidString), .int64(context.epoch)])
     }
 
     /// Durable history cursor belongs to a completed inventory, not vector readiness.
@@ -1307,24 +1386,29 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
                       try self.int64(state[7]) == 0 else { throw SyncStoreError.invalidTransition("Stale reconciliation invalidation.") }
-                let context = try self.libraryContext(state)
-                let base: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
-                let ids: [String?] = assetIDs.map { $0.map(Optional.some) } ?? [nil]
-                for asset in ids {
-                    let filter = "context_id = ? AND context_epoch = ?" + (asset == nil ? "" : " AND asset_id = ?")
-                    let bindings = base + (asset.map { [Binding.text($0)] } ?? [])
-                    try self.execute("UPDATE photos_representation SET state = 'pending', vector = NULL WHERE " + filter, bindings)
-                    try self.execute("DELETE FROM fingerprint_task WHERE " + filter, bindings)
-                    // Earlier pages may already have been upserted in this generation.
-                    try self.execute("""
-                        INSERT INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation)
-                        SELECT context_id, context_epoch, asset_id, kind, revision, fingerprint_version, seen_generation
-                        FROM photos_representation WHERE
-                        """ + " " + filter + " AND seen_generation = ? AND tombstoned = 0", bindings + [.int64(generation)])
-                }
+                try self.invalidateRepresentationsSync(assetIDs: assetIDs, state: state, generation: generation)
             }
         }
     }
+
+    private func invalidateRepresentationsSync(assetIDs: [String]?, state: [Value], generation: Int64) throws {
+        let context = try self.libraryContext(state)
+        let base: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
+        let ids: [String?] = assetIDs.map { $0.map(Optional.some) } ?? [nil]
+        for asset in ids {
+            let filter = "context_id = ? AND context_epoch = ?" + (asset == nil ? "" : " AND asset_id = ?")
+            let bindings = base + (asset.map { [Binding.text($0)] } ?? [])
+            try self.execute("UPDATE photos_representation SET state = 'pending', vector = NULL, seen_generation = ? WHERE " + filter, [.int64(generation)] + bindings)
+            try self.execute("DELETE FROM fingerprint_task WHERE " + filter, bindings)
+            // Earlier pages may already have been upserted in this generation.
+            try self.execute("""
+                INSERT INTO fingerprint_task (context_id, context_epoch, asset_id, kind, revision, fingerprint_version, generation)
+                SELECT context_id, context_epoch, asset_id, kind, revision, fingerprint_version, seen_generation
+                FROM photos_representation WHERE
+                """ + " " + filter + " AND tombstoned = 0", bindings)
+        }
+    }
+
 
     /// Revalidates only known classified failures after catalog reconciliation.
     /// Each input is a primary-key lookup; no inventory/vector materialization or
@@ -1335,14 +1419,14 @@ public final class SyncStore: @unchecked Sendable {
         guard !descriptors.isEmpty else { return [] }
         return try await perform {
             guard let state = try self.indexStateRow(), try self.text(state[4]) == fingerprintVersion else { return [] }
-            let context = try self.libraryContext(state), generation = try self.int64(state[2])
+            let context = try self.libraryContext(state)
             return try descriptors.filter { descriptor in
                 guard descriptor.context == context else { return false }
                 guard let row = try self.one("""
                     SELECT revision, width, height, equivalent_to_original, revision_is_reliable
                     FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?
-                    AND seen_generation = ? AND fingerprint_version = ? AND tombstoned = 0 AND state = 'failed'
-                    """, self.representationBindings(descriptor) + [.int64(generation), .text(fingerprintVersion)]) else { return false }
+                    AND fingerprint_version = ? AND tombstoned = 0 AND state = 'failed'
+                    """, self.representationBindings(descriptor) + [.text(fingerprintVersion)]) else { return false }
                 return try self.text(row[0]) == descriptor.revision &&
                     self.pixelSize(width: row[1], height: row[2]) == descriptor.size &&
                     (self.int64(row[3]) != 0) == descriptor.equivalentToOriginal &&
@@ -1359,14 +1443,14 @@ public final class SyncStore: @unchecked Sendable {
                                      totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
             }
             let context = try self.libraryContext(state)
-            let bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .int64(try self.int64(state[2]))]
+            let bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
             let row = try self.one("""
                 SELECT COUNT(*), COALESCE(SUM(state = 'ready'), 0), COALESCE(SUM(state = 'failed'), 0), COUNT(DISTINCT asset_id)
-                FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND seen_generation = ? AND tombstoned = 0
+                FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0
                 """, bindings)!
             let ready = try self.one("""
                 SELECT COUNT(*) FROM (SELECT asset_id FROM photos_representation WHERE context_id = ? AND context_epoch = ?
-                AND seen_generation = ? AND tombstoned = 0 GROUP BY asset_id HAVING MIN(state = 'ready') = 1)
+                AND tombstoned = 0 GROUP BY asset_id HAVING MIN(state = 'ready') = 1)
                 """, bindings)!
             let excludedRow = try self.one("SELECT excluded_assets FROM dedup_index_state WHERE id = 1", [])!
             let excluded = Int(try self.int64(excludedRow[0]))
@@ -1385,8 +1469,8 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
                 let token = try self.indexToken(state)
-                let row = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ?",
-                    [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)])!
+                let row = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0",
+                    [.text(token.context.id.uuidString), .int64(token.context.epoch)])!
                 return (token, Int(try self.int64(row[0])))
             }
         }
@@ -1405,16 +1489,16 @@ public final class SyncStore: @unchecked Sendable {
         guard limit > 0 else { return [] }
         return try await perform {
             guard let state = try self.indexStateRow() else { return [] }
-            let context = try self.libraryContext(state), generation = try self.int64(state[2]), version = try self.text(state[4])
+            let context = try self.libraryContext(state), version = try self.text(state[4])
             let rows = try self.rows("""
                 SELECT r.asset_id, r.kind, r.revision, r.width, r.height, r.equivalent_to_original, r.revision_is_reliable,
-                t.retry_count, t.next_retry_at FROM fingerprint_task t JOIN photos_representation r
+                t.retry_count, t.next_retry_at, t.generation FROM fingerprint_task t JOIN photos_representation r
                 ON r.context_id = t.context_id AND r.context_epoch = t.context_epoch AND r.asset_id = t.asset_id AND r.kind = t.kind
                 AND r.revision = t.revision AND r.fingerprint_version = t.fingerprint_version
-                WHERE t.context_id = ? AND t.context_epoch = ? AND t.generation = ? AND t.fingerprint_version = ?
-                AND r.tombstoned = 0 AND r.seen_generation = ? AND r.state <> 'ready'
+                WHERE t.context_id = ? AND t.context_epoch = ? AND t.fingerprint_version = ?
+                AND r.tombstoned = 0 AND r.seen_generation = t.generation AND t.generation > 0 AND t.generation <= ? AND r.state <> 'ready'
                 AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?) ORDER BY r.asset_id, r.kind LIMIT ?
-                """, [.text(context.id.uuidString), .int64(context.epoch), .int64(generation), .text(version), .int64(generation), .double(now.timeIntervalSince1970), .int64(Int64(limit))])
+                """, [.text(context.id.uuidString), .int64(context.epoch), .text(version), .int64(try self.int64(state[2])), .double(now.timeIntervalSince1970), .int64(Int64(limit))])
             return try rows.map { row in
                 guard let kind = RepresentationKind(rawValue: try self.text(row[1])) else { throw AdvancedDedupError.invalidConfiguration }
                 let descriptor = RepresentationDescriptor(key: RepresentationKey(assetID: try self.text(row[0]), kind: kind),
@@ -1422,7 +1506,7 @@ public final class SyncStore: @unchecked Sendable {
                     equivalentToOriginal: try self.int64(row[5]) != 0, revisionIsReliable: try self.int64(row[6]) != 0)
                 return RepresentationTask(descriptor: descriptor, retryCount: Int(try self.int64(row[7])),
                     nextRetryAt: self.optionalDouble(row[8]).map(Date.init(timeIntervalSince1970:)),
-                    fingerprintVersion: version, indexGeneration: generation)
+                    fingerprintVersion: version, indexGeneration: try self.int64(row[9]))
             }
         }
     }
@@ -1440,7 +1524,7 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    /// Stale failures are no-ops; retry scheduling never crosses a generation.
+    /// Stale failures are no-ops; retry state belongs to the same persisted task issuance.
     @discardableResult
     public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws -> Bool {
         try await perform {
@@ -1460,7 +1544,7 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
                 let token = try self.indexToken(state)
-                let count = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ?", [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)])!
+                let count = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0", [.text(token.context.id.uuidString), .int64(token.context.epoch)])!
                 return IndexPublication(token: token, representationCount: Int(try self.int64(count[0])))
             }
         }
@@ -1508,13 +1592,14 @@ public final class SyncStore: @unchecked Sendable {
     private func indexFactsComplete(_ row: [Value]) throws -> Bool {
         guard try int64(row[7]) != 0 else { return false }
         let context = try libraryContext(row)
-        let incomplete = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <> ? OR state <> 'ready' OR fingerprint_version <> ? OR (vector IS NULL) = 1) LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))])
+        let incomplete = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <= 0 OR seen_generation > ? OR state <> 'ready' OR fingerprint_version <> ? OR (vector IS NULL) = 1) LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))])
         guard incomplete == nil else { return false }
-        return try one("SELECT 1 FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND generation = ? AND fingerprint_version = ? LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))]) == nil
+        return try one("SELECT 1 FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch)]) == nil
     }
     private func representationTaskIsCurrent(_ task: RepresentationTask) throws -> Bool {
         guard let state = try indexStateRow(), try libraryContext(state) == task.descriptor.context,
-              try int64(state[2]) == task.indexGeneration, try text(state[4]) == task.fingerprintVersion else { return false }
+              try text(state[4]) == task.fingerprintVersion, task.indexGeneration > 0,
+              try task.indexGeneration <= int64(state[2]) else { return false }
         let row = try one("SELECT r.revision, r.seen_generation, r.tombstoned, r.width, r.height, r.equivalent_to_original, r.revision_is_reliable FROM photos_representation r JOIN fingerprint_task t ON r.context_id = t.context_id AND r.context_epoch = t.context_epoch AND r.asset_id = t.asset_id AND r.kind = t.kind AND r.revision = t.revision AND r.fingerprint_version = t.fingerprint_version WHERE r.context_id = ? AND r.context_epoch = ? AND r.asset_id = ? AND r.kind = ? AND t.generation = ?", representationBindings(task.descriptor) + [.int64(task.indexGeneration)])
         guard let row else { return false }
         return try text(row[0]) == task.descriptor.revision && int64(row[1]) == task.indexGeneration && int64(row[2]) == 0 &&
@@ -1530,8 +1615,9 @@ public final class SyncStore: @unchecked Sendable {
 
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 4 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 4 else {
+        guard version <= 5 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 5 else { return }
+        if version == 4 {
             // P1/P2 integration snapshots already use v4. Extend that unpublished
             // schema transactionally without resetting any previously stored facts.
             try transaction {
@@ -1547,7 +1633,11 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 try execute("CREATE INDEX IF NOT EXISTS advanced_evidence_file ON advanced_match_evidence(file_id)")
                 try execute("CREATE INDEX IF NOT EXISTS dedup_dependency_candidate ON dedup_dependency(candidate_file_id, file_id)")
+                try execute("DROP INDEX IF EXISTS photos_representation_readiness")
                 try execute(Self.readinessIndexSchema)
+                try execute(Self.exclusionSchema)
+                try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
+                try execute("PRAGMA user_version = 5")
                 try ensureLegacyRecheckSchema()
             }
             return
@@ -1565,7 +1655,7 @@ public final class SyncStore: @unchecked Sendable {
             }
             try execute(Self.advancedSchema)
             try ensureLegacyRecheckSchema()
-            try execute("PRAGMA user_version = 4")
+            try execute("PRAGMA user_version = 5")
         }
     }
 
@@ -1725,7 +1815,14 @@ public final class SyncStore: @unchecked Sendable {
     """
 
     private static let readinessIndexSchema = """
-    CREATE INDEX IF NOT EXISTS photos_representation_readiness ON photos_representation(context_id,context_epoch,seen_generation,state,fingerprint_version,(vector IS NULL)) WHERE tombstoned=0;
+    CREATE INDEX IF NOT EXISTS photos_representation_readiness ON photos_representation(context_id,context_epoch,state,fingerprint_version,(vector IS NULL),seen_generation) WHERE tombstoned=0;
+    """
+
+    private static let exclusionSchema = """
+    CREATE TABLE photos_index_exclusion (
+     context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
+     PRIMARY KEY(context_id, context_epoch, asset_id)
+    );
     """
 
     private static let advancedSchema = """
@@ -1748,6 +1845,7 @@ public final class SyncStore: @unchecked Sendable {
      CHECK(vector IS NULL OR length(vector) = 4096)
     );
     \(readinessIndexSchema)
+    \(exclusionSchema)
     CREATE TABLE fingerprint_task (
      context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, asset_id TEXT NOT NULL,
      kind TEXT NOT NULL, revision TEXT NOT NULL, fingerprint_version TEXT NOT NULL,

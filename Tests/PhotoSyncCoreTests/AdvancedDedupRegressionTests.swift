@@ -3,6 +3,7 @@ import CryptoKit
 import ImageIO
 import Darwin
 import SQLite3
+import TestSQLiteMetrics
 @testable import PhotoSyncCore
 
 final class AdvancedDedupRegressionTests: XCTestCase {
@@ -163,7 +164,10 @@ private func p10SQLiteSearch(query: Fingerprint, entries: [VectorEntry], configu
         let completed = try await store.completeRepresentation(task, fingerprint: fingerprint)
         XCTAssertTrue(completed)
     }
-    try await store.finishIndexReconciliation(generation: generation)
+    try await store.finishIndexReconciliation(generation: generation, seenKeys: Set((entries.map {
+        RepresentationDescriptor(key: .init(assetID: $0.key, kind: .original), context: context, revision: "fixed-replay",
+            size: $0.size, equivalentToOriginal: false, revisionIsReliable: true)
+    }).map(\.key)))
     let value = try await store.indexPublication(), publication = try XCTUnwrap(value)
     let published = try await store.markIndexPublished(token: publication.token); XCTAssertTrue(published)
     let result = try await store.vectorCandidates(for: fileID, query: query, token: publication.token,
@@ -363,6 +367,16 @@ extension AdvancedDedupRegressionTests {
         }
         let historyCount = Int(ProcessInfo.processInfo.environment["PHOTOSYNC_SCALE_HISTORY"] ?? "0") ?? 0
         guard historyCount == 0 || (count == 200000 && historyCount == 100000) else { return XCTFail("Unsupported scale fixture") }
+        try await runControlledScale(count: count, historyCount: historyCount)
+    }
+
+    /// Exercise the measurement/row-audit/restart workflow on two generated rows.
+    /// This verifies harness wiring, not any production-scale performance claim.
+    func testControlledDeltaMeasurementHarnessSmoke() async throws {
+        try await runControlledScale(count: 2, historyCount: 0)
+    }
+
+    private func runControlledScale(count: Int, historyCount: Int) async throws {
         let sampleName = historyCount == 0 ? "scale-\(count)" : "scale-\(count)-history-\(historyCount)"
         let root = try temporaryDirectory(), source = root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
@@ -378,7 +392,10 @@ extension AdvancedDedupRegressionTests {
         let resources = try DedupConfiguration.bundledResourceDirectory()
         let c = try DedupConfiguration.loadValidated(resourceDirectory: resources)
         let executor = ReadExecutor(), budget = ImageWorkBudget(limits: c.resources)
-        let db = root.appendingPathComponent("scale.sqlite"), store = try SyncStore(url: db, readExecutor: executor)
+        let db = root.appendingPathComponent("scale.sqlite")
+        let metrics = try P11SQLiteMetrics(path: db.path)
+        let store = try SyncStore(url: db, readExecutor: executor)
+        defer { withExtendedLifetime(store) { metrics.stop() } }
         let sourceID = try await store.registerSource(url: source)
         let image = try p9Image(style: 1)
         let model = P9MeasuredModel(try CoreMLFingerprinter(modelURL: resources.appendingPathComponent("SSCDLarge.mlpackage"), configuration: c.fingerprint))
@@ -396,8 +413,8 @@ extension AdvancedDedupRegressionTests {
         let seedStart = ProcessInfo.processInfo.systemUptime
         try p9SeedScale(db: db, count: count, context: context, generation: generation, seed: seed)
         let seedMS = (ProcessInfo.processInfo.systemUptime - seedStart) * 1000
-        try await store.finishIndexReconciliation(generation: generation,
-            checkpoint: LibraryResumeCheckpoint(context: context, archivedChangeToken: Data([9])))
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set((0..<count).map { RepresentationKey(assetID: "asset-\($0 % 100000)", kind: $0 < 100000 ? .original : .current) }),
+            checkpoint: LibraryResumeCheckpoint(context: context, archivedChangeToken: Data([9]), photosGeneration: 1))
         let logger = try RunLogger(directory: root.appendingPathComponent("Logs"))
         let graph = AdvancedRuntimeGraph(store: store, photos: photos, model: model, configuration: c,
             executor: executor, budget: budget, directory: { DirectoryReader(sourceID: $0, executor: executor) }, now: { Date() }, logger: logger)
@@ -433,39 +450,107 @@ extension AdvancedDedupRegressionTests {
                 }
             }
         }
-        let changeStart = ProcessInfo.processInfo.systemUptime
-        await photos.changeOne()
-        try await graph.coordinator.reconcile()
-        await graph.coordinator.processDueWork(now: Date())
-        let changedEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
-            expectedPhotosGeneration: 2, expectedRepresentations: count)
-        let changeMS = (ProcessInfo.processInfo.systemUptime - changeStart) * 1000
-        let changedReads = await photos.reads, changedCalls = await model.calls
-        XCTAssertEqual(changedReads, 1); XCTAssertEqual(changedCalls, 22)
-        let addStart = ProcessInfo.processInfo.systemUptime
-        await photos.addOne()
-        try await graph.coordinator.reconcile(); await graph.coordinator.processDueWork(now: Date())
-        let addedEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
-            expectedPhotosGeneration: 3, expectedRepresentations: count + 1)
-        let addMS = (ProcessInfo.processInfo.systemUptime - addStart) * 1000
-        let addedReads = await photos.reads, addedCalls = await model.calls
-        XCTAssertEqual(addedReads, 2); XCTAssertEqual(addedCalls, 23)
-        let deleteStart = ProcessInfo.processInfo.systemUptime
-        await photos.removeAdded()
-        try await graph.coordinator.reconcile(); await graph.coordinator.processDueWork(now: Date())
-        let deletedEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
-            expectedPhotosGeneration: 4, expectedRepresentations: count)
-        let deleteMS = (ProcessInfo.processInfo.systemUptime - deleteStart) * 1000
-        let deletedReads = await photos.reads, deletedCalls = await model.calls
-        XCTAssertEqual(deletedReads, 2); XCTAssertEqual(deletedCalls, 23)
+        let evidence = try XCTUnwrap(lastEvidence)
+        var queryTimes: [Double] = []
+        let queryBefore = try metrics.snapshot(), queryProcessBefore = try p11ProcessMetrics()
+        for _ in 0..<20 {
+            let value = try await store.indexReadiness()?.token
+            let token = try XCTUnwrap(value)
+            let start = ProcessInfo.processInfo.systemUptime
+            _ = try await store.vectorCandidates(for: evidence.fileID, query: seed, token: token, threshold: c.threshold, diagnosticLimit: 10)
+            queryTimes.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+        }
+        let queryIO = try p11MetricDifference(metrics.snapshot(), queryBefore)
+        let queryProcessIO = try p11MetricDifference(p11ProcessMetrics(), queryProcessBefore)
+        XCTAssertEqual(queryIO["vfs.write_calls"], 0)
+        var changeSamples: [String: [Double]] = [:], changeEndpoints: [String: [String: Int64]] = [:]
+        var deltaWrites: [[String: Int64]] = []
+        let deltaBefore = try metrics.snapshot(), deltaProcessBefore = try p11ProcessMetrics()
+        let filesBefore = try p11PersistentSizes(db)
+        let catalogsBefore = await photos.catalogRequests
+        for _ in 0..<5 {
+            for operation in ["edited", "added", "deleted"] {
+                let start = ProcessInfo.processInfo.systemUptime
+                let delta: PhotosIndexDelta
+                switch operation {
+                case "edited": delta = await photos.changeOne()
+                case "added": delta = await photos.addOne()
+                default: delta = await photos.removeAdded()
+                }
+                await graph.coordinator.libraryChanged(.incremental(delta))
+                await graph.coordinator.processDueWork(now: Date())
+                changeEndpoints[operation] = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
+                    expectedPhotosGeneration: delta.toGeneration, expectedRepresentations: operation == "added" ? count + 1 : count)
+                changeSamples[operation, default: []].append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+            }
+        }
+        let catalogsAfter = await photos.catalogRequests
+        XCTAssertEqual(catalogsAfter, catalogsBefore, "Timed deltas must not fall back to a catalog")
+        let deltaIO = try p11MetricDifference(metrics.snapshot(), deltaBefore)
+        let deltaProcessIO = try p11MetricDifference(p11ProcessMetrics(), deltaProcessBefore)
+        let filesAfter = try p11PersistentSizes(db)
+        let deletedCalls = await model.calls, deletedReads = await photos.reads
+        XCTAssertEqual(deletedReads, 10); XCTAssertEqual(deletedCalls, 31)
+        let stableBefore = try metrics.snapshot(), stableProcessBefore = try p11ProcessMetrics()
         let stableStart = ProcessInfo.processInfo.systemUptime
         try await graph.coordinator.reconcile()
+        var finalGeneration = await photos.generation
         let stableEndpoint = try await p9RequireReadyEndpoint(graph.coordinator, store: store,
-            expectedPhotosGeneration: 4, expectedRepresentations: count)
+            expectedPhotosGeneration: finalGeneration, expectedRepresentations: count)
         let stableMS = (ProcessInfo.processInfo.systemUptime - stableStart) * 1000
+        let stableIO = try p11MetricDifference(metrics.snapshot(), stableBefore)
+        let stableProcessIO = try p11MetricDifference(p11ProcessMetrics(), stableProcessBefore)
         let stableReads = await photos.reads, stableCalls = await model.calls
         XCTAssertEqual(stableReads, deletedReads); XCTAssertEqual(stableCalls, deletedCalls)
-        let evidence = try XCTUnwrap(lastEvidence)
+        // Separate actual row-write audit. Its trigger writes are intentionally
+        // absent from every resource/latency sample above and from idle below.
+        try p11StartRowAudit(db)
+        var auditBefore = try p11RowAudit(db)
+        let auditValue = try await store.indexReadiness()?.token
+        _ = try await store.vectorCandidates(for: evidence.fileID, query: seed, token: XCTUnwrap(auditValue), threshold: c.threshold, diagnosticLimit: 10)
+        let queryRows = try p11MetricDifference(p11RowAudit(db), auditBefore)
+        XCTAssertEqual(queryRows.values.reduce(0, +), 0)
+        for operation in ["edited", "added", "deleted"] {
+            auditBefore = try p11RowAudit(db)
+            let delta: PhotosIndexDelta
+            switch operation {
+            case "edited": delta = await photos.changeOne()
+            case "added": delta = await photos.addOne()
+            default: delta = await photos.removeAdded()
+            }
+            await graph.coordinator.libraryChanged(.incremental(delta)); await graph.coordinator.processDueWork(now: Date())
+            _ = try await p9RequireReadyEndpoint(graph.coordinator, store: store, expectedPhotosGeneration: delta.toGeneration,
+                expectedRepresentations: operation == "added" ? count + 1 : count)
+            deltaWrites.append(try p11MetricDifference(p11RowAudit(db), auditBefore))
+        }
+        auditBefore = try p11RowAudit(db)
+        try await graph.coordinator.reconcile()
+        let fullRows = try p11MetricDifference(p11RowAudit(db), auditBefore)
+        XCTAssertEqual(fullRows["rows.photos_representation"], 0); XCTAssertEqual(fullRows["rows.fingerprint_task"], 0)
+        try p11StopRowAudit(db)
+        finalGeneration = await photos.generation
+        let readsBeforeRestart = await photos.reads
+        let restartStart = ProcessInfo.processInfo.systemUptime
+        let reopened = try SyncStore(url: db, readExecutor: executor)
+        let restarted = PhotosIndexCoordinator(store: reopened, photos: photos, fingerprinter: model, configuration: c)
+        try await restarted.reconcile(); await restarted.processDueWork(now: Date())
+        let restartedEndpoint = try await p9RequireReadyEndpoint(restarted, store: reopened,
+            expectedPhotosGeneration: finalGeneration, expectedRepresentations: count)
+        let restartMS = (ProcessInfo.processInfo.systemUptime - restartStart) * 1000
+        let restartedReads = await photos.reads; XCTAssertEqual(restartedReads, readsBeforeRestart)
+        var idle: [String: Any] = [:]
+        if historyCount == 100000 {
+            let value = try await reopened.indexReadiness()?.token
+            let token = try XCTUnwrap(value)
+            _ = try await reopened.vectorCandidates(for: evidence.fileID, query: seed, token: token, threshold: c.threshold, diagnosticLimit: 10)
+            let beforeIdle = try p11ProcessMetrics(), idleStart = ProcessInfo.processInfo.systemUptime
+            try await Task.sleep(for: .seconds(60))
+            let afterIdle = try p11ProcessMetrics(), afterIdleStart = ProcessInfo.processInfo.systemUptime
+            _ = try await reopened.vectorCandidates(for: evidence.fileID, query: seed, token: token, threshold: c.threshold, diagnosticLimit: 10)
+            idle = ["elapsed_seconds": afterIdleStart - idleStart, "before": beforeIdle, "after": afterIdle,
+                "resume_query_ms": (ProcessInfo.processInfo.systemUptime - afterIdleStart) * 1000,
+                "resume_process_io": try p11MetricDifference(p11ProcessMetrics(), afterIdle)]
+        }
         for n in 0..<100000 {
             logger.logDecision(AdvancedEvidence(eventID: UUID(), fileID: UUID(), stamp: evidence.stamp,
                 token: evidence.token, policyVersion: evidence.policyVersion, evaluation: evidence.evaluation,
@@ -499,21 +584,28 @@ extension AdvancedDedupRegressionTests {
         XCTAssertLessThanOrEqual(logFiles.count, 10)
         let leases = await budget.snapshot(); XCTAssertEqual(leases.images, 0); XCTAssertEqual(leases.bytes, 0)
         let peak = p9PeakRSS(), hot95 = p9Percentiles(hot)["p95"]!, cold95 = p9Percentiles(cold)["p95"]!
-        let changeWithinBudget = max(changeMS, addMS, deleteMS) <= 2000
+        let changeWithinBudget = changeSamples.values.flatMap { $0 }.allSatisfy { $0 <= 2000 }
         // Record even a failed budget so it cannot be laundered as a missing sample.
-        try p9WriteEvidence("\(sampleName).json", ["representations": count, "synthetic_assets": 100000, "success_history_vectors": historyCount,
+        try p9WriteEvidence("\(sampleName).json", ["representations": count, "synthetic_assets": min(count, 100000), "success_history_vectors": historyCount,
             "build_configuration": ProcessInfo.processInfo.environment["PHOTOSYNC_SCALE_BUILD_CONFIGURATION"] ?? "Debug",
-            "edited_fraction": Double(count - 100000) / 100000, "scope": "actual graph; synthetic persisted vectors and fake Photos; 20 real local synthetic-image CPU-only inferences",
+            "edited_fraction": Double(max(0, count - 100000)) / Double(min(count, 100000)), "scope": "actual graph; synthetic persisted vectors and fake Photos; 20 real local synthetic-image CPU-only inferences",
             "vector_generation": "unit basis cycling 1024 dimensions with real seed every 10000 rows; no accuracy claim",
             "seed_sqlite_ms": seedMS, "catalog_and_publication_ms": publishMS,
             "source_incremental_ms": p9Percentiles(cold), "hot_preparation_ms": p9Percentiles(hot),
             "stages_ms": stages.mapValues(p9Percentiles), "hot_stages_ms": hotStages.mapValues(p9Percentiles),
-            "one_changed_catalog_inference_publication_ms": changeMS,
-            "one_added_catalog_inference_publication_ms": addMS, "one_deleted_catalog_publication_ms": deleteMS,
-            "index_change_ready_within_2s": changeWithinBudget,
-            "index_change_sample_count_per_operation": 1, "index_change_percentile_claim": false,
-            "readiness_endpoints": ["initial": initialEndpoint, "edited": changedEndpoint,
-                "added": addedEndpoint, "deleted": deletedEndpoint, "unchanged": stableEndpoint],
+            "raw_query_ms": p9Percentiles(queryTimes), "raw_query_sample_count": queryTimes.count,
+            "change_to_ready_ms": changeSamples.mapValues(p9Percentiles),
+            "one_changed_catalog_inference_publication_ms": p9Percentiles(changeSamples["edited"]!)["p95"]!,
+            "one_added_catalog_inference_publication_ms": p9Percentiles(changeSamples["added"]!)["p95"]!,
+            "one_deleted_catalog_publication_ms": p9Percentiles(changeSamples["deleted"]!)["p95"]!,
+            "index_change_ready_within_2s": changeWithinBudget, "delta_path_verified": catalogsAfter == catalogsBefore,
+            "index_change_sample_count_per_operation": 5, "index_change_percentile_claim": true,
+            "readiness_endpoints": changeEndpoints.merging(["initial": initialEndpoint, "unchanged": stableEndpoint, "restart": restartedEndpoint]) { _, rhs in rhs },
+            "restart_catalog_publication_ms": restartMS, "idle_60s": idle,
+            "query_io": queryIO.merging(queryRows) { _, rhs in rhs }, "query_process_io": queryProcessIO, "delta_io": deltaIO, "delta_process_io": deltaProcessIO,
+            "unchanged_full_io": stableIO.merging(fullRows) { _, rhs in rhs }, "unchanged_full_process_io": stableProcessIO, "per_delta_row_writes": deltaWrites,
+            "delta_file_sizes_before": filesBefore, "delta_file_sizes_after": filesAfter,
+            "io_scope": "fixture DB/sidecar VFS logical requests and process accounting; row counts from separate audit pass; resource timings have no triggers; mmap fetch sizes are not physical reads",
             "unchanged_catalog_publication_ms": stableMS, "one_changed_inferences": 1, "unchanged_inferences": stableCalls - deletedCalls,
             "large_source_samples": largeSamples, "logger_unique_files": 100000, "logger_flush_interval": 128, "persistent_fixture_bytes": bytes,
             "rss_peak_bytes": peak, "budget_pass": peak <= 4 * 1024 * 1024 * 1024 && hot95 <= 250 && cold95 <= 2000 && changeWithinBudget,
@@ -522,6 +614,35 @@ extension AdvancedDedupRegressionTests {
         XCTAssertLessThanOrEqual(hot95, 250)
         XCTAssertLessThanOrEqual(cold95, 2000)
         XCTAssertTrue(changeWithinBudget, "At least one verified Photos change-to-ready observation exceeds 2 seconds")
+    }
+
+    func testScaleResourceHooksAreReadOnlyAndCountOnlyTheFixture() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = root.appendingPathComponent("metrics.sqlite"), metrics = try P11SQLiteMetrics(path: root.appendingPathComponent("metrics.sqlite").path)
+        let store = try SyncStore(url: db)
+        defer { withExtendedLifetime(store) { metrics.stop() } }
+        let before = try metrics.snapshot()
+        let generation = try await store.beginIndexReconciliation(context: .init(id: UUID(), epoch: 0), photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
+        let written = try p11MetricDifference(metrics.snapshot(), before)
+        XCTAssertGreaterThan(written["vfs.write_bytes"] ?? 0, 0)
+        let readBefore = try metrics.snapshot()
+        _ = try await store.indexReadiness()
+        let readAfter = try p11MetricDifference(metrics.snapshot(), readBefore)
+        XCTAssertEqual(readAfter["vfs.write_calls"], 0)
+        let other = try SyncStore(url: root.appendingPathComponent("other.sqlite"))
+        let afterOther = try metrics.snapshot(); XCTAssertEqual(afterOther, try metrics.snapshot())
+        XCTAssertEqual(try p11MetricDifference(afterOther, readBefore)["vfs.write_calls"], 0)
+        withExtendedLifetime(other) {}
+        let process = try p11ProcessMetrics(); XCTAssertGreaterThan(process["footprint_bytes"] ?? 0, 0)
+        XCTAssertGreaterThan(try p11PersistentSizes(db)["database"] ?? 0, 0)
+        try p11StartRowAudit(db)
+        let auditBefore = try p11RowAudit(db)
+        let next = try await store.beginIndexReconciliation(context: .init(id: UUID(), epoch: 0), photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.finishIndexReconciliation(generation: next, seenKeys: [])
+        XCTAssertEqual(try p11MetricDifference(p11RowAudit(db), auditBefore)["rows.dedup_index_state"], 2)
+        try p11StopRowAudit(db)
     }
 
     func testReadinessEndpointRejectsAcknowledgementFailureAfterCompletedInference() async throws {
@@ -553,8 +674,8 @@ extension AdvancedDedupRegressionTests {
                 XCTFail("Readiness must match both expected generation and representation count")
             } catch FixtureError.unavailable {}
         }
-        await photos.changeOne(); await photos.setAcknowledgementFailure(true)
-        try await coordinator.reconcile()
+        let delta = await photos.changeOne(); await photos.setAcknowledgementFailure(true)
+        await coordinator.libraryChanged(.incremental(delta))
         await coordinator.processDueWork(now: Date())
         let changedCalls = await model.calls, changedReads = await photos.reads
         XCTAssertEqual(changedCalls, 2); XCTAssertEqual(changedReads, 2)
@@ -579,20 +700,30 @@ private func p9RequireReadyEndpoint(_ coordinator: PhotosIndexCoordinator, store
 
 private actor P9ScalePhotos: PhotosIndexGateway {
     let context = LibraryContext(id: UUID(), epoch: 1), count: Int, image: CGImage, budget: ImageWorkBudget
+    nonisolated let channel = PhotosIndexChangeChannel(capacity: 128)
     var generation = 1, originalRevision = 1, reads = 0, hasAdded = false, acknowledgementFails = false
+    var catalogRequests = 0
     init(count: Int, image: CGImage, budget: ImageWorkBudget) { self.count = count; self.image = image; self.budget = budget }
-    nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { _ in } }
-    func changeOne() { generation += 1; originalRevision += 1 }
-    func addOne() { generation += 1; hasAdded = true }
-    func removeAdded() { generation += 1; hasAdded = false }
+    nonisolated func changes() -> AsyncStream<PhotosIndexChange> { channel.stream() }
+    private func change(changed: [String] = [], deleted: [String] = []) -> PhotosIndexDelta {
+        let from = generation; generation += 1
+        let delta = PhotosIndexDelta(context: context, fromGeneration: from, toGeneration: generation,
+            changedAssetIDs: changed, deletedAssetIDs: deleted)
+        channel.send(.incremental(delta)); return delta
+    }
+    @discardableResult func changeOne() -> PhotosIndexDelta { originalRevision += 1; return change(changed: ["asset-0"]) }
+    @discardableResult func addOne() -> PhotosIndexDelta { hasAdded = true; return change(changed: ["added-asset"]) }
+    @discardableResult func removeAdded() -> PhotosIndexDelta { hasAdded = false; return change(deleted: ["added-asset"]) }
     func setAcknowledgementFailure(_ fails: Bool) { acknowledgementFails = fails }
     func acknowledgeReconciliation(expectedGeneration: Int) async throws {
         guard !acknowledgementFails, expectedGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
+        channel.reconciled()
     }
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot { .init(generation: generation, candidates: []) }
-    func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { .init(context: context, archivedChangeToken: Data([9])) }
+    func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { .init(context: context, archivedChangeToken: Data([9]), photosGeneration: generation) }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool { checkpoint.context == context }
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
+        catalogRequests += 1
         let total = count + (hasAdded ? 1 : 0)
         let end = min(offset + limit, total)
         let descriptors = (offset..<end).map { n in
@@ -601,6 +732,20 @@ private actor P9ScalePhotos: PhotosIndexGateway {
                 equivalentToOriginal: false, revisionIsReliable: true)
         }
         return .init(context: context, generation: generation, descriptors: descriptors, nextOffset: end < total ? end : nil)
+    }
+    func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        guard delta.context == context, delta.toGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
+        var descriptors: [RepresentationDescriptor] = []
+        for id in delta.changedAssetIDs {
+            guard id == "asset-0" || (id == "added-asset" && hasAdded) else { throw PhotoKitGatewayError.libraryChanged }
+            let kinds: [RepresentationKind] = id == "asset-0" && count > 100000 ? [.original, .current] : [.original]
+            for kind in kinds {
+                descriptors.append(.init(key: .init(assetID: id, kind: kind), context: context,
+                    revision: id == "asset-0" && kind == .original ? "r\(originalRevision)" : "r1",
+                    size: try PixelSize(width: 256, height: 256), equivalentToOriginal: false, revisionIsReliable: true))
+            }
+        }
+        return .init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil)
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         reads += 1
@@ -704,4 +849,70 @@ private func p9SeedHistory(db url: URL, count: Int, sourceID: UUID, seed: Finger
         guard sqlite3_step(vector) == SQLITE_DONE else { throw FixtureError.unavailable("history vector insert") }
     }
     guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else { throw FixtureError.unavailable("history commit") }
+}
+
+// Test-host-only VFS: logical calls for the named fixture DB/sidecars.
+// mmap fetch sizes are requested ranges, not measured resident/physical reads.
+private final class P11SQLiteMetrics {
+    init(path: String) throws {
+        let status = p11_metrics_start(path)
+        guard status == SQLITE_OK else { throw FixtureError.unavailable("SQLite fixture VFS status \(status)") }
+    }
+    func stop() { p11_metrics_stop() }
+    func snapshot() throws -> [String: Int64] {
+        let names = ["vfs.read_calls", "vfs.read_bytes", "vfs.write_calls", "vfs.write_bytes",
+            "vfs.fetch_calls", "vfs.fetch_bytes", "vfs.fetch_hits", "vfs.fetch_hit_bytes"]
+        return Dictionary(uniqueKeysWithValues: names.enumerated().map { ($0.element, Int64(p11_metrics_counter(Int32($0.offset)))) })
+    }
+}
+
+private func p11ProcessMetrics() throws -> [String: Int64] {
+    var vm = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let status = withUnsafeMutablePointer(to: &vm) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    var usage = rusage_info_v4()
+    let ioStatus = withUnsafeMutablePointer(to: &usage) { pointer in
+        pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, $0) }
+    }
+    guard status == KERN_SUCCESS, ioStatus == 0 else { throw FixtureError.unavailable("process resource accounting") }
+    return ["rss_bytes": Int64(vm.resident_size), "footprint_bytes": Int64(vm.phys_footprint),
+        "diskread_bytes": Int64(usage.ri_diskio_bytesread), "diskwritten_bytes": Int64(usage.ri_diskio_byteswritten),
+        "logical_writes": Int64(usage.ri_logical_writes), "pageins": Int64(usage.ri_pageins)]
+}
+
+private func p11MetricDifference(_ after: [String: Int64], _ before: [String: Int64]) -> [String: Int64] {
+    Dictionary(uniqueKeysWithValues: Set(after.keys).union(before.keys).map { ($0, (after[$0] ?? 0) - (before[$0] ?? 0)) })
+}
+
+private func p11PersistentSizes(_ db: URL) throws -> [String: Int64] {
+    var sizes: [String: Int64] = [:]
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = db.path + suffix
+        sizes[suffix.isEmpty ? "database" : suffix] = FileManager.default.fileExists(atPath: path)
+            ? (try FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0 : 0
+    }
+    return sizes
+}
+
+private let p11AuditedTables = ["photos_representation", "fingerprint_task", "photos_index_exclusion", "dedup_index_state"]
+private func p11StartRowAudit(_ db: URL) throws {
+    try injectEngineSQL("CREATE TABLE p11_writes (table_name TEXT);" + p11AuditedTables.flatMap { table in
+        ["INSERT", "UPDATE", "DELETE"].map { operation in
+            "CREATE TRIGGER p11_\(table)_\(operation) AFTER \(operation) ON \(table) BEGIN INSERT INTO p11_writes VALUES ('\(table)'); END;"
+        }
+    }.joined(), at: db)
+}
+private func p11RowAudit(_ db: URL) throws -> [String: Int64] {
+    try Dictionary(uniqueKeysWithValues: p11AuditedTables.map { table in
+        ("rows." + table, Int64(try engineSQLInteger("SELECT COUNT(*) FROM p11_writes WHERE table_name='\(table)'", at: db)))
+    })
+}
+private func p11StopRowAudit(_ db: URL) throws {
+    try injectEngineSQL(p11AuditedTables.flatMap { table in
+        ["INSERT", "UPDATE", "DELETE"].map { "DROP TRIGGER p11_\(table)_\($0);" }
+    }.joined() + "DROP TABLE p11_writes;", at: db)
 }

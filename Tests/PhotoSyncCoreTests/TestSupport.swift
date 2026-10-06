@@ -306,3 +306,8 @@ actor JournalRaceReader: DirectoryReading {
         return try await real.stamp(of: file)
     }
 }
+
+func fixtureIndexChange(changed: [String] = [], deleted: [String] = []) -> PhotosIndexChange {
+    .incremental(.init(context: LibraryContext(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, epoch: 0),
+        fromGeneration: 0, toGeneration: 1, changedAssetIDs: changed, deletedAssetIDs: deleted))
+}

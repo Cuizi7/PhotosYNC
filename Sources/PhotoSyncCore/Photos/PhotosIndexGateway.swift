@@ -3,10 +3,28 @@ import CoreGraphics
 import ImageIO
 
 public enum PhotosIndexChange: Equatable, Sendable {
-    case assetsChanged([String])
-    case assetsDeleted([String])
+    case incremental(PhotosIndexDelta)
     case fullReconcileRequired
     case contextInvalidated
+}
+
+public struct PhotosIndexDelta: Equatable, Sendable {
+    public let context: LibraryContext
+    public let fromGeneration: Int
+    public let toGeneration: Int
+    public let changedAssetIDs: [String]
+    public let deletedAssetIDs: [String]
+    public init(context: LibraryContext, fromGeneration: Int, toGeneration: Int,
+                changedAssetIDs: [String], deletedAssetIDs: [String]) {
+        self.context = context; self.fromGeneration = fromGeneration; self.toGeneration = toGeneration
+        self.changedAssetIDs = changedAssetIDs; self.deletedAssetIDs = deletedAssetIDs
+    }
+    var isValid: Bool {
+        fromGeneration >= 0 && toGeneration > fromGeneration &&
+        changedAssetIDs.allSatisfy { !$0.isEmpty } && deletedAssetIDs.allSatisfy { !$0.isEmpty } &&
+        Set(changedAssetIDs).count == changedAssetIDs.count && Set(deletedAssetIDs).count == deletedAssetIDs.count &&
+        Set(changedAssetIDs).isDisjoint(with: deletedAssetIDs)
+    }
 }
 
 /// One bounded page from a fixed Photos generation, including excluded version
@@ -29,6 +47,7 @@ public struct RepresentationPage: Equatable, Sendable {
 
 public protocol PhotosIndexGateway: PhotosGateway {
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage
+    func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage
     func changes() -> AsyncStream<PhotosIndexChange>
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation
     /// Capture BEFORE catalog/snapshot acquisition, persist only alongside a
@@ -36,7 +55,7 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// evidence, never a stable physical-library identity or an index-ready flag.
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint?
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool
-    /// Call only after full same-generation reconciliation, durable facts and
+    /// Call only after complete same-generation full/delta reconciliation, durable facts and
     /// derived publication succeed. Keep ready admission unavailable until this
     /// returns; stale/pending generations throw and retain invalidation evidence.
     func acknowledgeReconciliation(expectedGeneration: Int) async throws
@@ -104,16 +123,9 @@ final class PhotosIndexChangeChannel: @unchecked Sendable {
         }
     }
     func send(_ event: PhotosIndexChange) {
-        switch event {
-        case .assetsChanged(let ids) where ids.count > capacity:
-            for start in stride(from: 0, to: ids.count, by: capacity) { send(.assetsChanged(Array(ids[start..<min(start + capacity, ids.count)]))) }
-            return
-        case .assetsDeleted(let ids) where ids.count > capacity:
-            for start in stride(from: 0, to: ids.count, by: capacity) { send(.assetsDeleted(Array(ids[start..<min(start + capacity, ids.count)]))) }
-            return
-        default: break
-        }
         lock.lock(); defer { lock.unlock() }
+        if case .incremental(let delta) = event,
+           !delta.isValid || delta.changedAssetIDs.count + delta.deletedAssetIDs.count > capacity { dirty = true }
         if event == .fullReconcileRequired || event == .contextInvalidated { dirty = true }
         guard !continuations.isEmpty else { dirty = true; return }
         var overflowed = false
@@ -135,12 +147,15 @@ final class PhotosIndexChangeChannel: @unchecked Sendable {
 public struct LibraryResumeCheckpoint: Codable, Equatable, Sendable {
     public let context: LibraryContext
     public let archivedChangeToken: Data
-    public init(context: LibraryContext, archivedChangeToken: Data) {
-        self.context = context; self.archivedChangeToken = archivedChangeToken
+    /// Process-local generation at token capture; old persisted checkpoints decode as nil.
+    public let photosGeneration: Int?
+    public init(context: LibraryContext, archivedChangeToken: Data, photosGeneration: Int? = nil) {
+        self.context = context; self.archivedChangeToken = archivedChangeToken; self.photosGeneration = photosGeneration
     }
 }
 
 public extension PhotosIndexGateway {
+    func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage { throw PhotoKitGatewayError.libraryChanged }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool { false }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { nil }
     func acknowledgeReconciliation(expectedGeneration: Int) async throws {}

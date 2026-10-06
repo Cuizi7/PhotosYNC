@@ -247,6 +247,25 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
                 or result.get("budget_pass") is not True
                 or result.get("index_change_ready_within_2s") is not True):
             raise ValidationError(f"Scale {count} failed current runtime/resource budgets")
+        if (result.get("delta_path_verified") is not True
+                or result.get("index_change_sample_count_per_operation", 0) < 5
+                or not isinstance(result.get("query_io"), dict)
+                or not isinstance(result.get("unchanged_full_io"), dict)):
+            raise ValidationError(f"Scale {count} lacks verified delta/write measurements")
+        row_keys = {"rows." + table for table in (
+            "photos_representation", "fingerprint_task", "photos_index_exclusion", "dedup_index_state")}
+        if not all(row_keys.issubset(result[field]) for field in ("query_io", "unchanged_full_io")):
+            raise ValidationError(f"Scale {count} lacks per-table row-write observations")
+        if any(value != 0 for key, value in result["query_io"].items() if key.startswith("rows.")):
+            raise ValidationError(f"Scale {count} query wrote persistent rows")
+        if any(result["unchanged_full_io"].get("rows." + table, 0) != 0
+               for table in ("photos_representation", "fingerprint_task")):
+            raise ValidationError(f"Scale {count} unchanged inventory rewrote representation/task rows")
+        if history_count == 100000:
+            idle = result.get("idle_60s", {})
+            if (idle.get("elapsed_seconds", 0) < 60 or idle.get("after", {}).get("footprint_bytes", 0) <= 0
+                    or idle.get("after", {}).get("rss_bytes", 0) <= 0 or "resume_query_ms" not in idle):
+                raise ValidationError("Maximum scale lacks 60-second idle/resume resource evidence")
         if count == 200000 and len(result.get("large_source_samples", [])) != 2:
             raise ValidationError("Maximum scale lacks both representative large-source measurements")
         scale_results[sample] = {"result": report.name, "result_sha256": sha256_file(report)}

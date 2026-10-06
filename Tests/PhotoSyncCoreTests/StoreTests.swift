@@ -195,7 +195,7 @@ final class StoreTests: XCTestCase {
         let indexCount = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'file_state_created_order'"
         XCTAssertEqual(try engineSQLInteger(indexCount, at: database), 1)
 
-        try injectEngineSQL("DROP TABLE dedup_recheck_progress; DROP TABLE dedup_dependency; DROP TABLE advanced_match_evidence; DROP TABLE file_fingerprint; DROP TABLE fingerprint_task; DROP TABLE photos_representation; DROP TABLE dedup_index_state; DROP INDEX file_state_created_order; PRAGMA user_version = 2", at: database)
+        try injectEngineSQL("DROP TABLE dedup_recheck_progress; DROP TABLE dedup_dependency; DROP TABLE advanced_match_evidence; DROP TABLE file_fingerprint; DROP TABLE fingerprint_task; DROP TABLE photos_representation; DROP TABLE photos_index_exclusion; DROP TABLE dedup_index_state; DROP INDEX file_state_created_order; PRAGMA user_version = 2", at: database)
         let reopened = try SyncStore(url: database)
         XCTAssertEqual(try engineSQLInteger(indexCount, at: database), 1)
         let reopenedState = try await reopened.state(of: fileID)
@@ -219,7 +219,7 @@ final class StoreTests: XCTestCase {
 
         try injectEngineSQL("DROP INDEX file_state_created_order; CREATE TABLE file_state_created_order (marker INTEGER)", at: database)
         XCTAssertThrowsError(try SyncStore(url: database))
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 4)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 5)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record WHERE id = '\(fileID.uuidString)'", at: database), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_state_created_order'", at: database), 1)
     }
@@ -741,14 +741,14 @@ final class StoreTests: XCTestCase {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(database.path, &handle), SQLITE_OK)
         defer { sqlite3_close(handle) }
-        XCTAssertEqual(sqlite3_exec(handle, "PRAGMA user_version = 5", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(handle, "PRAGMA user_version = 6", nil, nil, nil), SQLITE_OK)
 
         XCTAssertThrowsError(try SyncStore(url: database))
         var statement: OpaquePointer?
         XCTAssertEqual(sqlite3_prepare_v2(handle, "PRAGMA user_version", -1, &statement, nil), SQLITE_OK)
         defer { sqlite3_finalize(statement) }
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
-        XCTAssertEqual(sqlite3_column_int(statement, 0), 5)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 6)
     }
 
     private func makeRoot() throws -> URL {
@@ -847,9 +847,9 @@ extension StoreTests {
         let fixture = try await makeEngineFixture(sourceCount: 1)
         let file = try await engineSourceFile(sourceID: fixture.sourceIDs[0], directory: fixture.directories[0])
         _ = try await fixture.store.save(file, decision: .importNew)
-        try injectEngineSQL("DROP TABLE dedup_recheck_progress; DROP TABLE dedup_dependency; DROP TABLE advanced_match_evidence; DROP TABLE file_fingerprint; DROP TABLE fingerprint_task; DROP TABLE photos_representation; DROP TABLE dedup_index_state; DROP TABLE non_media_skip; ALTER TABLE source DROP COLUMN removed; PRAGMA user_version = 1", at: fixture.databaseURL)
+        try injectEngineSQL("DROP TABLE dedup_recheck_progress; DROP TABLE dedup_dependency; DROP TABLE advanced_match_evidence; DROP TABLE file_fingerprint; DROP TABLE fingerprint_task; DROP TABLE photos_representation; DROP TABLE photos_index_exclusion; DROP TABLE dedup_index_state; DROP TABLE non_media_skip; ALTER TABLE source DROP COLUMN removed; PRAGMA user_version = 1", at: fixture.databaseURL)
         let migrated = try SyncStore(url: fixture.databaseURL)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: fixture.databaseURL), 4)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: fixture.databaseURL), 5)
         let pending = try await migrated.countFiles(state: .pending)
         XCTAssertEqual(pending, 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM non_media_skip", at: fixture.databaseURL), 0)
@@ -873,7 +873,7 @@ extension StoreTests {
 
         let migrated = try SyncStore(url: database)
         let sources = try await migrated.sources()
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 4)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 5)
         XCTAssertEqual(try engineSQLInteger("SELECT removed FROM source WHERE id = '\(sourceID.uuidString)'", at: database), 0)
         XCTAssertEqual(sources.map(\.id), [sourceID])
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record WHERE success_id='asset-success' AND success_metadata_json='{\"history\":\"retained\"}' AND recheck_retry_count=0", at: database), 1)

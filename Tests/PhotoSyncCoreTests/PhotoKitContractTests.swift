@@ -106,6 +106,45 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testGenerationBoundProducerSendsOneCompleteDeltaAndFetchesOnlyRequestedIDs() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "old"), candidate(key: "unchanged")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        let before = try await gateway.candidateSnapshot()
+        var events = gateway.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: ["old"],
+            insertedAssets: [.init(identifier: "new", candidates: [candidate(key: "new")])], changedAssets: [])
+        gateway.recordLibraryChangeForTesting()
+        let after = try await gateway.candidateSnapshot()
+        guard case .incremental(let delta) = await events.next() else { return XCTFail("complete incremental event required") }
+        XCTAssertEqual(delta.fromGeneration, before.generation); XCTAssertEqual(delta.toGeneration, after.generation)
+        XCTAssertEqual(delta.changedAssetIDs, ["new"]); XCTAssertEqual(delta.deletedAssetIDs, ["old"])
+        let page = try await gateway.representationDelta(delta)
+        XCTAssertEqual(page.descriptors.map { $0.key.assetID }, ["new"])
+        XCTAssertEqual(lifecycle.deltaIDs, [["new"]]); XCTAssertEqual(lifecycle.loadCount, 1)
+        lifecycle.omitDeltaIDs = true
+        do { _ = try await gateway.representationDelta(delta); XCTFail("missing requested IDs must fail closed") } catch {}
+    }
+
+    func testEmptyIncrementalGenerationAndOversizedEventNeverSplitTransactions() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let photos = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 1)
+        _ = try await photos.candidateSnapshot()
+        var events = photos.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        photos.recordLibraryChangeForTesting(); _ = try await photos.candidateSnapshot()
+        guard case .incremental(let empty) = await events.next() else { return XCTFail("empty event must advance generation") }
+        XCTAssertEqual(empty.toGeneration, empty.fromGeneration + 1)
+        XCTAssertEqual(empty.changedAssetIDs, []); XCTAssertEqual(empty.deletedAssetIDs, [])
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [
+            .init(identifier: "a", candidates: []), .init(identifier: "b", candidates: [])], changedAssets: [])
+        photos.recordLibraryChangeForTesting(); _ = try await photos.candidateSnapshot()
+        let overflow = await events.next(); XCTAssertEqual(overflow, .fullReconcileRequired)
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        photos.recordLibraryChangeForTesting(); _ = try await photos.candidateSnapshot()
+        let sticky = await events.next(); XCTAssertEqual(sticky, .fullReconcileRequired)
+    }
+
     func testGatewayErrorsKeepCheckpointFailureAndUnknownOutcomeSeparateFromDefiniteFailure() {
         XCTAssertEqual(
             PhotoKitGatewayError.definitelyNotCommitted("validation failed").recoveryEvidence,
@@ -440,6 +479,14 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
     }
     func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange {
         nextChange
+    }
+    var deltaIDs: [[String]] = [], omitDeltaIDs = false
+    func representationDelta(assetIDs: [String], context: LibraryContext, generation: Int) throws -> RepresentationPage {
+        deltaIDs.append(assetIDs)
+        return .init(context: context, generation: generation, descriptors: omitDeltaIDs ? [] : assetIDs.map {
+            .init(key: .init(assetID: $0, kind: .original), context: context, revision: "r1", size: nil,
+                  equivalentToOriginal: false, revisionIsReliable: true)
+        }, nextOffset: nil)
     }
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         self.beforeMutation?()

@@ -20,6 +20,29 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
+    func testUnchangedFullReconciliationWritesNoRepresentationOrTaskRows() async throws {
+        for pending in [false, true] {
+            let f = try fixture()
+            let a = descriptor(f.photos.context), current = descriptor(f.photos.context, kind: .current, equivalent: true)
+            let b = descriptor(f.photos.context, asset: "retry")
+            await f.photos.setPages([.init(context: f.photos.context, generation: 1,
+                descriptors: pending ? [a, current, b] : [a, current], nextOffset: nil,
+                exclusions: [.init(descriptor: descriptor(f.photos.context, asset: "raw"), reason: .rawResource)])])
+            if pending { await f.photos.fail("retry") }
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            try installWriteAudit(at: f.db)
+            try injectEngineSQL("CREATE TABLE previous_tasks AS SELECT * FROM fingerprint_task;", at: f.db)
+            await f.photos.resetReads(); await f.model.reset()
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            for table in ["photos_representation", "fingerprint_task", "photos_index_exclusion"] {
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM p11_writes WHERE table_name='\(table)'", at: f.db), 0)
+            }
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM previous_tasks EXCEPT SELECT * FROM fingerprint_task)", at: f.db), 0)
+            await assertEqual(await f.photos.readCount, 0); await assertEqual(await f.model.count, 0)
+            let token = try await f.coordinator.readyToken(); XCTAssertEqual(token == nil, pending)
+        }
+    }
+
     func testSingleEditInvalidatesOnlyAffectedRepresentations() async throws {
         let f = try fixture()
         let original = descriptor(f.photos.context)
@@ -257,7 +280,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             let generation = try await f.store.beginIndexReconciliation(context: f.photos.context,
                 photosGeneration: snapshot.generation, fingerprintVersion: f.configuration.fingerprint.version)
             try await f.store.upsertRepresentations([d], generation: generation)
-            try await f.store.finishIndexReconciliation(generation: generation, checkpoint: checkpoint)
+            try await f.store.finishIndexReconciliation(generation: generation, seenKeys: Set(([d]).map(\.key)), checkpoint: checkpoint)
             let tasks = try await f.store.nextRepresentationTasks(now: now, limit: 1)
             let fingerprint = try Fingerprint(version: f.configuration.fingerprint.version, values: [1] + Array(repeating: 0, count: 1023))
             _ = try await f.store.completeRepresentation(try XCTUnwrap(tasks.first), fingerprint: fingerprint)
@@ -298,11 +321,12 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
     func testStoreIssuedGenerationRejectsLateFailureAndCompletion() async throws {
         let f = try fixture(); let d = descriptor(f.photos.context)
         let first = try await f.store.beginIndexReconciliation(context: f.photos.context, photosGeneration: 1, fingerprintVersion: f.configuration.fingerprint.version)
-        try await f.store.upsertRepresentations([d], generation: first); try await f.store.finishIndexReconciliation(generation: first)
+        try await f.store.upsertRepresentations([d], generation: first); try await f.store.finishIndexReconciliation(generation: first, seenKeys: Set(([d]).map(\.key)))
         let oldTasks = try await f.store.nextRepresentationTasks(now: now, limit: 1)
         let old = try XCTUnwrap(oldTasks.first)
         let second = try await f.store.beginIndexReconciliation(context: f.photos.context, photosGeneration: 1, fingerprintVersion: f.configuration.fingerprint.version)
-        try await f.store.upsertRepresentations([d], generation: second); try await f.store.finishIndexReconciliation(generation: second)
+        try await f.store.invalidateRepresentations(assetIDs: [d.key.assetID], generation: second)
+        try await f.store.upsertRepresentations([d], generation: second); try await f.store.finishIndexReconciliation(generation: second, seenKeys: Set(([d]).map(\.key)))
         try await f.store.failRepresentation(old, nextRetryAt: now.addingTimeInterval(100), detail: "late failure")
         let accepted = try await f.store.completeRepresentation(old, fingerprint: Fingerprint(version: old.fingerprintVersion, values: [1] + Array(repeating: 0, count: 1023)))
         XCTAssertFalse(accepted)
@@ -370,10 +394,10 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         let before = try await f.store.indexPublication()
-        try injectEngineSQL("ALTER TABLE dedup_index_state DROP COLUMN resume_checkpoint; ALTER TABLE dedup_index_state DROP COLUMN excluded_assets;", at: f.db)
+        try injectEngineSQL("PRAGMA user_version=4; DROP TABLE photos_index_exclusion; ALTER TABLE dedup_index_state DROP COLUMN resume_checkpoint; ALTER TABLE dedup_index_state DROP COLUMN excluded_assets;", at: f.db)
         let reopened = try SyncStore(url: f.db)
         let after = try await reopened.indexPublication()
-        XCTAssertEqual(before, after)
+        XCTAssertNotNil(before); XCTAssertNil(after) // v4 exclusion facts require a fresh inventory.
         let bytes = try Fingerprint(version: f.configuration.fingerprint.version,
             values: [1] + Array(repeating: 0, count: 1023)).littleEndianFloat32
         let hex = bytes.map { String(format: "%02x", $0) }.joined()
@@ -385,7 +409,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let f = try fixture(); let generation = try await f.store.beginIndexReconciliation(context: f.photos.context,
             photosGeneration: 1, fingerprintVersion: f.configuration.fingerprint.version)
         let invalid = LibraryResumeCheckpoint(context: .init(id: UUID(), epoch: 1), archivedChangeToken: Data([1]))
-        do { try await f.store.finishIndexReconciliation(generation: generation, checkpoint: invalid); XCTFail("Expected context rejection") } catch {}
+        do { try await f.store.finishIndexReconciliation(generation: generation, seenKeys: [], checkpoint: invalid); XCTFail("Expected context rejection") } catch {}
         let p = try await f.store.indexProgress(); XCTAssertFalse(p.totalsKnown)
         let checkpoint = try await f.store.libraryResumeCheckpoint(); XCTAssertNil(checkpoint)
     }
@@ -511,6 +535,131 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         }
     }
 
+    func testContinuousDeltaAddEditDeleteUsesOnlyChangedIDFetchAndBoundedWrites() async throws {
+        var writes: [[Int]] = []
+        for size in [2, 40] {
+            let f = try fixture()
+            let original = (0..<size).map { descriptor(f.photos.context, asset: "a\($0)") }
+            await f.photos.set(original); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            try installWriteAudit(at: f.db)
+            try injectEngineSQL("CREATE TABLE untouched AS SELECT * FROM photos_representation WHERE asset_id <> 'a0';", at: f.db)
+            await f.photos.resetReads(); await f.model.reset()
+            let edit = descriptor(f.photos.context, asset: "a0", revision: "r2")
+            let delta = await f.photos.changeFacts([edit] + Array(original.dropFirst()), changed: ["a0"])
+            await f.coordinator.libraryChanged(.incremental(delta))
+            try await assertNil(try await f.coordinator.readyToken())
+            await f.coordinator.processDueWork(now: now)
+            let token = try await f.coordinator.readyToken()
+            XCTAssertEqual(token?.photosGeneration, delta.toGeneration)
+            await assertEqual(await f.photos.requestedLimits, [])
+            await assertEqual(await f.photos.deltaRequests, [["a0"]])
+            await assertEqual(await f.model.count, 1)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM untouched EXCEPT SELECT * FROM photos_representation)", at: f.db), 0)
+            writes.append(try ["photos_representation", "fingerprint_task"].map { try engineSQLInteger("SELECT COUNT(*) FROM p11_writes WHERE table_name='\($0)'", at: f.db) })
+            let added = descriptor(f.photos.context, asset: "new")
+            let add = await f.photos.changeFacts([edit, added] + Array(original.dropFirst()), changed: ["new"])
+            await f.coordinator.libraryChanged(.incremental(add)); await f.coordinator.processDueWork(now: now)
+            let remove = await f.photos.changeFacts(original, deleted: ["new"], changed: ["a0"])
+            await f.coordinator.libraryChanged(.incremental(remove)); await f.coordinator.processDueWork(now: now)
+            let publication = try await f.store.indexPublication(); XCTAssertEqual(publication?.representationCount, size)
+            await assertEqual(await f.photos.requestedLimits, [])
+        }
+        XCTAssertEqual(writes, [[2, 2], [2, 2]])
+    }
+
+    func testDeltaExclusionsEditRevertAndEmptyGeneration() async throws {
+        let f = try fixture(), id = "asset"
+        let original = descriptor(f.photos.context)
+        await f.photos.set([original]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.resetReads(); await f.model.reset()
+        let edited = descriptor(f.photos.context, kind: .current, revision: "edit")
+        let edit = await f.photos.changeFacts([original, edited], changed: [id])
+        await f.coordinator.libraryChanged(.incremental(edit)); await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readKinds, [.current])
+        let reverted = descriptor(f.photos.context, kind: .current, equivalent: true)
+        let revert = await f.photos.changeFacts([original, reverted], changed: [id])
+        await f.coordinator.libraryChanged(.incremental(revert)); await f.coordinator.processDueWork(now: now)
+        let one = try await f.store.indexPublication(); XCTAssertEqual(one?.representationCount, 1)
+        let exclude = await f.photos.changeFacts([], exclusions: [.init(descriptor: original, reason: .rawResource)], changed: [id])
+        await f.coordinator.libraryChanged(.incremental(exclude)); await f.coordinator.processDueWork(now: now)
+        let excluded = await f.coordinator.progress(); XCTAssertEqual(excluded.excludedAssets, 1); XCTAssertEqual(excluded.totalRepresentations, 0)
+        let include = await f.photos.changeFacts([original], changed: [id])
+        await f.coordinator.libraryChanged(.incremental(include)); await f.coordinator.processDueWork(now: now)
+        let included = await f.coordinator.progress(); XCTAssertEqual(included.excludedAssets, 0); XCTAssertEqual(included.readyRepresentations, 1)
+        let empty = await f.photos.changeFacts([original])
+        await f.coordinator.libraryChanged(.incremental(empty)); await f.coordinator.processDueWork(now: now)
+        let token = try await f.coordinator.readyToken(); XCTAssertEqual(token?.photosGeneration, empty.toGeneration)
+        await assertEqual(await f.photos.requestedLimits, [])
+    }
+
+    func testDeltaCoalescingLastChangeWinsAndGapsFallbackToFull() async throws {
+        let f = try fixture()
+        let original = descriptor(f.photos.context)
+        await f.photos.set([original]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.resetReads()
+        let deleted = await f.photos.changeFacts([], deleted: [original.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(deleted))
+        let restored = await f.photos.changeFacts([original], changed: [original.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(restored)); await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.deltaRequests, [[original.key.assetID]])
+        let removed = await f.photos.changeFacts([], deleted: [original.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(removed)); await f.coordinator.processDueWork(now: now)
+        let empty = try await f.store.indexPublication(); XCTAssertEqual(empty?.representationCount, 0)
+        await f.photos.set([original]) // a missed event
+        let gap = await f.photos.changeFacts([original], changed: [original.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(gap)); await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.requestedLimits.isEmpty, false)
+    }
+
+    func testMissingIDDeltaFetchDoesNotDeleteAndRecoversThroughCompleteInventory() async throws {
+        let f = try fixture()
+        let d = descriptor(f.photos.context)
+        await f.photos.set([d]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.setMissingDelta(true); await f.photos.resetReads()
+        let delta = await f.photos.changeFacts([d], changed: [d.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(delta)); await f.coordinator.processDueWork(now: now)
+        let publication = try await f.store.indexPublication(); XCTAssertEqual(publication?.representationCount, 1)
+        await assertEqual(await f.photos.requestedLimits.isEmpty, false)
+    }
+
+    func testUnaffectedInFlightTaskCompletesOnceAcrossDelta() async throws {
+        let f = try fixture(), gate = CoordinatorGate()
+        let a = descriptor(f.photos.context, asset: "a"), b = descriptor(f.photos.context, asset: "b")
+        await f.photos.set([a, b]); try await f.coordinator.reconcile(); await f.model.setGate(gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered()
+        let delta = await f.photos.changeFacts([a, descriptor(f.photos.context, asset: "b", revision: "new")], changed: ["b"])
+        await f.coordinator.libraryChanged(.incremental(delta))
+        await gate.release(); await work.value
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.model.count, 2)
+        try await assertNotNil(try await f.coordinator.readyToken())
+    }
+
+    func testDeletedThenReinsertedSameRevisionRejectsTheReplacedInFlightTask() async throws {
+        let f = try fixture(), gate = CoordinatorGate()
+        let a = descriptor(f.photos.context)
+        await f.photos.set([a]); try await f.coordinator.reconcile(); await f.model.setGate(gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered()
+        let removed = await f.photos.changeFacts([], deleted: [a.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(removed))
+        let restored = await f.photos.changeFacts([a], changed: [a.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(restored))
+        await gate.release(); await work.value
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.model.count, 2)
+        try await assertNotNil(try await f.coordinator.readyToken())
+    }
+
+    private func installWriteAudit(at db: URL) throws {
+        try injectEngineSQL("CREATE TABLE p11_writes (table_name TEXT);" + ["photos_representation", "fingerprint_task", "photos_index_exclusion"].flatMap { table in
+            ["INSERT", "UPDATE", "DELETE"].map { operation in
+                "CREATE TRIGGER p11_\(table)_\(operation) AFTER \(operation) ON \(table) BEGIN INSERT INTO p11_writes VALUES ('\(table)'); END;"
+            }
+        }.joined(), at: db)
+    }
+
     private struct Fixture {
         let db: URL; let store: SyncStore; let photos: CoordinatorPhotos; let model: CoordinatorModel
         let configuration: DedupConfiguration; let coordinator: PhotosIndexCoordinator
@@ -609,7 +758,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? {
         checkpointCaptured = true
-        return .init(context: replacementContext ?? context, archivedChangeToken: Data([UInt8(generation)]))
+        return .init(context: replacementContext ?? context, archivedChangeToken: Data([UInt8(generation)]), photosGeneration: generation)
     }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool {
         resumeCount += 1
@@ -623,6 +772,23 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
         guard expectedGeneration == generation, offset < pages.count else { throw PhotoKitGatewayError.libraryChanged }
         requestedLimits.append(limit); return pages[offset]
+    }
+    private(set) var deltaRequests: [[String]] = []
+    private var missingDelta = false
+    func setMissingDelta(_ value: Bool) { missingDelta = value }
+    func changeFacts(_ descriptors: [RepresentationDescriptor], exclusions: [RepresentationCatalogExclusion] = [],
+                     deleted: [String] = [], changed: [String] = []) -> PhotosIndexDelta {
+        let from = generation; generation += 1
+        pages = [.init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil, exclusions: exclusions)]
+        return .init(context: context, fromGeneration: from, toGeneration: generation, changedAssetIDs: changed, deletedAssetIDs: deleted)
+    }
+    func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        deltaRequests.append(delta.changedAssetIDs)
+        guard delta.toGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
+        let ids = Set(delta.changedAssetIDs)
+        return .init(context: context, generation: generation,
+            descriptors: missingDelta ? [] : pages.flatMap(\.descriptors).filter { ids.contains($0.key.assetID) }, nextOffset: nil,
+            exclusions: pages.flatMap(\.exclusions).filter { ids.contains($0.descriptor.key.assetID) })
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         readCount += 1; readKinds.append(descriptor.key.kind)
