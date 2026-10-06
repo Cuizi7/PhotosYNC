@@ -1,5 +1,9 @@
 # PhotoKit Manual Validation
 
+## Current 0.2 validation authority (2026-10-06; planned, not executed)
+
+The user has no separate test environment and explicitly permits this Mac's actively used production Photos library, with read-only work first, writing last, defensive limits and restoration afterwards. Follow the [current production-library plan](../docs/release/2026-10-06-real-photos-icloud-validation-plan.md): use isolated QA application state, real pending-source directories for read-only evaluation, and exact creation evidence for bounded additions and cleanup. Never roll the production library/database back wholesale or edit/delete pre-existing assets. Restoration includes an explicit Recently Deleted check; a remaining cleanup obligation is not a successful full rollback. The older separate-account and iCloud-off instructions and results below are historical and do not override this later authorization. This document change performs no library access or test execution.
+
 ## Current Validation Status (2026-09-13)
 
 | Specification acceptance case | Status | Evidence type and result |
