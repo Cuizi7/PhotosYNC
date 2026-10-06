@@ -4,7 +4,9 @@ PhotosYNC v1 scans selected filesystem folders and adds eligible images and vide
 
 ## Advanced dedup source branch (not released)
 
-The 0.2 integration branch adds the approved SSCD Large FP32 CPU-only model and native gallery-analysis flow. Fixed model weights use Git LFS; install Git LFS with repository-local filters (`git lfs install --local --skip-repo`) and hydrate the exact checkout before building. The package entry point verifies and hydrates archived pointers from local objects only, and fails on absent/corrupt resources. It does not download a model at App runtime.
+The 0.2 integration branch adds SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
+
+Fixed model weights use Git LFS; install Git LFS with repository-local filters (`git lfs install --local --skip-repo`) and hydrate the exact checkout before building. The package entry point verifies and hydrates archived pointers from local objects only, and fails on absent/corrupt resources. It does not download a model at App runtime.
 
 The user-selected threshold remains 0.98 with a 512 MiB decoded allowance and conservative original import for readable still images exceeding that allowance. This is not an independently calibrated statistical acceptance. See [current validation and limitations](docs/release/0.2.0-advanced-dedup-validation.md), including the reproduced and corrected R2 decode integration defect. Local validation includes six user attachments authorized only for local tests; never add them to the App or public CI. The released v1 behavior and version below remain historical distribution facts.
 
@@ -48,7 +50,7 @@ If an import result is uncertain after an interruption, PhotosYNC keeps it in an
 
 ## Boundaries
 
-Do not use a personal Photos library as a test fixture. Real Photos-write validation requires a separate macOS test account, its System Photo Library, disabled iCloud Photos, and user authorization for that isolated environment. See `Design/Validation.md` for the procedure and current validation status.
+Real Photos-write validation uses an explicitly authorized separate test account and its System Photo Library. The historical v1 procedure in `Design/Validation.md` disables iCloud; it cannot establish iCloud behavior. The [0.2 real Photos/iCloud validation plan](docs/release/2026-10-06-real-photos-icloud-validation-plan.md) separates local integration, proven cloud-needed requests, and recovery checks. It has not been executed. Personal-library write tests and production-database resets are excluded; any narrower personal-library read-only probe requires a separately confirmed asset scope.
 
 PhotosYNC v1 does not synchronize deletions, re-import assets removed from Photos, manage Photos libraries, auto-mount network storage, or provide a media browser. A slow or disconnected network mount is treated as a source error or waiting condition, not as a reason to alter the mount or the source contents.
 
