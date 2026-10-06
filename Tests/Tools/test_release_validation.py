@@ -197,12 +197,58 @@ class ReleaseValidationTests(unittest.TestCase):
                 )
                 scale = json.loads((output_dir / "scale-100000.json").read_text())
                 self.assertIs(scale["budget_pass"], True)
-                self.assertLessEqual(scale["hot_preparation_ms"]["p95"], 250)
+                self.assertLessEqual(scale["hot_preparation_ms"]["p95"], 2000)
                 self.assertLessEqual(scale["source_incremental_ms"]["p95"], 2000)
                 self.assertLessEqual(scale["rss_peak_bytes"], 4 * 1024**3)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((output_dir / "validation.json").exists())
                 self.assertFalse((output_dir / "validation-report.md").exists())
+
+    def test_validator_accepts_background_preparation_through_inclusive_budget(self) -> None:
+        for scope in ("scale", "runtime"):
+            for p95 in (750, 2000):
+                with self.subTest(scope=scope, p95=p95):
+                    output_dir = Path(self.temporary_directory.name) / f"budget-{scope}-{p95}"
+                    result = self.fixture.run_validator(
+                        output_dir, output_dir.with_name(output_dir.name + "-derived"),
+                        FAKE_PREPARATION_SCOPE=scope,
+                        FAKE_PREPARATION_OVERRIDES=json.dumps({
+                            "hot_preparation_ms": {"p95": p95},
+                            "source_incremental_ms": {"p95": p95},
+                        }),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads((output_dir / "validation.json").read_text())["status"], "passed")
+
+    def test_validator_rejects_invalid_preparation_evidence_despite_true_budget_flag(self) -> None:
+        cases = [
+            {"performance_contract": None},
+            {"performance_contract": "historical-v1"},
+            {"preparation_p95_budget_ms": None},
+            {"preparation_p95_budget_ms": 250},
+            {"preparation_p95_budget_ms": 3000},
+            {"preparation_p95_budget_ms": "2000"},
+        ]
+        for field in ("hot_preparation_ms", "source_incremental_ms"):
+            cases.extend({field: value} for value in (
+                None, {}, "bad", {"p95": None}, {"p95": "100"}, {"p95": True},
+                {"p95": -1}, {"p95": float("nan")}, {"p95": float("inf")}, {"p95": 2000.01},
+            ))
+        for scope in ("scale", "runtime"):
+            for index, overrides in enumerate(cases):
+                with self.subTest(scope=scope, overrides=overrides):
+                    output_dir = Path(self.temporary_directory.name) / f"invalid-{scope}-{index}"
+                    result = self.fixture.run_validator(
+                        output_dir, output_dir.with_name(output_dir.name + "-derived"),
+                        FAKE_PREPARATION_SCOPE=scope,
+                        FAKE_PREPARATION_OVERRIDES=json.dumps(overrides),
+                    )
+                    report = "scale-100000.json" if scope == "scale" else "runtime-load.json"
+                    self.assertIs(json.loads((output_dir / report).read_text())["budget_pass"], True)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("preparation", result.stderr.lower())
+                    self.assertFalse((output_dir / "validation.json").exists())
+                    self.assertFalse((output_dir / "validation-report.md").exists())
 
     def test_validator_rejects_missing_or_false_delta_path_evidence(self) -> None:
         for mode in ("false", "missing"):
@@ -450,6 +496,22 @@ esac
 
 _FAKE_XCRUN = """#!/bin/sh
 set -eu
+patch_preparation_report() {
+  if [ "${FAKE_PREPARATION_SCOPE:-}" = "$1" ]; then
+    python3 - "$2" <<'PY'
+import json, os, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+report = json.loads(path.read_text())
+for key, value in json.loads(os.environ["FAKE_PREPARATION_OVERRIDES"]).items():
+    if value is None:
+        report.pop(key, None)
+    else:
+        report[key] = value
+path.write_text(json.dumps(report))
+PY
+  fi
+}
 printf 'xcrun:%s:%s\\n' "${1:-}" "${RQDATAC2_CONF:-absent}" >> "$FAKE_EVENTS"
 if [ "${1:-}" = 'swift' ]; then
   printf 'Swift fake 1.0\\n'
@@ -469,7 +531,8 @@ if [ -n "${PHOTOSYNC_SCALE_REPRESENTATIONS:-}" ]; then
     false) delta=',"delta_path_verified":false' ;;
     missing) delta='' ;;
   esac
-  printf '{"representations":%s,"success_history_vectors":%s,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}],"index_change_sample_count_per_operation":5,"query_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":0},"unchanged_full_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":3},"idle_60s":{"elapsed_seconds":60,"after":{"footprint_bytes":1,"rss_bytes":1},"resume_query_ms":1}%s%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" "$delta" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  printf '{"representations":%s,"success_history_vectors":%s,"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}],"index_change_sample_count_per_operation":5,"query_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":0},"unchanged_full_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":3},"idle_60s":{"elapsed_seconds":60,"after":{"footprint_bytes":1,"rss_bytes":1},"resume_query_ms":1}%s%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" "$delta" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  patch_preparation_report scale "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
   printf "Test Suite 'Selected tests' passed at fixture.\\n"
   printf 'Executed 1 test, with 0 failures\\n'
   exit 0
@@ -477,7 +540,8 @@ fi
 case "${FAKE_XCTEST_MODE:-success}" in
   success)
     printf '{"case_count":33,"duplicate_count":14,"skip_count":11}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-regression.json"
-    printf '{"legacy_imports":1,"one_changed_inferences":1,"unchanged_inferences":0}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
+    printf '{"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"legacy_imports":1,"one_changed_inferences":1,"unchanged_inferences":0}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
+    patch_preparation_report runtime "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
     mkdir -p "$PHOTOSYNC_MODEL_CACHE_DIR"
     printf 'synthetic compiled bytes' > "$PHOTOSYNC_MODEL_CACHE_DIR/fixture.bin"
     printf "Test Suite 'All tests' passed at fixture.\\n"

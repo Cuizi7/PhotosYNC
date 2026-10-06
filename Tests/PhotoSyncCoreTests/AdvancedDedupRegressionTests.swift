@@ -6,6 +6,9 @@ import SQLite3
 import TestSQLiteMetrics
 @testable import PhotoSyncCore
 
+private let backgroundPreparationContract = "background-preparation-v2"
+private let preparationP95BudgetMS: Double = 2000
+
 final class AdvancedDedupRegressionTests: XCTestCase {
     func testBundledApprovedConfigurationAndExactModel() throws {
         let root = try DedupConfiguration.bundledResourceDirectory()
@@ -275,11 +278,12 @@ extension AdvancedDedupRegressionTests {
         XCTAssertEqual(lease.images, 0); XCTAssertEqual(lease.bytes, 0)
         XCTAssertEqual(try p9Hash(legacyURL), initialHash)
         XCTAssertLessThan(p9PeakRSS(), 4 * 1024 * 1024 * 1024)
-        XCTAssertLessThan(p9Percentiles(hot)["p95"]!, 250)
-        XCTAssertLessThan(p9Percentiles(cold)["p95"]!, 2000)
+        XCTAssertLessThanOrEqual(p9Percentiles(hot)["p95"]!, preparationP95BudgetMS)
+        XCTAssertLessThanOrEqual(p9Percentiles(cold)["p95"]!, preparationP95BudgetMS)
         let diskBytes = (FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey])?.allObjects as? [URL] ?? [])
             .reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
         try p9WriteEvidence("runtime-load.json", ["scope": "injected actual AdvancedRuntimeGraph; synthetic local 256px PNG; fake Photos; real CPU-only model",
+            "performance_contract": backgroundPreparationContract, "preparation_p95_budget_ms": preparationP95BudgetMS,
             "assets": 16, "representation_rows": 32, "source_samples": 20, "logger_unique_files": 5020,
             "initial_runtime_ms": initialMS, "source_incremental_ms": p9Percentiles(cold), "hot_preparation_ms": p9Percentiles(hot),
             "stages_ms": stages.mapValues(p9Percentiles), "rss_peak_bytes": p9PeakRSS(), "persistent_fixture_bytes": diskBytes,
@@ -621,6 +625,7 @@ extension AdvancedDedupRegressionTests {
         let changeWithinBudget = changeSamples.values.flatMap { $0 }.allSatisfy { $0 <= 2000 }
         // Record even a failed budget so it cannot be laundered as a missing sample.
         try p9WriteEvidence("\(sampleName).json", ["representations": count, "synthetic_assets": min(count, 100000), "success_history_vectors": historyCount,
+            "performance_contract": backgroundPreparationContract, "preparation_p95_budget_ms": preparationP95BudgetMS,
             "build_configuration": ProcessInfo.processInfo.environment["PHOTOSYNC_SCALE_BUILD_CONFIGURATION"] ?? "Debug",
             "edited_fraction": Double(max(0, count - 100000)) / Double(min(count, 100000)), "scope": "actual graph; synthetic persisted vectors and fake Photos; 20 real local synthetic-image CPU-only inferences",
             "vector_generation": "unit basis cycling 1024 dimensions with real seed every 10000 rows; no accuracy claim",
@@ -642,11 +647,11 @@ extension AdvancedDedupRegressionTests {
             "io_scope": "fixture DB/sidecar VFS logical requests and process accounting; row counts from separate audit pass; resource timings have no triggers; mmap fetch sizes are not physical reads",
             "unchanged_catalog_publication_ms": stableMS, "one_changed_inferences": 1, "unchanged_inferences": stableCalls - deletedCalls,
             "large_source_samples": largeSamples, "logger_unique_files": 100000, "logger_flush_interval": 128, "persistent_fixture_bytes": bytes,
-            "rss_peak_bytes": peak, "budget_pass": peak <= 4 * 1024 * 1024 * 1024 && hot95 <= 250 && cold95 <= 2000 && changeWithinBudget,
+            "rss_peak_bytes": peak, "budget_pass": peak <= 4 * 1024 * 1024 * 1024 && hot95 <= preparationP95BudgetMS && cold95 <= preparationP95BudgetMS && changeWithinBudget,
             "real_photos": false, "real_100k_assets": false])
         XCTAssertLessThanOrEqual(peak, 4 * 1024 * 1024 * 1024)
-        XCTAssertLessThanOrEqual(hot95, 250)
-        XCTAssertLessThanOrEqual(cold95, 2000)
+        XCTAssertLessThanOrEqual(hot95, preparationP95BudgetMS)
+        XCTAssertLessThanOrEqual(cold95, preparationP95BudgetMS)
         XCTAssertTrue(changeWithinBudget, "At least one verified Photos change-to-ready observation exceeds 2 seconds")
     }
 

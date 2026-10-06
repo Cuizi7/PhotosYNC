@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,8 @@ XCTEST_TIMEOUT_SECONDS = 10 * 60
 TOOLS_TIMEOUT_SECONDS = 5 * 60
 CONTINUATION_TIMEOUT_SECONDS = 5 * 60
 TOOLCHAIN_TIMEOUT_SECONDS = 60
+PERFORMANCE_CONTRACT = "background-preparation-v2"
+PREPARATION_P95_BUDGET_MS = 2000
 
 EXCLUDED_MANIFEST_DIRECTORIES = {
     ".git",
@@ -242,6 +245,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             raise ValidationError(f"Scale {count} did not finish its one selected XCTest")
         report = output_dir / f"scale-{sample}.json"
         result = json.loads(report.read_text())
+        validate_preparation_budget(result, label=f"Scale {count}")
         if (result.get("representations") != count
                 or result.get("success_history_vectors") != history_count
                 or result.get("budget_pass") is not True
@@ -312,6 +316,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
         continuation_phases.append(phase_record(name, continuation, output_dir))
     model_result = json.loads((output_dir / "model-regression.json").read_text())
     runtime_result = json.loads((output_dir / "runtime-load.json").read_text())
+    validate_preparation_budget(runtime_result, label="Runtime")
     if (model_result.get("case_count"), model_result.get("duplicate_count"), model_result.get("skip_count")) != (33, 14, 11):
         raise ValidationError("Missing complete actual-model 33-case regression evidence")
     if runtime_result.get("legacy_imports") != 1 or runtime_result.get("one_changed_inferences") != 1 or runtime_result.get("unchanged_inferences") != 0:
@@ -382,6 +387,20 @@ def child_environment() -> dict[str, str]:
     # Python test discovery must not mutate the frozen source snapshot with .pyc files.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def validate_preparation_budget(result: Any, *, label: str) -> None:
+    if (not isinstance(result, dict)
+            or result.get("performance_contract") != PERFORMANCE_CONTRACT
+            or result.get("preparation_p95_budget_ms") != PREPARATION_P95_BUDGET_MS):
+        raise ValidationError(f"{label} preparation contract/budget identity is missing or incorrect")
+    for field in ("hot_preparation_ms", "source_incremental_ms"):
+        timings = result.get(field)
+        p95 = timings.get("p95") if isinstance(timings, dict) else None
+        if (type(p95) not in (int, float)
+                or not 0 <= p95 <= PREPARATION_P95_BUDGET_MS
+                or not math.isfinite(p95)):
+            raise ValidationError(f"{label} {field} preparation P95 must be finite and within 0..{PREPARATION_P95_BUDGET_MS} ms")
 
 
 def run_command(
