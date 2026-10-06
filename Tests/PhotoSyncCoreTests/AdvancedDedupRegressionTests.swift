@@ -389,6 +389,13 @@ extension AdvancedDedupRegressionTests {
                 largeURLs.append(url)
             }
         }
+        if count == 2 {
+            // The smoke must traverse the same post-restart preparation loop as
+            // the 200k large-input samples, without allocating a huge fixture.
+            let url = source.appendingPathComponent("post-restart-smoke.png")
+            try p9PNG(p9Image(style: 1), at: url)
+            largeURLs.append(url)
+        }
         let resources = try DedupConfiguration.bundledResourceDirectory()
         let c = try DedupConfiguration.loadValidated(resourceDirectory: resources)
         let executor = ReadExecutor(), budget = ImageWorkBudget(limits: c.resources)
@@ -530,6 +537,8 @@ extension AdvancedDedupRegressionTests {
         try p11StopRowAudit(db)
         finalGeneration = await photos.generation
         let readsBeforeRestart = await photos.reads
+        let originalTokenBeforeRestart = try await graph.coordinator.readyToken()
+        XCTAssertNotNil(originalTokenBeforeRestart)
         let restartStart = ProcessInfo.processInfo.systemUptime
         let reopened = try SyncStore(url: db, readExecutor: executor)
         let restarted = PhotosIndexCoordinator(store: reopened, photos: photos, fingerprinter: model, configuration: c)
@@ -538,6 +547,12 @@ extension AdvancedDedupRegressionTests {
             expectedPhotosGeneration: finalGeneration, expectedRepresentations: count)
         let restartMS = (ProcessInfo.processInfo.systemUptime - restartStart) * 1000
         let restartedReads = await photos.reads; XCTAssertEqual(restartedReads, readsBeforeRestart)
+        // A reopened connection owns the new publication proof. All subsequent
+        // preparations must use its coordinator/store pair, with the same model/budget.
+        let restartedService = AdvancedDedupService(store: reopened, photos: photos, coordinator: restarted,
+            fingerprinter: model, configuration: c, executor: executor, budget: budget)
+        let originalTokenAfterRestart = try await graph.coordinator.readyToken()
+        XCTAssertNil(originalTokenAfterRestart, "The old connection must not adopt the restarted store's publication proof")
         var idle: [String: Any] = [:]
         if historyCount == 100000 {
             let value = try await reopened.indexReadiness()?.token
@@ -565,17 +580,36 @@ extension AdvancedDedupRegressionTests {
             let metadata = try await MetadataReader(sourceID: sourceID, executor: executor).read(url: url, filename: url.lastPathComponent)
             let file = SourceFile(sourceID: sourceID, relativePath: url.lastPathComponent, url: url,
                 stamp: try await DirectoryReader(sourceID: sourceID, executor: executor).stamp(of: url), metadata: metadata)
-            let id = try await store.save(file, decision: .importNew)
+            let id = try await reopened.save(file, decision: .importNew)
+            if count == 2 {
+                let callsBefore = await model.calls, readsBefore = await photos.reads
+                let stalePreparation = try await graph.service.prepare(fileID: id, file: file)
+                guard case .waiting(let reason) = stalePreparation else { return XCTFail("Old service must reject a replaced publication before image work") }
+                let callsAfter = await model.calls, readsAfter = await photos.reads
+                XCTAssertEqual(reason, "来源或图库索引正在等待确认。")
+                XCTAssertEqual(callsAfter, callsBefore); XCTAssertEqual(readsAfter, readsBefore)
+                try p9WriteEvidence("restart-handoff-2.json", [
+                    "before_index_generation": originalTokenBeforeRestart!.indexGeneration,
+                    "after_index_generation": restartedEndpoint["index_generation"]!,
+                    "original_ready_after_restart": originalTokenAfterRestart != nil,
+                    "restarted_endpoint": restartedEndpoint, "stale_preparation_reason": reason,
+                    "model_calls_before": callsBefore, "model_calls_after": callsAfter,
+                    "photos_reads_before": readsBefore, "photos_reads_after": readsAfter])
+            }
             let beforePeak = p9PeakRSS(), started = ProcessInfo.processInfo.systemUptime
-            guard case .ready(let admission) = try await graph.service.prepare(fileID: id, file: file) else {
-                return XCTFail("Representative large input must be comparable under 512 MiB")
+            let preparation = try await restartedService.prepare(fileID: id, file: file)
+            let admission: AdvancedAdmission
+            switch preparation {
+            case .ready(let value): admission = value
+            case .waiting(let reason): return XCTFail("Post-restart preparation waited: \(reason)")
+            case .conservative(let value): return XCTFail("Post-restart preparation was not compared: \(value.reason)")
             }
             let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
             let actualInput = await model.lastInput
             largeSamples.append(["name": url.lastPathComponent, "original_width": metadata.width!, "original_height": metadata.height!,
                 "prepared_ms": elapsed, "stages_ms": admission.evidence.timingsMS, "model_input_raster": actualInput,
                 "process_peak_rss_before_bytes": beforePeak, "process_peak_rss_after_bytes": p9PeakRSS(),
-                "sample_count": 1, "percentile_claim": false])
+                "sample_count": 1, "percentile_claim": false, "is_large_fixture": count == 200000])
             XCTAssertEqual(try p9Hash(url), beforeHash)
         }
         let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey])?.allObjects as? [URL] ?? []
