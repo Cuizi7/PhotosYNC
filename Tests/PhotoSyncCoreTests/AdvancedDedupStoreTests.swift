@@ -5,6 +5,226 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testSQLiteStepFailureDiscardsHitsAndFinalizesReadSnapshot() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        _ = try await prepared(store, source, root, "first-hit.jpg")
+        let bad = try await prepared(store, source, root, "second-error.jpg")
+        let incoming = try await prepared(store, source, root, "incoming.jpg")
+        try await publishEmpty(store)
+        let token = try await unwrap(try await store.indexReadiness()).token
+        try injectEngineSQL("""
+            ALTER TABLE file_fingerprint RENAME TO saved_fingerprint;
+            CREATE VIEW file_fingerprint AS SELECT file_id,size,modified_ns,fingerprint_version,purpose,width,height,
+                CASE WHEN file_id = '\(bad.fileID.uuidString)' THEN abs(-9223372036854775808) ELSE vector END AS vector,
+                attempt_id FROM saved_fingerprint;
+            """, at: db)
+        do {
+            _ = try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10)
+            XCTFail("SQLite step failure returned a partial result")
+        } catch SyncStoreError.sqlite(let detail) { XCTAssertTrue(detail.contains("overflow")) }
+        try injectEngineSQL("DROP VIEW file_fingerprint; ALTER TABLE saved_fingerprint RENAME TO file_fingerprint;", at: db)
+        let recovered = try await unwrap(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+        XCTAssertEqual(recovered.matches.count, 2)
+    }
+
+    func testSQLiteQueryEligibilityCancellationAndExpiredTokens() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var sourceIDs = [UUID](), roots = [URL]()
+        for name in ["active", "disabled", "removed", "history"] {
+            let directory = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            roots.append(directory); sourceIDs.append(try await store.registerSource(url: directory))
+        }
+        let pending = try await prepared(store, sourceIDs[0], roots[0], "pending.jpg")
+        let importing = try await prepared(store, sourceIDs[0], roots[0], "importing.jpg")
+        try await store.beginAttempt(fileID: importing.fileID, attemptID: UUID())
+        let skipped = try await prepared(store, sourceIDs[0], roots[0], "skipped.jpg")
+        try await store.markSkipped(fileID: skipped.fileID, reason: .unsupportedFormat, candidates: [])
+        _ = try await prepared(store, sourceIDs[1], roots[1], "disabled.jpg")
+        _ = try await prepared(store, sourceIDs[2], roots[2], "removed.jpg")
+        let history = try await prepared(store, sourceIDs[3], roots[3], "history.jpg")
+        let attempt = UUID(); try await store.beginAttempt(fileID: history.fileID, attemptID: attempt)
+        try await store.markImported(fileID: history.fileID, attemptID: attempt, identifier: "retained-success", sourceFingerprint: history)
+        try await store.disableSource(id: sourceIDs[1]); try await store.removeSource(id: sourceIDs[2])
+        try await store.removeSource(id: sourceIDs[3])
+        _ = try await store.recordSourceChange(fileID: history.fileID, stamp: .init(size: 20, modifiedNanoseconds: 30))
+        let changed = try await prepared(store, sourceIDs[0], roots[0], "stale-stamp.jpg")
+        let version = try await prepared(store, sourceIDs[0], roots[0], "other-version.jpg")
+        try injectEngineSQL("UPDATE file_fingerprint SET modified_ns = 99 WHERE file_id = '\(changed.fileID.uuidString)'; UPDATE file_fingerprint SET fingerprint_version = 'other' WHERE file_id = '\(version.fileID.uuidString)'", at: db)
+        let incoming = try await prepared(store, sourceIDs[0], roots[0], "incoming.jpg")
+        _ = try await prepared(store, sourceIDs[0], roots[0], "newer.jpg")
+        try await publishEmpty(store)
+        let token = try await unwrap(try await store.indexReadiness()).token
+        let before = try Data(contentsOf: db)
+        let result = try await unwrap(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+        XCTAssertEqual(Set(result.matches.map(\.key)), Set([pending, importing, history].map { "file:\($0.fileID.uuidString)" }))
+        XCTAssertEqual(Set(result.matches.map(\.origin)), [.localPending, .localImporting, .successHistory])
+        XCTAssertEqual(try Data(contentsOf: db), before, "Candidate queries must not write persistent facts")
+        XCTAssertGreaterThanOrEqual(store.vectorQueryMmapBytes, 0)
+        XCTAssertLessThanOrEqual(store.vectorQueryMmapBytes, 2147483648)
+        let stale = [
+            IndexToken(context: .init(id: UUID(), epoch: token.context.epoch), photosGeneration: token.photosGeneration, indexGeneration: token.indexGeneration, localRevision: token.localRevision, fingerprintVersion: token.fingerprintVersion),
+            IndexToken(context: .init(id: token.context.id, epoch: token.context.epoch + 1), photosGeneration: token.photosGeneration, indexGeneration: token.indexGeneration, localRevision: token.localRevision, fingerprintVersion: token.fingerprintVersion),
+            IndexToken(context: token.context, photosGeneration: token.photosGeneration + 1, indexGeneration: token.indexGeneration, localRevision: token.localRevision, fingerprintVersion: token.fingerprintVersion),
+            IndexToken(context: token.context, photosGeneration: token.photosGeneration, indexGeneration: token.indexGeneration + 1, localRevision: token.localRevision, fingerprintVersion: token.fingerprintVersion),
+            IndexToken(context: token.context, photosGeneration: token.photosGeneration, indexGeneration: token.indexGeneration, localRevision: token.localRevision + 1, fingerprintVersion: token.fingerprintVersion),
+            IndexToken(context: token.context, photosGeneration: token.photosGeneration, indexGeneration: token.indexGeneration, localRevision: token.localRevision, fingerprintVersion: "other")]
+        for old in stale {
+            try await assertNil(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: old, threshold: 0.98, diagnosticLimit: 10))
+        }
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10)
+        }
+        do { _ = try await cancelled.value; XCTFail("Cancelled query exposed a result") } catch is CancellationError {}
+        for assignments in ["width=NULL", "height=0", "width='bad'"] {
+            try injectEngineSQL("UPDATE file_fingerprint SET \(assignments) WHERE file_id = '\(pending.fileID.uuidString)'", at: db)
+            await XCTAssertThrowsErrorAsync(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+            try injectEngineSQL("UPDATE file_fingerprint SET width=640,height=480 WHERE file_id = '\(pending.fileID.uuidString)'", at: db)
+        }
+    }
+
+    func testSQLiteQueryRetainsAllMatchesAndSwiftUnicodeDiagnosticOrder() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let files = try configurationFiles(); defer { try? FileManager.default.removeItem(at: files) }
+        let config = try DedupConfiguration.loadValidated(resourceDirectory: files)
+        let version = config.fingerprint.version
+        let source = try await store.registerSource(url: root)
+        let olderSeed = try await prepared(store, source, root, "older.jpg", version: version)
+        let older = PreparedSource(fileID: olderSeed.fileID, file: olderSeed.file, fingerprint: olderSeed.fingerprint,
+            size: try PixelSize(width: 1, height: 1))
+        try await assertTrue(try await store.cacheFingerprint(older))
+        let incoming = try await prepared(store, source, root, "incoming.jpg", version: version)
+        let newer = try await prepared(store, source, root, "newer.jpg", version: version)
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 7, fingerprintVersion: version)
+        let names = (0..<400).map { String(format: "tie-%03d", $0) } + ["é:原", "é:原", "😀:current", "字:原", "negative"]
+        let descriptors = names.enumerated().map { i, name in
+            RepresentationDescriptor(key: .init(assetID: name, kind: .original), context: context,
+                revision: "A", size: try! PixelSize(width: i == 11 ? 1000 : 1, height: i == 11 ? 1000 : 1),
+                equivalentToOriginal: false, revisionIsReliable: true)
+        }
+        try await store.upsertRepresentations(descriptors, generation: generation)
+        let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 1000)
+        var oracle = [VectorEntry(key: "file:\(older.fileID.uuidString)", origin: .localPending, fingerprint: older.fingerprint, size: older.size)]
+        for task in tasks {
+            let asset = task.descriptor.key.assetID
+            let vector = try Fingerprint(version: version, values: [asset == "negative" ? -1 : 1] + Array(repeating: 0, count: 1023))
+            try await assertTrue(try await store.completeRepresentation(task, fingerprint: vector))
+            oracle.append(.init(key: "photos:\(asset.utf8.count):\(asset):original", origin: .photosOriginal, fingerprint: vector, size: task.descriptor.size))
+        }
+        try await store.finishIndexReconciliation(generation: generation)
+        let publication = try await unwrap(try await store.indexPublication())
+        try await assertTrue(try await store.markIndexPublished(token: publication.token))
+        for threshold in [0.98, 1, -1] {
+            let expected = try ExactVectorIndex.scoreWithDiagnostics(query: incoming.fingerprint, entries: oracle, minimumScore: threshold, diagnosticLimit: 10)
+            let result = try await unwrap(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: publication.token, threshold: threshold, diagnosticLimit: 10))
+            XCTAssertEqual(result.matches, expected.matches)
+            XCTAssertEqual(result.diagnostics, expected.diagnostics)
+            XCTAssertFalse(result.matches.contains { $0.key == "file:\(newer.fileID.uuidString)" || $0.key == "file:\(incoming.fileID.uuidString)" })
+            if threshold == 0.98 {
+                XCTAssertEqual(result.matches.count, 405)
+                XCTAssertTrue(result.matches.contains { $0.size?.width == 1000 })
+                XCTAssertFalse(result.diagnostics.contains { $0.size?.width == 1000 }, "Only a candidate beyond the diagnostic limit covers the source")
+                let decision = try AdvancedDuplicatePolicy.evaluate(sourceSize: incoming.size, candidates: result.matches, configuration: config)
+                XCTAssertEqual(decision.action, .skip)
+                XCTAssertEqual(decision.coveringKeys, ["photos:7:tie-011:original"])
+            }
+        }
+        let token = publication.token
+        try await store.disableSource(id: source)
+        try await assertNil(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation", at: db), names.count)
+    }
+
+    func testSQLiteQueryFailsForMalformedNonmatchAfterLegalHits() async throws {
+        for payload in ["NULL", "X'0000'", vectorSQL(.nan), vectorSQL(.infinity), vectorSQL(0), vectorSQL(-2), vectorSQL(-0.5)] {
+            let (root, db, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let source = try await store.registerSource(url: root)
+            _ = try await prepared(store, source, root, "first-hit.jpg")
+            let incoming = try await prepared(store, source, root, "incoming.jpg")
+            let context = LibraryContext(id: UUID(), epoch: 1)
+            let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+            try await store.upsertRepresentations([descriptor(context, asset: "a-hit"), descriptor(context, asset: "z-nonmatch")], generation: generation)
+            for task in try await store.nextRepresentationTasks(now: Date(), limit: 2) {
+                try await assertTrue(try await store.completeRepresentation(task, fingerprint: fingerprint("v1")))
+            }
+            try await store.finishIndexReconciliation(generation: generation)
+            let publication = try await unwrap(try await store.indexPublication())
+            try await assertTrue(try await store.markIndexPublished(token: publication.token))
+            let token = try await unwrap(try await store.indexReadiness()).token
+            try injectEngineSQL("PRAGMA ignore_check_constraints = ON; UPDATE photos_representation SET vector = \(payload) WHERE asset_id = 'z-nonmatch'", at: db)
+            await XCTAssertThrowsErrorAsync(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+        }
+    }
+
+    func testSQLiteQueryNormAndThresholdAdjacentFloatsMatchOracle() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let candidate = try await prepared(store, source, root, "candidate.jpg")
+        let incoming = try await prepared(store, source, root, "incoming.jpg")
+        try await publishEmpty(store)
+        let token = try await unwrap(try await store.indexReadiness()).token
+        let high = Float(sqrt(1.00001)), low = Float(sqrt(0.99999))
+        for component in [high.nextDown, high, high.nextUp, low.nextDown, low, low.nextUp] {
+            try injectEngineSQL("UPDATE file_fingerprint SET vector = \(vectorSQL(component)) WHERE file_id = '\(candidate.fileID.uuidString)'", at: db)
+            let data = vectorData(component)
+            if let vector = try? Fingerprint(version: "v1", littleEndianFloat32: data) {
+                let expected = try ExactVectorIndex.scoreWithDiagnostics(query: incoming.fingerprint, entries: [.init(key: "file:\(candidate.fileID.uuidString)", origin: .localPending, fingerprint: vector, size: candidate.size)], minimumScore: 0.98, diagnosticLimit: 10)
+                let actual = try await unwrap(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+                XCTAssertEqual(actual, expected)
+            } else {
+                await XCTAssertThrowsErrorAsync(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+            }
+        }
+        for score in [Float(0.98).nextDown, Float(0.98), Float(0.98).nextUp, Float(-0.98)] {
+            let vector = try Fingerprint(version: "v1", values: [score, Float(sqrt(1 - Double(score) * Double(score)))] + Array(repeating: 0, count: 1022))
+            try injectEngineSQL("UPDATE file_fingerprint SET vector = X'\(vector.littleEndianFloat32.map { String(format: "%02x", $0) }.joined())' WHERE file_id = '\(candidate.fileID.uuidString)'", at: db)
+            let expected = try ExactVectorIndex.scoreWithDiagnostics(query: incoming.fingerprint, entries: [.init(key: "file:\(candidate.fileID.uuidString)", origin: .localPending, fingerprint: vector, size: candidate.size)], minimumScore: 0.98, diagnosticLimit: 10)
+            let actual = try await unwrap(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
+            XCTAssertEqual(actual, expected)
+        }
+    }
+
+    private func vectorData(_ first: Float) -> Data {
+        var bytes = Data(count: 4096)
+        for i in 0..<4 { bytes[i] = UInt8(truncatingIfNeeded: first.bitPattern >> (8 * i)) }
+        return bytes
+    }
+    private func vectorSQL(_ first: Float) -> String {
+        "X'\(vectorData(first).map { String(format: "%02x", $0) }.joined())'"
+    }
+    private func photosVector(at database: URL) throws -> Fingerprint {
+        var handle: OpaquePointer?, statement: OpaquePointer?
+        guard sqlite3_open(database.path, &handle) == SQLITE_OK else { throw FixtureError.unavailable("sqlite") }
+        defer { sqlite3_finalize(statement); sqlite3_close(handle) }
+        guard sqlite3_prepare_v2(handle, "SELECT fingerprint_version, vector FROM photos_representation WHERE tombstoned = 0", -1, &statement, nil) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW, let version = sqlite3_column_text(statement, 0),
+              let bytes = sqlite3_column_blob(statement, 1) else { throw FixtureError.unavailable("vector") }
+        return try Fingerprint(version: String(cString: version), littleEndianFloat32: Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 1))))
+    }
+
+    func testPublicationContainsOnlyTokenAndRepresentationCount() async throws {
+        let (root, _, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([descriptor(context)], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await store.completeRepresentation(task, fingerprint: fingerprint("v1")))
+        try await store.finishIndexReconciliation(generation: generation)
+        let publication = try await unwrap(try await store.indexPublication())
+        let fields = try JSONSerialization.jsonObject(with: JSONEncoder().encode(publication)) as! [String: Any]
+        XCTAssertEqual(Set(fields.keys), ["token", "representationCount"], "Publication must not retain or copy every gallery vector")
+        XCTAssertEqual(fields["representationCount"] as? Int, 1)
+    }
+
     func testLocalRevisionChangesWithCandidateLifecycle() async throws {
         let (root, _, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -82,10 +302,10 @@ final class AdvancedDedupStoreTests: XCTestCase {
         let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await assertTrue(try await store.completeRepresentation(task, fingerprint: a.fingerprint))
         try await store.finishIndexReconciliation(generation: generation)
-        try await assertEqual(try await store.indexPublication()?.entries.count, 1)
+        try await assertEqual(try await store.indexPublication()?.representationCount, 1)
         generation = try await store.beginIndexReconciliation(context: library, photosGeneration: 3, fingerprintVersion: "v1")
         try await store.finishIndexReconciliation(generation: generation)
-        try await assertEqual(try await store.indexPublication()?.entries.count, 0)
+        try await assertEqual(try await store.indexPublication()?.representationCount, 0)
         let candidates = try await store.localVectorCandidates(beforeOrder: 1, excluding: incoming.fileID, version: "v1")
         XCTAssertEqual(candidates.entries.map(\.key), ["file:\(a.fileID.uuidString)"])
         XCTAssertEqual(candidates.entries.first?.origin, .successHistory)
@@ -392,12 +612,12 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await assertFalse(try await store.advancedAttemptIsCurrent(fileID: a.fileID, attemptID: attempt))
     }
 
-    private func prepared(_ store: SyncStore, _ source: UUID, _ root: URL, _ path: String, cache: Bool = true) async throws -> PreparedSource {
+    private func prepared(_ store: SyncStore, _ source: UUID, _ root: URL, _ path: String, cache: Bool = true, version: String = "v1") async throws -> PreparedSource {
         let file = SourceFile(sourceID: source, relativePath: path, url: root.appendingPathComponent(path),
             stamp: .init(size: 10, modifiedNanoseconds: 12), metadata: .init(filename: path, kind: .image,
                 captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: 640, height: 480, duration: nil))
         let id = try await store.save(file, decision: .importNew)
-        let result = PreparedSource(fileID: id, file: file, fingerprint: try fingerprint("v1"), size: try PixelSize(width: 640, height: 480))
+        let result = PreparedSource(fileID: id, file: file, fingerprint: try fingerprint(version), size: try PixelSize(width: 640, height: 480))
         if cache { _ = try await store.cacheFingerprint(result) }
         return result
     }
@@ -499,8 +719,8 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await assertTrue(try await store.completeRepresentation(try XCTUnwrap(tasks.first), fingerprint: fingerprint("v1")))
         let reopened = try SyncStore(url: db)
         let publication = try await unwrap(try await reopened.indexPublication())
-        XCTAssertEqual(publication.entries.count, 1)
-        XCTAssertEqual(publication.entries[0].fingerprint.littleEndianFloat32, try fingerprint("v1").littleEndianFloat32)
+        XCTAssertEqual(publication.representationCount, 1)
+        XCTAssertEqual(try photosVector(at: db), try fingerprint("v1"))
         try await assertFalse(try await reopened.indexIsReady(token: publication.token))
         try await assertTrue(try await reopened.markIndexPublished(token: publication.token))
         try await assertTrue(try await reopened.indexIsReady(token: publication.token))
@@ -510,7 +730,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await store.upsertRepresentations([descriptor(context)], generation: next)
         try await store.finishIndexReconciliation(generation: next)
         try await assertTrue(try await store.nextRepresentationTasks(now: Date(), limit: 10).isEmpty)
-        try await assertEqual(try await store.indexPublication()?.entries.count, 1)
+        try await assertEqual(try await store.indexPublication()?.representationCount, 1)
     }
 
     func testVersionContextAndUnreliableRevisionDoNotReuseStaleVectors() async throws {
@@ -553,7 +773,13 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(due.first?.retryCount, 1)
         try await assertTrue(try await store.completeRepresentation(try XCTUnwrap(due.first), fingerprint: fingerprint("v1")))
         try injectEngineSQL("PRAGMA ignore_check_constraints = ON; UPDATE photos_representation SET vector = X'0000'", at: db)
-        await XCTAssertThrowsErrorAsync(try await store.indexPublication())
+        let metadata = try await unwrap(try await store.indexPublication())
+        XCTAssertEqual(metadata.representationCount, 1)
+        try await assertTrue(try await store.markIndexPublished(token: metadata.token))
+        let source = try await store.registerSource(url: root)
+        let incoming = try await prepared(store, source, root, "incoming.jpg")
+        let token = try await unwrap(try await store.indexReadiness()).token
+        await XCTAssertThrowsErrorAsync(try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10))
     }
 
     func testUserSelectedConfigurationLoadsWithoutStatisticalPass() throws {
@@ -561,7 +787,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let configuration = try DedupConfiguration.loadValidated(resourceDirectory: root)
         XCTAssertEqual(configuration.threshold, 0.98)
-        XCTAssertEqual(configuration.backend, "exact-f32-v1")
+        XCTAssertEqual(configuration.backend, "sqlite-exact-f32-v1")
         XCTAssertTrue(configuration.acceptanceID.hasPrefix("user-decision:"))
     }
 
@@ -595,10 +821,30 @@ final class AdvancedDedupStoreTests: XCTestCase {
         // Even a valid recomputed policy cannot change the selection without a new bound decision.
         try mutate(root, file: "profile.json") {
             let fingerprint = $0["fingerprint"] as! [String: Any]
-            $0["policyVersion"] = DedupConfiguration.computePolicyVersion(fingerprintVersion: fingerprint["version"] as! String, threshold: 0.97, backend: "exact-f32-v1")
+            $0["policyVersion"] = DedupConfiguration.computePolicyVersion(fingerprintVersion: fingerprint["version"] as! String, threshold: 0.97, backend: "sqlite-exact-f32-v1")
         }
         try rebind(root)
         XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: root))
+    }
+
+    func testBoundResourcesRejectAnOldOrUnrecognizedQueryBackend() throws {
+        for backend in ["exact-f32-v1", "sqlite-vec", "sqlite-exact-f32-v2"] {
+            let root = try configurationFiles()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let original = try DedupConfiguration.loadValidated(resourceDirectory: root)
+            let policy = DedupConfiguration.computePolicyVersion(fingerprintVersion: original.fingerprint.version,
+                threshold: original.threshold, backend: backend)
+            XCTAssertNotEqual(policy, original.policyVersion)
+            try mutate(root, file: "decision.json") {
+                var selected = $0["configuration"] as! [String: Any]
+                selected["backend"] = backend; selected["policyVersion"] = policy; $0["configuration"] = selected
+            }
+            for file in ["profile.json", "regression.json", "closeout.json"] {
+                try mutate(root, file: file) { $0["backend"] = backend; $0["policyVersion"] = policy }
+            }
+            try rebind(root)
+            XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: root), backend)
+        }
     }
 
     func testReopenedStoreRequiresDerivedIndexRepublication() async throws {
@@ -676,7 +922,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await store.upsertRepresentations([descriptor(context)], generation: generation)
         try await store.finishIndexReconciliation(generation: generation)
         try await assertTrue(try await store.nextRepresentationTasks(now: Date(), limit: 10).isEmpty)
-        try await assertEqual(try await store.indexPublication()?.entries.count, 1)
+        try await assertEqual(try await store.indexPublication()?.representationCount, 1)
         XCTAssertEqual(try facts(at: db), before)
     }
 
@@ -749,7 +995,8 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 4)
         let after = try await upgraded.indexReadiness(); XCTAssertEqual(after?.entryCount, 1)
         let publication = try await upgraded.indexPublication()
-        XCTAssertEqual(publication?.entries.first?.fingerprint, vector)
+        XCTAssertEqual(try photosVector(at: db), vector)
+        XCTAssertEqual(publication?.representationCount, 1)
     }
 
     func testFreshDependencyReverseQueriesUseIndexedLookup() throws {
@@ -915,6 +1162,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
 private struct P5InvalidValidity: PhotosCandidateValidity {
     func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool { false }
 }
+
 
 private struct P5BeforeTransactionValidity: PhotosCandidateValidity {
     let database: URL

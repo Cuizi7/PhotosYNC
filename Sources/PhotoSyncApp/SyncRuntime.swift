@@ -27,7 +27,6 @@ struct AdvancedRuntimeGraph: Sendable {
     let configuration: DedupConfiguration
     let photos: any PhotosIndexGateway
     let model: any ImageFingerprinting
-    let index: ExactVectorIndex
     let budget: ImageWorkBudget
     let coordinator: PhotosIndexCoordinator
     let service: AdvancedDedupService
@@ -37,11 +36,12 @@ struct AdvancedRuntimeGraph: Sendable {
          configuration: DedupConfiguration, executor: ReadExecutor, budget: ImageWorkBudget,
          directory: @escaping SyncEngine.DirectoryFactory, now: @escaping @Sendable () -> Date, logger: RunLogger? = nil) {
         self.configuration = configuration; self.photos = photos; self.model = model; self.budget = budget
-        index = ExactVectorIndex(version: configuration.fingerprint.version)
+        logger?.log(["phase": "sqlite-vector-query", "backend": configuration.backend,
+            "effectiveMmapBytes": String(store.vectorQueryMmapBytes), "ordinaryCacheKiB": "16384"])
         coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-            index: index, configuration: configuration, diagnostics: { logger?.log($0) })
+            configuration: configuration, diagnostics: { logger?.log($0) })
         service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator,
-            fingerprinter: model, index: index, configuration: configuration, executor: executor, budget: budget)
+            fingerprinter: model, configuration: configuration, executor: executor, budget: budget)
         legacy = LegacySkipReevaluation(store: store,
             stamp: { file in try await directory(file.sourceID).stamp(of: file.url) },
             policyVersion: configuration.policyVersion, retryDelaysSeconds: configuration.resources.retryDelaysSeconds, now: now)

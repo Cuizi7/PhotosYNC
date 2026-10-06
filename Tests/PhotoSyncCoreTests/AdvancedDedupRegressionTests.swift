@@ -18,6 +18,50 @@ final class AdvancedDedupRegressionTests: XCTestCase {
 }
 
 extension AdvancedDedupRegressionTests {
+    /// Local saved-vector replay, separate from the opt-in new model inference below.
+    func testExistingVectorReplayUsesSQLiteBackend() async throws {
+        guard let batchPath = ProcessInfo.processInfo.environment["PHOTOSYNC_SQLITE_REPLAY_BATCH"],
+              let profilePath = ProcessInfo.processInfo.environment["PHOTOSYNC_SQLITE_REPLAY_PROFILE"] else {
+            throw XCTSkip("Saved-vector replay requires explicit local inputs")
+        }
+        let config = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: URL(fileURLWithPath: profilePath)))
+        let batch = try p9JSON(URL(fileURLWithPath: batchPath))
+        let cases = try XCTUnwrap(batch["queries"] as? [[String: Any]])
+        var results = [[String: Any]]()
+        func vector(_ record: [String: Any]) throws -> Fingerprint {
+            let url = URL(fileURLWithPath: record["vector"] as! String)
+            XCTAssertEqual(try p9Hash(url), record["vectorSHA256"] as? String)
+            return try Fingerprint(version: config.fingerprint.version, littleEndianFloat32: Data(contentsOf: url))
+        }
+        func size(_ record: [String: Any]) throws -> PixelSize? {
+            guard let pixels = record["size"] as? [String: Int] else { return nil }
+            return try PixelSize(width: XCTUnwrap(pixels["width"]), height: XCTUnwrap(pixels["height"]))
+        }
+        for item in cases {
+            let query = try vector(item)
+            let candidates = try XCTUnwrap(item["candidates"] as? [[String: Any]])
+            let entries = try candidates.map { record in
+                VectorEntry(key: record["key"] as! String, origin: .photosOriginal, fingerprint: try vector(record), size: try size(record))
+            }
+            let actual = try await p10SQLiteSearch(query: query, entries: entries, configuration: config)
+            let framed = entries.map { VectorEntry(key: "photos:\($0.key.utf8.count):\($0.key):original", origin: $0.origin, fingerprint: $0.fingerprint, size: $0.size) }
+            let oracle = try ExactVectorIndex.scoreWithDiagnostics(query: query, entries: framed, minimumScore: config.threshold, diagnosticLimit: 10)
+            XCTAssertEqual(actual, oracle)
+            let decision = try AdvancedDuplicatePolicy.evaluate(sourceSize: size(item), candidates: actual.matches, configuration: config)
+            results.append(["id": item["id"]!, "content": decision.content.rawValue,
+                "action": decision.action.rawValue, "queryVectorSHA256": item["vectorSHA256"]!,
+                "candidates": actual.diagnostics.map { candidate in
+                    let original = entries.first { "photos:\($0.key.utf8.count):\($0.key):original" == candidate.key }!
+                    return ["key": candidate.key, "origin": candidate.origin.rawValue, "score": candidate.score,
+                            "vectorSHA256": SHA256.hash(data: original.fingerprint.littleEndianFloat32).map { String(format: "%02x", $0) }.joined()] as [String: Any]
+                }])
+        }
+        XCTAssertEqual(results.count, 33)
+        try p9WriteEvidence("sqlite-vector-replay.json", ["backend": config.backend, "policyVersion": config.policyVersion,
+            "fingerprintVersion": config.fingerprint.version, "newImageInference": false,
+            "independentValidation": false, "cases": results, "batchSHA256": try p9Hash(URL(fileURLWithPath: batchPath))])
+    }
+
     /// Local opt-in only: canonical validation supplies the authorized fixture path.
     /// Ordinary tests never load user photographs; public CI must not opt in.
     func testFrozenCorpusContentAndActions() async throws {
@@ -73,15 +117,19 @@ extension AdvancedDedupRegressionTests {
             let entries = try (item["candidates"] as! [String]).map { id in
                 VectorEntry(key: id, origin: .photosOriginal, fingerprint: try XCTUnwrap(vectors[id]), size: sizes[id])
             }
-            let matches = try ExactVectorIndex.score(query: XCTUnwrap(vectors[query]), entries: entries, minimumScore: -1)
-            let result = try AdvancedDuplicatePolicy.evaluate(sourceSize: sizes[query], candidates: matches, configuration: config)
+            let search = try await p10SQLiteSearch(query: XCTUnwrap(vectors[query]), entries: entries, configuration: config)
+            let oracle = try ExactVectorIndex.scoreWithDiagnostics(query: XCTUnwrap(vectors[query]), entries: entries.map {
+                VectorEntry(key: "photos:\($0.key.utf8.count):\($0.key):original", origin: $0.origin, fingerprint: $0.fingerprint, size: $0.size)
+            }, minimumScore: config.threshold, diagnosticLimit: 10)
+            XCTAssertEqual(search, oracle)
+            let result = try AdvancedDuplicatePolicy.evaluate(sourceSize: sizes[query], candidates: search.matches, configuration: config)
             let content = result.content == .duplicate ? "duplicate" : "not_duplicate"
             let action = result.action == .skip ? "skip" : "import"
             XCTAssertEqual(content, expected["content_result"], item["id"] as! String)
             XCTAssertEqual(action, expected["action"], item["id"] as! String)
             duplicates += result.content == .duplicate ? 1 : 0; skips += result.action == .skip ? 1 : 0
             results.append(["id": item["id"]!, "content": content, "action": action,
-                            "candidate_scores": matches.map(\.score)])
+                            "candidate_scores": search.diagnostics.map(\.score)])
         }
         XCTAssertEqual(duplicates, 14); XCTAssertEqual(33 - duplicates, 19)
         XCTAssertEqual(skips, 11); XCTAssertEqual(33 - skips, 22)
@@ -89,8 +137,38 @@ extension AdvancedDedupRegressionTests {
             "duplicate_count": duplicates, "skip_count": skips, "unique_images": used.count,
             "model_load_compile_ms": loadMS, "fingerprint_ms": p9Percentiles(timings),
             "model_sha256": config.fingerprint.modelSHA256, "acceptance_id": config.acceptanceID,
-            "inputs": inputs, "new_image_inference": true, "statistical_acceptance": "not_performed", "rss_peak_bytes": p9PeakRSS()])
+            "inputs": inputs, "backend": config.backend, "policy_version": config.policyVersion,
+            "new_image_inference": true, "statistical_acceptance": "not_performed", "rss_peak_bytes": p9PeakRSS()])
     }
+}
+
+private func p10SQLiteSearch(query: Fingerprint, entries: [VectorEntry], configuration: DedupConfiguration) async throws -> VectorSearchResult {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try SyncStore(url: root.appendingPathComponent("query.sqlite"))
+    let source = try await store.registerSource(url: root)
+    let incoming = SourceFile(sourceID: source, relativePath: "query.jpg", url: root.appendingPathComponent("query.jpg"),
+        stamp: .init(size: 1, modifiedNanoseconds: 1), metadata: .init(filename: "query.jpg", kind: .image,
+            captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: nil, height: nil, duration: nil))
+    let fileID = try await store.save(incoming, decision: .importNew)
+    let context = LibraryContext(id: UUID(), epoch: 1)
+    let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: query.version)
+    try await store.upsertRepresentations(entries.map {
+        RepresentationDescriptor(key: .init(assetID: $0.key, kind: .original), context: context, revision: "fixed-replay",
+            size: $0.size, equivalentToOriginal: false, revisionIsReliable: true)
+    }, generation: generation)
+    let tasks = try await store.nextRepresentationTasks(now: Date(), limit: max(1, entries.count))
+    for task in tasks {
+        let fingerprint = try XCTUnwrap(entries.first { $0.key == task.descriptor.key.assetID }?.fingerprint)
+        let completed = try await store.completeRepresentation(task, fingerprint: fingerprint)
+        XCTAssertTrue(completed)
+    }
+    try await store.finishIndexReconciliation(generation: generation)
+    let value = try await store.indexPublication(), publication = try XCTUnwrap(value)
+    let published = try await store.markIndexPublished(token: publication.token); XCTAssertTrue(published)
+    let result = try await store.vectorCandidates(for: fileID, query: query, token: publication.token,
+        threshold: configuration.threshold, diagnosticLimit: 10)
+    return try XCTUnwrap(result)
 }
 
 private func p9JSON(_ url: URL) throws -> [String: Any] {
@@ -456,7 +534,7 @@ extension AdvancedDedupRegressionTests {
         let model = P9MeasuredModel(CoreMLFingerprinter(configuration: configuration.fingerprint,
             predict: { _ in [1] + [Float](repeating: 0, count: 1023) }))
         let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-            index: ExactVectorIndex(version: configuration.fingerprint.version), configuration: configuration)
+            configuration: configuration)
         await photos.setAcknowledgementFailure(true)
         // processDueWork deliberately catches publication/acknowledgement errors.
         await coordinator.processDueWork(now: Date())

@@ -352,10 +352,10 @@ public struct RepresentationTask: Codable, Equatable, Sendable {
 }
 public struct IndexPublication: Codable, Equatable, Sendable {
     public let token: IndexToken
-    public let entries: [VectorEntry]
-    public init(token: IndexToken, entries: [VectorEntry]) { self.token = token; self.entries = entries }
+    public let representationCount: Int
+    public init(token: IndexToken, representationCount: Int) { self.token = token; self.representationCount = representationCount }
 }
-// VectorEntry's declaration stays with ExactVectorIndex; these conformances enable persisted publications.
+// VectorEntry remains the independent research/oracle representation.
 extension VectorEntry: Equatable, Codable {
     public static func == (lhs: VectorEntry, rhs: VectorEntry) -> Bool {
         lhs.key == rhs.key && lhs.origin == rhs.origin && lhs.fingerprint == rhs.fingerprint && lhs.size == rhs.size
@@ -472,7 +472,7 @@ extension DedupConfiguration {
               d.fingerprint.modelSHA256 == "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
               d.fingerprint.inputSide == 320, d.fingerprint.resizeMode == .stretchFullFrame,
               d.fingerprint.colorSpace == "sRGB", d.fingerprint.mean == [0.485, 0.456, 0.406],
-              d.fingerprint.std == [0.229, 0.224, 0.225], d.backend == "exact-f32-v1",
+              d.fingerprint.std == [0.229, 0.224, 0.225], d.backend == "sqlite-exact-f32-v1",
               profile.threshold == decision.selectedThreshold, profile.fingerprint == d.fingerprint,
               profile.policyVersion == d.policyVersion, profile.backend == d.backend,
               profile.resources == d.resources, profile.evidenceCandidateLimit == d.evidenceCandidateLimit,

@@ -6,7 +6,6 @@ public actor PhotosIndexCoordinator {
     private let store: SyncStore
     private let photos: any PhotosIndexGateway
     private let fingerprinter: any ImageFingerprinting
-    private let index: ExactVectorIndex
     private let configuration: DedupConfiguration
     private var observer: Task<Void, Never>?
     private var started = false, paused = false, reconciling = false, processing = false
@@ -22,10 +21,10 @@ public actor PhotosIndexCoordinator {
     private let diagnostics: @Sendable ([String: String]) -> Void
 
     public init(store: SyncStore, photos: any PhotosIndexGateway, fingerprinter: any ImageFingerprinting,
-                index: ExactVectorIndex, configuration: DedupConfiguration,
+                configuration: DedupConfiguration,
                 diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         self.store = store; self.photos = photos; self.fingerprinter = fingerprinter
-        self.index = index; self.configuration = configuration; self.diagnostics = diagnostics
+        self.configuration = configuration; self.diagnostics = diagnostics
     }
 
     deinit { observer?.cancel() }
@@ -251,7 +250,6 @@ public actor PhotosIndexCoordinator {
         guard !needsReconciliation, !reconciling, let acknowledgedGeneration else { return nil }
         guard let publication = try await store.indexReadiness(),
               publication.token.photosGeneration == acknowledgedGeneration,
-              await index.containsGeneration(publication.token.indexGeneration, entryCount: publication.entryCount),
               try await store.indexIsReady(token: publication.token) else { return nil }
         let snapshot = try await photos.candidateSnapshot()
         if snapshot.generation != acknowledgedGeneration {
@@ -279,9 +277,6 @@ public actor PhotosIndexCoordinator {
               publication.token.photosGeneration == reconciledGeneration else { return }
         let snapshot = try await photos.candidateSnapshot()
         guard !needsReconciliation, snapshot.generation == publication.token.photosGeneration else { throw PhotoKitGatewayError.libraryChanged }
-        if await !index.containsGeneration(publication.token.indexGeneration, entryCount: publication.entries.count) {
-            try await index.replace(entries: publication.entries, generation: publication.token.indexGeneration)
-        }
         guard !needsReconciliation, try await store.markIndexPublished(token: publication.token) else { throw PhotoKitGatewayError.libraryChanged }
         try await photos.acknowledgeReconciliation(expectedGeneration: publication.token.photosGeneration)
         let latest = try await photos.candidateSnapshot()

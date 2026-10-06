@@ -282,11 +282,10 @@ final class AdvancedDedupEngineTests: XCTestCase {
         let photos = EngineIndexPhotos()
         var values = [Float](repeating: 0, count: 1024); values[0] = 1
         let model = EngineIndexModel(vector: try Fingerprint(version: c.fingerprint.version, values: values))
-        let index = ExactVectorIndex(version: c.fingerprint.version)
-        let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, index: index, configuration: c)
+        let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, configuration: c)
         let budget = ImageWorkBudget(limits: c.resources)
         let service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator, fingerprinter: model,
-            index: index, configuration: c, executor: ReadExecutor(maxConcurrentOperations: c.resources.maxInFlightTasks), budget: budget)
+            configuration: c, executor: ReadExecutor(maxConcurrentOperations: c.resources.maxInFlightTasks), budget: budget)
         let clock = EngineIndexClock()
         let engine = SyncEngine(store: store, photos: photos, logger: logger, advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, dedupConfiguration: c, now: { clock.now })
         return Fixture(engine: engine, store: store, photos: photos, coordinator: coordinator, model: model, budget: budget, configuration: c, source: source, root: sourceURL, clock: clock)

@@ -40,7 +40,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.set([descriptor(f.photos.context), descriptor(f.photos.context, kind: .current, equivalent: true)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         let publication = try await f.store.indexPublication()
-        XCTAssertEqual(publication?.entries.count, 1)
+        XCTAssertEqual(publication?.representationCount, 1)
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
@@ -116,7 +116,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.set([]); try await f.coordinator.reconcile()
         await gate.release(); await work.value
         let publication = try await f.store.indexPublication()
-        XCTAssertEqual(publication?.entries.count, 0)
+        XCTAssertEqual(publication?.representationCount, 0)
         let tasks = try await f.store.nextRepresentationTasks(now: now, limit: 10); XCTAssertTrue(tasks.isEmpty)
         await assertEqual(await f.photos.readCount, 1)
     }
@@ -167,7 +167,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let reopened = try SyncStore(url: f.db)
         let model = CoordinatorModel(version: f.configuration.fingerprint.version)
         let resumed = PhotosIndexCoordinator(store: reopened, photos: f.photos, fingerprinter: model,
-            index: ExactVectorIndex(version: f.configuration.fingerprint.version), configuration: f.configuration)
+            configuration: f.configuration)
         await f.photos.fail(nil); await f.photos.resetReads()
         try await resumed.reconcile(); await resumed.processDueWork(now: now.addingTimeInterval(5))
         await assertEqual(await f.photos.resumeCount, 1); await assertEqual(await f.photos.readCount, 1)
@@ -180,7 +180,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         let reopened = try SyncStore(url: f.db); await f.photos.setResumeSuccess(false); await f.model.reset()
         let resumed = PhotosIndexCoordinator(store: reopened, photos: f.photos, fingerprinter: f.model,
-            index: ExactVectorIndex(version: f.configuration.fingerprint.version), configuration: f.configuration)
+            configuration: f.configuration)
         try await resumed.reconcile(); await resumed.processDueWork(now: now)
         await assertEqual(await f.model.count, 1)
     }
@@ -201,11 +201,11 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await assertNil(try await f.coordinator.readyToken())
     }
 
-    func testReopenedReadyFactsRebuildDerivedIndexWithoutInference() async throws {
+    func testReopenedReadyFactsRepublishReadinessWithoutInference() async throws {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
-        let store = try SyncStore(url: f.db), index = ExactVectorIndex(version: f.configuration.fingerprint.version)
-        let resumed = PhotosIndexCoordinator(store: store, photos: f.photos, fingerprinter: f.model, index: index, configuration: f.configuration)
+        let store = try SyncStore(url: f.db)
+        let resumed = PhotosIndexCoordinator(store: store, photos: f.photos, fingerprinter: f.model, configuration: f.configuration)
         await f.photos.resetReads(); await f.model.reset()
         try await assertNil(try await resumed.readyToken())
         try await resumed.reconcile(); await resumed.processDueWork(now: now)
@@ -249,8 +249,8 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
-    func testReopensAtAllThreePublicationBoundariesWithoutClearingFacts() async throws {
-        for stage in 0...2 {
+    func testReopensAtPublicationBoundariesWithoutClearingFacts() async throws {
+        for stage in 0...1 {
             let f = try fixture(); let d = descriptor(f.photos.context); await f.photos.set([d])
             let checkpoint = try await f.photos.contextCheckpoint()
             let snapshot = try await f.photos.candidateSnapshot()
@@ -263,12 +263,11 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             _ = try await f.store.completeRepresentation(try XCTUnwrap(tasks.first), fingerprint: fingerprint)
             let value = try await f.store.indexPublication()
             let publication = try XCTUnwrap(value)
-            let oldIndex = ExactVectorIndex(version: f.configuration.fingerprint.version)
-            if stage >= 1 { try await oldIndex.replace(entries: publication.entries, generation: generation) }
-            if stage >= 2 { _ = try await f.store.markIndexPublished(token: publication.token) }
+            XCTAssertEqual(publication.representationCount, 1)
+            if stage == 1 { _ = try await f.store.markIndexPublished(token: publication.token) }
             let reopened = try SyncStore(url: f.db)
             let coordinator = PhotosIndexCoordinator(store: reopened, photos: f.photos, fingerprinter: f.model,
-                index: ExactVectorIndex(version: f.configuration.fingerprint.version), configuration: f.configuration)
+                configuration: f.configuration)
             try await assertNil(try await coordinator.readyToken())
             try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
             try await assertNotNil(try await coordinator.readyToken())
@@ -289,7 +288,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
                 evidenceCandidateLimit: f.configuration.evidenceCandidateLimit, acceptanceID: f.configuration.acceptanceID)
             let model = CoordinatorModel(version: changed.version)
             let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: model,
-                index: ExactVectorIndex(version: changed.version), configuration: configuration)
+                configuration: configuration)
             try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
             await assertEqual(await model.count, 1)
             let token = try await coordinator.readyToken(); XCTAssertEqual(token?.fingerprintVersion, changed.version)
@@ -361,7 +360,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             threshold: 0.97, backend: c.backend, resources: c.resources, evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
         let model = CoordinatorModel(version: changed.fingerprint.version)
         let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: model,
-            index: ExactVectorIndex(version: changed.fingerprint.version), configuration: changed)
+            configuration: changed)
         try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
         await assertEqual(await model.count, 0)
         try await assertNotNil(try await coordinator.readyToken())
@@ -374,7 +373,11 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try injectEngineSQL("ALTER TABLE dedup_index_state DROP COLUMN resume_checkpoint; ALTER TABLE dedup_index_state DROP COLUMN excluded_assets;", at: f.db)
         let reopened = try SyncStore(url: f.db)
         let after = try await reopened.indexPublication()
-        XCTAssertEqual(before?.entries, after?.entries)
+        XCTAssertEqual(before, after)
+        let bytes = try Fingerprint(version: f.configuration.fingerprint.version,
+            values: [1] + Array(repeating: 0, count: 1023)).littleEndianFloat32
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='asset' AND kind='original' AND width=8 AND height=8 AND vector=X'\(hex)' AND fingerprint_version='\(f.configuration.fingerprint.version)'", at: f.db), 1)
         let checkpoint = try await reopened.libraryResumeCheckpoint(); XCTAssertNil(checkpoint)
     }
 
@@ -392,7 +395,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         let reopened = try SyncStore(url: f.db); await f.photos.throwNextResume(); await f.model.reset()
         let resumed = PhotosIndexCoordinator(store: reopened, photos: f.photos, fingerprinter: f.model,
-            index: ExactVectorIndex(version: f.configuration.fingerprint.version), configuration: f.configuration)
+            configuration: f.configuration)
         do { try await resumed.reconcile(); XCTFail("Expected interrupted replay") } catch {}
         try await resumed.reconcile(); await resumed.processDueWork(now: now)
         await assertEqual(await f.model.count, 1)
@@ -522,7 +525,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let photos = CoordinatorPhotos(limits: configuration.resources), model = CoordinatorModel(version: configuration.fingerprint.version)
         return Fixture(db: db, store: store, photos: photos, model: model, configuration: configuration,
             coordinator: PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-                index: ExactVectorIndex(version: configuration.fingerprint.version), configuration: configuration))
+                configuration: configuration))
     }
     private func descriptor(_ context: LibraryContext, asset: String = "asset", kind: RepresentationKind = .original,
                             revision: String = "r1", equivalent: Bool = false) -> RepresentationDescriptor {

@@ -19,10 +19,10 @@ WEIGHT_SHA = "e67a9b7f25cfc0b0fc98eff41ff5357c4477c642aa2f4790ed4479b7a2a31917"
 WEIGHT_SIZE = 176645312
 LICENSE_SHA = "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93"
 RECORD_HASHES = {
-    "decision.json": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
-    "profile.json": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
-    "regression.json": "c30e33331aa73a0e574c13d1648db2b2f65a7318023888db3c0a07b42ba4e5b6",
-    "closeout.json": "a1815f2ba03887968ea6274b389f7011fb4c310b0205d40919e85740777e7278",
+    "decision.json": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
+    "profile.json": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
+    "regression.json": "77edba15a226197594625656b336d33f7e169609c5d1d6787270ea804c82704f",
+    "closeout.json": "56f5e4dc59c51d535e58477bcc037b889a019039cb6d495853d4379ffd6c58d5",
     "LICENSE-SSCD.txt": LICENSE_SHA,
     "model-provenance.json": "d59d381e71afd5bebf8d448f64a3d27c5019963228a3fc1a02d5be9ae5528a65",
 }

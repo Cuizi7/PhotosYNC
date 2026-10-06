@@ -343,13 +343,12 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
     if isAdvanced {
         let profileURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("integration-profile.json")
         let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: profileURL))
-        let index = ExactVectorIndex(version: configuration.fingerprint.version)
-        let current = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, index: index, configuration: configuration)
+        let current = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, configuration: configuration)
         try await current.reconcile()
         await current.processDueWork(now: Date())
         coordinator = current
         service = AdvancedDedupService(store: store, photos: photos, coordinator: current, fingerprinter: model,
-            index: index, configuration: configuration, executor: executor, budget: ImageWorkBudget(limits: configuration.resources))
+            configuration: configuration, executor: executor, budget: ImageWorkBudget(limits: configuration.resources))
     }
     let notifications = NotificationRecorder()
     let engine = SyncEngine(

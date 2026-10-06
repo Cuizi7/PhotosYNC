@@ -1,5 +1,49 @@
 import Foundation
 import SQLite3
+import SQLiteVectorQuery
+
+/// Query-local scores and metadata only. The cancellation bit is the sole field
+/// shared with the calling task; collection happens synchronously on the store queue.
+private final class SQLiteVectorCollector: @unchecked Sendable {
+    let version: String, threshold: Double, diagnosticLimit: Int
+    private var matches = [ScoredCandidate](), diagnostics = [ScoredCandidate]()
+    private let cancellationLock = NSLock()
+    private var cancelled = false
+    private(set) var error: Error?
+    init(version: String, threshold: Double, diagnosticLimit: Int) {
+        self.version = version; self.threshold = threshold; self.diagnosticLimit = diagnosticLimit
+    }
+    func cancel() { cancellationLock.lock(); cancelled = true; cancellationLock.unlock() }
+    var isCancelled: Bool {
+        cancellationLock.lock(); defer { cancellationLock.unlock() }; return cancelled
+    }
+    var diagnosticFloor: Float {
+        diagnosticLimit == 0 ? .infinity : diagnostics.count < diagnosticLimit ? -.infinity : Float(diagnostics.last!.score)
+    }
+    var result: VectorSearchResult { .init(matches: matches.sorted(by: Self.ranked), diagnostics: diagnostics) }
+    func collect(row: OpaquePointer, score: Float) -> Float {
+        guard let keyBytes = sqlite3_column_text(row, 0), let originBytes = sqlite3_column_text(row, 1),
+              let key = String(bytes: UnsafeBufferPointer(start: keyBytes, count: Int(sqlite3_column_bytes(row, 0))), encoding: .utf8),
+              let originText = String(bytes: UnsafeBufferPointer(start: originBytes, count: Int(sqlite3_column_bytes(row, 1))), encoding: .utf8),
+              let origin = CandidateOrigin(rawValue: originText) else {
+            error = AdvancedDedupError.invalidConfiguration; return .nan
+        }
+        do {
+            let size = sqlite3_column_type(row, 2) == SQLITE_NULL ? nil :
+                try PixelSize(width: Int(sqlite3_column_int64(row, 2)), height: Int(sqlite3_column_int64(row, 3)))
+            let candidate = ScoredCandidate(key: key, origin: origin, score: Double(score), size: size, fingerprintVersion: version)
+            if Double(score) >= threshold { matches.append(candidate) }
+            if diagnosticLimit > 0 {
+                diagnostics.append(candidate); diagnostics.sort(by: Self.ranked)
+                if diagnostics.count > diagnosticLimit { diagnostics.removeLast() }
+            }
+            return diagnosticFloor
+        } catch { self.error = error; return .nan }
+    }
+    private static func ranked(_ lhs: ScoredCandidate, _ rhs: ScoredCandidate) -> Bool {
+        lhs.score == rhs.score ? lhs.key < rhs.key : lhs.score > rhs.score
+    }
+}
 
 public struct StoredFile: Sendable {
     public let id: UUID
@@ -77,9 +121,11 @@ public final class SyncStore: @unchecked Sendable {
     private let readExecutor: ReadExecutor
     private let validateSource: @Sendable (URL) throws -> URL
     private let decodeObserver: @Sendable () -> Void
-    /// A durable published marker cannot prove that this instance rebuilt its derived index.
-    /// Accessed only on the database queue. Local candidate revisions do not change that index.
+    /// A durable marker does not prove this process completed its publication barrier.
+    /// Accessed only on the database queue; local revisions do not invalidate Photos publication.
     private var publishedIndexToken: IndexToken?
+    /// Effective optional mapping allowance. Zero/truncation never changes query correctness.
+    public private(set) var vectorQueryMmapBytes: Int64 = 0
 
     public init(url: URL, readExecutor: ReadExecutor = .shared,
                 validateSource: @escaping @Sendable (URL) throws -> URL = { try SourceRegistry.normalizedURL($0) },
@@ -98,6 +144,9 @@ public final class SyncStore: @unchecked Sendable {
         database = handle
         do {
             try execute("PRAGMA foreign_keys = ON")
+            try execute("PRAGMA mmap_size = 2147483648")
+            vectorQueryMmapBytes = try int64(one("PRAGMA mmap_size", [])![0])
+            try execute("PRAGMA cache_size = -16384")
             try migrate()
             try ensureIndexes()
         } catch {
@@ -657,6 +706,87 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 return (revision, entries)
             }
+        }
+    }
+
+    /// One read snapshot owns token validation and the complete Photos/local/history scan.
+    /// No vector survives its cursor row. Nil means expired publication/token; malformed
+    /// facts, failed SQLite reads and cancellation throw without exposing partial results.
+    public func vectorCandidates(for fileID: UUID, query: Fingerprint, token: IndexToken,
+                                 threshold: Double, diagnosticLimit: Int) async throws -> VectorSearchResult? {
+        guard threshold.isFinite, (-1...1).contains(threshold), diagnosticLimit >= 0 else {
+            throw AdvancedDedupError.invalidConfiguration
+        }
+        let collector = SQLiteVectorCollector(version: query.version, threshold: threshold, diagnosticLimit: diagnosticLimit)
+        return try await withTaskCancellationHandler(operation: {
+            try await self.perform {
+                // The store queue is acquired before the transaction. No Photos/model
+                // lock or I/O is needed here; commitAdvanced keeps its existing gate order.
+                try self.execute("BEGIN")
+                do {
+                    let result = try self.vectorCandidatesSync(for: fileID, query: query, token: token, collector: collector)
+                    try self.execute("COMMIT")
+                    return result
+                } catch { try? self.execute("ROLLBACK"); throw error }
+            }
+        }, onCancel: { collector.cancel() })
+    }
+
+    private func vectorCandidatesSync(for fileID: UUID, query: Fingerprint, token: IndexToken,
+                                      collector: SQLiteVectorCollector) throws -> VectorSearchResult? {
+        guard !collector.isCancelled else { throw CancellationError() }
+        guard let state = try indexStateRow(), try indexToken(state) == token,
+              optionalInteger(state[3]) == token.indexGeneration,
+              let published = publishedIndexToken, samePhotosIndex(published, token) else { return nil }
+        guard query.version == token.fingerprintVersion else { throw AdvancedDedupError.modelMismatch }
+        // A matching published token with corrupted underlying facts is an error,
+        // never a stale-token nil or an empty gallery proving non-duplication.
+        guard try indexFactsComplete(state) else { throw AdvancedDedupError.invalidFingerprint }
+        guard let incoming = try one("SELECT created_order FROM file_record WHERE id = ?", [.text(fileID.uuidString)]) else {
+            throw SyncStoreError.invalidTransition("The incoming file is no longer recorded.")
+        }
+        let sql = """
+            SELECT 'photos:' || length(CAST(asset_id AS BLOB)) || ':' || asset_id || ':' || kind,
+                CASE kind WHEN 'original' THEN 'photosOriginal' WHEN 'current' THEN 'photosCurrent' ELSE '' END,
+                width, height, vector FROM photos_representation
+            WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0
+                AND seen_generation = ? AND state = 'ready' AND fingerprint_version = ?
+            UNION ALL
+            SELECT 'file:' || f.id,
+                CASE WHEN f.success_id IS NOT NULL THEN 'successHistory'
+                     WHEN f.state = 'importing' THEN 'localImporting' ELSE 'localPending' END,
+                v.width, v.height, v.vector FROM file_record f
+            JOIN source s ON s.id = f.source_id JOIN file_fingerprint v ON v.file_id = f.id
+            WHERE f.id <> ? AND v.fingerprint_version = ? AND (
+                (f.success_id IS NOT NULL AND v.purpose = 'success') OR
+                (f.success_id IS NULL AND f.state IN ('pending', 'importing') AND f.created_order < ?
+                 AND s.enabled = 1 AND s.removed = 0 AND v.purpose = 'current'
+                 AND v.size = f.size AND v.modified_ns = f.modified_ns))
+            """
+        let bindings: [Binding] = [.text(token.context.id.uuidString), .int64(token.context.epoch),
+            .int64(token.indexGeneration), .text(token.fingerprintVersion), .text(fileID.uuidString),
+            .text(query.version), .int64(try int64(incoming[0]))]
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw databaseError() }
+        guard sqlite3_stmt_readonly(statement) != 0 else { throw AdvancedDedupError.invalidConfiguration }
+        for (offset, binding) in bindings.enumerated() { try bind(binding, to: statement, index: Int32(offset + 1)) }
+        let context = Unmanaged.passUnretained(collector).toOpaque()
+        let status = query.values.withUnsafeBufferPointer { values in
+            ps_vector_scan(statement, values.baseAddress!, collector.threshold, collector.diagnosticFloor,
+                { context, row, score in
+                    Unmanaged<SQLiteVectorCollector>.fromOpaque(context!).takeUnretainedValue().collect(row: row!, score: score)
+                }, { context in
+                    Unmanaged<SQLiteVectorCollector>.fromOpaque(context!).takeUnretainedValue().isCancelled ? 1 : 0
+                }, context)
+        }
+        switch status {
+        case Int32(PS_VECTOR_OK.rawValue): return collector.result
+        case Int32(PS_VECTOR_INVALID_METADATA.rawValue): throw AdvancedDedupError.invalidConfiguration
+        case Int32(PS_VECTOR_INVALID_FINGERPRINT.rawValue): throw AdvancedDedupError.invalidFingerprint
+        case Int32(PS_VECTOR_CANCELLED.rawValue): throw CancellationError()
+        case Int32(PS_VECTOR_COLLECTION_ERROR.rawValue): throw collector.error ?? AdvancedDedupError.invalidConfiguration
+        default: throw databaseError()
         }
     }
 
@@ -1249,7 +1379,7 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     /// Lightweight admission metadata: never materialize all vector BLOBs just
-    /// to render progress or validate a token. Publication still decodes every vector.
+    /// to render progress, publish readiness or validate a token.
     public func indexReadiness() async throws -> (token: IndexToken, entryCount: Int)? {
         try await perform {
             try self.transaction {
@@ -1324,31 +1454,19 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    /// A reconstructible immutable snapshot. Returning it does not make it ready for admission.
+    /// A lightweight fact-complete publication. Returning it does not authorize admission.
     public func indexPublication() async throws -> IndexPublication? {
         try await perform {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
                 let token = try self.indexToken(state)
-                let entries = try self.mappedRows("SELECT asset_id, kind, width, height, fingerprint_version, vector FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ? ORDER BY asset_id, kind", [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)]) { row -> VectorEntry in
-                    guard let kind = RepresentationKind(rawValue: try self.text(row[1])),
-                          try self.text(row[4]) == token.fingerprintVersion, case .blob(let data) = row[5] else {
-                        throw AdvancedDedupError.invalidFingerprint
-                    }
-                    // Length framing keeps opaque asset IDs, including separators, collision-free.
-                    let asset = try self.text(row[0])
-                    return VectorEntry(key: "photos:\(asset.utf8.count):\(asset):\(kind.rawValue)",
-                        origin: kind == .original ? .photosOriginal : .photosCurrent,
-                        fingerprint: try Fingerprint(version: token.fingerprintVersion, littleEndianFloat32: data),
-                        size: try self.pixelSize(width: row[2], height: row[3]))
-                }
-                return IndexPublication(token: token, entries: entries)
+                let count = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND seen_generation = ?", [.text(token.context.id.uuidString), .int64(token.context.epoch), .int64(token.indexGeneration)])!
+                return IndexPublication(token: token, representationCount: Int(try self.int64(count[0])))
             }
         }
     }
 
-    /// The caller must first install the complete immutable derived generation.
-    /// This transaction validates facts/token, but cannot inspect an external index.
+    /// Completes this process's publication proof after the coordinator checks Photos.
     public func markIndexPublished(token: IndexToken) async throws -> Bool {
         try await perform {
             try self.transaction {

@@ -1,26 +1,24 @@
 {
   "schemaVersion": 1,
-  "date": "2026-10-05",
+  "date": "2026-10-06",
   "kind": "fixed_user_threshold_replay_of_existing_vectors",
   "threshold": 0.98,
   "thresholdBasis": "explicit_user_choice_not_independent_calibration",
-  "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
-  "integrationProfileSHA256": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
-  "replayProfileSHA256": "107e03d70e04494f96128a180e9dc56ebc6c428ddb42978055c141f9a1783637",
-  "replayProfileDifference": [
-    "Historical replay used the prior 128MiB resource allowance and prior acceptanceID; score/model/preprocessing/threshold/coverage fields are unchanged. No new replay or inference was performed for this 512MiB amendment."
-  ],
+  "decisionSHA256": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
+  "integrationProfileSHA256": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
+  "replayProfileSHA256": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
+  "replayProfileDifference": [],
   "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
   "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
   "sourceReportSHA256": "daf6e5eee5199abb32abf1322b1e15616fe5532f8c0885fae0d0745fa0ea3ac3",
   "sourceVectorManifestSHA256": "f16e5ef96c5ab8d67444aea6110424a9d7c7956e34ac95973d363aed4e947be3",
   "fingerprintVersion": "d7412709d47be7d1f56529adda4956f555feafd86843ca38f408a8dda87dacf6",
-  "policyVersion": "42a811d97844de4a0e2223060178ee1136ef74775a31d2d12a56f9007eff6570",
-  "backend": "exact-f32-v1",
+  "policyVersion": "5349c094e1ace02c494fe258233a1986d2b42125b263ec41a0250a02d3d7be7a",
+  "backend": "sqlite-exact-f32-v1",
   "executionProtocolSHA256": "ea0060bb4839fe25f3fe30f781c4c51470adad19ed684cc6630ef05d8be25ae8",
   "executionProtocolUse": "legacy resource and input bindings only; no legacy R4 or statistical pass claimed",
-  "swiftBatchSHA256": "6255b3e21dbcd93ad804ce3722721ce4c2d6bfe2a41556d8e93f078e9fd98edc",
-  "rawReplaySHA256": "9216f2653725052dddd8fa4c3503fcf3de6eaf3ff12209c600f9603ff563400b",
+  "swiftBatchSHA256": "3a663fbdd19e78742659a249e793b07c63b129068cbefaec747da882de5278f0",
+  "rawReplaySHA256": "e8541181a37e3f413c39090f7a00761cad8f660ecd9405473b74a9440d92f6bb",
   "newImageInference": false,
   "independentValidation": false,
   "caseCount": 33,
@@ -40,22 +38,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 1,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-01-1-base"
-        ],
-        "id": "P001",
-        "matchedKeys": [
-          "cc-01-1-base"
-        ],
-        "queryVectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a",
-        "reason": "covered"
+        "queryVectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
       },
       "contentPass": true,
       "actionPass": true,
@@ -73,22 +63,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 1,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-01-1-base"
-        ],
-        "id": "P002",
-        "matchedKeys": [
-          "cc-01-1-base"
-        ],
-        "queryVectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a",
-        "reason": "covered"
+        "queryVectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
       },
       "contentPass": true,
       "actionPass": true,
@@ -106,22 +88,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9951159358024597,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-01-1-base"
-        ],
-        "id": "P003",
-        "matchedKeys": [
-          "cc-01-1-base"
-        ],
-        "queryVectorSHA256": "491f981fcbfc2c22dc65ab35e6665611f77f5723d7a0ba85ca8ef4be26aee5b7",
-        "reason": "covered"
+        "queryVectorSHA256": "491f981fcbfc2c22dc65ab35e6665611f77f5723d7a0ba85ca8ef4be26aee5b7"
       },
       "contentPass": true,
       "actionPass": true,
@@ -139,22 +113,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 0.998173177242279,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-01-1-base"
-        ],
-        "id": "P004",
-        "matchedKeys": [
-          "cc-01-1-base"
-        ],
-        "queryVectorSHA256": "a116033b4ad8c467a338e6d0b80429db846b8538625175c0ad13013f07c1d6aa",
-        "reason": "covered"
+        "queryVectorSHA256": "a116033b4ad8c467a338e6d0b80429db846b8538625175c0ad13013f07c1d6aa"
       },
       "contentPass": true,
       "actionPass": true,
@@ -172,22 +138,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9998792409896851,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-01-1-base"
-        ],
-        "id": "P005",
-        "matchedKeys": [
-          "cc-01-1-base"
-        ],
-        "queryVectorSHA256": "700bb53bab00c7c939e2e385fa0efdefa9181e79691b49047a16586c23ba78a3",
-        "reason": "covered"
+        "queryVectorSHA256": "700bb53bab00c7c939e2e385fa0efdefa9181e79691b49047a16586c23ba78a3"
       },
       "contentPass": true,
       "actionPass": true,
@@ -205,18 +163,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 0.210320845246315,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N001",
-        "matchedKeys": [],
-        "queryVectorSHA256": "71dba325d2e65fb6e06f99f3a4ee9a33352cd84398c03cc360b1ac6bc0b4f77f",
-        "reason": "noMatch"
+        "queryVectorSHA256": "71dba325d2e65fb6e06f99f3a4ee9a33352cd84398c03cc360b1ac6bc0b4f77f"
       },
       "contentPass": true,
       "actionPass": true,
@@ -234,18 +188,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-01-1-base",
+            "key": "photos:12:cc-01-1-base:original",
             "origin": "photosOriginal",
             "score": 0.4984217584133148,
             "vectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B001",
-        "matchedKeys": [],
-        "queryVectorSHA256": "3ed83f0ac305e82e505d6faa1fd39583a57645e6671d938811b458863e15b0f7",
-        "reason": "noMatch"
+        "queryVectorSHA256": "3ed83f0ac305e82e505d6faa1fd39583a57645e6671d938811b458863e15b0f7"
       },
       "contentPass": true,
       "actionPass": true,
@@ -263,20 +213,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-01-1-half",
+            "key": "photos:12:cc-01-1-half:original",
             "origin": "photosOriginal",
             "score": 0.998173177242279,
             "vectorSHA256": "a116033b4ad8c467a338e6d0b80429db846b8538625175c0ad13013f07c1d6aa"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [],
-        "id": "B002",
-        "matchedKeys": [
-          "cc-01-1-half"
-        ],
-        "queryVectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a",
-        "reason": "resolutionUpgrade"
+        "queryVectorSHA256": "12def260a655747adb35e2a8cdbe5f89f41c750787496d348a201cb9bd5d9b3a"
       },
       "contentPass": true,
       "actionPass": true,
@@ -294,18 +238,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-02-1-base",
+            "key": "photos:12:cc-02-1-base:original",
             "origin": "photosOriginal",
             "score": 0.009943651035428047,
             "vectorSHA256": "65ca6d4cb8c7430d2527da810e710e87c0106308037a381a508ce46bbfecfddf"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N004",
-        "matchedKeys": [],
-        "queryVectorSHA256": "cb063962c5c2599a8278c768090e04ff7e676f3488413418d0986bc9c5545cb0",
-        "reason": "noMatch"
+        "queryVectorSHA256": "cb063962c5c2599a8278c768090e04ff7e676f3488413418d0986bc9c5545cb0"
       },
       "contentPass": true,
       "actionPass": true,
@@ -323,18 +263,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-02-1-base",
+            "key": "photos:12:cc-02-1-base:original",
             "origin": "photosOriginal",
             "score": 0.42460954189300537,
             "vectorSHA256": "65ca6d4cb8c7430d2527da810e710e87c0106308037a381a508ce46bbfecfddf"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B003",
-        "matchedKeys": [],
-        "queryVectorSHA256": "a09b74d5f95fda5808c16e0f638e840d29af93693b48e5d51e57738bf7c3ac3c",
-        "reason": "noMatch"
+        "queryVectorSHA256": "a09b74d5f95fda5808c16e0f638e840d29af93693b48e5d51e57738bf7c3ac3c"
       },
       "contentPass": true,
       "actionPass": true,
@@ -352,22 +288,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-03-1-base",
+            "key": "photos:12:cc-03-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9931633472442627,
             "vectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-03-1-base"
-        ],
-        "id": "P013",
-        "matchedKeys": [
-          "cc-03-1-base"
-        ],
-        "queryVectorSHA256": "3f1c43402cb2939abda4aaeaa8b446f1857d8f23e052c8f8120f4b6ca4ddf262",
-        "reason": "covered"
+        "queryVectorSHA256": "3f1c43402cb2939abda4aaeaa8b446f1857d8f23e052c8f8120f4b6ca4ddf262"
       },
       "contentPass": true,
       "actionPass": true,
@@ -385,22 +313,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-03-1-base",
+            "key": "photos:12:cc-03-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9968506097793579,
             "vectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-03-1-base"
-        ],
-        "id": "P014",
-        "matchedKeys": [
-          "cc-03-1-base"
-        ],
-        "queryVectorSHA256": "a8bdcfd7e411b90091f266b5d890d08851b823d5cd937fae727c1ed98632a770",
-        "reason": "covered"
+        "queryVectorSHA256": "a8bdcfd7e411b90091f266b5d890d08851b823d5cd937fae727c1ed98632a770"
       },
       "contentPass": true,
       "actionPass": true,
@@ -418,22 +338,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-03-1-base",
+            "key": "photos:12:cc-03-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9998407363891602,
             "vectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-03-1-base"
-        ],
-        "id": "P015",
-        "matchedKeys": [
-          "cc-03-1-base"
-        ],
-        "queryVectorSHA256": "506eaa340c5e434f453c8395cc0e53b03e1ee487e4d72262f74d68d2477edac2",
-        "reason": "covered"
+        "queryVectorSHA256": "506eaa340c5e434f453c8395cc0e53b03e1ee487e4d72262f74d68d2477edac2"
       },
       "contentPass": true,
       "actionPass": true,
@@ -451,18 +363,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-03-1-base",
+            "key": "photos:12:cc-03-1-base:original",
             "origin": "photosOriginal",
             "score": 0.250259131193161,
             "vectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N007",
-        "matchedKeys": [],
-        "queryVectorSHA256": "6de48e24609045fe04d8cd6b0e3e2563ef83d852a0a30a18ec580d2a3ffa0566",
-        "reason": "noMatch"
+        "queryVectorSHA256": "6de48e24609045fe04d8cd6b0e3e2563ef83d852a0a30a18ec580d2a3ffa0566"
       },
       "contentPass": true,
       "actionPass": true,
@@ -480,18 +388,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-03-1-base",
+            "key": "photos:12:cc-03-1-base:original",
             "origin": "photosOriginal",
             "score": 0.5247641801834106,
             "vectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B005",
-        "matchedKeys": [],
-        "queryVectorSHA256": "f3b33e845a3d069e9e872dc9e6f8d546c9f64b85489d2e45bfd71a7b53942a89",
-        "reason": "noMatch"
+        "queryVectorSHA256": "f3b33e845a3d069e9e872dc9e6f8d546c9f64b85489d2e45bfd71a7b53942a89"
       },
       "contentPass": true,
       "actionPass": true,
@@ -509,20 +413,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-03-1-half",
+            "key": "photos:12:cc-03-1-half:original",
             "origin": "photosOriginal",
             "score": 0.9968506097793579,
             "vectorSHA256": "a8bdcfd7e411b90091f266b5d890d08851b823d5cd937fae727c1ed98632a770"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [],
-        "id": "B006",
-        "matchedKeys": [
-          "cc-03-1-half"
-        ],
-        "queryVectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c",
-        "reason": "resolutionUpgrade"
+        "queryVectorSHA256": "4861d14f93fec48cf800734a473dd7d8d72e0bd870277167f9d8d9a18607164c"
       },
       "contentPass": true,
       "actionPass": true,
@@ -540,18 +438,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-04-1-base",
+            "key": "photos:12:cc-04-1-base:original",
             "origin": "photosOriginal",
             "score": 0.3505951166152954,
             "vectorSHA256": "290249fee1195401a61e791e29f19317b56e4b9634362f56213e8184a8e099c2"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N010",
-        "matchedKeys": [],
-        "queryVectorSHA256": "1bb1937645bfaea027c375ee8082ffbd028797097b3fc57b828160290eea11df",
-        "reason": "noMatch"
+        "queryVectorSHA256": "1bb1937645bfaea027c375ee8082ffbd028797097b3fc57b828160290eea11df"
       },
       "contentPass": true,
       "actionPass": true,
@@ -569,18 +463,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-04-1-base",
+            "key": "photos:12:cc-04-1-base:original",
             "origin": "photosOriginal",
             "score": 0.5047425627708435,
             "vectorSHA256": "290249fee1195401a61e791e29f19317b56e4b9634362f56213e8184a8e099c2"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B007",
-        "matchedKeys": [],
-        "queryVectorSHA256": "babbf93cc5c80bb535031c041fdeeb80033d281a42b6add07e6cf170d695432f",
-        "reason": "noMatch"
+        "queryVectorSHA256": "babbf93cc5c80bb535031c041fdeeb80033d281a42b6add07e6cf170d695432f"
       },
       "contentPass": true,
       "actionPass": true,
@@ -598,18 +488,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-05-1-base",
+            "key": "photos:12:cc-05-1-base:original",
             "origin": "photosOriginal",
             "score": 0.2030332386493683,
             "vectorSHA256": "96896cea48a01ad1d47e10e91ff5e4c527f8e9ce965d0ef2b55ab187b65d984c"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N013",
-        "matchedKeys": [],
-        "queryVectorSHA256": "80985461d94f9a1567a419b3a67e22eb41d5baaddae9e4f840c21f4bcaf5a1f1",
-        "reason": "noMatch"
+        "queryVectorSHA256": "80985461d94f9a1567a419b3a67e22eb41d5baaddae9e4f840c21f4bcaf5a1f1"
       },
       "contentPass": true,
       "actionPass": true,
@@ -627,18 +513,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-05-1-base",
+            "key": "photos:12:cc-05-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9685084819793701,
             "vectorSHA256": "96896cea48a01ad1d47e10e91ff5e4c527f8e9ce965d0ef2b55ab187b65d984c"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B009",
-        "matchedKeys": [],
-        "queryVectorSHA256": "a87bd251ef76f566534e8b1f25a1a9851ff7fb83e98739a22aa33a69dcb857cd",
-        "reason": "noMatch"
+        "queryVectorSHA256": "a87bd251ef76f566534e8b1f25a1a9851ff7fb83e98739a22aa33a69dcb857cd"
       },
       "contentPass": true,
       "actionPass": true,
@@ -656,18 +538,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-06-1-base",
+            "key": "photos:12:cc-06-1-base:original",
             "origin": "photosOriginal",
             "score": 0.18399924039840698,
             "vectorSHA256": "abae0c781a6c659ebfc02b37eaf16a595bb3ecab74cac4ab0db06d750664b566"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N016",
-        "matchedKeys": [],
-        "queryVectorSHA256": "e110e9c939558458c408af127e0b27267fe632b7a795652e160434e27bfa0b9d",
-        "reason": "noMatch"
+        "queryVectorSHA256": "e110e9c939558458c408af127e0b27267fe632b7a795652e160434e27bfa0b9d"
       },
       "contentPass": true,
       "actionPass": true,
@@ -685,18 +563,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-06-1-base",
+            "key": "photos:12:cc-06-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9043540954589844,
             "vectorSHA256": "abae0c781a6c659ebfc02b37eaf16a595bb3ecab74cac4ab0db06d750664b566"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B011",
-        "matchedKeys": [],
-        "queryVectorSHA256": "a918b5817742d40649fe930c3a679b2c6fafb22dd69096921875ed2471baae34",
-        "reason": "noMatch"
+        "queryVectorSHA256": "a918b5817742d40649fe930c3a679b2c6fafb22dd69096921875ed2471baae34"
       },
       "contentPass": true,
       "actionPass": true,
@@ -714,18 +588,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-07-1-base",
+            "key": "photos:12:cc-07-1-base:original",
             "origin": "photosOriginal",
             "score": 0.4250897765159607,
             "vectorSHA256": "db77d2738a19e06b7860b656b41cdcbd5abc5fdc297d1a325f174b051463762c"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N019",
-        "matchedKeys": [],
-        "queryVectorSHA256": "a4a6f7010db5cd937b956ad181da9906802e43f44871000b59d6f0a9af5363c2",
-        "reason": "noMatch"
+        "queryVectorSHA256": "a4a6f7010db5cd937b956ad181da9906802e43f44871000b59d6f0a9af5363c2"
       },
       "contentPass": true,
       "actionPass": true,
@@ -743,18 +613,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-07-1-base",
+            "key": "photos:12:cc-07-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9484604597091675,
             "vectorSHA256": "db77d2738a19e06b7860b656b41cdcbd5abc5fdc297d1a325f174b051463762c"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "B013",
-        "matchedKeys": [],
-        "queryVectorSHA256": "f12a46a8e62e014043a729a6b762e3984b128524badeef15c90d8485981ae892",
-        "reason": "noMatch"
+        "queryVectorSHA256": "f12a46a8e62e014043a729a6b762e3984b128524badeef15c90d8485981ae892"
       },
       "contentPass": true,
       "actionPass": true,
@@ -772,18 +638,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-07-2-base",
+            "key": "photos:12:cc-07-2-base:original",
             "origin": "photosOriginal",
             "score": 0.29211023449897766,
             "vectorSHA256": "bf3c53efd5d4c06d1a7bf928536c0a4f64818881f5139df9014cf9db28912387"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N022",
-        "matchedKeys": [],
-        "queryVectorSHA256": "3fb1bfbf7b549ecab312cdf3af84644f5b9d0c289eb2629a107dbfd54b5c6224",
-        "reason": "noMatch"
+        "queryVectorSHA256": "3fb1bfbf7b549ecab312cdf3af84644f5b9d0c289eb2629a107dbfd54b5c6224"
       },
       "contentPass": true,
       "actionPass": true,
@@ -801,22 +663,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-10-1-base",
+            "key": "photos:12:cc-10-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9881904721260071,
             "vectorSHA256": "590266571ff64005192c597a614574229d619961738b2fdfbfa395d8463810df"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-10-1-base"
-        ],
-        "id": "P048",
-        "matchedKeys": [
-          "cc-10-1-base"
-        ],
-        "queryVectorSHA256": "af93734ea3384a991d139900f17f166e1a333dd9a01edf33c8331328b79b7c2d",
-        "reason": "covered"
+        "queryVectorSHA256": "af93734ea3384a991d139900f17f166e1a333dd9a01edf33c8331328b79b7c2d"
       },
       "contentPass": true,
       "actionPass": true,
@@ -834,22 +688,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-10-1-base",
+            "key": "photos:12:cc-10-1-base:original",
             "origin": "photosOriginal",
             "score": 0.994247317314148,
             "vectorSHA256": "590266571ff64005192c597a614574229d619961738b2fdfbfa395d8463810df"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-10-1-base"
-        ],
-        "id": "P049",
-        "matchedKeys": [
-          "cc-10-1-base"
-        ],
-        "queryVectorSHA256": "f27ba1cd5c3a501a151a653c5dd921340aeaff542d3422dfdb03e56d6c047a87",
-        "reason": "covered"
+        "queryVectorSHA256": "f27ba1cd5c3a501a151a653c5dd921340aeaff542d3422dfdb03e56d6c047a87"
       },
       "contentPass": true,
       "actionPass": true,
@@ -867,22 +713,14 @@
         "action": "skip",
         "candidates": [
           {
-            "key": "cc-10-1-base",
+            "key": "photos:12:cc-10-1-base:original",
             "origin": "photosOriginal",
             "score": 0.9997038245201111,
             "vectorSHA256": "590266571ff64005192c597a614574229d619961738b2fdfbfa395d8463810df"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [
-          "cc-10-1-base"
-        ],
-        "id": "P050",
-        "matchedKeys": [
-          "cc-10-1-base"
-        ],
-        "queryVectorSHA256": "2b0c753a23f8c1393873efa2a8d3732402167d589cadcfe3223efd1452f3d406",
-        "reason": "covered"
+        "queryVectorSHA256": "2b0c753a23f8c1393873efa2a8d3732402167d589cadcfe3223efd1452f3d406"
       },
       "contentPass": true,
       "actionPass": true,
@@ -900,18 +738,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-10-1-base",
+            "key": "photos:12:cc-10-1-base:original",
             "origin": "photosOriginal",
             "score": 0.13115502893924713,
             "vectorSHA256": "590266571ff64005192c597a614574229d619961738b2fdfbfa395d8463810df"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N028",
-        "matchedKeys": [],
-        "queryVectorSHA256": "e74a533eb5041595eec99b5967f6994668ff67595fbfbef6093eb9c8d64d445e",
-        "reason": "noMatch"
+        "queryVectorSHA256": "e74a533eb5041595eec99b5967f6994668ff67595fbfbef6093eb9c8d64d445e"
       },
       "contentPass": true,
       "actionPass": true,
@@ -929,20 +763,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "cc-10-1-half",
+            "key": "photos:12:cc-10-1-half:original",
             "origin": "photosOriginal",
             "score": 0.994247317314148,
             "vectorSHA256": "f27ba1cd5c3a501a151a653c5dd921340aeaff542d3422dfdb03e56d6c047a87"
           }
         ],
         "content": "duplicate",
-        "coveringKeys": [],
-        "id": "B020",
-        "matchedKeys": [
-          "cc-10-1-half"
-        ],
-        "queryVectorSHA256": "590266571ff64005192c597a614574229d619961738b2fdfbfa395d8463810df",
-        "reason": "resolutionUpgrade"
+        "queryVectorSHA256": "590266571ff64005192c597a614574229d619961738b2fdfbfa395d8463810df"
       },
       "contentPass": true,
       "actionPass": true,
@@ -960,18 +788,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "user-01-1",
+            "key": "photos:9:user-01-1:original",
             "origin": "photosOriginal",
             "score": 0.9543159008026123,
             "vectorSHA256": "01df4f69aa7e5ee5c4d58d973ca96707112ff5539326dc28c12b35e185117cfc"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N051",
-        "matchedKeys": [],
-        "queryVectorSHA256": "926ba79994ab1f4230c81c9c940a4a7beecb47b1a97c34e724068fddc9750424",
-        "reason": "noMatch"
+        "queryVectorSHA256": "926ba79994ab1f4230c81c9c940a4a7beecb47b1a97c34e724068fddc9750424"
       },
       "contentPass": true,
       "actionPass": true,
@@ -989,18 +813,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "user-02-1",
+            "key": "photos:9:user-02-1:original",
             "origin": "photosOriginal",
             "score": 0.9494500160217285,
             "vectorSHA256": "112d9ba5b4b35e9b78f5b73ba2183345fc965ebb99611d48ef3eb0b9c76686f6"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N052",
-        "matchedKeys": [],
-        "queryVectorSHA256": "aeecbdb87db7156ef414aa4859b9a756111d3459701610ad9a2730b1d949e133",
-        "reason": "noMatch"
+        "queryVectorSHA256": "aeecbdb87db7156ef414aa4859b9a756111d3459701610ad9a2730b1d949e133"
       },
       "contentPass": true,
       "actionPass": true,
@@ -1018,18 +838,14 @@
         "action": "importFile",
         "candidates": [
           {
-            "key": "user-03-1",
+            "key": "photos:9:user-03-1:original",
             "origin": "photosOriginal",
             "score": 0.973709225654602,
             "vectorSHA256": "2af83cd79f0107fff1d39fcbe793719d6b70ac4e2b8fbd31b41318e3c65f5f69"
           }
         ],
         "content": "notDuplicate",
-        "coveringKeys": [],
-        "id": "N053",
-        "matchedKeys": [],
-        "queryVectorSHA256": "f57c6658139755111670092ebad64ece33c193c5c964a3667da79c388f6d3945",
-        "reason": "noMatch"
+        "queryVectorSHA256": "f57c6658139755111670092ebad64ece33c193c5c964a3667da79c388f6d3945"
       },
       "contentPass": true,
       "actionPass": true,
@@ -1045,5 +861,17 @@
     "priorSourceCommit": "1c77ef1d991f36d16ca0fcfde1d1b3cf73a92238",
     "finalRealModelRegression": "pending_P9",
     "independentCalibration": "not_performed"
+  },
+  "sqliteQueryAmendment": {
+    "priorSourceCommit": "e62e3ae",
+    "priorRecordSHA256": "c30e33331aa73a0e574c13d1648db2b2f65a7318023888db3c0a07b42ba4e5b6",
+    "priorReplayProfileSHA256": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
+    "priorSwiftBatchSHA256": "3a663fbdd19e78742659a249e793b07c63b129068cbefaec747da882de5278f0",
+    "priorRawReplaySHA256": "e8541181a37e3f413c39090f7a00761cad8f660ecd9405473b74a9440d92f6bb",
+    "producer": "native XCTest AdvancedDedupRegressionTests.testExistingVectorReplayUsesSQLiteBackend through current SyncStore.vectorCandidates + system SQLite/Accelerate C bridge",
+    "evidence": "work/P10-20261006/replay-final-profile-green.log",
+    "exactOracle": "all 33 complete result sets equal unchanged ExactVectorIndex; original vector bytes/scores and truth verified; Photos keys use production byte framing",
+    "newImageInference": false,
+    "independentValidation": false
   }
 }

@@ -41,6 +41,7 @@ ADVANCED_RETRY_ANCHOR = (
 )
 GATE_LINE = "await integrationRetryGate.wait()"
 EXPECTED_RED_ASSERTION = "post_resume_waiting_sources"
+VECTOR_BRIDGE_FLAGS = ["-O3", "-fno-fast-math", "-ffp-contract=off"]
 
 
 class RunnerError(RuntimeError):
@@ -237,14 +238,27 @@ def compile_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
     source_files = sorted(source_directory.rglob("*.swift"))
     if not source_files:
         raise RunnerError(f"No Core Swift files were copied for {scenario.name}.")
+    bridge = source_directory / "Storage/SQLiteVectorQuery"
+    object_file = scenario / "SQLiteVectorQuery.o"
+    c_command = ["xcrun", "clang", *VECTOR_BRIDGE_FLAGS, "-c", str(bridge / "SQLiteVectorQuery.c"), "-o", str(object_file)]
+    write_json(scenario / "bridge-compile-command.json", c_command)
+    c_result = run_process(c_command, cwd=scenario, timeout_seconds=timeout_seconds,
+                           stdout_path=scenario / "bridge-compile.stdout.log", stderr_path=scenario / "bridge-compile.stderr.log")
+    if c_result.timed_out:
+        raise RunnerError(f"{scenario.name} SQLite vector bridge compilation timed out.")
+    if c_result.exit_code != 0:
+        raise RunnerError(f"{scenario.name} SQLite vector bridge compilation failed; inspect bridge-compile.stderr.log.")
     command = [
         "xcrun",
         "swiftc",
         "-parse-as-library",
         "-module-name",
         "PhotoSyncCore",
+        "-I", str(bridge),
+        "-module-cache-path", str(scenario / "module-cache"),
         *map(str, source_files),
         str(fixture),
+        str(object_file),
         "-o",
         str(executable),
         "-framework",
@@ -256,6 +270,7 @@ def compile_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
         "-framework",
         "UniformTypeIdentifiers",
         "-lsqlite3",
+        "-framework", "Accelerate",
     ]
     write_json(scenario / "compile-command.json", command)
     result = run_process(
@@ -372,6 +387,7 @@ def run(args: argparse.Namespace, output: Path) -> dict[str, Any]:
         "fixture_sha256": sha256_file(probe),
         "green_sync_engine_sha256": hashlib.sha256(green_engine.encode("utf-8")).hexdigest(),
         "red_sync_engine_sha256": hashlib.sha256(red_engine.encode("utf-8")).hexdigest(),
+        "vector_bridge_compile_flags": VECTOR_BRIDGE_FLAGS,
     }
     if args.scenario == "advanced-preparation":
         source_hashes["profile_sha256"] = sha256_file(REPO_ROOT / "docs/research/advanced-dedup/integration-profile.json")

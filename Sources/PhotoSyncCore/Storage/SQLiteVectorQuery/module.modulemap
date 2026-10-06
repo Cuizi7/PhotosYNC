@@ -1,0 +1,4 @@
+module SQLiteVectorQuery {
+    header "SQLiteVectorQuery.h"
+    export *
+}

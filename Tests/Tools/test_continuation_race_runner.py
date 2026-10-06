@@ -30,6 +30,10 @@ class ContinuationRaceRunnerTests(unittest.TestCase):
         shutil.copy2(RUNNER, self.script)
         shutil.copy2(FIXTURE, self.fixture)
         self.engine.write_text(self.engine_source(), encoding="utf-8")
+        bridge = self.engine.parents[1] / "Storage/SQLiteVectorQuery"
+        bridge.mkdir(parents=True)
+        for name in ("SQLiteVectorQuery.c", "SQLiteVectorQuery.h", "module.modulemap"):
+            shutil.copy2(WORKTREE_ROOT / "Sources/PhotoSyncCore/Storage/SQLiteVectorQuery" / name, bridge / name)
         profile = self.repository / "docs/research/advanced-dedup/integration-profile.json"
         profile.parent.mkdir(parents=True)
         profile.write_text("{}", encoding="utf-8")
@@ -56,6 +60,13 @@ class ContinuationRaceRunnerTests(unittest.TestCase):
         repeated = self.run_runner(output)
         self.assertNotEqual(repeated.returncode, 0)
         self.assertEqual((output / "result.json").read_bytes(), preserved)
+
+    def test_bridge_compile_failure_does_not_produce_pass_marker(self) -> None:
+        output = self.root / "bridge-failure"
+        result = self.run_runner(output, mode="c-compile-fail")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((output / "result.json").exists())
+        self.assertIn("bridge", result.stderr.lower())
 
     def test_scenarios_instrument_and_mutate_only_the_selected_branch(self) -> None:
         source = self.engine_source()
@@ -166,6 +177,12 @@ import os
 from pathlib import Path
 import sys
 
+if len(sys.argv) >= 2 and sys.argv[1] == \"clang\":
+    if os.environ.get(\"FAKE_XCRUN_MODE\") == \"c-compile-fail\":
+        raise SystemExit(23)
+    args = sys.argv[2:]
+    Path(args[args.index(\"-o\") + 1]).write_bytes(b\"fake object\")
+    raise SystemExit(0)
 if len(sys.argv) < 2 or sys.argv[1] != \"swiftc\":
     raise SystemExit(90)
 if os.environ.get(\"FAKE_XCRUN_MODE\") == \"compile-fail\":

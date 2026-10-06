@@ -16,9 +16,9 @@
       0.225
     ]
   },
-  "policyVersion": "42a811d97844de4a0e2223060178ee1136ef74775a31d2d12a56f9007eff6570",
+  "policyVersion": "5349c094e1ace02c494fe258233a1986d2b42125b263ec41a0250a02d3d7be7a",
   "threshold": 0.98,
-  "backend": "exact-f32-v1",
+  "backend": "sqlite-exact-f32-v1",
   "resources": {
     "decodeConcurrency": 1,
     "photoRequestConcurrency": 1,
@@ -37,11 +37,16 @@
     "batchSize": 1
   },
   "evidenceCandidateLimit": 200000,
-  "acceptanceID": "user-decision:62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
+  "acceptanceID": "user-decision:3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
   "resourcePolicyAmendment": {
     "decisionSHA256": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
     "priorProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
     "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
     "reason": "decodedResourceLimit"
+  },
+  "sqliteQueryAmendment": {
+    "decisionSHA256": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
+    "priorProfileSHA256": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
+    "backend": "sqlite-exact-f32-v1"
   }
 }

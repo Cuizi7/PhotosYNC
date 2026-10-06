@@ -1,8 +1,10 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,66 @@ converter = importlib.util.module_from_spec(CONVERTER_SPEC)
 CONVERTER_SPEC.loader.exec_module(converter)
 FIXTURE_MANIFEST = ROOT / "Tests/Fixtures/AdvancedDedup/manifest.json"
 FIXTURE_HASH = json.loads(FIXTURE_MANIFEST.read_text())["content_sha256"]
+
+
+class ProbeBridgeCacheTests(unittest.TestCase):
+    def test_c_header_modulemap_and_flags_invalidate_cached_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            driver = root / "scripts/advanced-dedup/run-probe.sh"
+            driver.parent.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts/advanced-dedup/run-probe.sh", driver)
+            shutil.copy2(SCRIPT, driver.parent / "research.py")
+            protocol = root / "docs/research/advanced-dedup/protocol.json"
+            protocol.parent.mkdir(parents=True)
+            shutil.copy2(ROOT / "docs/research/advanced-dedup/protocol.json", protocol)
+            bridge = root / "Sources/PhotoSyncCore/Storage/SQLiteVectorQuery"
+            bridge.mkdir(parents=True)
+            files = [bridge / name for name in ("SQLiteVectorQuery.c", "SQLiteVectorQuery.h", "module.modulemap")]
+            for path in files:
+                path.write_text("initial input\n")
+            (bridge.parents[1] / "Dummy.swift").write_text("// fake source\n")
+            main = root / "Tools/AdvancedDedupProbe/main.swift"
+            main.parent.mkdir(parents=True); main.write_text("// fake source\n")
+            profile = root / "profile.json"; profile.write_text("{}")
+            fake_bin = root / "fake-bin"; fake_bin.mkdir()
+            compiler = fake_bin / "xcrun"
+            compiler.write_text('''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+args = sys.argv[1:]
+if args[0] == "--sdk" or "--version" in args:
+    print("fixed test compiler and SDK")
+    raise SystemExit(0)
+output = Path(args[args.index("-o") + 1])
+if args[0] == "clang":
+    assert "-fno-fast-math" in args and "-ffp-contract=off" in args
+    output.write_bytes(b"fake object")
+elif args[0] == "swiftc":
+    assert any(value.endswith(".o") for value in args)
+    counter = Path(os.environ["PHOTOSYNC_TEST_COMPILATIONS"])
+    counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else "1")
+    output.write_text("#!/bin/sh\\nexit 0\\n"); output.chmod(0o755)
+else:
+    raise SystemExit(91)
+''')
+            compiler.chmod(0o755)
+            counter = root / "compile-count"
+            environment = dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ["PATH"],
+                               PHOTOSYNC_TEST_COMPILATIONS=str(counter))
+            def run():
+                result = subprocess.run(["bash", str(driver), "validate-profile", "--profile", str(profile),
+                                         "--output-dir", str(root / "out")], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return int(counter.read_text())
+            self.assertEqual(run(), 1)
+            self.assertEqual(run(), 1)
+            for expected, path in enumerate(files, 2):
+                path.write_text(path.read_text() + "changed input\n")
+                self.assertEqual(run(), expected, path.name)
+            driver.write_text(driver.read_text().replace("-O3", "-O2"))
+            self.assertEqual(run(), 5)
 
 
 class ResearchProtocolTests(unittest.TestCase):

@@ -12,7 +12,7 @@ final class AdvancedDedupServiceTests: XCTestCase {
             policyVersion: DedupConfiguration.computePolicyVersion(fingerprintVersion: c.fingerprint.version, threshold: 0.90, backend: c.backend),
             threshold: 0.90, backend: c.backend, resources: c.resources, evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
         let oldService = AdvancedDedupService(store: f.store, photos: f.photos, coordinator: f.coordinator,
-            fingerprinter: f.model, index: f.index, configuration: oldConfiguration, executor: f.executor, budget: f.budget)
+            fingerprinter: f.model, configuration: oldConfiguration, executor: f.executor, budget: f.budget)
         guard case .ready(let old) = try await oldService.prepare(fileID: f.id, file: f.file) else { return XCTFail("Old admission missing") }
         XCTAssertEqual(old.evidence.evaluation.action, .skip)
         let skipped = try await f.store.commitAdvancedSkip(old); XCTAssertTrue(skipped)
@@ -106,7 +106,7 @@ final class AdvancedDedupServiceTests: XCTestCase {
             policyVersion: DedupConfiguration.computePolicyVersion(fingerprintVersion: c.fingerprint.version, threshold: 0.96, backend: c.backend),
             threshold: 0.96, backend: c.backend, resources: c.resources, evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
         let service = AdvancedDedupService(store: f.store, photos: f.photos, coordinator: f.coordinator, fingerprinter: f.model,
-            index: f.index, configuration: changed, executor: f.executor, budget: f.budget)
+            configuration: changed, executor: f.executor, budget: f.budget)
         guard case .ready(let second) = try await service.prepare(fileID: f.id, file: f.file) else { return XCTFail("Expected new policy admission") }
         XCTAssertEqual(second.evidence.evaluation.action, .skip)
         XCTAssertNotEqual(first.evidence.policyVersion, second.evidence.policyVersion)
@@ -326,8 +326,8 @@ final class AdvancedDedupServiceTests: XCTestCase {
             threshold: c.threshold, backend: c.backend, resources: limits, evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
         let budget = ImageWorkBudget(limits: limits)
         let service = AdvancedDedupService(store: base.store, photos: base.photos, coordinator: base.coordinator,
-            fingerprinter: base.model, index: base.index, configuration: configuration, executor: base.executor, budget: budget)
-        let f = Fixture(store: base.store, photos: base.photos, model: base.model, index: base.index, coordinator: base.coordinator,
+            fingerprinter: base.model, configuration: configuration, executor: base.executor, budget: budget)
+        let f = Fixture(store: base.store, photos: base.photos, model: base.model, coordinator: base.coordinator,
             service: service, configuration: configuration, executor: base.executor, budget: budget, file: file, id: id)
         return (f, service, configuration, budget)
     }
@@ -359,7 +359,7 @@ final class AdvancedDedupServiceTests: XCTestCase {
         guard case .waiting = result else { return XCTFail("Invalid final snapshot cannot escape as conservative import") }
     }
     private struct Fixture {
-        let store: SyncStore; let photos: AdmissionPhotos; let model: AdmissionModel; let index: ExactVectorIndex
+        let store: SyncStore; let photos: AdmissionPhotos; let model: AdmissionModel
         let coordinator: PhotosIndexCoordinator; let service: AdvancedDedupService; let configuration: DedupConfiguration
         let executor: ReadExecutor; let budget: ImageWorkBudget; let file: SourceFile; let id: UUID
     }
@@ -373,10 +373,9 @@ final class AdvancedDedupServiceTests: XCTestCase {
         let metadata = MediaMetadata(filename: url.lastPathComponent, kind: .image, captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: 2, height: 2, duration: nil)
         let file = SourceFile(sourceID: source, relativePath: url.lastPathComponent, url: url, stamp: try await DirectoryReader().stamp(of: url), metadata: metadata)
         let id = try await store.save(file, decision: .importNew), photos = AdmissionPhotos(), model = AdmissionModel(vector: try fingerprint(c, score: 1))
-        let index = ExactVectorIndex(version: c.fingerprint.version)
-        let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, index: index, configuration: c)
-        return Fixture(store: store, photos: photos, model: model, index: index, coordinator: coordinator,
-            service: AdvancedDedupService(store: store, photos: photos, coordinator: coordinator, fingerprinter: model, index: index, configuration: c, executor: executor, budget: budget),
+        let coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, configuration: c)
+        return Fixture(store: store, photos: photos, model: model, coordinator: coordinator,
+            service: AdvancedDedupService(store: store, photos: photos, coordinator: coordinator, fingerprinter: model, configuration: c, executor: executor, budget: budget),
             configuration: c, executor: executor, budget: budget, file: file, id: id)
     }
     private func ready(_ f: Fixture, candidates: [(String, RepresentationKind, Float, Int)]) async throws {
@@ -475,21 +474,21 @@ extension AdvancedDedupServiceTests {
     func testSegmentedTimingReportsOnlyExecutedStages() async throws {
         let f = try await fixture(); try await ready(f, candidates: [])
         let first = try await admission(f)
-        for key in ["sourceReadDecodeWait", "fingerprintPreprocessInference", "photosSearch", "localSearch", "cacheLookup", "localCandidateRead", "preparation"] {
+        for key in ["sourceReadDecodeWait", "fingerprintPreprocessInference", "sqliteSearch", "cacheLookup", "preparation"] {
             XCTAssertNotNil(first.evidence.timingsMS[key], key)
             XCTAssertGreaterThanOrEqual(first.evidence.timingsMS[key] ?? -1, 0)
         }
         let cached = try await admission(f)
         XCTAssertNil(cached.evidence.timingsMS["sourceReadDecodeWait"])
         XCTAssertNil(cached.evidence.timingsMS["fingerprintPreprocessInference"])
-        XCTAssertNotNil(cached.evidence.timingsMS["photosSearch"])
+        XCTAssertNotNil(cached.evidence.timingsMS["sqliteSearch"])
         let (oversize, service, _, _) = try await resourceFixture()
         guard case .conservative(let admission) = try await service.prepare(fileID: oversize.id, file: oversize.file) else {
             return XCTFail("Expected conservative admission")
         }
         XCTAssertNotNil(admission.evidence.timingsMS["sourceReadDecodeWait"])
         XCTAssertNil(admission.evidence.timingsMS["fingerprintPreprocessInference"])
-        XCTAssertNil(admission.evidence.timingsMS["photosSearch"])
+        XCTAssertNil(admission.evidence.timingsMS["sqliteSearch"])
         XCTAssertNil(admission.evidence.timingsMS["localSearch"])
     }
 }

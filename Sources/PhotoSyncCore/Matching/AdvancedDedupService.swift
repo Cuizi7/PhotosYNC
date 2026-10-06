@@ -7,17 +7,16 @@ public actor AdvancedDedupService {
     private let photos: any PhotosIndexGateway
     private let coordinator: PhotosIndexCoordinator
     private let fingerprinter: any ImageFingerprinting
-    private let index: ExactVectorIndex
     private let configuration: DedupConfiguration
     private let executor: ReadExecutor
     private let budget: ImageWorkBudget
     private var paused = false
 
     public init(store: SyncStore, photos: any PhotosIndexGateway, coordinator: PhotosIndexCoordinator,
-                fingerprinter: any ImageFingerprinting, index: ExactVectorIndex,
+                fingerprinter: any ImageFingerprinting,
                 configuration: DedupConfiguration, executor: ReadExecutor, budget: ImageWorkBudget) {
         self.store = store; self.photos = photos; self.coordinator = coordinator
-        self.fingerprinter = fingerprinter; self.index = index; self.configuration = configuration
+        self.fingerprinter = fingerprinter; self.configuration = configuration
         self.executor = executor; self.budget = budget
     }
     /// Stops new admissions; already-started physical reads/inference retain
@@ -44,7 +43,7 @@ public actor AdvancedDedupService {
         let started = ProcessInfo.processInfo.systemUptime
         var timings: [String: Double] = [:]
         guard !paused, file.metadata.kind == .image,
-              let record = try await eligibleRecord(fileID: fileID, file: file), !paused else { return waiting() }
+              try await eligibleRecord(fileID: fileID, file: file) != nil, !paused else { return waiting() }
         guard let initialToken = await readyToken(), !paused else { return waiting() }
         guard try await stamp(file) == file.stamp, !paused else { return waiting() }
         let size = sourceSize(file)
@@ -100,11 +99,6 @@ public actor AdvancedDedupService {
         let snapshot: PhotosCandidateSnapshot
         do { snapshot = try await photos.candidateSnapshot() } catch { return waiting() }
         guard !paused, snapshot.generation == token.photosGeneration else { return waiting() }
-        let localReadStarted = ProcessInfo.processInfo.systemUptime
-        let local = try await store.localVectorCandidates(beforeOrder: record.createdOrder, excluding: fileID,
-                                                          version: configuration.fingerprint.version)
-        timings["localCandidateRead"] = (ProcessInfo.processInfo.systemUptime - localReadStarted) * 1000
-        guard !paused, local.revision == token.localRevision else { return waiting() }
         let matches: [ScoredCandidate], diagnostics: [ScoredCandidate]
         let evaluation: DuplicateEvaluation
         if conservativeReason != nil {
@@ -114,19 +108,10 @@ public actor AdvancedDedupService {
         } else {
             guard let fingerprint else { return waiting() }
             let searchStarted = ProcessInfo.processInfo.systemUptime
-            let photosResult: VectorSearchResult
-            do {
-                photosResult = try await index.searchWithDiagnostics(query: fingerprint,
-                    minimumScore: configuration.threshold, generation: token.indexGeneration, diagnosticLimit: 10)
-            } catch { return waiting() }
-            timings["photosSearch"] = (ProcessInfo.processInfo.systemUptime - searchStarted) * 1000
-            guard !paused else { return waiting() }
-            let localSearchStarted = ProcessInfo.processInfo.systemUptime
-            let localResult = try ExactVectorIndex.scoreWithDiagnostics(query: fingerprint, entries: local.entries,
-                minimumScore: configuration.threshold, diagnosticLimit: 10)
-            timings["localSearch"] = (ProcessInfo.processInfo.systemUptime - localSearchStarted) * 1000
-            matches = (photosResult.matches + localResult.matches).sorted(by: Self.ranked)
-            diagnostics = Array((photosResult.diagnostics + localResult.diagnostics).sorted(by: Self.ranked).prefix(10))
+            guard let result = try await store.vectorCandidates(for: fileID, query: fingerprint, token: token,
+                threshold: configuration.threshold, diagnosticLimit: 10), !paused else { return waiting() }
+            timings["sqliteSearch"] = (ProcessInfo.processInfo.systemUptime - searchStarted) * 1000
+            matches = result.matches; diagnostics = result.diagnostics
             evaluation = try AdvancedDuplicatePolicy.evaluate(sourceSize: size, candidates: matches, configuration: configuration)
         }
         guard !paused, !Task.isCancelled, try await eligibleRecord(fileID: fileID, file: file) != nil, !paused,
@@ -178,9 +163,6 @@ public actor AdvancedDedupService {
     private func samePhotosIndex(_ lhs: IndexToken, _ rhs: IndexToken) -> Bool {
         lhs.context == rhs.context && lhs.photosGeneration == rhs.photosGeneration &&
             lhs.indexGeneration == rhs.indexGeneration && lhs.fingerprintVersion == rhs.fingerprintVersion
-    }
-    private static func ranked(_ lhs: ScoredCandidate, _ rhs: ScoredCandidate) -> Bool {
-        lhs.score == rhs.score ? lhs.key < rhs.key : lhs.score > rhs.score
     }
     private func waiting() -> AdvancedPreparation { .waiting(reason: "来源或图库索引正在等待确认。") }
 }

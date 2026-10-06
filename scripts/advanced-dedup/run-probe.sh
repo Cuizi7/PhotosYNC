@@ -135,9 +135,11 @@ import subprocess
 import sys
 root = Path(sys.argv[1])
 h = hashlib.sha256(subprocess.check_output(['xcrun', 'swiftc', '--version']))
+h.update(subprocess.check_output(['xcrun', 'clang', '--version']))
 h.update(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path']))
 h.update(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-version']))
 paths = sorted((root / 'Sources/PhotoSyncCore').rglob('*.swift'))
+paths += sorted((root / 'Sources/PhotoSyncCore/Storage/SQLiteVectorQuery').iterdir())
 paths += [root / 'Tools/AdvancedDedupProbe/main.swift', root / 'scripts/advanced-dedup/run-probe.sh']
 for path in paths:
     h.update(path.relative_to(root).as_posix().encode() + b'\0')
@@ -147,10 +149,15 @@ HASH
 )"
 BIN="$ROOT/work/advanced-dedup-probe-$BUILD_KEY"
 if [[ ! -x "$BIN" ]]; then
+BRIDGE="$ROOT/Sources/PhotoSyncCore/Storage/SQLiteVectorQuery"
+BRIDGE_OBJECT="$BIN.bridge.tmp.$$.o"
+trap 'rm -f "$BRIDGE_OBJECT" "$BIN.tmp.$$"' EXIT
+xcrun clang -O3 -fno-fast-math -ffp-contract=off -c "$BRIDGE/SQLiteVectorQuery.c" -o "$BRIDGE_OBJECT"
 xcrun swiftc -O -module-cache-path "$MODULE_CACHE" -module-name AdvancedDedupProbe \
-  "${CORE_SOURCES[@]}" "$ROOT/Tools/AdvancedDedupProbe/main.swift" \
+  -I "$BRIDGE" "${CORE_SOURCES[@]}" "$ROOT/Tools/AdvancedDedupProbe/main.swift" "$BRIDGE_OBJECT" -framework Accelerate -lsqlite3 \
   -o "$BIN.tmp.$$"
 mv "$BIN.tmp.$$" "$BIN"
+rm -f "$BRIDGE_OBJECT"
 fi
 
 exec "$BIN" "${ARGS[@]}" --approved-protocol-json "$APPROVED_BINDING"
