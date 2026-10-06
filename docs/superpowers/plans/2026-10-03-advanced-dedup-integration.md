@@ -284,10 +284,10 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 - 配置后端显式为 `sqlite-exact-f32-v1`，重新计算 policyVersion / acceptanceID 与四文件原字节哈希链。fingerprintVersion、模型、阈值、真值不变。新回归记录必须由新查询后端重放产生；旧报告不能仅改标签变成新证据。追加带本次用户指令、旧记录 SHA/提交、后端变化依据的 amendment，保留 `statisticalAcceptance.status=not_performed`。
 - 请求 `PRAGMA mmap_size=2147483648` 并记录实际生效值，`PRAGMA cache_size=-16384` 限制普通页缓存；mmap 为 0/被系统截断仍正确。不改变已有事务/耐久化配置。查询不使用全量排序、临时表或持久写入，不为优化开启不受控 TEMP 内存。
 
-- [ ] **Step 1 — 写并运行 RED。** 对同一临时数据库和原 `ExactVectorIndex` oracle，断言全部阈值命中、全局前 10 ID/精确分数/Swift key 同分次序和动作一致，覆盖第 11 个才具有尺寸覆盖的候选、400 个同分命中、Unicode key、负分、阈值及范数容差邻接 Float。非命中行放在合法命中之后，分别写入 NULL、非法长度、NaN/Inf、零/高/低范数，查询必须整体失败；不能返回先累计的 skip。资格测试覆盖停用/移除来源、较新 pending、自身、已跳过无 success、成功历史、stamp/version/context/generation。令牌/本地修订改变应返回等待，旧 admission 不得提交。
-- [ ] **Step 2 — 实现并接入单遍扫描。** SQL 仍由 SyncStore 定义候选资格及 metadata；扫描按行验证必需的 key/origin/尺寸字段及 1024 个 f32，长度 4096、分量 finite、Double 平方和误差 ≤1e-5，再调用原 `vDSP_dotpr`。只把全部达阈值候选或可能进入诊断前 10 的行交给 Swift；等分也交回，排序仍用原 Swift String 规则。向量只在当前行缓冲中存在；错误/取消/SQLite step 失败不暴露部分结果。C 禁用 fast-math 并固定 `-ffp-contract=off`；跨语言对象、statement、BLOB 指针仅在同步扫描期有效，所有路径 finalize/free。不添加本地候选缓存、不改提交锁顺序。
-- [ ] **Step 3 — 轻量发布与配置证据。** service 改用统一 SQLite 查询，coordinator 不再解码/复制/replace 全库向量。更新 graph、fake、测试调用点及 Core/Tools/race 编译成员关系。更新后端绑定及逐字段/篡改测试；用既有固定输入重放新后端并生成四文件一致的记录，另跑实际 bundled 模型的 33 例，明确两者来源。
-- [ ] **Step 4 — GREEN 与独立任务审阅。** 运行受影响原生测试及编译入口检查，最后一个 P10 快照做一次完整 native XCTest；记录有效 mmap、查询写计数为零、向量内存不随总数常驻增长的受控检查。完整 100k/150k/200k Photos + 100k 历史性能/闲置测量留到 P11 集成完成，避免重复。自行审阅后提交 `feat: query dedup fingerprints directly from SQLite`，输出 RED/GREEN、命令/退出码、资源身份和剩余性能风险，控制线程做 SPEC/QUALITY 审阅。
+- [x] **Step 1 — 写并运行 RED。** 对同一临时数据库和原 `ExactVectorIndex` oracle，断言全部阈值命中、全局前 10 ID/精确分数/Swift key 同分次序和动作一致，覆盖第 11 个才具有尺寸覆盖的候选、400 个同分命中、Unicode key、负分、阈值及范数容差邻接 Float。非命中行放在合法命中之后，分别写入 NULL、非法长度、NaN/Inf、零/高/低范数，查询必须整体失败；不能返回先累计的 skip。资格测试覆盖停用/移除来源、较新 pending、自身、已跳过无 success、成功历史、stamp/version/context/generation。令牌/本地修订改变应返回等待，旧 admission 不得提交。
+- [x] **Step 2 — 实现并接入单遍扫描。** SQL 仍由 SyncStore 定义候选资格及 metadata；扫描按行验证必需的 key/origin/尺寸字段及 1024 个 f32，长度 4096、分量 finite、Double 平方和误差 ≤1e-5，再调用原 `vDSP_dotpr`。只把全部达阈值候选或可能进入诊断前 10 的行交给 Swift；等分也交回，排序仍用原 Swift String 规则。向量只在当前行缓冲中存在；错误/取消/SQLite step 失败不暴露部分结果。C 禁用 fast-math 并固定 `-ffp-contract=off`；跨语言对象、statement、BLOB 指针仅在同步扫描期有效，所有路径 finalize/free。不添加本地候选缓存、不改提交锁顺序。
+- [x] **Step 3 — 轻量发布与配置证据。** service 改用统一 SQLite 查询，coordinator 不再解码/复制/replace 全库向量。更新 graph、fake、测试调用点及 Core/Tools/race 编译成员关系。更新后端绑定及逐字段/篡改测试；用既有固定输入重放新后端并生成四文件一致的记录，另跑实际 bundled 模型的 33 例，明确两者来源。
+- [x] **Step 4 — GREEN 与独立任务审阅。** 运行受影响原生测试及编译入口检查，最后一个 P10 快照做一次完整 native XCTest；记录有效 mmap、查询写计数为零、向量内存不随总数常驻增长的受控检查。完整 100k/150k/200k Photos + 100k 历史性能/闲置测量留到 P11 集成完成，避免重复。自行审阅后提交 `feat: query dedup fingerprints directly from SQLite`，输出 RED/GREEN、命令/退出码、资源身份和剩余性能风险，控制线程做 SPEC/QUALITY 审阅。
 
 ### Task 11 (P11): Photos 连续变化集与无变化对账零行写入
 
@@ -341,3 +341,8 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 - 当前实施/回归/系统与平台缺口以 [P9 验收记录](../../release/0.2.0-advanced-dedup-validation.md) 为准。P9 已恢复冻结 R2 bounded thumbnail 解码并通过真实 33 例，失败对照仍保留；不能用历史重放替代当前产品验收；最终分支审阅和控制线程验收尚待完成。
 
 P9 真实回归发现并修复未发行的 P4 解码偏差：固定 R2 从引入提交 `f60bf5d` 到冻结底本 `04da1ab` 均使用有界 ImageIO thumbnail 解码。恢复其参数后 33 例从 30/33 回到全部通过，阈值与真值未动；保留 512 MiB 原始 backing 预检、超限保守导入、原始 metadata 尺寸、原 EXIF 处理和物理租约。该修复由控制线程明确确认，先前“full CreateImage 是冻结 R2”的说明不再适用。
+
+
+## 2026-10-06 P10 验证检查点
+
+SQLite 查询已在 `348e128` 实施，溯源字段修正在 `2eec0fe`；独立任务审阅及修正复核通过，未留开放问题。当前原生 480 项测试零失败（1 项规模测试按独立子进程执行），72 项受影响 Tools 与两个受控竞态通过；四文件资源绑定已重新核验。33 例分别通过既有向量 SQLite 重放和当前模型新推理。该检查点不代替 P11 后的最终规模/闲置/canonical/全分支审阅；已知最大档热查询超目标仍保留。
