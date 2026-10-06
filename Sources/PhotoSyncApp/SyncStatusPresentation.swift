@@ -37,7 +37,8 @@ struct SyncStatusPresentation {
     func statusDescription(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String {
         let issues = enabledIssues(for: enabledSourceIDs)
         let summary = snapshot.summary
-        if !snapshot.isPaused, let analysis, [.running, .waiting].contains(status) { return analysis.title }
+        if !snapshot.isPaused, !issues.contains(where: \.isSourceAvailability),
+           let analysis, [.running, .waiting].contains(status) { return analysis.title }
         switch status {
         case .error:
             return hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs)

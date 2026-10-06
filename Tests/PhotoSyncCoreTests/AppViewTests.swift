@@ -141,6 +141,24 @@ final class AppViewTests: XCTestCase {
 }
 
 extension AppViewTests {
+    func testUnavailableSourceKeepsRecoveryHeadlineAndAnalysisInNativeMenu() async throws {
+        let model = try await makeModel(sourceCount: 1)
+        for state in [IndexState.preparing, .updating, .waiting, .ready] {
+            model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
+                totalAssets: 2, readyAssets: 1, totalRepresentations: 3,
+                readyRepresentations: 1, excludedAssets: 0, issue: nil)
+            XCTAssertEqual(model.status, .waiting)
+            XCTAssertEqual(model.statusDescription, "等待恢复")
+            XCTAssertEqual(model.analysis != nil, state != .ready)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
+                XCTAssertEqual(size.width, 320, accuracy: 1)
+                XCTAssertLessThanOrEqual(size.height, 680)
+                try renderMenu(model, name: "source-unavailable-\(state.rawValue)-\(appearance.rawValue)", appearance: appearance)
+            }
+        }
+    }
+
     func testCompactAnalysisAndCountersFitNativeMenu() async throws {
         let model = try await makeModel(sourceCount: 1)
         model.state.snapshot.waitingSources = [:]
@@ -158,19 +176,22 @@ extension AppViewTests {
             model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
                 totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
                 readyRepresentations: 100000, excludedAssets: 0, issue: state == .waiting ? cloud : nil)
-            let size = try measure(StatusMenu(model: model), width: 320)
-            XCTAssertEqual(size.width, 320, accuracy: 1)
-            XCTAssertLessThanOrEqual(size.height, 680)
-            XCTAssertEqual(model.analysis == nil, state == .ready)
-            if state == .waiting || state == .ready { try renderMenu(model, name: state.rawValue) }
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
+                XCTAssertEqual(size.width, 320, accuracy: 1)
+                XCTAssertLessThanOrEqual(size.height, 680)
+                XCTAssertEqual(model.analysis == nil, state == .ready)
+                try renderMenu(model, name: "\(state.rawValue)-\(appearance.rawValue)", appearance: appearance)
+            }
         }
     }
 
-    private func renderMenu(_ model: AppModel, name: String) throws {
+    private func renderMenu(_ model: AppModel, name: String, appearance: NSAppearance.Name) throws {
         guard let directory = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] else { return }
         let host = NSHostingView(rootView: StatusMenu(model: model)
-            .environment(\.colorScheme, .light).background(Color(nsColor: .windowBackgroundColor)))
-        host.appearance = NSAppearance(named: .aqua)
+            .environment(\.colorScheme, appearance == .darkAqua ? .dark : .light)
+            .background(Color(nsColor: .windowBackgroundColor)))
+        host.appearance = NSAppearance(named: appearance)
         host.frame = NSRect(x: 0, y: 0, width: 320, height: 680)
         let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false; window.contentView = host

@@ -291,6 +291,43 @@ final class SyncStatusPresentationTests: XCTestCase {
 }
 
 extension SyncStatusPresentationTests {
+    // Analysis remains visible, but must not replace the headline explaining an unavailable source.
+    func testUnavailableSourceHeadlineWinsWhileAnalysisVisible() {
+        let id = UUID()
+        for state in [IndexState.preparing, .updating, .waiting] {
+            var snapshot = EngineSnapshot()
+            snapshot.indexProgress = IndexProgress(state: state, totalsKnown: true,
+                totalAssets: 2, readyAssets: 1, totalRepresentations: 3,
+                readyRepresentations: 1, excludedAssets: 0, issue: nil)
+            snapshot.waitingSources[id] = SourceIssue(summary: "来源目录暂时不可用。",
+                detail: "synthetic unavailable source", kind: .sourceAvailability)
+            let p = SyncStatusPresentation(snapshot: snapshot)
+            let status = p.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+            XCTAssertEqual(status, .waiting, state.rawValue)
+            XCTAssertEqual(p.statusDescription(for: status, enabledSourceIDs: [id]), "等待恢复", state.rawValue)
+            XCTAssertNotNil(p.analysis, state.rawValue)
+
+            snapshot.isPaused = true
+            let paused = SyncStatusPresentation(snapshot: snapshot)
+            let pausedStatus = paused.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
+            XCTAssertEqual(pausedStatus, .paused)
+            XCTAssertEqual(paused.statusDescription(for: pausedStatus, enabledSourceIDs: [id]), "已暂停")
+            for (authorized, blocked) in [(false, false), (true, true)] {
+                let error = p.globalStatus(enabledSourceIDs: [id], authorized: authorized, hasBlockingError: blocked)
+                XCTAssertEqual(error, .error)
+                XCTAssertEqual(p.statusDescription(for: error, enabledSourceIDs: [id]), "需要处理错误")
+            }
+            let unconfigured = p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false)
+            XCTAssertEqual(unconfigured, .unconfigured)
+            XCTAssertEqual(p.statusDescription(for: unconfigured, enabledSourceIDs: []), "未配置来源")
+
+            snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
+                totalAssets: 2, readyAssets: 2, totalRepresentations: 3,
+                readyRepresentations: 3, excludedAssets: 0, issue: nil)
+            XCTAssertNil(SyncStatusPresentation(snapshot: snapshot).analysis)
+        }
+    }
+
     func testLibraryAnalysisVisibility() {
         for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
             var snapshot = EngineSnapshot()
