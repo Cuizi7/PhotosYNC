@@ -865,9 +865,9 @@
   "sqliteQueryAmendment": {
     "priorSourceCommit": "e62e3ae",
     "priorRecordSHA256": "c30e33331aa73a0e574c13d1648db2b2f65a7318023888db3c0a07b42ba4e5b6",
-    "priorReplayProfileSHA256": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
-    "priorSwiftBatchSHA256": "3a663fbdd19e78742659a249e793b07c63b129068cbefaec747da882de5278f0",
-    "priorRawReplaySHA256": "e8541181a37e3f413c39090f7a00761cad8f660ecd9405473b74a9440d92f6bb",
+    "priorReplayProfileSHA256": "107e03d70e04494f96128a180e9dc56ebc6c428ddb42978055c141f9a1783637",
+    "priorSwiftBatchSHA256": "6255b3e21dbcd93ad804ce3722721ce4c2d6bfe2a41556d8e93f078e9fd98edc",
+    "priorRawReplaySHA256": "9216f2653725052dddd8fa4c3503fcf3de6eaf3ff12209c600f9603ff563400b",
     "producer": "native XCTest AdvancedDedupRegressionTests.testExistingVectorReplayUsesSQLiteBackend through current SyncStore.vectorCandidates + system SQLite/Accelerate C bridge",
     "evidence": "work/P10-20261006/replay-final-profile-green.log",
     "exactOracle": "all 33 complete result sets equal unchanged ExactVectorIndex; original vector bytes/scores and truth verified; Photos keys use production byte framing",

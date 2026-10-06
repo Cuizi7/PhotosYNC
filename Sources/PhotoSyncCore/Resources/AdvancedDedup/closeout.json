@@ -19,7 +19,7 @@
   "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
   "regression": {
     "file": "2026-10-05-threshold-098-regression.json",
-    "sha256": "77edba15a226197594625656b336d33f7e169609c5d1d6787270ea804c82704f",
+    "sha256": "817f22f083e8debe88af8189a98977a2168785cf6f33b782d9800db532f5fa3e",
     "caseCount": 33,
     "passCount": 33,
     "contentFailures": [],

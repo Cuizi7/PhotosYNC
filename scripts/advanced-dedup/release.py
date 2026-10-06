@@ -21,8 +21,8 @@ LICENSE_SHA = "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93"
 RECORD_HASHES = {
     "decision.json": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
     "profile.json": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
-    "regression.json": "77edba15a226197594625656b336d33f7e169609c5d1d6787270ea804c82704f",
-    "closeout.json": "56f5e4dc59c51d535e58477bcc037b889a019039cb6d495853d4379ffd6c58d5",
+    "regression.json": "817f22f083e8debe88af8189a98977a2168785cf6f33b782d9800db532f5fa3e",
+    "closeout.json": "8376b632764d80b6b213eb019a8bcc7c153af5968e67df3fe56a346340451b9b",
     "LICENSE-SSCD.txt": LICENSE_SHA,
     "model-provenance.json": "d59d381e71afd5bebf8d448f64a3d27c5019963228a3fc1a02d5be9ae5528a65",
 }
