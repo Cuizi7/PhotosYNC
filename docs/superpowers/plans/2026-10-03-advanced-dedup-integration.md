@@ -1,6 +1,6 @@
 # PhotosYNC 0.2.0 高级照片判重集成 Implementation Plan
 
-> **2026-10-06 当前状态：** 用户已选定初始阈值 **0.98** 并结束独立校准研究。P1–P8 已实施，P9 已接入资源与验收门槛，真实 33 例已通过；历史候选热路径及图库变化就绪时延仍超目标。用户本日明确选择 SQLite 并授权完成 Photos 按变化更新索引，新增 P10/P11 后回到 P9 收尾；不重做已完成任务，不豁免性能目标。旧 44 例、0.8 失败及既有研究证据保留，独立统计保证仍未验证。
+> **2026-10-06 当前状态：** P10 SQLite 查询和 P11 Photos 按变化更新索引已完成实现、源码审阅及受控测量，最后测试快照为 `171485732fa1ee027b62b88afc1c724a9c626192`。完整 XCTest 495 项零失败（2 项明确跳过）、Tools 90 项、两项恢复竞态及实际模型 33 例通过。四档规模数据已齐；15 万表示起热准备 P95 超过 250 ms，canonical 验收仍失败，P9 性能门槛未关闭。单张索引变更和峰值 RSS 达标；未做新的真实 Photos/iCloud、平台实机或发布验收。阈值仍为用户选定的 0.98，独立统计保证未验证。
 
 > **同日产品交互补充：** 用户已确认仅在点击菜单栏图标后的下拉面板展示图库分析，就绪时隐藏；首次自动分析，完成后静默进入同步；iCloud 等待提示与基础同步统计各占一行。用户明确要求实际实现继续使用原生控件。具体约束与验收见 P8，浏览器草图仅用于设计审阅。
 
@@ -304,12 +304,14 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 - 原 `seen_generation` 可保留为表示/任务发行代次，不再要求等于当前全局发布代次；变更语义必须同步修正完整性、publication、query、progress、task polling/completion、索引和迁移。无变化表示/任务不 UPDATE。任务保留自己的发行代次，完成时验证持久 task 仍存在、发行代次和完整 descriptor/fingerprintVersion；换任务后同 revision 的迟到结果也拒绝。保留事务化 v3→当前及已有 v4 数据升级，不清成功历史/unknown。
 - 为在增量时准确更新 excludedAssets，增加同一数据库的轻量 `photos_index_exclusion` 表（context_id/context_epoch/asset_id 主键，只保存完全不属于高级候选的资产），不能靠单个累计数猜某 ID 原先是否被排除。完整对账更新实际差异，delta 只处理涉及的 ID；与表示更新同事务。迁移升至 schema v5，旧 v4 初始化为空且必须重新完成清单再发布；v3 路径仍保留全部历史，未知更高版本拒绝。`Schema.sql` 与迁移同步；这不是第二套向量或成功历史表。
 
-- [ ] **Step 1 — 写并运行 RED。** 初始化后加/改/删单资产，断言 gateway 只读取给定 ID、没有完整 catalog、无关表示/任务逐字段不变、只重推理有关表示、动作和尺寸覆盖正确；metadata/编辑/撤销/排除 transitions 分别覆盖。使用 SQLite update hook 或等价实际语句变化计数断言 unchanged 完整对账对 `photos_representation` / `fingerprint_task` 零写入、零图像读取/推理，不能用现有逻辑 IndexMutationCounts 代替物理写证明。不同总库规模同一 delta 的行写数相同。
-- [ ] **Step 2 — 增量 producer 与落库。** gateway 在既有 observer/串行 candidate index/validity 中产生带基线的完整增量，先使旧提交失效，再处理详情；队列丢失/无订阅/overflow 继续 sticky full。runtime 传递变化原因，不把每个 granular event 都提升为全库 force。coordinator 只合并同上下文连续增量，以后发生的 changed/deleted 状态为准；有歧义保守 full，不猜遗漏。事务完成后再做所需图像任务及轻量发布，所有 await 后核对暂停/变化/上下文。
-- [ ] **Step 3 — 无变化完整检查及任务 fencing。** 改为本次临时 seen-key 集合，去掉未变化表示及 task 的 generation UPDATE；完整校验后才处理遗漏。保留启动/恢复/30 分钟 full。补 controlled tests：事件断档、非增量、overflow、缺 ID、暂停分页/重启、上下文/授权变化、中途失败、连续改删/删改、受影响晚结果被拒、无关在途结果仍可完成、发表前又来变化不得 ready。对方系统变化不能只靠 fake 改 enum 跳过实际接线。
-- [ ] **Step 4 — 聚焦 GREEN 并冻结。** 对真实 SQLite + fake Photos 运行相关状态/持久化/恢复/并发测试，检查 SQL 查询计划不因去掉 seen_generation 谓词退化到读全部 BLOB 来判 readiness；必要索引属于同任务。记录写行计数与持久文件/WAL变化，保持既有日志完整。提交 `feat: update Photos fingerprints from asset deltas` 并接受独立 SPEC/QUALITY 审阅。完整 canonical 由控制线程指派 tester 在最终快照运行，不由 implementer 重复执行同一快照全套。
-- [ ] **Step 5 — 回到 P9 最终验收。** 更新既有受控 scale harness，覆盖 100k/150k/200k Photos 表示，以及 200k Photos + 100k 成功历史。热查询分段与 source prepare 分开；单项变化计时直到有效 ready token/Photos generation/表示数全部吻合，多次样本给 P50/P95/P99；初建、单变更、无变更 full、重启各标明真实/合成。最大档记录查询后 60 秒闲置的 footprint/RSS、再次查询延迟及查询/增量/无变更对账的逻辑 I/O/进程 I/O/写计数；查询零写不等于整个导入零写。沿用 `scripts/validate.py` 的完整 native/Tools/两个 continuation race/实际模型/规模门槛；失败仍退出非零并报告，不重跑已见统计校准或无限增加优化路线。
-- [ ] **Step 6 — 最后集成审阅与交付记录。** 全分支审阅聚焦新查询与既有 commit/恢复、轻量 publication 和 delta 的组合风险；修复后补受影响验证。已知最大规模热查询风险必须以最终测量说明，达不到仍不能宣称完整性能验收或发行就绪。更新 spec/plan 实际完成状态与验证记录，交付本地源码提交；不发布、安装或启动真实应用。
+- [x] **Step 1 — 写并运行 RED。** 初始化后加/改/删单资产，断言 gateway 只读取给定 ID、没有完整 catalog、无关表示/任务逐字段不变、只重推理有关表示、动作和尺寸覆盖正确；metadata/编辑/撤销/排除 transitions 分别覆盖。使用 SQLite update hook 或等价实际语句变化计数断言 unchanged 完整对账对 `photos_representation` / `fingerprint_task` 零写入、零图像读取/推理，不能用现有逻辑 IndexMutationCounts 代替物理写证明。不同总库规模同一 delta 的行写数相同。
+- [x] **Step 2 — 增量 producer 与落库。** gateway 在既有 observer/串行 candidate index/validity 中产生带基线的完整增量，先使旧提交失效，再处理详情；队列丢失/无订阅/overflow 继续 sticky full。runtime 传递变化原因，不把每个 granular event 都提升为全库 force。coordinator 只合并同上下文连续增量，以后发生的 changed/deleted 状态为准；有歧义保守 full，不猜遗漏。事务完成后再做所需图像任务及轻量发布，所有 await 后核对暂停/变化/上下文。
+- [x] **Step 3 — 无变化完整检查及任务 fencing。** 改为本次临时 seen-key 集合，去掉未变化表示及 task 的 generation UPDATE；完整校验后才处理遗漏。保留启动/恢复/30 分钟 full。补 controlled tests：事件断档、非增量、overflow、缺 ID、暂停分页/重启、上下文/授权变化、中途失败、连续改删/删改、受影响晚结果被拒、无关在途结果仍可完成、发表前又来变化不得 ready。对方系统变化不能只靠 fake 改 enum 跳过实际接线。
+- [x] **Step 4 — 聚焦 GREEN 并冻结。** 对真实 SQLite + fake Photos 运行相关状态/持久化/恢复/并发测试，检查 SQL 查询计划不因去掉 seen_generation 谓词退化到读全部 BLOB 来判 readiness；必要索引属于同任务。记录写行计数与持久文件/WAL变化，保持既有日志完整。提交 `feat: update Photos fingerprints from asset deltas` 并接受独立 SPEC/QUALITY 审阅。完整 canonical 由控制线程指派 tester 在最终快照运行，不由 implementer 重复执行同一快照全套。
+- [x] **Step 5 — 回到 P9 最终验收。** 更新既有受控 scale harness，覆盖 100k/150k/200k Photos 表示，以及 200k Photos + 100k 成功历史。热查询分段与 source prepare 分开；单项变化计时直到有效 ready token/Photos generation/表示数全部吻合，多次样本给 P50/P95/P99；初建、单变更、无变更 full、重启各标明真实/合成。最大档记录查询后 60 秒闲置的 footprint/RSS、再次查询延迟及查询/增量/无变更对账的逻辑 I/O/进程 I/O/写计数；查询零写不等于整个导入零写。沿用 `scripts/validate.py` 的完整 native/Tools/两个 continuation race/实际模型/规模门槛；失败仍退出非零并报告，不重跑已见统计校准或无限增加优化路线。
+- [x] **Step 6 — 最后集成审阅与交付记录。** 全分支审阅聚焦新查询与既有 commit/恢复、轻量 publication 和 delta 的组合风险；修复后补受影响验证。已知最大规模热查询风险必须以最终测量说明，达不到仍不能宣称完整性能验收或发行就绪。更新 spec/plan 实际完成状态与验证记录，交付本地源码提交；不发布、安装或启动真实应用。
+
+> P11 步骤完成表示实现、审阅和要求的测量均已执行并记录，不表示所有性能指标通过。最终 canonical 的失败与 P9 未关闭项目见文末；不继续扩展查询架构或放宽门槛来制造通过。
 
 ## 自检覆盖与执行交接
 
@@ -327,7 +329,7 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 | 9/10 阈值调整、近邻日志和UI | P4/P7/P8 |
 | 11 自动/系统/平台/交付 | P6/P9 |
 
-任务顺序：P1–P8 已完成 → P9 当前检查点 `9186766` → P10 SQLite → P11 Photos delta → P9 最终验收与全分支审阅。共享文件由单一所有者串行整合，不并发改 SyncStore；持续用最小相关检查，非最终任务不重复平台或真实图库全验收。上方 P1–P9 原实施步骤和值类型保留作历史，P10/P11 的新接口与用户批准方向优先。
+任务状态：P1–P8 已完成；P10 SQLite 和 P11 Photos delta 已实施并完成源码审阅；P9 最终自动检查与四档规模测量已执行，性能验收因热准备超标仍未通过。共享文件由单一所有者串行整合，不并发改 SyncStore；持续用最小相关检查，非最终任务不重复平台或真实图库全验收。上方 P1–P9 原实施步骤和值类型保留作历史，P10/P11 的新接口与用户批准方向优先。
 
 用户已授权并采用 subagent-driven 实施 P1–P9。P1–P8 已完成任务级实施与评审；P9 及最后全量验收、分支审阅按当前证据收尾。以下任务框架保留为原计划，不应重新执行已完成步骤。
 
@@ -338,7 +340,7 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 - 用户选择 Git LFS；固定权重按 exact-commit pointer、local object SHA/size、完整模型包身份依次校验后才允许归档构建，无自动远端上传。
 - P5 实际锁顺序为 store 串行队列 → Photos validity → SQLite 事务；原计划的简写不授权反向持锁或跨 await 等待 Photos。
 - 实际 runtime/UI/诊断责任落在 SyncRuntime、AppModel、SyncStatusPresentation、AdvancedRuntimeTests 等已有边界；不为匹配原计划文件名进行机械迁移。
-- 当前实施/回归/系统与平台缺口以 [P9 验收记录](../../release/0.2.0-advanced-dedup-validation.md) 为准。P9 已恢复冻结 R2 bounded thumbnail 解码并通过真实 33 例，失败对照仍保留；不能用历史重放替代当前产品验收；最终分支审阅和控制线程验收尚待完成。
+- 当前实施/回归/系统与平台缺口以 [P9 验收记录](../../release/0.2.0-advanced-dedup-validation.md) 为准。P9 已恢复冻结 R2 bounded thumbnail 解码并通过真实 33 例，失败对照仍保留；不能用历史重放替代当前产品验收；最终分支审阅已完成；控制线程验收结果及未通过项见下方 2026-10-06 收尾记录。
 
 P9 真实回归发现并修复未发行的 P4 解码偏差：固定 R2 从引入提交 `f60bf5d` 到冻结底本 `04da1ab` 均使用有界 ImageIO thumbnail 解码。恢复其参数后 33 例从 30/33 回到全部通过，阈值与真值未动；保留 512 MiB 原始 backing 预检、超限保守导入、原始 metadata 尺寸、原 EXIF 处理和物理租约。该修复由控制线程明确确认，先前“full CreateImage 是冻结 R2”的说明不再适用。
 
@@ -346,3 +348,26 @@ P9 真实回归发现并修复未发行的 P4 解码偏差：固定 R2 从引入
 ## 2026-10-06 P10 验证检查点
 
 SQLite 查询已在 `348e128` 实施，溯源字段修正在 `2eec0fe`；独立任务审阅及修正复核通过，未留开放问题。当前原生 480 项测试零失败（1 项规模测试按独立子进程执行），72 项受影响 Tools 与两个受控竞态通过；四文件资源绑定已重新核验。33 例分别通过既有向量 SQLite 重放和当前模型新推理。该检查点不代替 P11 后的最终规模/闲置/canonical/全分支审阅；已知最大档热查询超目标仍保留。
+
+
+## 2026-10-06 SQLite / Photos delta 收尾
+
+实现提交为 `348e128`（SQLite）、`a32fd9f`（Photos delta），后续 `75d62a6` 修正旧 v4 迁移夹具及接口文档，`1714857` 修正测试宿主的重启后服务配对。后两次修正没有改变产品判定、资源预算或迁移安全检查。独立全分支审阅及局部复核通过；原有来源恢复标题的低优先级 UI 问题记录在验收文档，未扩入本轮修改。
+
+最终测试源树为 `d63764a7d741b50e23437462cea564691c2a4caf`。`scripts/validate.py` 在该快照的 150k 热准备门槛处退出 1；未执行的 200k、200k+100k、完整 Tools 和两项 continuation 检查随后在同一源码串行补齐。原始失败不改写为通过，不生成成功 `validation.json`。
+
+M2 Pro、实际模型及产品组件、临时 SQLite / 合成表示 / fake Photos 的 Release 测量如下；不是十万真实 Photos 资产的实测。查询/准备各 20 个样本，增删改各 5 个样本；“变更”列取三类操作 P95 中最高值。
+
+| Photos 表示 / 成功历史 | 纯查询 P95 ms | 热准备 P95 ms | 新来源准备 P95 ms | 变更至就绪 P95 ms | 峰值 RSS GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 100k / 0 | 168.42 | 232.68 | 316.72 | 167.09 | 0.90 |
+| 150k / 0 | 252.94 | 344.27 | 437.35 | 238.30 | 1.13 |
+| 200k / 0 | 339.17 | 455.45 | 560.93 | 301.28 | 1.80 |
+| 200k / 100k | 612.05 | 732.36 | 846.22 | 357.92 | 1.67 |
+
+- 已证明的写入边界：四档纯查询均零行写入、零 VFS 写入；无变化核对均无模型调用，表示/任务/排除表零写入，只更新 3 行全局状态，约 50,772 字节逻辑 VFS 写入。单资产编辑/新增分别涉及 2 次表示写与 2 次任务写，删除 1 次表示写；另有各 4 次全局状态写，与总库大小无关。这是受控 fixture 的行计数，不是所有原生编辑类型的固定写次数。
+- 最大档真实闲置 60.041 秒：footprint 50,710,760 → 31,967,416 字节（约 48.36 → 30.49 MiB），RSS 1,645,887,488 → 1,401,110,528 字节；恢复查询单次 615.98 ms。该间隔没有观测到进程磁盘读写或 page-in 增加。它位于查询/增量/同进程重新打开之后、日志压力与大图读取之前；旧新对象仍共存，不是 App 冷重启或真实 Photos 闲置验收。未单独量出文件映射，不能把 RSS 差额全部称为可回收缓存；逻辑 I/O 不是 SSD/NAND 磨损。
+- 大图成功参与比较，但 61 MP 16-bit PNG 的两个单次观察为 2.24 / 2.56 秒，超过 2 秒；不能用普通小图的 P95 掩盖，也不能把两次观察称为 P95。
+- 功能回归、写入边界、单张 Photos 增量和峰值 RSS 已取得受控证据。P9 的 250 ms 热准备目标、真实系统/平台和发行验收仍未关闭；本次交付本地源码与记录，未授权任何合并、推送、打包或部署。
+
+完整数值、原始失败、验证命令和局限见 [0.2.0 验收记录](../../release/0.2.0-advanced-dedup-validation.md)。保留本计划的 SDD 记录及 `work/final-integrated-171485732fa1-20261006/` 证据，后续不要重做 P1–P11 或将已完成的源代码审阅误当作完整性能通过。
