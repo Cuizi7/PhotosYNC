@@ -1,5 +1,7 @@
 # PhotosYNC 0.2.0 高级照片判重集成 Implementation Plan
 
+> **2026-10-06 FP16 执行授权：** 用户选择研究方案 A（ANE 优先、GPU 降级），要求执行后端集成、原生交互收尾与最终验收，然后编制真实 Photos＋iCloud 验证计划。新增 P12–P14 承接这次授权；P1–P11 已完成部分不重做。Intel 实机验证跳过，用户确认无 macOS 13 Apple Silicon 设备、保留该实机缺口；最低 macOS 13 与 Universal 构建目标不变。本轮不执行真实图库测试或合并/推送/发布。
+
 > **2026-10-06 指标修订完成：** 用户要求复核 250 ms 的依据并直接修正不合理指标。已确认其旧 FP16/all-compute 粗测依据及测量口径不适用于当前 FP32/CPU-only 后台准备；当前改为 `background-preparation-v2`，缓存命中与新来源准备统一 P95 ≤2 秒，纯查询仅独立报告。P10/P11 已完成；验收代码修订 `477284b` 已独立审阅并通过新 canonical：495 项 XCTest（2 项显式跳过、0 失败）、92 项 Tools、33 例回归、四档规模和两项恢复竞态。此前 `1714857` 的 250 ms 失败保留；真实系统/平台和发行边界尚未验收。
 
 > **同日产品交互补充：** 用户已确认仅在点击菜单栏图标后的下拉面板展示图库分析，就绪时隐藏；首次自动分析，完成后静默进入同步；iCloud 等待提示与基础同步统计各占一行。用户明确要求实际实现继续使用原生控件。具体约束与验收见 P8，浏览器草图仅用于设计审阅。
@@ -19,7 +21,7 @@
 - “只读来源；Photos 只新增，不修改、替换、删除已有资产。”导入原始 URL，`shouldMoveFile = false`。
 - “保留四种文件状态 `pending`、`importing`、`imported`、`skipped`”；不加产品人工审核环节。
 - “视频保持 0.1 的文件名与 metadata 策略”，不增加 RAW 来源、视频抽帧或 Live Photo 配对。
-- “不加入 pHash、第二个核验模型、服务端模型或独立向量数据库服务。”固定 SSCD Large FP32、Core ML `.cpuOnly`、全画面 stretch 320×320、sRGB、1024 维 L2 Float32 和 `score >= 0.98`；P10 将查询后端由历史 `exact-f32-v1` 改为 `sqlite-exact-f32-v1`，原 Float32 点积与 Swift 同分排序不变，不暗换 FP16、GPU/ANE 或 ANN。
+- “不加入 pHash、第二个核验模型、服务端模型或独立向量数据库服务。”P12 按用户明确授权使用 SSCD Large FP16、Float32 IO、ANE 优先与一次 GPU 降级（spec §7.1）；不允许 CPU-only 兜底。保持全画面 stretch 320×320、sRGB、1024 维 L2 Float32 和 `score >= 0.98`。查询仍为 `sqlite-exact-f32-v1`，原 Float32 点积与 Swift 同分排序不变，不引入 ANN。
 - “应用运行时每 30 分钟”核对 Photos 清单；现有 `ScanSchedule.interval = 1_800`，不叠加、不补跑所有过期周期。
 - “读取失败、索引未完成等属于未知，等待恢复，不能等同于‘不是重复’。”已观察到新增/变化立即挡住新提交。
 - “不得持数据库锁等待 Photos、下载或模型。”任意 await 后重新核对暂停、来源状态、stamp、图库和索引代次。
@@ -385,3 +387,52 @@ M2 Pro、实际模型及产品组件、临时 SQLite / 合成表示 / fake Photo
 沿用现有子代理执行方式：一个实现者只改验收代码；控制线程负责文档和最后记录，审阅/测试独立执行。这是同一后台准备工作单元的预算纠偏，不扩成算法性能重构，也不新增一个贴着已观察时延选取的 1 秒门槛。
 
 冻结测试提交为 `477284b3025351683a7460ca4ce4cd4fedd5c847`，源码树为 `a6f4117f69d85255f936c916a693e2f62c23ea8b`；完整入口在 `work/validation-background-preparation-v2-20261006/` 生成通过报告，239 项源码清单前后一致。四档缓存准备 P95 为 225.01/341.41/454.24/735.97 ms，新来源为 300.45/430.99/555.15/845.23 ms；变化至就绪最高 P95 348.81 ms、峰值 RSS 最高 1.86 GiB。最大档测量 60 秒闲置及恢复；61 MP PNG 单次 2.22/2.46 秒单列披露。后续收尾仅更新这组文档，不把文档提交冒充新一次代码验收。详细表格、命令与限制见 [验收记录](../../release/0.2.0-advanced-dedup-validation.md)。
+
+### Task 12 (P12): FP16 模型、实例自检和串行 GPU 降级
+
+**Authority:** 本计划 Global Constraints 与 spec §7.1；用户已明确选择研究方案 A 并要求执行。模型/后端研究不再重跑，研究 golden 失败不能改成通过。实施基线 `2d90d3d`，开始前核对包含文档授权补充的 HEAD。
+
+**Files / ownership:**
+- Modify: `Sources/PhotoSyncCore/Fingerprinting/CoreMLFingerprinter.swift`、`Matching/AdvancedDedupTypes.swift`、`Matching/AdvancedDedupService.swift`、`Sync/PhotosIndexCoordinator.swift`、`Storage/SyncStore.swift`（仅必要的旧版本成功向量保护）、`Sources/PhotoSyncApp/SyncRuntime.swift`、`Logging/DedupDecisionLog.swift` 或现有 logger 事件接点。
+- Create: `Sources/PhotoSyncCore/Fingerprinting/ModelExecution.swift`，集中小型执行策略/自检值类型、资源解析与会话状态，不建立通用推理框架。更新 Xcode target membership。
+- Replace active bundle: `Sources/PhotoSyncCore/Resources/AdvancedDedup/SSCDLarge.mlpackage` 及当前配置/来源记录；Create 同目录 `execution-policy.json`、`ModelSelfTest/manifest.json` 与 `input-0.f32`…`input-3.f32`、`reference-0.f32`…`reference-3.f32`。
+- Create: `docs/research/advanced-dedup/fp16-ane-gpu-v1/` 的新 decision/profile/regression/closeout/model-provenance/执行策略证据。历史目录已有 JSON 原始字节不变。
+- Modify: `scripts/advanced-dedup/convert-model.py`、`release.py`、`Tools/AdvancedDedupProbe/main.swift`、必要的 `run-probe.sh` 与 `scripts/validate.py`；只修改新产品后端必需的资源/证据接口，原研究协议与旧 `research.py evaluate/accept` 语义不改。
+- Tests: `FingerprintTests.swift`、`AdvancedRuntimeTests.swift`、`AdvancedDedupServiceTests.swift`、`AdvancedDedupEngineTests.swift`、`PhotosIndexCoordinatorTests.swift`、`AdvancedDedupStoreTests.swift`、`AdvancedDedupRegressionTests.swift`；`Tests/Tools/test_advanced_dedup_release.py`、`test_release_validation.py`。仅扩与本任务行为/资源相关的断言。
+
+**Interfaces / values:**
+- 继续消费 `ImageFingerprinting.fingerprint(image:orientation:) async throws -> Fingerprint`，保留现有注入预测器测试。生产构造入口仍由 `AdvancedRuntimeGraph.load` 拥有一个 fingerprinter；增加受验证执行策略和自检资源的显式输入，不能由调用端传一个未校验 backend 字符串。
+- 引入 `ModelExecutionPolicy`（标识 `fp16-ane-gpu-v1`、arm64 主/备用为 `cpuAndNeuralEngine` / `cpuAndGPU`、x86_64 仅 `cpuAndGPU`、无 `.all`/`.cpuOnly`、Float32 IO、低精度 GPU accumulation 为 false）及 `ModelExecutionUnavailable` 类型错误。只将可恢复执行错误/数值自检不合格归入该等待错误；配置损坏保留 fail-closed 配置错误，来源损坏保持原读取错误。
+- `CoreMLFingerprinter` 内的一个 serial physical queue 拥有可变模型会话、选择/验证/预测/降级及释放；不能让每次 enqueue 捕获旧不可变 predictor 后绕过会话状态，也不通过新建 fingerprinter 增加第二条物理队列。只在旧调用/实例结束后换 GPU；逻辑取消不能提前腾槽。
+- 当前批准候选是 `work/coreml-acceleration-20261006/SSCDLargeFP16.mlpackage`，SHA `026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0`，FP32 IO，fingerprintVersion `ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d`。复用确切字节，不再转换出另一个未经比较的包。权重继续 LFS。
+- 四个固定输入来自 `work/R2-synthetic-tensors/{0,1,2,3}.f32`，各 1,228,800 字节；四个参考来自 `{0,1,2,3}-torch.f32`，各 4,096 字节。每个新会话在当前配置下逐一比较，全部 `maxAbs <= 0.02` 且 `cosine >= 0.999` 后才可输出持久化指纹；不改变比较/归一化口径。清单绑定每文件 SHA256，外层执行策略和 decision 绑定清单，加载与 release 都核验路径、大小、有限值和门槛。合成自检资源是 App 资源白名单的明确新增例外；私人图片、私人 embedding、任意研究文件仍禁止进入 App。
+- `ModelExecutionUnavailable` 在来源准备映射为 `AdvancedPreparation.waiting`，利用 `SyncEngine.recordAdvancedWait`，不记录损坏来源、不增加提交失败/unknown。协调器的模型失败仍阻止对应任务 ready，但使用模型等待文案，不冒充 iCloud/照片读取失败。初次模型不可用由 runtime 保留可恢复 waiting；已有 `advancedLoadAttempted` 不能让其永久卡在配置 error。
+- 在现有 tick 检查模型重试期限，自动重试最多每 60 秒一次，手动强制扫描/恢复允许一次即时重试；暂停/停用/撤权不重试。每个新会话只尝试其批准候选各一次。所有 await 后保留既有提交和所有权复核。
+- 日志记录 policy ID、requested/selected 配置、自检结果及失败/降级阶段，技术原文仅在诊断；不宣称配置名等于实际硬件，不输出完整张量或向量。不要引入模型卸载定时器、第二模型或额外推理并发。
+
+- [ ] **Step 1 — 有行为意义的 RED。** 加入具名测试：`testSelfTestFailureSelectsGPUBeforePublishingFingerprint`（主会话验证失败，释放后 GPU 验证通过，未验证结果绝不返回）；`testPredictionFailureFallsBackOnlyAfterPhysicalReturn`（受控门闩证明最大物理并发/活跃实例为 1）；`testCancelledPredictionDoesNotStartFallback`；`testBothBackendsUnavailableNeverUsesCPU`；`testModelUnavailableDefersWithoutPersistingFileError`；`testModelRetryRespectsDeadlinePauseAndAuthorization`；`testBackendResourceCorruptionIsNotRetryableHardwareFailure`；`testOldSuccessfulFingerprintVersionIsRetainedAndNotSilentlyIgnored`。工具测试拒绝错误模型/策略/自检文件或摘要、CPU-only 策略、非法 IO/门槛；保留边界等号与现有 missing-resource 案例。先运行并记录预期失败，不以编译环境失败当作 RED。
+- [ ] **Step 2 — 实现模型会话及等待接入。** 按上述单队列实现加载/验证/一次降级，接入 runtime、service 和 coordinator 的类型化等待。改动只覆盖该失败来源，保留非模型读错误、unknown 提交、旧成功关系和已有索引代次的原语义。版本变化重算可重建表示；旧高级成功向量无法安全使用时保留并等待，不静默过滤后判无重复。本轮不做多版本历史自动转换。
+- [ ] **Step 3 — 固定资源、绑定与真值回归。** 为本次用户授权另存新绑定链，并用实际 bundled FP16 管线产生 33 例结果及允许后端对照；真实 source decoder、当前 SQLite scorer/策略和 0.98 均不变。正确区分查询 backend 与模型 execution policy。由 loader/release 同时核验执行/self-test/模型身份，legacy 研究构造路径若保留必须显式为历史用途且不能被 App 生产装配采用。转换工具补显式 Float32 IO，以便未来重现，不修改已选候选字节。
+- [ ] **Step 4 — 聚焦 GREEN 与本地提交。** 优先跑以上新测试和受影响套件、资源 Tools；在本机实际跑批准的 ANE/GPU 各四个 golden 与 33 例内容/动作，不能只用 fake。检查实际 bundle self-test bytes、模型/LFS、记录哈希和旧不可变资源字节。报告包括 RED/GREEN、真实/注入边界、变化文件和未验证平台。产品最终全量入口留给 P14 串行执行，避免多个 worker 同时跑性能负载。提交 `feat: validate FP16 ANE inference with serial GPU fallback`。
+
+### Task 13 (P13): 原生状态标题与隔离交互验证
+
+**Files / ownership:** Modify `Sources/PhotoSyncApp/SyncStatusPresentation.swift`，必要的原生 accessibility 属性限于 `StatusMenu.swift`；Test `SyncStatusPresentationTests.swift`、`AppViewTests.swift`。复用当前 injected AppModel/runtime 与既有测试 seam；如需可见原生验证宿主，仅放在 ignored `work/`，不要创建产品网页/新的正常入口或无关 build/run 系统。
+
+**Interfaces:** 保持 `globalStatus`、`statusDescription(for:enabledSourceIDs:)` 和 `analysis` 的现有 API。`statusDescription` 在未暂停、无更高优先级错误时，来源不可用先于分析标题；单独的图库分析区域仍显示，原生控件、菜单栏仅图标、就绪后隐藏、单行基础统计/iCloud 提示继续生效。
+
+- [ ] **Step 1 — RED。** `testUnavailableSourceHeadlineWinsWhileAnalysisVisible` 覆盖 preparing/updating/waiting，断言图标 waiting、主标题“等待恢复”、分析区域保留；暂停/授权/阻断状态不被该修复覆盖，ready 后分析隐藏。实际运行该测试，确认原行 40 的覆盖错误被复现。
+- [ ] **Step 2 — 最小修复并 GREEN。** 修正标题优先级；运行 presentation 与 AppView 相关用例，保留 320pt 宽、两处单行、明暗主题及有界动作区域证据。无必要不改布局或其他文案。
+- [ ] **Step 3 — 本机原生验证。** 以明确只用 fake/临时 UUID 数据、无 Photos/生产库/系统集成的专用宿主检查五种分析状态、暂停/恢复、就绪隐藏和原生动作。观察可访问性树的角色/标签/状态及键盘/responder 路径；区分自动 AX/键盘验证与实际 VoiceOver 听读，不从离屏尺寸测试推导后者通过。不得启动当前会自动激活或复用生产实例的普通 App/旧 GUIQA 路径，不抢用户前台、不发全局快捷键、不改系统权限。受工具能力限制的项目原样报告，不能伪称完成。
+- [ ] **Step 4 — 报告并提交。** 保存命令、截图/结构证据、结果和限制，提交 `fix: preserve source recovery priority in native status panel`；只提交产品修复与可复用行为测试，不提交临时 QA 宿主或个人数据。
+
+### Task 14 (P14): 最终审阅、完整验收与真实图库验证计划
+
+**Files / ownership:** 控制线程更新本 spec/plan、`README.md`、`docs/release/0.2.0-advanced-dedup-validation.md`、`docs/release/2026-10-06-0.2.0-merge-readiness.md`；新增 `docs/release/2026-10-06-real-photos-icloud-validation-plan.md`。Reviewer 只读、tester 不改产品。不得调整版本/channel/build 或实际打包/合并/推送。
+
+- [ ] **Step 1 — 一次深度集成审阅。** 覆盖 P12/P13 新差异及执行策略、缓存/历史、失败等待/恢复、取消和原生状态的相互作用；已有 P1–P11 等价源码审阅不重做。新发现仅在当前授权边界内修复，修复后只复核新差异。此深度 review 同时满足新增任务和最终集成门槛，避免重复审阅同一快照。
+- [ ] **Step 2 — 冻结后完整验证。** 用全新 work 输出与 DerivedData 跑 `python3 scripts/validate.py --output-dir "$PWD/work/validation-fp16-<唯一名>" --derived-data "$PWD/work/validation-fp16-<唯一名>-derived"`。必须完整 XCTest/Tools、实际 33 例、runtime、四档规模、最大档 60s idle、两项 continuation GREEN/预期 RED、前后源码身份一致。验证包内新模型/自检资源和允许后端，不用研究探针替代。另做正常 Universal 构建但不运行 Intel、Rosetta 或旧 macOS 实机测试；这些范围由用户明确跳过/保留。
+- [ ] **Step 3 — 收口当前证据。** 写明新提交、全部命令/结果、有效 execution policy、允许配置与实际设备证据的区别、旧失败和被排除平台；只记录已测性能与资源，不把短时/合成证据写成真实 Photos 或功耗通过。只读 review、最后的文档更新不触发同快照重复全量测试。
+- [ ] **Step 4 — 之后规划真实 Photos＋iCloud。** 按最终实现写可执行分阶段计划：明确测试账号/图库/来源授权、fixture 与观察点、original/current/edit/undo、外部变化、云端-only 前置证明、离线/恢复、权限/暂停/进程重启、源不变及仅新增、缓存/下载/时延证据和停止条件。把自动假网关不能证明的内容列成明确步骤，区分公开 API 可观测与不能可靠计量的字节/缓存信息；不假设已有可用测试账号，也不自行切系统图库或 iCloud。计划交付到此，本轮不执行它。
+
+P12/P13 按串行所有者实施，最终 tester 独占重负载。本节的授权、错误分类与 60 秒有界恢复节拍须写入 SDD ledger；不再重复询问已经批准的后端方案或执行方式。
