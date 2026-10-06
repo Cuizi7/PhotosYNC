@@ -732,6 +732,18 @@ public final class SyncStore: @unchecked Sendable {
         }, onCancel: { collector.cancel() })
     }
 
+    /// Successful vectors remain immutable even across source retirement and model upgrades.
+    /// A different model cannot prove these histories are nonduplicates.
+    public func hasUnsupportedSuccessfulFingerprint(version: String) async throws -> Bool {
+        try await perform { try self.hasUnsupportedSuccessfulFingerprintSync(version: version) }
+    }
+    private func hasUnsupportedSuccessfulFingerprintSync(version: String) throws -> Bool {
+        try one("""
+            SELECT 1 FROM file_fingerprint v JOIN file_record f ON f.id = v.file_id
+            WHERE f.success_id IS NOT NULL AND v.purpose = 'success' AND v.fingerprint_version <> ? LIMIT 1
+            """, [.text(version)]) != nil
+    }
+
     private func vectorCandidatesSync(for fileID: UUID, query: Fingerprint, token: IndexToken,
                                       collector: SQLiteVectorCollector) throws -> VectorSearchResult? {
         guard !collector.isCancelled else { throw CancellationError() }
@@ -739,6 +751,9 @@ public final class SyncStore: @unchecked Sendable {
               optionalInteger(state[3]) == token.indexGeneration,
               let published = publishedIndexToken, samePhotosIndex(published, token) else { return nil }
         guard query.version == token.fingerprintVersion else { throw AdvancedDedupError.modelMismatch }
+        guard try !hasUnsupportedSuccessfulFingerprintSync(version: query.version) else {
+            throw ModelExecutionUnavailable(detail: "Successful history uses an unsupported fingerprint version; preserved pending explicit upgrade")
+        }
         // A matching published token with corrupted underlying facts is an error,
         // never a stale-token nil or an empty gallery proving non-duplication.
         guard try indexFactsComplete(state) else { throw AdvancedDedupError.invalidFingerprint }
@@ -849,7 +864,7 @@ public final class SyncStore: @unchecked Sendable {
             guard let state = try self.indexStateRow(), try self.indexToken(state) == expected,
                   self.optionalInteger(state[3]) == expected.indexGeneration,
                   let published = self.publishedIndexToken, self.samePhotosIndex(published, expected) else { return false }
-            return try self.indexFactsComplete(state)
+            return try !self.hasUnsupportedSuccessfulFingerprintSync(version: expected.fingerprintVersion) && self.indexFactsComplete(state)
         }
     }
 
@@ -868,6 +883,7 @@ public final class SyncStore: @unchecked Sendable {
                               self.optionalInteger(state[3]) == evidence.token.indexGeneration,
                               let published = self.publishedIndexToken, self.samePhotosIndex(published, evidence.token),
                               try self.indexFactsComplete(state),
+                              try !self.hasUnsupportedSuccessfulFingerprintSync(version: evidence.token.fingerprintVersion),
                               let record = try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.id = ? AND source.enabled = 1 AND source.removed = 0 AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(fileID.uuidString)]),
                               record.state == .pending, record.successID == nil, record.file.sourceID == file.sourceID,
                               record.file.relativePath == file.relativePath, record.file.stamp == file.stamp,

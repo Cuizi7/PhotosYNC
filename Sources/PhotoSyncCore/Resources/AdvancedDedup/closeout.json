@@ -1,110 +1,38 @@
 {
-  "schemaVersion": 1,
-  "status": "closed_with_user_selected_configuration",
-  "date": "2026-10-06",
-  "approvedForProductIntegration": true,
-  "productImplementationStarted": true,
-  "decisionFile": "integration-decision.json",
-  "decisionSHA256": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
-  "profileFile": "integration-profile.json",
-  "profileSHA256": "a838d00add5ac43c0ef5eac5f02a67e7f5e2becbeddfa1404f15ecfa9c34ec08",
-  "acceptanceID": "user-decision:3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
-  "threshold": 0.98,
-  "thresholdBasis": "explicit_user_choice",
-  "computeUnits": "cpuOnly",
-  "backend": "sqlite-exact-f32-v1",
-  "fingerprintVersion": "d7412709d47be7d1f56529adda4956f555feafd86843ca38f408a8dda87dacf6",
-  "policyVersion": "5349c094e1ace02c494fe258233a1986d2b42125b263ec41a0250a02d3d7be7a",
-  "modelSHA256": "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
+  "acceptanceID": "user-decision:b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
   "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
+  "approvedForProductIntegration": true,
+  "backend": "sqlite-exact-f32-v1",
+  "computeUnits": "fp16-ane-gpu-v1",
+  "date": "2026-10-06",
+  "decisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+  "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+  "performanceAcceptance": "Final full budget matrix belongs to P14; no P12 full-scale claim",
+  "platformLimitations": [
+    "macOS13 Apple Silicon physical validation unavailable",
+    "Intel physical execution excluded"
+  ],
+  "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
+  "profileSHA256": "25749a222f56277607a85004edb43b594a7595406d4a63112631dd4cc00f00d8",
+  "realPhotosValidation": "not performed in P12",
   "regression": {
-    "file": "2026-10-05-threshold-098-regression.json",
-    "sha256": "817f22f083e8debe88af8189a98977a2168785cf6f33b782d9800db532f5fa3e",
-    "caseCount": 33,
-    "passCount": 33,
-    "contentFailures": [],
     "actionFailures": [],
-    "sameImagePairsAndVectors": true,
-    "positiveCount": 14,
-    "negativeCount": 19,
-    "skipCount": 11,
-    "importCount": 22,
-    "resolutionUpgradeCount": 3,
+    "caseCount": 33,
+    "contentFailures": [],
     "independent": false,
-    "newImageInference": false
+    "newImageInference": true,
+    "passCount": 33,
+    "sameImagePairsAndVectors": false,
+    "sha256": "17da760deff666a9328c15d2f65e22b1a49adc8f1151a72ce24c16605b6cf6e5"
   },
-  "profileDeserialization": {
-    "tool": "existing Swift DedupConfiguration / validate-profile",
-    "status": "historical_prior_profile_pass_not_current_profile_verification",
-    "reportSHA256": "364d06d8849e3ddc58941e0caef1924fba5b6826c853d193a9f63c6c804af627",
-    "priorProfileSHA256": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404"
-  },
+  "schemaVersion": 1,
   "statisticalAcceptance": {
-    "status": "not_performed",
-    "historicalProtocolSHA256": "ea0060bb4839fe25f3fe30f781c4c51470adad19ed684cc6630ef05d8be25ae8",
     "falseSkipUpperBoundClaimed": false,
     "recallConfidenceClaimed": false,
-    "continuationDeferredByUser": true
+    "status": "not_performed"
   },
-  "performanceEvidence": {
-    "status": "historical_synthetic_baseline_only",
-    "thresholdUsedInHistoricalRuns": 0.8,
-    "remeasuredAt098": false,
-    "real100kCatalogVerified": false,
-    "modelAndFingerprintUnchanged": true,
-    "reports": [
-      {
-        "path": "work/R4-final-combined-0/combined-benchmark.json",
-        "sha256": "82fc17834e64330470fc61c0f61a5fa4adfa954dba98233a06a1886e641777a3"
-      },
-      {
-        "path": "work/R4-final-combined-50/combined-benchmark.json",
-        "sha256": "86c619cd74ace577631348b4be9293f7e86a79c65df3a9f03f79bee879af8c24"
-      },
-      {
-        "path": "work/R4-final-combined-100/combined-benchmark.json",
-        "sha256": "95bbdae91bd23f67f53496f6fac84af426dd2df7808373845da7b5947136d38c"
-      }
-    ]
-  },
-  "remainingProductChecks": [
-    "normal automated correctness and current 33-case regression",
-    "PhotoKit original/current representation and iCloud system behavior",
-    "full-app bounded resources and supported-platform execution",
-    "model and fixture distribution permission before distributing assets"
-  ],
-  "supersedesForIntegration": "The original R4 statistical pass requirement is replaced by the explicit user decision plus bound 0.98 configuration and current regression. Original R4 artifacts remain historical and are not relabeled passed.",
-  "scopeOfThisCompletion": "Research handoff artifacts and product-plan revision only; no production App, Photos, database, packaging or product-task execution.",
-  "resourcePolicyAmendment": {
-    "maxDecodedBytes": 536870912,
-    "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
-    "reason": "decodedResourceLimit",
-    "priorCloseoutSHA256": "d7b642888a6f12b58dd9bd2076b4fc3048f9ca93803e05c457ab31e50b2229c5",
-    "regressionEvidence": "exact_prior33_case_score_evidence_rebound_without_replay_or_new_inference",
-    "finalRealModelRegression": "pending_P9",
-    "fullAppResourceAcceptance": "not_performed"
-  },
-  "sqliteQueryAmendment": {
-    "date": "2026-10-06",
-    "basis": "explicit_user_authorized_sqlite_query_and_photos_delta_implementation",
-    "userInstruction": "可以，定为使用 sqlite 方案。如果还有什么要调研的你继续调研，觉得差不多了就可以更新 plan 了，完成 sqlite 和 Photos 按变化更新索引两项改进。",
-    "implementationChoice": "system SQLite + Accelerate single cursor bridge; controller choice based on final production-query-probe, not a verbatim user C-bridge instruction; no sqlite-vec dependency",
-    "priorBackend": "exact-f32-v1",
-    "backend": "sqlite-exact-f32-v1",
-    "priorPolicyVersion": "42a811d97844de4a0e2223060178ee1136ef74775a31d2d12a56f9007eff6570",
-    "policyVersion": "5349c094e1ace02c494fe258233a1986d2b42125b263ec41a0250a02d3d7be7a",
-    "fingerprintModelThresholdAndTruth": "unchanged",
-    "priorSourceCommit": "e62e3ae",
-    "productBaselineCommit": "9186766",
-    "priorRecordSHA256": {
-      "integration-decision.json": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
-      "integration-profile.json": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
-      "2026-10-05-threshold-098-regression.json": "c30e33331aa73a0e574c13d1648db2b2f65a7318023888db3c0a07b42ba4e5b6",
-      "research-closeout.json": "a1815f2ba03887968ea6274b389f7011fb4c310b0205d40919e85740777e7278"
-    },
-    "probeEvidence": "work/backend-validation-20261006/production-query-probe/report.md",
-    "probeReportSHA256": "223288840b8904934a6320ff2bbe228442d58656b4453b8e6b891e77b5af5a65",
-    "knownPerformanceLimit": "300k prototype hot P95 477.9 ms exceeds unchanged 250 ms target; not a performance pass; final scale/idle acceptance deferred until P11 integration",
-    "currentRegression": "new native production-query replay of existing vectors; separate actual bundled-model 33-case inference recorded in P10 acceptance evidence"
-  }
+  "status": "closed_with_user_selected_configuration",
+  "threshold": 0.98,
+  "thresholdBasis": "explicit_user_choice"
 }

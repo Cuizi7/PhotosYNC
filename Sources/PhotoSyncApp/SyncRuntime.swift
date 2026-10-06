@@ -54,7 +54,12 @@ struct AdvancedRuntimeGraph: Sendable {
         try await Task.detached(priority: .utility) {
             let root = try resourceDirectory ?? DedupConfiguration.bundledResourceDirectory()
             let configuration = try configuration ?? DedupConfiguration.loadValidated(resourceDirectory: root)
-            let model = try CoreMLFingerprinter(modelURL: root.appendingPathComponent("SSCDLarge.mlpackage"), configuration: configuration.fingerprint)
+            let policy = try ModelExecutionPolicy.loadValidated(resourceDirectory: root)
+            let selfTest = try ModelSelfTest.loadValidated(resourceDirectory: root, policy: policy)
+            let model = try CoreMLFingerprinter(modelURL: root.appendingPathComponent("SSCDLarge.mlpackage"),
+                configuration: configuration.fingerprint, policy: policy, selfTest: selfTest, now: now,
+                diagnostics: { logger?.log($0) })
+            try await model.prepareExecution()
             let budget = ImageWorkBudget(limits: configuration.resources)
             let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget)
             return AdvancedRuntimeGraph(store: store, photos: photos, model: model,
@@ -79,6 +84,8 @@ actor SyncRuntime {
     private var advancedWork: Task<Void, Never>?
     private var changeObserver: Task<Void, Never>?
     private var advancedLoadAttempted = false
+    private var modelRetryAt: Date?
+    private var modelRecovery: Task<Void, Error>?
     private var changePending = false
     private var indexEventPending = false
     private var pendingAdvancedScan = false
@@ -316,6 +323,7 @@ actor SyncRuntime {
 
     func pause() async {
         schedule.pause()
+        modelRecovery?.cancel()
         state.snapshot.isPaused = true
         await engine?.pause()
         await advancedGraph?.coordinator.setPaused(true)
@@ -346,7 +354,20 @@ actor SyncRuntime {
         refreshAuthorization()
         await applyAnalysisEligibility()
         guard eligibleForWork else { return }
-        if engine == nil { startAdvancedGraphIfNeeded(); return }
+        if engine == nil { startAdvancedGraphIfNeeded(force: force); return }
+        if let model = advancedGraph?.model as? any ModelExecutionRecovering {
+            // Coalesce ticks while the single physical queue is loading/validating.
+            guard modelRecovery == nil else { return }
+            let recovery = Task { try await model.prepareExecution(forceRetry: force) }
+            modelRecovery = recovery
+            do { try await recovery.value }
+            catch is ModelExecutionUnavailable { modelRecovery = nil; return }
+            catch is CancellationError { modelRecovery = nil; return }
+            catch { modelRecovery = nil; advancedLoadFailed(error); return }
+            modelRecovery = nil
+            refreshAuthorization()
+            guard eligibleForWork else { return }
+        }
         guard let engine else { return }
         if includeAdvanced { scheduleAdvancedWork(force: force) }
         let force = force || pendingAdvancedScan
@@ -443,13 +464,17 @@ actor SyncRuntime {
     }
 
     private func applyAnalysisEligibility() async {
+        if !eligibleForWork { modelRecovery?.cancel() }
         guard let graph = advancedGraph else { return }
         await graph.coordinator.setPaused(!eligibleForWork)
         await graph.service.setPaused(!eligibleForWork)
     }
 
-    private func startAdvancedGraphIfNeeded() {
-        guard !advancedLoadAttempted, let store, let advancedFactory else { return }
+    private func startAdvancedGraphIfNeeded(force: Bool) {
+        guard loading == nil, let store, let advancedFactory else { return }
+        if advancedLoadAttempted {
+            guard let modelRetryAt, force || now() >= modelRetryAt else { return }
+        }
         advancedLoadAttempted = true
         state.snapshot.indexProgress = IndexProgress(state: .preparing, totalsKnown: false, totalAssets: 0,
             readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
@@ -465,6 +490,16 @@ actor SyncRuntime {
 
     private func advancedLoadFailed(_ error: Error) {
         loading = nil
+        if error is ModelExecutionUnavailable {
+            modelRetryAt = now().addingTimeInterval(60)
+            state.message = nil; state.messageDetail = nil
+            state.snapshot.indexProgress = IndexProgress(state: .waiting, totalsKnown: false, totalAssets: 0,
+                readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0,
+                issue: ModelExecutionUnavailable.summary)
+            logger?.log(["phase": "advanced-initialization", "result": "model-waiting", "error": String(describing: error)])
+            return
+        }
+        modelRetryAt = nil
         state.message = "照片判重配置不可用，同步尚未启动。"
         state.messageDetail = error.localizedDescription
         state.snapshot.indexProgress = IndexProgress(state: .waiting, totalsKnown: false, totalAssets: 0,
@@ -475,6 +510,7 @@ actor SyncRuntime {
 
     private func install(_ graph: AdvancedRuntimeGraph, store: SyncStore, directory: @escaping SyncEngine.DirectoryFactory) async {
         advancedGraph = graph
+        modelRetryAt = nil; state.message = nil; state.messageDetail = nil
         let executor = self.executor
         engine = SyncEngine(store: store, photos: graph.photos, directory: directory,
             metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger,

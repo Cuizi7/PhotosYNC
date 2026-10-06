@@ -5,6 +5,19 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupServiceTests: XCTestCase {
+    func testModelUnavailableDefersWithoutPersistingFileError() async throws {
+        let f = try await fixture(); try await ready(f, candidates: [])
+        await f.model.setUnavailable(true)
+        let prepared = try await f.service.prepare(fileID: f.id, file: f.file)
+        guard case .waiting(let reason) = prepared else { return XCTFail("model failure must defer") }
+        XCTAssertEqual(reason, ModelExecutionUnavailable.summary)
+        let stored = try await f.store.file(sourceID: f.file.sourceID, relativePath: f.file.relativePath)
+        XCTAssertEqual(stored?.state, .pending); XCTAssertEqual(stored?.retryCount, 0); XCTAssertNil(stored?.nextRetryAt)
+        let creates = await f.photos.createCount; XCTAssertEqual(creates, 0)
+        let cached = try await f.store.fingerprint(fileID: f.id, stamp: f.file.stamp, version: f.configuration.fingerprint.version)
+        XCTAssertNil(cached)
+    }
+
     func testNewThresholdRechecksOldAdvancedSkipsWithoutInference() async throws {
         let f = try await fixture(); try await ready(f, candidates: [("similar", .original, 0.97, 8)])
         let c = f.configuration
@@ -446,10 +459,12 @@ private actor AdmissionGate {
 private actor AdmissionModel: ImageFingerprinting {
     let vector: Fingerprint; private var gate: AdmissionGate?; private(set) var count = 0
     private(set) var dimensions: PixelSize?
+    private var unavailable = false
+    func setUnavailable(_ value: Bool) { unavailable = value }
     init(vector: Fingerprint) { self.vector = vector }
     func setGate(_ gate: AdmissionGate) { self.gate = gate }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
-        count += 1; dimensions = try PixelSize(width: image.width, height: image.height); if let gate { self.gate = nil; await gate.hold() }; return vector
+        if unavailable { throw ModelExecutionUnavailable(detail: "test model") }; count += 1; dimensions = try PixelSize(width: image.width, height: image.height); if let gate { self.gate = nil; await gate.hold() }; return vector
     }
 }
 private actor AdmissionPhotos: PhotosIndexGateway {

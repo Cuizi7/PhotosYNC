@@ -1,0 +1,851 @@
+{
+  "actionFailures": [],
+  "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
+  "backend": "sqlite-exact-f32-v1",
+  "backendComparisonSHA256": "1dd010e89db483551a17a89d55e582751ead7fad643fe93cc886177a3dd31efd",
+  "caseCount": 33,
+  "cases": [
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "P001",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 1,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+      },
+      "pass": true,
+      "query": "cc-01-1-renamed"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "P002",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 1,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+      },
+      "pass": true,
+      "query": "cc-01-1-metadata"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "P003",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9948686361312866,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "ed9bf38f72c9c6f96876f70b7cd8977e1e9f8103cd2ea4c6d8abe3fdc57e925d"
+      },
+      "pass": true,
+      "query": "cc-01-1-jpeg-q45"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "P004",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9980829954147339,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "27e6ff351076bd4b0b1d3524a7b842b9f8dd414837db96f0c871e81b4b218035"
+      },
+      "pass": true,
+      "query": "cc-01-1-half"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "P005",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9998005628585815,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "fd3b29d572d4f507cef6f1788c9f4a38feb271e26f245594037d25fb641a6869"
+      },
+      "pass": true,
+      "query": "cc-01-1-png"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "N001",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.21053215861320496,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "9e3c2de6f30669f0a263101485f93edc68deb26c909fec44bf59808397f1c347"
+      },
+      "pass": true,
+      "query": "cc-01-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-01-1-base"
+      ],
+      "id": "B001",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.49690479040145874,
+            "vectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "908f7e0fdebddeb25accd9722b9ead625ea4ef68be35bfb977387c8c20e46952"
+      },
+      "pass": true,
+      "query": "cc-01-1-crop"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-01-1-half"
+      ],
+      "id": "B002",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-01-1-half:original",
+            "origin": "photosOriginal",
+            "score": 0.9980829954147339,
+            "vectorSHA256": "27e6ff351076bd4b0b1d3524a7b842b9f8dd414837db96f0c871e81b4b218035"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "81eddbded81212dd5acfe4e770d31065c1ca6e94c520c1c1b4a4731f5111b095"
+      },
+      "pass": true,
+      "query": "cc-01-1-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-02-1-base"
+      ],
+      "id": "N004",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-02-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.009760718792676926,
+            "vectorSHA256": "fd098f96ed3fef14a450bef9d93f8eb82a97da5a124d7c1a4332ada4b9d8487c"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "434150bedc49512b3856f0d61e3f76d144f97c7ebdf4ec431079c7c8586ef89d"
+      },
+      "pass": true,
+      "query": "cc-02-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-02-1-base"
+      ],
+      "id": "B003",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-02-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.4252678453922272,
+            "vectorSHA256": "fd098f96ed3fef14a450bef9d93f8eb82a97da5a124d7c1a4332ada4b9d8487c"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "0d41921f88059bf4cf13a0ed50f12de0f9566933fd05c58557a9854f70bee3bf"
+      },
+      "pass": true,
+      "query": "cc-02-1-crop"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-03-1-base"
+      ],
+      "id": "P013",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-03-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9921952486038208,
+            "vectorSHA256": "15c98ac8cc3105b37e9170f28d13be56b7b1cf6ccf105e87ec1d8640844f594b"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "29dac96d6aec353d950d81eada0eec8ea87eb38d83711710660b2e1bef70bd05"
+      },
+      "pass": true,
+      "query": "cc-03-1-jpeg-q45"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-03-1-base"
+      ],
+      "id": "P014",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-03-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9959026575088501,
+            "vectorSHA256": "15c98ac8cc3105b37e9170f28d13be56b7b1cf6ccf105e87ec1d8640844f594b"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "f3ff87f203427734c701fda811a61ed135e077876d718654a25632e986125200"
+      },
+      "pass": true,
+      "query": "cc-03-1-half"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-03-1-base"
+      ],
+      "id": "P015",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-03-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9991976022720337,
+            "vectorSHA256": "15c98ac8cc3105b37e9170f28d13be56b7b1cf6ccf105e87ec1d8640844f594b"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "9dcb67864d5556a96b90e4622df97027282a6406bb000f38b4d7cda56dd2609c"
+      },
+      "pass": true,
+      "query": "cc-03-1-png"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-03-1-base"
+      ],
+      "id": "N007",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-03-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.2479829490184784,
+            "vectorSHA256": "15c98ac8cc3105b37e9170f28d13be56b7b1cf6ccf105e87ec1d8640844f594b"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "e1251ba2df056c2fdb3f6ffce7ad88e2e95914b2a824cc76d8be592d50fa74f8"
+      },
+      "pass": true,
+      "query": "cc-03-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-03-1-base"
+      ],
+      "id": "B005",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-03-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.527689516544342,
+            "vectorSHA256": "15c98ac8cc3105b37e9170f28d13be56b7b1cf6ccf105e87ec1d8640844f594b"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "6607dd2af536775381d1d01b189694d6c40266ce18587990dbfa294cc43c05a7"
+      },
+      "pass": true,
+      "query": "cc-03-1-crop"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-03-1-half"
+      ],
+      "id": "B006",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-03-1-half:original",
+            "origin": "photosOriginal",
+            "score": 0.9959026575088501,
+            "vectorSHA256": "f3ff87f203427734c701fda811a61ed135e077876d718654a25632e986125200"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "15c98ac8cc3105b37e9170f28d13be56b7b1cf6ccf105e87ec1d8640844f594b"
+      },
+      "pass": true,
+      "query": "cc-03-1-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-04-1-base"
+      ],
+      "id": "N010",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-04-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.34926941990852356,
+            "vectorSHA256": "f1e7167f924ac73cd1658ba3f1e1509bcd921db5eb0e6ddf6867a0ff2366ad87"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "70d2532e19dab14ca1553bdb21d661bba51d6e84bb63cae70e5c51a7da450e1a"
+      },
+      "pass": true,
+      "query": "cc-04-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-04-1-base"
+      ],
+      "id": "B007",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-04-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.504004716873169,
+            "vectorSHA256": "f1e7167f924ac73cd1658ba3f1e1509bcd921db5eb0e6ddf6867a0ff2366ad87"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "76d7c8eb9825e5a3a1bcd3fd6534bbfa3fc7ae60dac455d1272be3afd7a0dc12"
+      },
+      "pass": true,
+      "query": "cc-04-1-crop"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-05-1-base"
+      ],
+      "id": "N013",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-05-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.2029019445180893,
+            "vectorSHA256": "1c0cf74402580681a21355d810bb0f56a7f15cbe25a85628da57f9e711cca396"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "643f30c1e33a061e54471da6c4895f695b619beaf61e2801812f5a98ca9c7750"
+      },
+      "pass": true,
+      "query": "cc-05-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-05-1-base"
+      ],
+      "id": "B009",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-05-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9689767360687256,
+            "vectorSHA256": "1c0cf74402580681a21355d810bb0f56a7f15cbe25a85628da57f9e711cca396"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "e8ca41cc487d21f458e8475aeacfa064cc80ca3d36fcf1bf416544413e23cf7b"
+      },
+      "pass": true,
+      "query": "cc-05-1-tone"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-06-1-base"
+      ],
+      "id": "N016",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-06-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.18450519442558289,
+            "vectorSHA256": "9dcc47cc3b184a993f0b23aac9686c16c3aad330ee11fd9f79869e6717273309"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "1686b0e2607e2b9b0fb55f39c0e751b0b6b22b1fa363b9f65cf11ef9581bfee3"
+      },
+      "pass": true,
+      "query": "cc-06-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-06-1-base"
+      ],
+      "id": "B011",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-06-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9048569202423096,
+            "vectorSHA256": "9dcc47cc3b184a993f0b23aac9686c16c3aad330ee11fd9f79869e6717273309"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "f395ce86d5e54d11da159d89ae8b7317d495278a835a709126bf3b6c485f1235"
+      },
+      "pass": true,
+      "query": "cc-06-1-tone"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-07-1-base"
+      ],
+      "id": "N019",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-07-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.422379732131958,
+            "vectorSHA256": "c2fe03a1ac2fe6377b181ac09313053f975b449a0209d76ab40f5aea890ba987"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "0ff126dc3c2f2e9d323e7b814ff21e71df9abd6312453f314d3988ebd7e8c081"
+      },
+      "pass": true,
+      "query": "cc-08-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-07-1-base"
+      ],
+      "id": "B013",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-07-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9397011399269104,
+            "vectorSHA256": "c2fe03a1ac2fe6377b181ac09313053f975b449a0209d76ab40f5aea890ba987"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "cd37f87e4e91fbec5bbe9b90ef24a99224f573943b23171cffbb3ab691cb9376"
+      },
+      "pass": true,
+      "query": "cc-07-1-tone"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-07-2-base"
+      ],
+      "id": "N022",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-07-2-base:original",
+            "origin": "photosOriginal",
+            "score": 0.2934386730194092,
+            "vectorSHA256": "7a8ff8466c3ed8ae6c69bfeb3f4f507a4001eaf8850e17d7ba0a65c1ac144200"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "b69a732f3add3d953a4607d7ab40449acfb64f2480f13e6a07d90c7284c02d92"
+      },
+      "pass": true,
+      "query": "cc-08-1-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-10-1-base"
+      ],
+      "id": "P048",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-10-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9881294369697571,
+            "vectorSHA256": "24387453d444d7260353295c29a10a3306cba9fddfb07dbb13b248162e977dd9"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "fb4579b232dd318991778de4f33e97410ea06bc4c1442279a75ba4606254b458"
+      },
+      "pass": true,
+      "query": "cc-10-1-jpeg-q45"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-10-1-base"
+      ],
+      "id": "P049",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-10-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9941995143890381,
+            "vectorSHA256": "24387453d444d7260353295c29a10a3306cba9fddfb07dbb13b248162e977dd9"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "2e25b6f4ae4ce2b804e43ea39e10f2a4375efe32382835078c8d03d24011d6ab"
+      },
+      "pass": true,
+      "query": "cc-10-1-half"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "skip",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-10-1-base"
+      ],
+      "id": "P050",
+      "observed": {
+        "action": "skip",
+        "candidates": [
+          {
+            "key": "photos:12:cc-10-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.9997097253799438,
+            "vectorSHA256": "24387453d444d7260353295c29a10a3306cba9fddfb07dbb13b248162e977dd9"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "29bed4f0d1b8835deb66abb6c9a2e9425ae565dc1371386d4cda5dfcebcc531c"
+      },
+      "pass": true,
+      "query": "cc-10-1-png"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "cc-10-1-base"
+      ],
+      "id": "N028",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-10-1-base:original",
+            "origin": "photosOriginal",
+            "score": 0.13095375895500183,
+            "vectorSHA256": "24387453d444d7260353295c29a10a3306cba9fddfb07dbb13b248162e977dd9"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "5fdbf3b37c756ac379a30516c388e1cd91bec76e21b6db72ce9c54ef1b30026d"
+      },
+      "pass": true,
+      "query": "cc-10-2-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "duplicate",
+      "gallery": [
+        "cc-10-1-half"
+      ],
+      "id": "B020",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:12:cc-10-1-half:original",
+            "origin": "photosOriginal",
+            "score": 0.9941995143890381,
+            "vectorSHA256": "2e25b6f4ae4ce2b804e43ea39e10f2a4375efe32382835078c8d03d24011d6ab"
+          }
+        ],
+        "content": "duplicate",
+        "queryVectorSHA256": "24387453d444d7260353295c29a10a3306cba9fddfb07dbb13b248162e977dd9"
+      },
+      "pass": true,
+      "query": "cc-10-1-base"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "user-01-1"
+      ],
+      "id": "N051",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:9:user-01-1:original",
+            "origin": "photosOriginal",
+            "score": 0.9550212621688843,
+            "vectorSHA256": "ac9b27a8158b32d8f9f7773051529b72c99b089fc78f78c07f303e6d6569246a"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "97ae9d392daafe9c712ee877ab009b077e9ec88f275f538dafe4b2bbd3b159ff"
+      },
+      "pass": true,
+      "query": "user-01-2"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "user-02-1"
+      ],
+      "id": "N052",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:9:user-02-1:original",
+            "origin": "photosOriginal",
+            "score": 0.948868989944458,
+            "vectorSHA256": "682afef615f698e6d4d28c3705aa8141eee62a60f4c269cd5221794317272d07"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "ce0dc640d7e5549840b210a5af6c248cb40cae74943dbf35e6712d333e0e9ca7"
+      },
+      "pass": true,
+      "query": "user-02-2"
+    },
+    {
+      "actionPass": true,
+      "contentPass": true,
+      "expectedAction": "importFile",
+      "expectedContent": "notDuplicate",
+      "gallery": [
+        "user-03-1"
+      ],
+      "id": "N053",
+      "observed": {
+        "action": "importFile",
+        "candidates": [
+          {
+            "key": "photos:9:user-03-1:original",
+            "origin": "photosOriginal",
+            "score": 0.9744579792022705,
+            "vectorSHA256": "7aa4c4f7b222616436488002f9fc422f60e94943427816635a835fd88fdb96e3"
+          }
+        ],
+        "content": "notDuplicate",
+        "queryVectorSHA256": "16e7a136435b23871e8509b45d8938f5b0409c53ea4ad0b2138a04392d2b6646"
+      },
+      "pass": true,
+      "query": "user-03-2"
+    }
+  ],
+  "contentFailures": [],
+  "date": "2026-10-06",
+  "decisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "executionPolicyID": "fp16-ane-gpu-v1",
+  "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
+  "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+  "independentValidation": false,
+  "integrationProfileSHA256": "25749a222f56277607a85004edb43b594a7595406d4a63112631dd4cc00f00d8",
+  "kind": "fixed_user_threshold_actual_fp16_inference",
+  "newImageInference": true,
+  "passCount": 33,
+  "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
+  "schemaVersion": 1,
+  "sourceReportSHA256": "86b9c4c9a4d56a2f85c99a06ff95a7d9f6a076146b35988bcc171715731b8332",
+  "sourceVectorManifestSHA256": "c6a0b3f0be99b0e1837f2d8cb09fa1bf00d016c729ececc72ac8146e0f8625ea",
+  "threshold": 0.98,
+  "thresholdBasis": "explicit_user_choice_not_independent_calibration"
+}

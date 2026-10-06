@@ -3,6 +3,19 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class AdvancedDedupEngineTests: XCTestCase {
+    func testUnavailableModelWaitDoesNotCreateSourceOrSubmissionError() async throws {
+        let f = try await fixture(); try await ready(f)
+        await f.model.setUnavailable(true)
+        await f.engine.scanEnabledSources()
+        let snapshot = await f.engine.snapshot()
+        XCTAssertEqual(snapshot.advancedWaitingReasons[f.source], ModelExecutionUnavailable.summary)
+        XCTAssertTrue(snapshot.waitingSources.isEmpty); XCTAssertNil(snapshot.blockingError)
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+        let record = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+        XCTAssertEqual(record?.state, .pending); XCTAssertEqual(record?.retryCount, 0); XCTAssertNil(record?.nextRetryAt)
+        let creates = await f.photos.createCount; XCTAssertEqual(creates, 0)
+    }
+
     func testReopenedLegacySkipReturnsToNormalAdvancedDrain() async throws {
         let f = try await fixture()
         await f.engine.scanEnabledSources()
@@ -303,10 +316,12 @@ private actor EngineIndexModel: ImageFingerprinting {
     let vector: Fingerprint
     private var gate: EngineBoundaryGate?
     private(set) var count = 0
+    private var unavailable = false
+    func setUnavailable(_ value: Bool) { unavailable = value }
     init(vector: Fingerprint) { self.vector = vector }
     func setGate(_ gate: EngineBoundaryGate) { self.gate = gate }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
-        count += 1; if let gate { await gate.hold() }; return vector
+        if unavailable { throw ModelExecutionUnavailable(detail: "test engine") }; count += 1; if let gate { await gate.hold() }; return vector
     }
 }
 private actor EngineIndexPhotos: PhotosIndexGateway {

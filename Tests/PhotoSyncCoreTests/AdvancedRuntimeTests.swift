@@ -4,6 +4,36 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testPauseCancelsQueuedModelRecoveryWithoutConfigurationError() async throws {
+        let f = try await fixture()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let gate = P8Gate(); await f.model.setRecoveryGate(gate)
+        let tick = Task { await f.runtime.tick(force: true) }
+        await gate.waitUntilEntered(); await f.runtime.pause()
+        await gate.release(); await tick.value
+        let state = await f.runtime.current()
+        XCTAssertTrue(state.snapshot.isPaused); XCTAssertNil(state.message)
+        await f.runtime.resume(); await f.runtime.waitForRound()
+        let after = await f.runtime.current(); XCTAssertNil(after.message)
+    }
+
+    func testModelRetryRespectsDeadlinePauseAndAuthorization() async throws {
+        let clock = P12Clock()
+        let f = try await fixture(modelUnavailable: true, now: { clock.value })
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let waiting = await f.runtime.current()
+        XCTAssertNil(waiting.message)
+        XCTAssertEqual(waiting.snapshot.indexProgress?.issue, ModelExecutionUnavailable.summary)
+        XCTAssertEqual(f.loads.value, 1)
+        clock.advance(59); await f.runtime.tick(); await f.runtime.waitForRound(); XCTAssertEqual(f.loads.value, 1)
+        clock.advance(1); await f.runtime.tick(); await f.runtime.waitForRound(); XCTAssertEqual(f.loads.value, 2)
+        await f.runtime.tick(force: true); await f.runtime.waitForRound(); XCTAssertEqual(f.loads.value, 3)
+        await f.runtime.pause(); clock.advance(60); await f.runtime.tick(force: true); XCTAssertEqual(f.loads.value, 3)
+        f.authorization.value = false; await f.runtime.resume(); XCTAssertEqual(f.loads.value, 3)
+        f.authorization.value = true; await f.runtime.tick(); await f.runtime.waitForRound(); XCTAssertEqual(f.loads.value, 4)
+        try await f.runtime.disable(f.sourceID); clock.advance(60); await f.runtime.tick(force: true); XCTAssertEqual(f.loads.value, 4)
+    }
+
     func testAnalysisStartsAutomaticallyOnlyWhenEligible() async throws {
         let f = try await fixture(authorized: false)
         await f.runtime.tick(force: true)
@@ -159,36 +189,43 @@ final class AdvancedRuntimeTests: XCTestCase {
     private struct Fixture {
         let runtime: SyncRuntime, photos: P8Photos, sourceID: UUID
         let loads: P8Counter, notifications: P8Counter, authorization: P8Authorization
+        let model: P8Model
     }
-    private func fixture(authorized: Bool = true, gate: P8Gate? = nil, resourceDirectory: URL? = nil) async throws -> Fixture {
+    private func fixture(authorized: Bool = true, gate: P8Gate? = nil, resourceDirectory: URL? = nil, modelUnavailable: Bool = false, now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }) async throws -> Fixture {
         let root = try temporaryDirectory(), source = root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         let executor = ReadExecutor()
         let store = try SyncStore(url: root.appendingPathComponent("test.sqlite"), readExecutor: executor)
         let sourceID = try await store.registerSource(url: source)
-        let c = try p8Configuration(), photos = P8Photos(), loads = P8Counter(), notifications = P8Counter()
+        let c = try p8Configuration(), photos = P8Photos(), loads = P8Counter(), notifications = P8Counter(), model = P8Model()
         let auth = P8Authorization(authorized)
         let runtime = SyncRuntime(store: store, executor: executor,
             advancedFactory: { store, executor, directory, now, _ in
                 loads.increment()
+                if modelUnavailable { throw ModelExecutionUnavailable(detail: "test runtime") }
                 if let gate { await gate.hold() }
                 if let resourceDirectory {
                     return try await AdvancedRuntimeGraph.load(store: store, executor: executor,
                         directory: directory, now: now, resourceDirectory: resourceDirectory)
                 }
                 return AdvancedRuntimeGraph(store: store, photos: photos,
-                    model: P8Model(), configuration: c, executor: executor,
+                    model: model, configuration: c, executor: executor,
                     budget: ImageWorkBudget(limits: c.resources), directory: directory, now: now)
-            }, now: { Date(timeIntervalSince1970: 1000) }, authorized: { auth.value },
+            }, now: now, authorized: { auth.value },
             notificationsEnabled: { true }, notification: { _, _ in notifications.increment() })
         try await runtime.prepareInjectedRuntime()
         addTeardownBlock { await runtime.stop(); await runtime.waitForRound(); try? FileManager.default.removeItem(at: root) }
         return Fixture(runtime: runtime, photos: photos, sourceID: sourceID, loads: loads,
-                       notifications: notifications, authorization: auth)
+                       notifications: notifications, authorization: auth, model: model)
     }
 }
 
-private actor P8Model: ImageFingerprinting {
+private actor P8Model: ImageFingerprinting, ModelExecutionRecovering {
+    private var recoveryGate: P8Gate?
+    func setRecoveryGate(_ gate: P8Gate) { recoveryGate = gate }
+    func prepareExecution(forceRetry: Bool) async throws {
+        if let gate = recoveryGate { recoveryGate = nil; await gate.hold(); try Task.checkCancellation() }
+    }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
         XCTFail("Empty catalog must not infer"); throw AdvancedDedupError.invalidImage
     }
@@ -260,4 +297,10 @@ private actor P8Gate {
     func hold() async { entered = true; waiters.forEach { $0.resume() }; waiters = []; if !open { await withCheckedContinuation { blocked = $0 } } }
     func waitUntilEntered() async { if !entered { await withCheckedContinuation { waiters.append($0) } } }
     func release() { open = true; blocked?.resume(); blocked = nil }
+}
+
+private final class P12Clock: @unchecked Sendable {
+    private let lock = NSLock(); private var date = Date(timeIntervalSince1970: 1000)
+    var value: Date { lock.lock(); defer { lock.unlock() }; return date }
+    func advance(_ seconds: Double) { lock.lock(); date.addTimeInterval(seconds); lock.unlock() }
 }

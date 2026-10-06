@@ -1,0 +1,38 @@
+{
+  "acceptanceID": "user-decision:b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
+  "approvedForProductIntegration": true,
+  "backend": "sqlite-exact-f32-v1",
+  "computeUnits": "fp16-ane-gpu-v1",
+  "date": "2026-10-06",
+  "decisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+  "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+  "performanceAcceptance": "Final full budget matrix belongs to P14; no P12 full-scale claim",
+  "platformLimitations": [
+    "macOS13 Apple Silicon physical validation unavailable",
+    "Intel physical execution excluded"
+  ],
+  "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
+  "profileSHA256": "25749a222f56277607a85004edb43b594a7595406d4a63112631dd4cc00f00d8",
+  "realPhotosValidation": "not performed in P12",
+  "regression": {
+    "actionFailures": [],
+    "caseCount": 33,
+    "contentFailures": [],
+    "independent": false,
+    "newImageInference": true,
+    "passCount": 33,
+    "sameImagePairsAndVectors": false,
+    "sha256": "17da760deff666a9328c15d2f65e22b1a49adc8f1151a72ce24c16605b6cf6e5"
+  },
+  "schemaVersion": 1,
+  "statisticalAcceptance": {
+    "falseSkipUpperBoundClaimed": false,
+    "recallConfidenceClaimed": false,
+    "status": "not_performed"
+  },
+  "status": "closed_with_user_selected_configuration",
+  "threshold": 0.98,
+  "thresholdBasis": "explicit_user_choice"
+}

@@ -21,6 +21,7 @@ public actor PhotosIndexCoordinator {
     private var issue: String?
     // A successful catalog does not resolve failed reads. Retain explicit cloud
     // classification only while the same descriptor remains a current failed fact.
+    private var modelWaiting: [String: RepresentationDescriptor] = [:]
     private var cloudWaiting: [String: RepresentationDescriptor] = [:]
     private let diagnostics: @Sendable ([String: String]) -> Void
 
@@ -115,12 +116,15 @@ public actor PhotosIndexCoordinator {
             complete = true
             let retainedCloudFailures = try await store.currentFailedRepresentations(Array(cloudWaiting.values),
                 fingerprintVersion: configuration.fingerprint.version)
+            let retainedModelFailures = try await store.currentFailedRepresentations(Array(modelWaiting.values),
+                fingerprintVersion: configuration.fingerprint.version)
             guard !paused else { throw CancellationError() }
             let after = try await photos.candidateSnapshot()
             guard after.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
             needsReconciliation = false; forceCacheInvalidation = false
             reconciledGeneration = snapshot.generation; reconciledContext = context; issue = nil
             cloudWaiting = Dictionary(uniqueKeysWithValues: retainedCloudFailures.map { (Self.waitKey($0), $0) })
+            modelWaiting = Dictionary(uniqueKeysWithValues: retainedModelFailures.map { (Self.waitKey($0), $0) })
             try await publishIfComplete()
         } catch {
             needsReconciliation = true; issue = "图库索引正在等待重新核对。"
@@ -212,7 +216,7 @@ public actor PhotosIndexCoordinator {
                             acknowledgedGeneration = nil; continue
                         }
                         if try await store.completeRepresentation(task, fingerprint: fingerprint) {
-                            completed += 1; cloudWaiting.removeValue(forKey: waitKey)
+                            completed += 1; cloudWaiting.removeValue(forKey: waitKey); modelWaiting.removeValue(forKey: waitKey)
                         }
                     } catch {
                         let latest = try? await photos.candidateSnapshot()
@@ -220,11 +224,13 @@ public actor PhotosIndexCoordinator {
                             if pendingDelta == nil { needsReconciliation = true }; acknowledgedGeneration = nil
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
-                            let delay = delays[min(task.retryCount, delays.count - 1)]
+                            let delay = error is ModelExecutionUnavailable ? 60 : delays[min(task.retryCount, delays.count - 1)]
                             if try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay), detail: String(describing: error)) {
                                 failed += 1
                                 diagnostics(["phase": "index-representation", "result": "waiting", "asset": task.descriptor.key.assetID,
                                     "representation": task.descriptor.key.kind.rawValue, "error": String(describing: error)])
+                                if error is ModelExecutionUnavailable { modelWaiting[waitKey] = task.descriptor }
+                                else { modelWaiting.removeValue(forKey: waitKey) }
                                 if case .iCloudUnavailable = error as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
                                 else { cloudWaiting.removeValue(forKey: waitKey) }
                             }
@@ -246,8 +252,11 @@ public actor PhotosIndexCoordinator {
         do {
             let stored = try await store.indexProgress()
             let ready = try await readyToken() != nil
-            let representationIssue = stored.state == .waiting
-                ? (cloudWaiting.isEmpty ? stored.issue : "正在等待 iCloud 图像，连接恢复后自动继续") : nil
+            let representationIssue: String?
+            if stored.state != .waiting { representationIssue = nil }
+            else if !modelWaiting.isEmpty { representationIssue = ModelExecutionUnavailable.summary }
+            else if !cloudWaiting.isEmpty { representationIssue = "正在等待 iCloud 图像，连接恢复后自动继续" }
+            else { representationIssue = stored.issue }
             let aggregateIssue = issue ?? representationIssue
             let state: IndexState = ready ? .ready : (paused ? .paused :
                 (aggregateIssue != nil || stored.state == .waiting ? .waiting : (stored.totalsKnown ? .updating : .preparing)))
@@ -335,9 +344,13 @@ public actor PhotosIndexCoordinator {
             let snapshot = try await photos.candidateSnapshot()
             guard !paused, serial == changeSerial, snapshot.generation == delta.toGeneration else { throw PhotoKitGatewayError.libraryChanged }
             let affected = Set(delta.changedAssetIDs + delta.deletedAssetIDs)
+            let retainedModels = try await store.currentFailedRepresentations(modelWaiting.values.filter { affected.contains($0.key.assetID) },
+                fingerprintVersion: configuration.fingerprint.version)
             let retained = try await store.currentFailedRepresentations(cloudWaiting.values.filter { affected.contains($0.key.assetID) },
                 fingerprintVersion: configuration.fingerprint.version)
             guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
+            modelWaiting = modelWaiting.filter { !affected.contains($0.value.key.assetID) }
+            for descriptor in retainedModels { modelWaiting[Self.waitKey(descriptor)] = descriptor }
             cloudWaiting = cloudWaiting.filter { !affected.contains($0.value.key.assetID) }
             for descriptor in retained { cloudWaiting[Self.waitKey(descriptor)] = descriptor }
             pendingDelta = nil; pendingReinsertedIDs.removeAll(); reconciledGeneration = delta.toGeneration; issue = nil

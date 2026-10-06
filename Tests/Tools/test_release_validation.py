@@ -540,6 +540,18 @@ fi
 case "${FAKE_XCTEST_MODE:-success}" in
   success)
     printf '{"case_count":33,"duplicate_count":14,"skip_count":11}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-regression.json"
+    python3 - "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-execution.json" <<'P12'
+import json,platform,sys
+from pathlib import Path
+names = ['cpuAndNeuralEngine','cpuAndGPU'] if platform.machine() == 'arm64' else ['cpuAndGPU']
+report = {'schemaVersion':1,'policyID':'fp16-ane-gpu-v1',
+'modelSHA256':'026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0',
+'fingerprintVersion':'ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d',
+'selfTestManifestSHA256':'8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9',
+'configurations':[{'requested':name,'selfTests':[{'case':str(i),'result':'passed','maxAbs':'0.02','cosine':'0.999'} for i in range(4)]} for name in names]}
+Path(sys.argv[1]).write_text(json.dumps(report))
+P12
+
     printf '{"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"legacy_imports":1,"one_changed_inferences":1,"unchanged_inferences":0}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
     patch_preparation_report runtime "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
     mkdir -p "$PHOTOSYNC_MODEL_CACHE_DIR"
@@ -589,3 +601,24 @@ esac
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelExecutionGateTests(unittest.TestCase):
+    def test_gate_rejects_missing_or_failed_instance_golden_evidence(self):
+        module_spec = importlib.util.spec_from_file_location("p12_validator", VALIDATOR)
+        module = importlib.util.module_from_spec(module_spec)
+        sys.modules[module_spec.name] = module
+        module_spec.loader.exec_module(module)
+        for report in [{}, {"policyID": "cpuOnly"}, {"policyID": "fp16-ane-gpu-v1", "configurations": []}]:
+            with self.assertRaises(module.ValidationError): module.validate_model_execution(report)
+
+        report = {"schemaVersion": 1, "policyID": "fp16-ane-gpu-v1",
+            "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+            "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+            "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+            "configurations": [{"requested": name, "selfTests": [{"case": str(i), "result": "passed", "maxAbs": "0.02", "cosine": "0.999"} for i in range(4)]}
+                for name in (["cpuAndNeuralEngine", "cpuAndGPU"] if module.platform.machine() == "arm64" else ["cpuAndGPU"])]}
+        module.validate_model_execution(report)
+        for field, bad in [("maxAbs", "0.020001"), ("cosine", "0.998999"), ("cosine", "nan"), ("result", "failed")]:
+            changed = json.loads(json.dumps(report)); changed["configurations"][0]["selfTests"][0][field] = bad
+            with self.assertRaises(module.ValidationError): module.validate_model_execution(changed)

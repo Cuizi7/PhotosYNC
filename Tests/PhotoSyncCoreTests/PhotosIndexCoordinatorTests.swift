@@ -4,6 +4,22 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testModelWaitKeepsTaskUnreadyAcrossReconciliation() async throws {
+        let f = try fixture()
+        await f.photos.set([descriptor(f.photos.context)])
+        await f.model.setUnavailable(true)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let failed = await f.coordinator.progress()
+        XCTAssertEqual(failed.state, .waiting); XCTAssertEqual(failed.issue, ModelExecutionUnavailable.summary)
+        try await f.coordinator.reconcile()
+        let retained = await f.coordinator.progress(); XCTAssertEqual(retained.issue, ModelExecutionUnavailable.summary)
+        let before = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(59), limit: 2)
+        XCTAssertTrue(before.isEmpty)
+        await f.model.setUnavailable(false)
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(60))
+        let recovered = await f.coordinator.progress(); XCTAssertEqual(recovered.state, .ready); XCTAssertNil(recovered.issue)
+    }
+
     private let now = Date(timeIntervalSince1970: 1_000)
 
     func testNoChangeReconciliationDoesNoImageIO() async throws {
@@ -704,10 +720,13 @@ private actor CoordinatorModel: ImageFingerprinting {
     private let version: String
     private(set) var count = 0
     private var gate: CoordinatorGate?
+    private var unavailable = false
+    func setUnavailable(_ value: Bool) { unavailable = value }
     init(version: String) { self.version = version }
     func setGate(_ gate: CoordinatorGate) { self.gate = gate }
     func reset() { count = 0 }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        if unavailable { throw ModelExecutionUnavailable(detail: "test index") }
         count += 1; if let gate { self.gate = nil; await gate.hold() }
         try Task.checkCancellation()
         return try Fingerprint(version: version, values: [1] + Array(repeating: 0, count: 1023))

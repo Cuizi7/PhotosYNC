@@ -121,7 +121,7 @@ final class FingerprintTests: XCTestCase {
         let configuration = try FingerprintConfiguration(modelSHA256: hash, inputSide: 4,
                                                         resizeMode: .stretchFullFrame,
                                                         colorSpace: "sRGB", mean: [0, 0, 0], std: [1, 1, 1])
-        let fingerprinter = try CoreMLFingerprinter(modelURL: fixture, configuration: configuration)
+        let fingerprinter = try CoreMLFingerprinter(researchCPUOnlyModelURL: fixture, configuration: configuration)
         let source = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
         let output = try await fingerprinter.fingerprint(image: source, orientation: .up)
         XCTAssertEqual(output.version, configuration.version)
@@ -179,5 +179,112 @@ final class FingerprintTests: XCTestCase {
         _ = try await second.value
         let after = starts.current()
         XCTAssertEqual(after, 2)
+    }
+}
+
+private final class P12Session: ModelPredictionSession, @unchecked Sendable {
+    let prediction: (MLMultiArray) throws -> [Float]
+    let released: () -> Void
+    init(prediction: @escaping (MLMultiArray) throws -> [Float], released: @escaping () -> Void = {}) {
+        self.prediction = prediction; self.released = released
+    }
+    func predict(_ input: MLMultiArray) throws -> [Float] { try prediction(input) }
+    deinit { released() }
+}
+
+extension FingerprintTests {
+    private func golden() -> [ModelSelfTestCase] {
+        (0..<4).map { _ in .init(input: Data(repeating: 0, count: 3 * 4 * 4 * 4),
+            reference: [1] + Array(repeating: 0, count: 1023)) }
+    }
+    func testSelfTestFailureSelectsGPUBeforePublishingFingerprint() async throws {
+        let released = PhysicalStartCounter(), loads = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { backend in
+            _ = loads.increment()
+            if backend == .cpuAndGPU { XCTAssertEqual(released.current(), 1, "old instance released first") }
+            return P12Session(prediction: { _ in
+                backend == .cpuAndNeuralEngine ? [0, 1] + Array(repeating: 0, count: 1022) : [1] + Array(repeating: 0, count: 1023)
+            }, released: { _ = released.increment() })
+        })
+        let output = try await model.fingerprint(image: image(width: 1, height: 1, pixels: [0, 0, 0, 255]), orientation: .up)
+        XCTAssertEqual(output.values[0], 1)
+        XCTAssertEqual(loads.current(), 2)
+    }
+    func testPredictionFailureFallsBackOnlyAfterPhysicalReturn() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let calls = PhysicalStartCounter(), released = PhysicalStartCounter(), loads = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { backend in
+            _ = loads.increment()
+            if backend == .cpuAndGPU { XCTAssertEqual(released.current(), 1) }
+            return P12Session(prediction: { _ in
+                if backend == .cpuAndNeuralEngine && calls.increment() == 5 {
+                    entered.signal(); release.wait(); throw ModelExecutionUnavailable(detail: "prediction")
+                }
+                return [1] + Array(repeating: 0, count: 1023)
+            }, released: { _ = released.increment() })
+        })
+        let source = image(width: 1, height: 1, pixels: [0, 0, 0, 255])
+        let task = Task { try await model.fingerprint(image: source, orientation: .up) }
+        let didEnter = entered.wait(timeout: .now() + 2)
+        XCTAssertEqual(didEnter, .success)
+        XCTAssertEqual(loads.current(), 1)
+        release.signal()
+        _ = try await task.value
+        XCTAssertEqual(loads.current(), 2)
+    }
+    func testCancelledPredictionDoesNotStartFallback() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let calls = PhysicalStartCounter(), loads = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { _ in
+            _ = loads.increment()
+            return P12Session(prediction: { _ in
+                if calls.increment() == 5 { entered.signal(); release.wait(); throw ModelExecutionUnavailable(detail: "prediction") }
+                return [1] + Array(repeating: 0, count: 1023)
+            })
+        })
+        let source = image(width: 1, height: 1, pixels: [0, 0, 0, 255])
+        let task = Task { try await model.fingerprint(image: source, orientation: .up) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        task.cancel(); release.signal()
+        do { _ = try await task.value; XCTFail("canceled prediction") } catch is CancellationError { }
+        XCTAssertEqual(loads.current(), 1)
+    }
+    func testBackendResourceCorruptionIsNotRetryableHardwareFailure() async throws {
+        let resources = try DedupConfiguration.bundledResourceDirectory()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["execution-policy.json", "ModelSelfTest"] {
+            try FileManager.default.copyItem(at: resources.appendingPathComponent(name), to: root.appendingPathComponent(name))
+        }
+        let policy = try ModelExecutionPolicy.loadValidated(resourceDirectory: root)
+        let selfTest = try ModelSelfTest.loadValidated(resourceDirectory: root, policy: policy)
+        let config = try DedupConfiguration.loadValidated(resourceDirectory: resources)
+        var altered = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("execution-policy.json"))) as! [String: Any]
+        altered["arm64"] = ["cpuAndGPU"]
+        let unchecked = try JSONDecoder().decode(ModelExecutionPolicy.self, from: JSONSerialization.data(withJSONObject: altered))
+        XCTAssertThrowsError(try CoreMLFingerprinter(modelURL: resources.appendingPathComponent("SSCDLarge.mlpackage"),
+            configuration: config.fingerprint, policy: unchecked, selfTest: selfTest))
+        try Data([0]).write(to: root.appendingPathComponent("ModelSelfTest/input-0.f32"))
+        XCTAssertThrowsError(try ModelSelfTest.loadValidated(resourceDirectory: root, policy: policy)) {
+            XCTAssertFalse($0 is ModelExecutionUnavailable)
+        }
+        let loads = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { _ in
+            _ = loads.increment(); throw AdvancedDedupError.invalidConfiguration
+        })
+        do { _ = try await model.fingerprint(image: image(width: 1, height: 1, pixels: [0,0,0,255]), orientation: .up); XCTFail("corruption") }
+        catch { XCTAssertEqual(error as? AdvancedDedupError, .invalidConfiguration) }
+        XCTAssertEqual(loads.current(), 1)
+    }
+    func testBothBackendsUnavailableNeverUsesCPU() async throws {
+        let calls = PhysicalStartCounter()
+        let model = try CoreMLFingerprinter(configuration: configuration(), selfTests: golden(), factory: { _ in
+            _ = calls.increment()
+            return P12Session(prediction: { _ in throw ModelExecutionUnavailable(detail: "unavailable") })
+        })
+        do { _ = try await model.fingerprint(image: image(width: 1, height: 1, pixels: [0,0,0,255]), orientation: .up); XCTFail("must wait") }
+        catch is ModelExecutionUnavailable { }
+        XCTAssertEqual(calls.current(), 2)
     }
 }

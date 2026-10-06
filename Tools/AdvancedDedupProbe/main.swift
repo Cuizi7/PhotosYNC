@@ -21,11 +21,12 @@ func parseArguments() throws -> (command: String, values: [String: String]) {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let command = args.first,
           ["fingerprint", "compare-tensors", "score-batch", "score-catalog", "search-benchmark",
-           "combined-benchmark", "validate-profile"].contains(command) else {
+           "combined-benchmark", "validate-profile", "validate-execution"].contains(command) else {
         throw ProbeError(description: "unknown probe command")
     }
     let required: [String]
     switch command {
+    case "validate-execution": required = ["--resources", "--dataset", "--output-dir"]
     case "fingerprint": required = ["--profile", "--model", "--output-dir", "--input-list"]
     case "compare-tensors": required = ["--profile", "--model", "--output-dir", "--tensor-list"]
     case "score-batch": required = ["--profile", "--input", "--output-dir"]
@@ -47,7 +48,7 @@ func parseArguments() throws -> (command: String, values: [String: String]) {
         }
         values[flag] = args[index + 1]
     }
-    guard (required + ["--approved-protocol-json"])
+    guard (required + (command == "validate-execution" ? [] : ["--approved-protocol-json"]))
         .allSatisfy({ values[$0] != nil }) else {
         throw ProbeError(description: "missing required probe option")
     }
@@ -71,6 +72,11 @@ func sha256(_ url: URL) throws -> String {
 func run() async throws {
     let parsed = try parseArguments()
     let args = parsed.values
+    if parsed.command == "validate-execution" {
+        try await validateProductExecution(resources: URL(fileURLWithPath: args["--resources"]!),
+            corpus: URL(fileURLWithPath: args["--dataset"]!), output: URL(fileURLWithPath: args["--output-dir"]!))
+        return
+    }
     let profile = URL(fileURLWithPath: args["--profile"]!)
     let output = URL(fileURLWithPath: args["--output-dir"]!)
     let approved = try JSONDecoder().decode(ApprovedProtocolBinding.self,
@@ -132,7 +138,7 @@ func run() async throws {
     let selected = (raw["fingerprint"] as? [String: Any]) ?? raw
     let configuration = try JSONDecoder().decode(FingerprintConfiguration.self,
                                                    from: JSONSerialization.data(withJSONObject: selected))
-    let fingerprinter = try CoreMLFingerprinter(modelURL: model, configuration: configuration)
+    let fingerprinter = try CoreMLFingerprinter(researchCPUOnlyModelURL: model, configuration: configuration)
     if parsed.command == "compare-tensors" {
         let maxError = approved.maxAbsError
         let minCosine = approved.minCosine
@@ -514,7 +520,7 @@ private func runSearchBenchmark(vectors: URL, assetCount: String, editedFraction
         let imagePaths = try JSONDecoder().decode([String].self, from: Data(contentsOf: inputList))
         guard !imagePaths.isEmpty else { throw ProbeError(description: "empty benchmark image list") }
         let coldStart = CFAbsoluteTimeGetCurrent()
-        let fingerprinter = try CoreMLFingerprinter(modelURL: model,
+        let fingerprinter = try CoreMLFingerprinter(researchCPUOnlyModelURL: model,
                                                     configuration: configuration.fingerprint)
         let first = try await fingerprintLocalImage(URL(fileURLWithPath: imagePaths[0]),
             fingerprinter: fingerprinter, configuration: configuration.fingerprint,
@@ -608,3 +614,118 @@ Task {
     catch { fputs("probe: \(error)\n", stderr); exit(EXIT_FAILURE) }
 }
 dispatchMain()
+
+
+// Approved product-boundary validation, deliberately distinct from historical research commands.
+private final class ExecutionEvents: @unchecked Sendable {
+    private let lock = NSLock(); private var entries: [[String: String]] = []
+    func append(_ item: [String: String]) { lock.lock(); entries.append(item); lock.unlock() }
+    var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return entries }
+}
+private func validateProductExecution(resources: URL, corpus: URL, output: URL) async throws {
+    let policy = try ModelExecutionPolicy.loadValidated(resourceDirectory: resources)
+    let selfTest = try ModelSelfTest.loadValidated(resourceDirectory: resources, policy: policy)
+    let config = try JSONDecoder().decode(DedupConfiguration.self, from: modelResourceBytes(root: resources, relative: "profile.json"))
+    guard config.fingerprint.modelSHA256 == policy.modelSHA256, config.fingerprint.version == policy.fingerprintVersion,
+          config.threshold == 0.98, config.backend == "sqlite-exact-f32-v1",
+          CoreMLFingerprinter.packageSHA256(resources.appendingPathComponent("SSCDLarge.mlpackage")) == policy.modelSHA256 else {
+        throw AdvancedDedupError.invalidConfiguration
+    }
+    let decision = try JSONSerialization.jsonObject(with: modelResourceBytes(root: resources, relative: "decision.json")) as! [String: Any]
+    let binding = decision["activeSuite"] as! [String: Any]
+    for (name,key) in [("active-suite.json","sha256"),("manifest.json","manifestSHA256"),
+                      ("expected-results.json","expectedResultsSHA256"),("human-review.json","humanReviewSHA256")] {
+        guard try sha256(corpus.appendingPathComponent(name)) == binding[key] as? String else { throw AdvancedDedupError.invalidConfiguration }
+    }
+    func json(_ name: String) throws -> [String: Any] {
+        try JSONSerialization.jsonObject(with: Data(contentsOf: corpus.appendingPathComponent(name))) as! [String: Any]
+    }
+    let active = Set(try json("active-suite.json")["kept_case_ids"] as! [String])
+    let truth = try (json("expected-results.json")["cases"] as! [[String: Any]]).filter { active.contains($0["id"] as! String) }
+    guard truth.count == 33 else { throw AdvancedDedupError.invalidConfiguration }
+    let images = try json("manifest.json")["images"] as! [[String: Any]]
+    let records = Dictionary(uniqueKeysWithValues: images.map { ($0["id"] as! String, $0) })
+    let used = Set(truth.flatMap { [$0["query"] as! String] + ($0["candidates"] as! [String]) })
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+    for backend in policy.candidates {
+        let events = ExecutionEvents()
+        // A separate *validation run* of each allowed configuration, with the product queue,
+        // IO checks and four-instance self-tests. No backend override exists in App assembly.
+        let modelURL = resources.appendingPathComponent("SSCDLarge.mlpackage")
+        let model = try CoreMLFingerprinter(configuration: config.fingerprint, selfTests: selfTest.cases,
+            candidates: [backend], factory: { selected in
+                try NativeModelSession(compiledURL: CoreMLFingerprinter.compiledModel(modelURL: modelURL, configuration: config.fingerprint),
+                    configuration: config.fingerprint, backend: selected)
+            }, diagnostics: { events.append($0) })
+        try await model.prepareExecution()
+        var vectors = [String: Fingerprint](), sizes = [String: PixelSize](), inputs = [[String: String]]()
+        let reader = MetadataReader(), budget = ImageWorkBudget(limits: config.resources)
+        for id in used.sorted() {
+            let record = records[id]!, url = corpus.appendingPathComponent(record["file"] as! String)
+            guard try sha256(url) == record["sha256"] as? String else { throw AdvancedDedupError.invalidConfiguration }
+            let loaded = try await reader.readForFingerprint(url: url, configuration: config, budget: budget)
+            do {
+                vectors[id] = try await model.fingerprint(image: loaded.value.image, orientation: loaded.value.orientation)
+                await loaded.lease.finishPhysicalWork()
+            } catch { await loaded.lease.finishPhysicalWork(); throw error }
+            sizes[id] = try PixelSize(width: record["width"] as! Int, height: record["height"] as! Int)
+            inputs.append(["id": id, "inputSHA256": record["sha256"] as! String,
+                "vectorSHA256": modelResourceSHA256(vectors[id]!.littleEndianFloat32)])
+        }
+        var cases = [[String: Any]]()
+        for item in truth {
+            let query = item["query"] as! String, gallery = item["candidates"] as! [String]
+            let expected = item["expected"] as! [String: String]
+            let entries = gallery.map { VectorEntry(key: $0, origin: .photosOriginal, fingerprint: vectors[$0]!, size: sizes[$0]) }
+            let results = try await productSQLiteCandidates(query: vectors[query]!, entries: entries, configuration: config)
+            let evaluation = try AdvancedDuplicatePolicy.evaluate(sourceSize: sizes[query], candidates: results.matches, configuration: config)
+            let content = evaluation.content.rawValue, action = evaluation.action.rawValue
+            let expectedContent = expected["content_result"] == "duplicate" ? "duplicate" : "notDuplicate"
+            let expectedAction = expected["action"] == "skip" ? "skip" : "importFile"
+            let contentPass = content == expectedContent, actionPass = action == expectedAction
+            cases.append(["id": item["id"]!, "query": query, "gallery": gallery,
+                "expectedContent": expectedContent, "expectedAction": expectedAction,
+                "contentPass": contentPass, "actionPass": actionPass, "pass": contentPass && actionPass,
+                "observed": ["content": content, "action": action, "queryVectorSHA256": modelResourceSHA256(vectors[query]!.littleEndianFloat32),
+                    "candidates": results.diagnostics.map { candidate in
+                        let entry = entries.first { "photos:\($0.key.utf8.count):\($0.key):original" == candidate.key }!
+                        return ["key": candidate.key, "origin": candidate.origin.rawValue, "score": candidate.score,
+                            "vectorSHA256": modelResourceSHA256(entry.fingerprint.littleEndianFloat32)] as [String: Any]
+                    }]] as [String: Any])
+        }
+        let contentFailures = cases.filter { $0["contentPass"] as? Bool != true }.map { $0["id"] as! String }
+        let actionFailures = cases.filter { $0["actionPass"] as? Bool != true }.map { $0["id"] as! String }
+        let report: [String: Any] = ["policyID": policy.id, "requestedConfiguration": backend.rawValue,
+            "modelSHA256": config.fingerprint.modelSHA256, "fingerprintVersion": config.fingerprint.version,
+            "backend": config.backend, "newImageInference": true, "independentValidation": false,
+            "selfTestManifestSHA256": policy.selfTestManifestSHA256, "selfTestEvents": events.values,
+            "caseCount": cases.count, "passCount": cases.count - Set(contentFailures + actionFailures).count,
+            "contentFailures": contentFailures, "actionFailures": actionFailures, "cases": cases, "inputs": inputs]
+        try writeJSON(report, at: output.appendingPathComponent(backend.rawValue + ".json"))
+        guard contentFailures.isEmpty, actionFailures.isEmpty else { throw ProbeError(description: "FP16 product regression failed") }
+        print("\(backend.rawValue): four golden tests and \(cases.count) product SQLite cases passed")
+    }
+}
+private func productSQLiteCandidates(query: Fingerprint, entries: [VectorEntry], configuration: DedupConfiguration) async throws -> VectorSearchResult {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try SyncStore(url: root.appendingPathComponent("validation.sqlite"))
+    let source = try await store.registerSource(url: root)
+    let file = SourceFile(sourceID: source, relativePath: "query.jpg", url: root.appendingPathComponent("query.jpg"),
+        stamp: .init(size: 1, modifiedNanoseconds: 1), metadata: .init(filename: "query.jpg", kind: .image,
+            captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: nil, height: nil, duration: nil))
+    let fileID = try await store.save(file, decision: .importNew)
+    let context = LibraryContext(id: UUID(), epoch: 1)
+    let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: query.version)
+    let descriptors = entries.map { RepresentationDescriptor(key: .init(assetID: $0.key, kind: .original), context: context,
+        revision: "validation", size: $0.size, equivalentToOriginal: false, revisionIsReliable: true) }
+    _ = try await store.upsertRepresentations(descriptors, generation: generation)
+    let tasks = try await store.nextRepresentationTasks(now: Date(), limit: max(1, entries.count))
+    for task in tasks { guard try await store.completeRepresentation(task, fingerprint: entries.first { $0.key == task.descriptor.key.assetID }!.fingerprint) else { throw AdvancedDedupError.invalidConfiguration } }
+    _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(descriptors.map(\.key)))
+    guard let publication = try await store.indexPublication(), try await store.markIndexPublished(token: publication.token),
+          let result = try await store.vectorCandidates(for: fileID, query: query, token: publication.token,
+                threshold: configuration.threshold, diagnosticLimit: 10) else { throw AdvancedDedupError.invalidConfiguration }
+    return result
+}

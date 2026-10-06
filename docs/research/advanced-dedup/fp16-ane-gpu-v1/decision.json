@@ -1,0 +1,67 @@
+{
+  "activeSuite": {
+    "caseCount": 33,
+    "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
+    "humanReviewSHA256": "5db705debe0ca4c139f5d89c4e360456553d2bd8155105637349d749095177a7",
+    "imageCount": 42,
+    "manifestSHA256": "1d0999497eac360bc2d09215e8cbb2f0ee0156d5a24ea28f6a5608bb37a5a0ea",
+    "revision": "2026-10-04-no-information-panels",
+    "sha256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23"
+  },
+  "basis": "explicit_user_selected_threshold",
+  "comparison": "score >= threshold",
+  "configuration": {
+    "backend": "sqlite-exact-f32-v1",
+    "computeUnits": "fp16-ane-gpu-v1",
+    "evidenceCandidateLimit": 200000,
+    "fingerprint": {
+      "colorSpace": "sRGB",
+      "inputSide": 320,
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+      "resizeMode": "stretchFullFrame",
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "version": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
+    },
+    "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
+    "resources": {
+      "batchSize": 1,
+      "catalogBatchSize": 128,
+      "decodeConcurrency": 1,
+      "inferenceConcurrency": 1,
+      "maxDecodedBytes": 536870912,
+      "maxInFlightTasks": 2,
+      "photoRequestConcurrency": 1,
+      "progressPublishIntervalSeconds": 1,
+      "requestTimeoutSeconds": 30,
+      "retryDelaysSeconds": [
+        5,
+        15,
+        30,
+        60
+      ]
+    },
+    "weightPrecision": "float16"
+  },
+  "date": "2026-10-06",
+  "decision": "close_research_and_select_configuration_for_integration",
+  "executionPolicySHA256": "03e34635df8a05e5b9e7d519dc4c1a0577a8f83ea771e237d2b085c9eb11e90e",
+  "platformLimitations": [
+    "macOS13 Apple Silicon physical validation unavailable",
+    "Intel physical execution excluded"
+  ],
+  "priorDecisionSHA256": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
+  "realPhotosValidation": "not performed in P12",
+  "schemaVersion": 1,
+  "selectedThreshold": 0.98,
+  "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+  "userInstruction": "Approved option A: FP16, ANE-first with one serialized GPU fallback; retain threshold 0.98 and Float32 pipeline."
+}

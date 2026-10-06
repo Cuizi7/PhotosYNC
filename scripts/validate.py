@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import re
 import signal
@@ -314,6 +315,8 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             "log": relative_to_output(continuation.log_path, output_dir),
         }
         continuation_phases.append(phase_record(name, continuation, output_dir))
+    execution_result = json.loads((output_dir / "model-execution.json").read_text())
+    validate_model_execution(execution_result)
     model_result = json.loads((output_dir / "model-regression.json").read_text())
     runtime_result = json.loads((output_dir / "runtime-load.json").read_text())
     validate_preparation_budget(runtime_result, label="Runtime")
@@ -373,6 +376,8 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             "scale": scale_results,
             "resources": "resources.json", "model_regression": "model-regression.json", "runtime_load": "runtime-load.json",
             "resources_sha256": sha256_file(output_dir / "resources.json"),
+            "model_execution": "model-execution.json",
+            "model_execution_sha256": sha256_file(output_dir / "model-execution.json"),
             "model_regression_sha256": sha256_file(output_dir / "model-regression.json"),
             "runtime_load_sha256": sha256_file(output_dir / "runtime-load.json"),
         },
@@ -387,6 +392,35 @@ def child_environment() -> dict[str, str]:
     # Python test discovery must not mutate the frozen source snapshot with .pyc files.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def validate_model_execution(report: dict[str, Any]) -> None:
+    expected = {
+        "schemaVersion": 1, "policyID": "fp16-ane-gpu-v1",
+        "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+        "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+        "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+    }
+    if any(report.get(key) != value for key, value in expected.items()):
+        raise ValidationError("Missing/wrong FP16 model execution identity")
+    configurations = report.get("configurations")
+    requested = ["cpuAndNeuralEngine", "cpuAndGPU"] if platform.machine() == "arm64" else ["cpuAndGPU"]
+    if not isinstance(configurations, list) or [item.get("requested") for item in configurations] != requested:
+        raise ValidationError("Missing approved native configuration evidence")
+    for item in configurations:
+        golden = item.get("selfTests")
+        if not isinstance(golden, list) or len(golden) != 4:
+            raise ValidationError("Missing four-instance golden evidence")
+        if [entry.get("case") for entry in golden] != [str(i) for i in range(4)]:
+            raise ValidationError("Golden cases incomplete or duplicated")
+        for entry in golden:
+            try:
+                max_abs, cosine = float(entry["maxAbs"]), float(entry["cosine"])
+            except (KeyError, ValueError, TypeError) as error:
+                raise ValidationError("Invalid numerical self-test evidence") from error
+            if (entry.get("result") != "passed" or not math.isfinite(max_abs) or not math.isfinite(cosine)
+                    or max_abs < 0 or max_abs > 0.02 or cosine < 0.999 or cosine > 1.00001):
+                raise ValidationError("Native model instance failed golden thresholds")
 
 
 def validate_preparation_budget(result: Any, *, label: str) -> None:

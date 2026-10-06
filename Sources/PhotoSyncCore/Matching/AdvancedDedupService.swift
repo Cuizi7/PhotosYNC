@@ -34,6 +34,7 @@ public actor AdvancedDedupService {
     /// transaction and native submit rechecks; this method does not submit Photos.
     public func prepare(fileID: UUID, file: SourceFile) async throws -> AdvancedPreparation {
         do { return try await prepareCurrent(fileID: fileID, file: file) }
+        catch is ModelExecutionUnavailable { return .waiting(reason: ModelExecutionUnavailable.summary) }
         catch is ReadExecutorError { return .waiting(reason: "来源读取稍后继续。") }
         catch is ImageWorkBudgetError { return .waiting(reason: "图像资源稍后可用。") }
         catch is CancellationError { return .waiting(reason: "来源准备已暂停。") }
@@ -44,6 +45,9 @@ public actor AdvancedDedupService {
         var timings: [String: Double] = [:]
         guard !paused, file.metadata.kind == .image,
               try await eligibleRecord(fileID: fileID, file: file) != nil, !paused else { return waiting() }
+        guard try await !store.hasUnsupportedSuccessfulFingerprint(version: configuration.fingerprint.version), !paused else {
+            return .waiting(reason: "历史照片分析记录需要升级确认，同步正在等待。")
+        }
         guard let initialToken = await readyToken(), !paused else { return waiting() }
         guard try await stamp(file) == file.stamp, !paused else { return waiting() }
         let size = sourceSize(file)

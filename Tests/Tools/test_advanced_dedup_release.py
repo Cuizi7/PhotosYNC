@@ -7,6 +7,7 @@ import unittest
 import hashlib
 import subprocess
 import shutil
+import json
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -17,6 +18,36 @@ spec.loader.exec_module(release)
 
 
 class AdvancedDedupReleaseTests(unittest.TestCase):
+    def test_execution_policy_rejects_cpu_io_threshold_and_tensor_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = ROOT / release.RESOURCE_PATH
+            shutil.copyfile(original / "execution-policy.json", root / "execution-policy.json")
+            shutil.copytree(original / "ModelSelfTest", root / "ModelSelfTest")
+            policy_path = root / "execution-policy.json"
+            original_policy = policy_path.read_bytes()
+            release.verify_execution_resources(root)
+            for key, value in [("arm64", ["cpuOnly"]), ("x86_64", ["all"]),
+                               ("inputType", "float16"), ("outputType", "float16"),
+                               ("allowLowPrecisionAccumulationOnGPU", True), ("retryIntervalSeconds", 1),
+                               ("modelSHA256", "0" * 64), ("selfTestManifestSHA256", "0" * 64)]:
+                policy = json.loads(original_policy); policy[key] = value
+                policy_path.write_text(json.dumps(policy))
+                with self.assertRaises(ValueError, msg=key): release.verify_execution_resources(root)
+            policy_path.write_bytes(original_policy)
+            manifest_path = root / "ModelSelfTest/manifest.json"
+            manifest = json.loads(manifest_path.read_bytes()); manifest["maxAbsError"] = 0.03
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError): release.verify_execution_resources(root)
+            shutil.copyfile(original / "ModelSelfTest/manifest.json", manifest_path)
+            tensor = root / "ModelSelfTest/input-0.f32"
+            tensor.write_bytes(b"corrupt")
+            with self.assertRaises(ValueError): release.verify_execution_resources(root)
+            shutil.copyfile(original / "ModelSelfTest/input-0.f32", tensor)
+            tensor.unlink(); tensor.symlink_to(original / "ModelSelfTest/input-0.f32")
+            with self.assertRaises(ValueError): release.verify_execution_resources(root)
+
+
     def test_hydration_requires_exact_archive_pointer_and_local_object(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -67,7 +98,9 @@ class AdvancedDedupReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.verify_resources(root)
             for name in release.RECORD_HASHES:
-                (root / name).write_text("{}")
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
             with self.assertRaises(ValueError):
                 release.verify_resources(root)
 

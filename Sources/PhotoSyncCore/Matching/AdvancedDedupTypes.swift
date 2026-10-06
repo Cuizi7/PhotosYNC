@@ -450,10 +450,13 @@ extension DedupConfiguration {
     /// Research paths embedded in records are explanatory only and are never followed here.
     public static func loadValidated(resourceDirectory: URL) throws -> DedupConfiguration {
         let decoder = JSONDecoder()
-        let decisionBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("decision.json"))
-        let profileBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("profile.json"))
-        let regressionBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("regression.json"))
-        let closeoutBytes = try Data(contentsOf: resourceDirectory.appendingPathComponent("closeout.json"))
+        let execution = try ModelExecutionPolicy.loadValidated(resourceDirectory: resourceDirectory)
+        _ = try ModelSelfTest.loadValidated(resourceDirectory: resourceDirectory, policy: execution)
+        let executionID = modelResourceSHA256(try modelResourceBytes(root: resourceDirectory, relative: "execution-policy.json"))
+        let decisionBytes = try modelResourceBytes(root: resourceDirectory, relative: "decision.json")
+        let profileBytes = try modelResourceBytes(root: resourceDirectory, relative: "profile.json")
+        let regressionBytes = try modelResourceBytes(root: resourceDirectory, relative: "regression.json")
+        let closeoutBytes = try modelResourceBytes(root: resourceDirectory, relative: "closeout.json")
         let decision = try decoder.decode(IntegrationDecision.self, from: decisionBytes)
         let profile = try decoder.decode(DedupConfiguration.self, from: profileBytes)
         let regression = try decoder.decode(IntegrationRegression.self, from: regressionBytes)
@@ -465,14 +468,16 @@ extension DedupConfiguration {
               decision.decision == "close_research_and_select_configuration_for_integration",
               !decision.userInstruction.isEmpty, decision.selectedThreshold == 0.98,
               decision.comparison == "score >= threshold",
-              d.computeUnits == "cpuOnly", d.weightPrecision == "float32",
+              d.computeUnits == execution.id, d.weightPrecision == "float16",
+              decision.executionPolicySHA256 == executionID,
+              decision.selfTestManifestSHA256 == execution.selfTestManifestSHA256,
               d.resources.decodeConcurrency == 1, d.resources.photoRequestConcurrency == 1,
               d.resources.maxDecodedBytes == 536870912, d.resources.requestTimeoutSeconds == 30,
               d.resources.retryDelaysSeconds == [5, 15, 30, 60], d.resources.catalogBatchSize == 128,
               d.resources.maxInFlightTasks == 2, d.resources.progressPublishIntervalSeconds == 1,
               d.resources.inferenceConcurrency == 1, d.resources.batchSize == 1,
               d.evidenceCandidateLimit == 200000,
-              d.fingerprint.modelSHA256 == "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
+              d.fingerprint.modelSHA256 == execution.modelSHA256, d.fingerprint.version == execution.fingerprintVersion,
               d.fingerprint.inputSide == 320, d.fingerprint.resizeMode == .stretchFullFrame,
               d.fingerprint.colorSpace == "sRGB", d.fingerprint.mean == [0.485, 0.456, 0.406],
               d.fingerprint.std == [0.229, 0.224, 0.225], d.backend == "sqlite-exact-f32-v1",
@@ -480,7 +485,7 @@ extension DedupConfiguration {
               profile.policyVersion == d.policyVersion, profile.backend == d.backend,
               profile.resources == d.resources, profile.evidenceCandidateLimit == d.evidenceCandidateLimit,
               profile.acceptanceID == "user-decision:" + decisionID,
-              regression.schemaVersion == 1, regression.kind == "fixed_user_threshold_replay_of_existing_vectors",
+              regression.schemaVersion == 1, regression.kind == "fixed_user_threshold_actual_fp16_inference",
               regression.thresholdBasis == "explicit_user_choice_not_independent_calibration",
               regression.decisionSHA256 == decisionID, regression.integrationProfileSHA256 == profileID,
               regression.threshold == profile.threshold, regression.policyVersion == profile.policyVersion,
@@ -488,7 +493,7 @@ extension DedupConfiguration {
               regression.activeSuiteSHA256 == decision.activeSuite.sha256,
               regression.expectedResultsSHA256 == decision.activeSuite.expectedResultsSHA256,
               isSHA256(regression.sourceVectorManifestSHA256), isSHA256(regression.sourceReportSHA256),
-              !regression.newImageInference, !regression.independentValidation,
+              regression.newImageInference, !regression.independentValidation,
               decision.activeSuite.caseCount == 33, regression.caseCount == 33, regression.passCount == 33,
               regression.cases.count == 33, Set(regression.cases.map(\.id)).count == 33,
               regression.contentFailures.isEmpty, regression.actionFailures.isEmpty,
@@ -500,14 +505,14 @@ extension DedupConfiguration {
               closeout.approvedForProductIntegration, closeout.decisionSHA256 == decisionID,
               closeout.profileSHA256 == profileID, closeout.regression.sha256 == regressionID,
               closeout.acceptanceID == profile.acceptanceID, closeout.threshold == profile.threshold,
-              closeout.thresholdBasis == "explicit_user_choice", closeout.computeUnits == "cpuOnly",
+              closeout.thresholdBasis == "explicit_user_choice", closeout.computeUnits == execution.id,
               closeout.backend == profile.backend, closeout.fingerprintVersion == profile.fingerprint.version,
               closeout.policyVersion == profile.policyVersion, closeout.modelSHA256 == profile.fingerprint.modelSHA256,
               closeout.activeSuiteSHA256 == regression.activeSuiteSHA256,
               closeout.regression.caseCount == 33, closeout.regression.passCount == 33,
               closeout.regression.contentFailures.isEmpty, closeout.regression.actionFailures.isEmpty,
-              closeout.regression.sameImagePairsAndVectors, !closeout.regression.independent,
-              !closeout.regression.newImageInference, closeout.statisticalAcceptance.status == "not_performed",
+              !closeout.regression.sameImagePairsAndVectors, !closeout.regression.independent,
+              closeout.regression.newImageInference, closeout.statisticalAcceptance.status == "not_performed",
               !closeout.statisticalAcceptance.falseSkipUpperBoundClaimed,
               !closeout.statisticalAcceptance.recallConfidenceClaimed
         else { throw AdvancedDedupError.invalidConfiguration }
@@ -518,6 +523,7 @@ extension DedupConfiguration {
 private struct IntegrationDecision: Decodable {
     let schemaVersion: Int, basis: String, userInstruction: String, decision: String
     let selectedThreshold: Double, comparison: String
+    let executionPolicySHA256: String, selfTestManifestSHA256: String
     let configuration: Selection
     let activeSuite: Suite
     struct Selection: Decodable {

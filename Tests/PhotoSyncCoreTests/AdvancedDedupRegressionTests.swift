@@ -1,6 +1,7 @@
 import XCTest
 import CryptoKit
 import ImageIO
+import CoreML
 import Darwin
 import SQLite3
 import TestSQLiteMetrics
@@ -10,9 +11,36 @@ private let backgroundPreparationContract = "background-preparation-v2"
 private let preparationP95BudgetMS: Double = 2000
 
 final class AdvancedDedupRegressionTests: XCTestCase {
+    func testBundledModelInstancesValidateApprovedNativeConfigurations() async throws {
+        let root = try DedupConfiguration.bundledResourceDirectory()
+        let config = try DedupConfiguration.loadValidated(resourceDirectory: root)
+        let policy = try ModelExecutionPolicy.loadValidated(resourceDirectory: root)
+        let selfTest = try ModelSelfTest.loadValidated(resourceDirectory: root, policy: policy)
+        var configurations = [[String: Any]]()
+        for backend in policy.candidates {
+            let events = P12NativeEvents()
+            let modelURL = root.appendingPathComponent("SSCDLarge.mlpackage")
+            let model = try CoreMLFingerprinter(configuration: config.fingerprint, selfTests: selfTest.cases,
+                candidates: [backend], factory: { selected in
+                    try NativeModelSession(compiledURL: CoreMLFingerprinter.compiledModel(modelURL: modelURL, configuration: config.fingerprint),
+                        configuration: config.fingerprint, backend: selected)
+                }, diagnostics: { events.append($0) })
+            try await model.prepareExecution()
+            let golden = events.values.filter { $0["stage"] == "self-test" }
+            XCTAssertEqual(golden.count, 4)
+            XCTAssertTrue(golden.allSatisfy { $0["result"] == "passed" })
+            configurations.append(["requested": backend.rawValue, "selfTests": golden])
+        }
+        try p9WriteEvidence("model-execution.json", ["schemaVersion": 1, "policyID": policy.id,
+            "modelSHA256": policy.modelSHA256, "fingerprintVersion": policy.fingerprintVersion,
+            "selfTestManifestSHA256": policy.selfTestManifestSHA256, "configurations": configurations,
+            "hardwareClaim": "requested configurations; physical processor assignment not inferred"])
+    }
+
     func testBundledApprovedConfigurationAndExactModel() throws {
         let root = try DedupConfiguration.bundledResourceDirectory()
         let configuration = try DedupConfiguration.loadValidated(resourceDirectory: root)
+        XCTAssertEqual(configuration.fingerprint.modelSHA256, "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0")
         XCTAssertEqual(configuration.threshold, 0.98)
         XCTAssertEqual(configuration.resources.maxDecodedBytes, 536870912)
         XCTAssertEqual(CoreMLFingerprinter.packageSHA256(root.appendingPathComponent("SSCDLarge.mlpackage")), configuration.fingerprint.modelSHA256)
@@ -92,7 +120,7 @@ extension AdvancedDedupRegressionTests {
         let used = Set(truth.flatMap { [$0["query"] as! String] + ($0["candidates"] as! [String]) })
         XCTAssertEqual(used.count, 42)
         let coldStart = ProcessInfo.processInfo.systemUptime
-        let model = try CoreMLFingerprinter(modelURL: root.appendingPathComponent("SSCDLarge.mlpackage"), configuration: config.fingerprint)
+        let model = try p12ProductModel(root: root, configuration: config.fingerprint)
         let loadMS = (ProcessInfo.processInfo.systemUptime - coldStart) * 1000
         var vectors = [String: Fingerprint](), sizes = [String: PixelSize](), timings = [Double]()
         var inputs = [[String: Any]]()
@@ -218,7 +246,7 @@ extension AdvancedDedupRegressionTests {
         try await store.markSkipped(fileID: legacyID, reason: .suspectedDuplicate, candidates: [])
         let initialHash = try p9Hash(legacyURL)
         let resources = try DedupConfiguration.bundledResourceDirectory()
-        let model = P9MeasuredModel(try CoreMLFingerprinter(modelURL: resources.appendingPathComponent("SSCDLarge.mlpackage"), configuration: c.fingerprint))
+        let model = P9MeasuredModel(try p12ProductModel(root: resources, configuration: c.fingerprint))
         let photos = P9FixturePhotos(image: a, budget: budget)
         let holder = P9GraphHolder(), logger = try RunLogger(directory: root.appendingPathComponent("Logs"))
         let runtime = SyncRuntime(store: store, executor: executor, advancedFactory: { store, executor, directory, now, _ in
@@ -409,7 +437,7 @@ extension AdvancedDedupRegressionTests {
         defer { withExtendedLifetime(store) { metrics.stop() } }
         let sourceID = try await store.registerSource(url: source)
         let image = try p9Image(style: 1)
-        let model = P9MeasuredModel(try CoreMLFingerprinter(modelURL: resources.appendingPathComponent("SSCDLarge.mlpackage"), configuration: c.fingerprint))
+        let model = P9MeasuredModel(try p12ProductModel(root: resources, configuration: c.fingerprint))
         let seed = try await model.fingerprint(image: image, orientation: .up)
         if historyCount > 0 {
             let historicalRoot = root.appendingPathComponent("retired-source")
@@ -954,4 +982,16 @@ private func p11StopRowAudit(_ db: URL) throws {
     try injectEngineSQL(p11AuditedTables.flatMap { table in
         ["INSERT", "UPDATE", "DELETE"].map { "DROP TRIGGER p11_\(table)_\($0);" }
     }.joined() + "DROP TABLE p11_writes;", at: db)
+}
+
+private func p12ProductModel(root: URL, configuration: FingerprintConfiguration) throws -> CoreMLFingerprinter {
+    let policy = try ModelExecutionPolicy.loadValidated(resourceDirectory: root)
+    return try CoreMLFingerprinter(modelURL: root.appendingPathComponent("SSCDLarge.mlpackage"), configuration: configuration,
+        policy: policy, selfTest: ModelSelfTest.loadValidated(resourceDirectory: root, policy: policy))
+}
+
+private final class P12NativeEvents: @unchecked Sendable {
+    private let lock = NSLock(); private var entries: [[String: String]] = []
+    func append(_ item: [String: String]) { lock.lock(); entries.append(item); lock.unlock() }
+    var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return entries }
 }

@@ -18,6 +18,7 @@ shift
 DATASET=''
 PROFILE=''
 case "$COMMAND" in
+  validate-execution) LIST_FLAG=--dataset ;;
   fingerprint) LIST_FLAG=--input-list ;;
   compare-tensors) LIST_FLAG=--tensor-list ;;
   score-batch) LIST_FLAG=--input ;;
@@ -34,6 +35,7 @@ while (( $# )); do
   shift
   case "$FLAG" in
     --profile|--output-dir|"$LIST_FLAG") ;;
+    --resources) [[ "$COMMAND" == validate-execution ]] || exit 2 ;;
     --model)
       [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors ||
          "$COMMAND" == evaluate || "$COMMAND" == combined-benchmark ]] || exit 2 ;;
@@ -61,6 +63,7 @@ while (( $# )); do
   shift
 done
 REQUIRED_FLAGS=(--profile --output-dir)
+if [[ "$COMMAND" == validate-execution ]]; then REQUIRED_FLAGS=(--resources --dataset --output-dir); fi
 if [[ "$COMMAND" != validate-profile ]]; then REQUIRED_FLAGS+=("$LIST_FLAG"); fi
 if [[ "$COMMAND" == fingerprint || "$COMMAND" == compare-tensors || "$COMMAND" == evaluate ]]; then
   REQUIRED_FLAGS+=(--model)
@@ -88,6 +91,9 @@ from pathlib import Path
 import sys
 
 root, path, profile_path, command = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+if command == "validate-execution":
+    print('{}')
+    sys.exit(0)
 spec = importlib.util.spec_from_file_location("advanced_dedup_research", root / "scripts/advanced-dedup/research.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

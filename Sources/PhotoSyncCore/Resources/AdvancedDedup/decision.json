@@ -1,117 +1,67 @@
 {
-  "schemaVersion": 1,
-  "date": "2026-10-05",
+  "activeSuite": {
+    "caseCount": 33,
+    "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
+    "humanReviewSHA256": "5db705debe0ca4c139f5d89c4e360456553d2bd8155105637349d749095177a7",
+    "imageCount": 42,
+    "manifestSHA256": "1d0999497eac360bc2d09215e8cbb2f0ee0156d5a24ea28f6a5608bb37a5a0ea",
+    "revision": "2026-10-04-no-information-panels",
+    "sha256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23"
+  },
   "basis": "explicit_user_selected_threshold",
-  "userInstruction": "我觉得不用搞了，搞多了容易过拟合，先定 0.98 推进后续流程，后面生产中根据实际情况可以在动这个参数。你来把研究验证阶段收尾。然后看看产品集成计划有没有需要调整的，有的话就改。",
-  "decision": "close_research_and_select_configuration_for_integration",
-  "selectedThreshold": 0.98,
   "comparison": "score >= threshold",
   "configuration": {
+    "backend": "sqlite-exact-f32-v1",
+    "computeUnits": "fp16-ane-gpu-v1",
+    "evidenceCandidateLimit": 200000,
     "fingerprint": {
-      "version": "d7412709d47be7d1f56529adda4956f555feafd86843ca38f408a8dda87dacf6",
-      "modelSHA256": "c0cb378982abd1bd775d377d4dfd66ac3469bce894d0834ed69c3c778fb3c9b3",
-      "inputSide": 320,
-      "resizeMode": "stretchFullFrame",
       "colorSpace": "sRGB",
+      "inputSide": 320,
       "mean": [
         0.485,
         0.456,
         0.406
       ],
+      "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+      "resizeMode": "stretchFullFrame",
       "std": [
         0.229,
         0.224,
         0.225
-      ]
+      ],
+      "version": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
     },
-    "policyVersion": "5349c094e1ace02c494fe258233a1986d2b42125b263ec41a0250a02d3d7be7a",
-    "backend": "sqlite-exact-f32-v1",
-    "computeUnits": "cpuOnly",
-    "weightPrecision": "float32",
+    "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
     "resources": {
+      "batchSize": 1,
+      "catalogBatchSize": 128,
       "decodeConcurrency": 1,
-      "photoRequestConcurrency": 1,
+      "inferenceConcurrency": 1,
       "maxDecodedBytes": 536870912,
+      "maxInFlightTasks": 2,
+      "photoRequestConcurrency": 1,
+      "progressPublishIntervalSeconds": 1,
       "requestTimeoutSeconds": 30,
       "retryDelaysSeconds": [
         5,
         15,
         30,
         60
-      ],
-      "catalogBatchSize": 128,
-      "maxInFlightTasks": 2,
-      "progressPublishIntervalSeconds": 1,
-      "inferenceConcurrency": 1,
-      "batchSize": 1
+      ]
     },
-    "evidenceCandidateLimit": 200000
+    "weightPrecision": "float16"
   },
-  "activeSuite": {
-    "revision": "2026-10-04-no-information-panels",
-    "sha256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
-    "caseCount": 33,
-    "imageCount": 42,
-    "manifestSHA256": "1d0999497eac360bc2d09215e8cbb2f0ee0156d5a24ea28f6a5608bb37a5a0ea",
-    "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
-    "humanReviewSHA256": "5db705debe0ca4c139f5d89c4e360456553d2bd8155105637349d749095177a7"
-  },
-  "researchDisposition": {
-    "independentCalibration": "not_performed; further work declined by user",
-    "sealedStatisticalAccuracy": "not_performed; no quantitative risk guarantee",
-    "real100kAssetPerformance": "not_performed; synthetic engineering baseline only",
-    "historicalProtocolSHA256": "ea0060bb4839fe25f3fe30f781c4c51470adad19ed684cc6630ef05d8be25ae8",
-    "historicalStatisticalPass": false
-  },
-  "nextStage": "product integration using this fixed configuration; this request revises the plan without executing product tasks",
-  "futureThresholdChanges": "explicit versioned configuration changes informed by production evidence; reuse unchanged fingerprints, invalidate old decisions; never automatically tune from scores",
-  "unchangedBoundaries": [
-    "source read-only",
-    "Photos additive-only",
-    "preserve successful import and unknown submission history",
-    "no product human-review queue",
-    "distribution rights and targeted system verification are separate from threshold selection"
+  "date": "2026-10-06",
+  "decision": "close_research_and_select_configuration_for_integration",
+  "executionPolicySHA256": "03e34635df8a05e5b9e7d519dc4c1a0577a8f83ea771e237d2b085c9eb11e90e",
+  "platformLimitations": [
+    "macOS13 Apple Silicon physical validation unavailable",
+    "Intel physical execution excluded"
   ],
-  "resourcePolicyAmendment": {
-    "date": "2026-10-05",
-    "basis": "explicit_user_selected_resource_policy",
-    "maxDecodedBytes": 536870912,
-    "oversizeSourceOutcome": "confirmed_readable_supported_source_import_original_without_comparison",
-    "reason": "decodedResourceLimit",
-    "content": "notCompared",
-    "transientOccupancyOrCancellation": "waiting",
-    "corruptUnknownOrReadFailure": "typed_error_or_waiting_never_conservative_import",
-    "fingerprintPipelineAndThreshold": "unchanged_original_pixels_common_R2_cpuOnly_FP32_score_gte_0.98",
-    "policyIdentity": "unchanged_by_established_computePolicyVersion_definition_fingerprint_threshold_backend_coverage_rule",
-    "priorRecordSHA256": {
-      "integration-decision.json": "5bb2dfe6cdd3b52dd3e84be3d57ae2d992521b06da871c3afc2675204ef7e926",
-      "integration-profile.json": "10a98218d0b7b5b1ea7be01d057be26c33da0c088e68e07ccd97d5843dc52404",
-      "2026-10-05-threshold-098-regression.json": "a61f1e9485a56e4d3bdad2505aa060960e15ccdf235002ccf49af40552e75724",
-      "research-closeout.json": "d7b642888a6f12b58dd9bd2076b4fc3048f9ca93803e05c457ab31e50b2229c5"
-    },
-    "priorSourceCommit": "1c77ef1d991f36d16ca0fcfde1d1b3cf73a92238",
-    "resourceMeasurements": "historical_controlled_generated_sources_in_task-4-report.md_and_work/P4-fix1-20261005_not_full_app_acceptance"
-  },
-  "sqliteQueryAmendment": {
-    "date": "2026-10-06",
-    "basis": "explicit_user_authorized_sqlite_query_and_photos_delta_implementation",
-    "userInstruction": "可以，定为使用 sqlite 方案。如果还有什么要调研的你继续调研，觉得差不多了就可以更新 plan 了，完成 sqlite 和 Photos 按变化更新索引两项改进。",
-    "implementationChoice": "system SQLite + Accelerate single cursor bridge; controller choice based on final production-query-probe, not a verbatim user C-bridge instruction; no sqlite-vec dependency",
-    "priorBackend": "exact-f32-v1",
-    "backend": "sqlite-exact-f32-v1",
-    "priorPolicyVersion": "42a811d97844de4a0e2223060178ee1136ef74775a31d2d12a56f9007eff6570",
-    "policyVersion": "5349c094e1ace02c494fe258233a1986d2b42125b263ec41a0250a02d3d7be7a",
-    "fingerprintModelThresholdAndTruth": "unchanged",
-    "priorSourceCommit": "e62e3ae",
-    "productBaselineCommit": "9186766",
-    "priorRecordSHA256": {
-      "integration-decision.json": "62cf88379adb7a1ff752b3e29d7a3a36ffdb5522f85c954d5dbae6eb3e3628da",
-      "integration-profile.json": "ca6250e3bcca3850b4b1d05279ad4feb4e9f02615aa30d03fc354dc54870e857",
-      "2026-10-05-threshold-098-regression.json": "c30e33331aa73a0e574c13d1648db2b2f65a7318023888db3c0a07b42ba4e5b6",
-      "research-closeout.json": "a1815f2ba03887968ea6274b389f7011fb4c310b0205d40919e85740777e7278"
-    },
-    "probeEvidence": "work/backend-validation-20261006/production-query-probe/report.md",
-    "probeReportSHA256": "223288840b8904934a6320ff2bbe228442d58656b4453b8e6b891e77b5af5a65",
-    "knownPerformanceLimit": "300k prototype hot P95 477.9 ms exceeds unchanged 250 ms target; not a performance pass; final scale/idle acceptance deferred until P11 integration"
-  }
+  "priorDecisionSHA256": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
+  "realPhotosValidation": "not performed in P12",
+  "schemaVersion": 1,
+  "selectedThreshold": 0.98,
+  "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+  "userInstruction": "Approved option A: FP16, ANE-first with one serialized GPU fallback; retain threshold 0.98 and Float32 pipeline."
 }

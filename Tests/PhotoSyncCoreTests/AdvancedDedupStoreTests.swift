@@ -5,6 +5,30 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testOldSuccessfulFingerprintVersionIsRetainedAndNotSilentlyIgnored() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let old = try await prepared(store, source, root, "old-success.jpg", version: "old")
+        let attempt = UUID(); try await store.beginAttempt(fileID: old.fileID, attemptID: attempt)
+        try await store.markImported(fileID: old.fileID, attemptID: attempt, identifier: "retained", sourceFingerprint: old)
+        let incoming = try await prepared(store, source, root, "incoming.jpg")
+        try await publishEmpty(store)
+        let token = try await unwrap(try await store.indexReadiness()).token
+        let bytes = try Data(contentsOf: db)
+        let accepted = try await store.beginAdvancedAttempt(admission(store, incoming), attemptID: UUID())
+        XCTAssertFalse(accepted, "Durable admission must independently block unsupported success history")
+        do {
+            _ = try await store.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10)
+            XCTFail("Old success cannot disappear from comparison")
+        } catch is ModelExecutionUnavailable { }
+        XCTAssertEqual(try Data(contentsOf: db), bytes)
+        let fact = try await store.file(sourceID: source, relativePath: old.file.relativePath)
+        XCTAssertEqual(fact?.successID, "retained"); XCTAssertEqual(fact?.state, .imported)
+        let held = try await store.fingerprint(fileID: old.fileID, stamp: old.file.stamp, version: "old")
+        XCTAssertEqual(held, old.fingerprint)
+    }
+
     func testSQLiteStepFailureDiscardsHitsAndFinalizesReadSnapshot() async throws {
         let (root, db, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1177,10 +1201,9 @@ final class AdvancedDedupStoreTests: XCTestCase {
     }
     private func configurationFiles() throws -> URL {
         let root = try temporaryDirectory()
-        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let research = repository.appendingPathComponent("docs/research/advanced-dedup")
-        for (from, to) in [("integration-decision.json", "decision.json"), ("integration-profile.json", "profile.json"), ("2026-10-05-threshold-098-regression.json", "regression.json"), ("research-closeout.json", "closeout.json")] {
-            try FileManager.default.copyItem(at: research.appendingPathComponent(from), to: root.appendingPathComponent(to))
+        let resources = try DedupConfiguration.bundledResourceDirectory()
+        for name in ["decision.json", "profile.json", "regression.json", "closeout.json", "execution-policy.json", "ModelSelfTest"] {
+            try FileManager.default.copyItem(at: resources.appendingPathComponent(name), to: root.appendingPathComponent(name))
         }
         return root
     }

@@ -1,0 +1,10 @@
+{
+  "filter": "lfs",
+  "localObjectVerified": true,
+  "networkAction": "none",
+  "objectLocation": "existing repository LocalMediaDir; absolute local path intentionally omitted",
+  "oidSHA256": "be1b28a5be24ca216884b6a04db291f58bd484328ac5307f9577fd27295cb338",
+  "resource": "Sources/PhotoSyncCore/Resources/AdvancedDedup/SSCDLarge.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+  "selectedPackageSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+  "size": 88329408
+}

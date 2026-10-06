@@ -68,13 +68,14 @@ def main() -> None:
         parser.error("output already exists; refusing to overwrite")
     import torch
     import coremltools as ct
+    import numpy as np
 
     torch.set_num_threads(4)
     model = torch.jit.load(str(args.weights), map_location="cpu").eval()
     converted = ct.convert(
         model,
-        inputs=[ct.TensorType(name="image", shape=(1, 3, 320, 320))],
-        outputs=[ct.TensorType(name="embedding")],
+        inputs=[ct.TensorType(name="image", shape=(1, 3, 320, 320), dtype=np.float32)],
+        outputs=[ct.TensorType(name="embedding", dtype=np.float32)],
         convert_to="mlprogram",
         compute_precision=ct.precision.FLOAT16 if args.precision == "float16" else ct.precision.FLOAT32,
         minimum_deployment_target=ct.target.macOS13,
