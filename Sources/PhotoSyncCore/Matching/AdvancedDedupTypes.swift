@@ -342,7 +342,10 @@ public struct RepresentationTask: Codable, Equatable, Sendable {
     public let retryCount: Int
     public let nextRetryAt: Date?
     public let fingerprintVersion: String
-    /// Store-issued generation prevents a late completion from crossing a reconciliation boundary.
+    /// Persistent task issuance, changed only when this task is replaced, not the
+    /// current global publication generation. Unchanged tasks may complete across
+    /// later reconciliations if their persisted identity and full descriptor still
+    /// match; replaced tasks reject late results even when revision strings match.
     public let indexGeneration: Int64
     public init(descriptor: RepresentationDescriptor, retryCount: Int, nextRetryAt: Date?,
                 fingerprintVersion: String, indexGeneration: Int64) {

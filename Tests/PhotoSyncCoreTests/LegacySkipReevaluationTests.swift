@@ -216,7 +216,10 @@ final class LegacySkipReevaluationTests: XCTestCase {
     func testExistingV4MigrationPreservesRowsAndRecheckProgress() async throws {
         let f = try Fixture(); defer { f.clean() }
         let source = try await f.source("active"), id = try await f.skip(source, "old.jpg")
+        // Reconstruct the supported older v4 shape, not a damaged current v5 store.
         try injectEngineSQL("""
+            PRAGMA user_version = 4;
+            DROP TABLE photos_index_exclusion;
             DROP INDEX file_recheck_retry;
             ALTER TABLE file_record DROP COLUMN recheck_policy_version;
             ALTER TABLE file_record DROP COLUMN recheck_retry_count;
@@ -225,10 +228,16 @@ final class LegacySkipReevaluationTests: XCTestCase {
             INSERT INTO dedup_recheck_progress VALUES ('target',1,1);
             """, at: f.db)
         let migrated = try SyncStore(url: f.db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: f.db), 5)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_index_exclusion", at: f.db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('file_record') WHERE name IN ('recheck_policy_version','recheck_retry_count','recheck_next_retry_at')", at: f.db), 3)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='file_recheck_retry'", at: f.db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_recheck_progress WHERE target_policy_version='target' AND cursor=1 AND complete=1 AND revision=0", at: f.db), 1)
+        let preserved = try await migrated.state(of: id); XCTAssertEqual(preserved, .skipped)
         let worker = LegacySkipReevaluation(store: migrated, stamp: { $0.stamp }, policyVersion: "target", retryDelaysSeconds: [5])
         let count = try await worker.processBatch(limit: 1); XCTAssertEqual(count, 1)
         let state = try await migrated.state(of: id); XCTAssertEqual(state, .pending)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: f.db), 4)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: f.db), 5)
     }
 
     func testRevisionOverflowRollsBackItemAndSourceRequeue() async throws {

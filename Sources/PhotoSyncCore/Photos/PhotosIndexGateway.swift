@@ -8,6 +8,14 @@ public enum PhotosIndexChange: Equatable, Sendable {
     case contextInvalidated
 }
 
+/// One complete change interval in a single library context, continuous from the
+/// caller's inventory generation to `toGeneration > fromGeneration`. ID arrays
+/// contain unique, nonempty, disjoint IDs: changed IDs require inventory inspection;
+/// deleted IDs require affirmative deletion evidence, never a missing fetch result.
+/// Both arrays may be empty for a valid advancing interval. Emit the whole interval,
+/// not independent batches; exceed `catalogBatchSize`, lose continuity or lack a
+/// complete baseline and emit full/context invalidation instead. Subscribers may
+/// receive the same interval more than once; duplicate delivery adds no new facts.
 public struct PhotosIndexDelta: Equatable, Sendable {
     public let context: LibraryContext
     public let fromGeneration: Int
@@ -36,6 +44,9 @@ public struct RepresentationPage: Equatable, Sendable {
     public let descriptors: [RepresentationDescriptor]
     public let nextOffset: Int?
     public let exclusions: [RepresentationCatalogExclusion]
+    /// Assets whose cached content must be invalidated even when descriptor revisions
+    /// match. Delta pages restrict these IDs to the delta's changed IDs; merely being
+    /// in changedAssetIDs does not itself establish same-revision content validity.
     public let invalidatedAssetIDs: [String]
     public let invalidateAllCachedRepresentations: Bool
     public init(context: LibraryContext, generation: Int, descriptors: [RepresentationDescriptor], nextOffset: Int?, exclusions: [RepresentationCatalogExclusion] = [],
@@ -47,12 +58,29 @@ public struct RepresentationPage: Equatable, Sendable {
 
 public protocol PhotosIndexGateway: PhotosGateway {
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage
+    /// Fetch only changed IDs and return their COMPLETE representation eligibility
+    /// inventory at delta.context/toGeneration: all eligible descriptors (including
+    /// unchanged original/current slots) plus confirmed exclusions. Returning only
+    /// the edited slot would remove an omitted original from the candidate inventory.
+    /// Every changed ID must be accounted for; keys are unique, nextOffset is nil,
+    /// and descriptors + exclusions fit catalogBatchSize. Deletions come exclusively
+    /// from delta.deletedAssetIDs, not omitted/unknown/unavailable fetch results.
+    /// Supply invalidatedAssetIDs whenever matching revisions cannot prove content
+    /// unchanged. Unknown scope, incomplete/oversized results, pagination, or context/
+    /// generation drift must throw for caller-owned full reconciliation; do not turn
+    /// uncertainty into exclusion/deletion or set invalidateAllCachedRepresentations
+    /// as a usable incremental result. This fetch neither persists a checkpoint nor
+    /// acknowledges readiness: the caller captures an optional checkpoint beforehand,
+    /// commits same-generation facts/checkpoint atomically, then publishes and calls
+    /// acknowledgeReconciliation only after those facts are complete and ready.
     func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage
     func changes() -> AsyncStream<PhotosIndexChange>
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation
-    /// Capture BEFORE catalog/snapshot acquisition, persist only alongside a
-    /// successful reconciliation of that same generation. Replay is continuity
-    /// evidence, never a stable physical-library identity or an index-ready flag.
+    /// Capture BEFORE catalog/delta/snapshot acquisition; nil means no resumable
+    /// checkpoint is available. The caller persists a nonnil value only alongside
+    /// successful inventory facts of its captured context and Photos generation.
+    /// Replay is continuity evidence, never a stable physical-library identity or
+    /// an index-ready flag. Fetching facts alone must not acknowledge reconciliation.
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint?
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool
     /// Call only after complete same-generation full/delta reconciliation, durable facts and
