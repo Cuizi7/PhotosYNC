@@ -37,6 +37,10 @@
 
 **Persistence decision:** 优先沿用表示 `state` 与非空 `vector` 分离：待验证设为不可查询状态但保留字节；task 的发行身份在真正替换时变更，无关对账不变。若有界变化集合需要新增持久表/字段，只能加到现有 SQLite，以事务迁移保留全部既有向量/成功历史，旧库撤销 publication 并重新建立覆盖证明；未知高版本继续拒绝。新增项须在编码前补入本计划的具体接口/迁移记录，说明为何已有表无法表示，不引入第二快照。未知区间不能靠默认“连续”字段升级成已证明连续。
 
+**实施前接口/迁移决定（2026-10-07）：** 当前 v5 的任务表不能可靠承载“通知尚未消费、描述尚未获取”的资产变化义务，故升至 v6，在同一个 SQLite 增加 `photos_content_change` 小表，按 `(context_id, context_epoch, asset_id)` 唯一记录内容待核验范围和覆盖代次。producer 将完整已知 ID 集合分批同步提交后才交付唤醒；大集合只升级清单核对，不升级全库内容失效。增加 `PhotosIndexGateway.attachIndexStore(_ store: SyncStore)`（兼容 fake 的默认 no-op）接线；稳定枚举接口为 `beginCatalogSession() -> PhotosCatalogSession`、`catalogPage(session:offset:limit:) -> RepresentationPage`、`catalogCoverage(session:) -> PhotosCatalogCoverage`，将基线身份与覆盖终点分开。最终签名随实际并发隔离加 `async throws`；旧适配方法仅作为显式保守兼容，不能绕过证据要求。
+
+迁移须事务化同步两份 schema，保留全部已有数据并撤销旧 publication；旧库没有 journal 不能证明连续。journal 还记录 changed/deleted/content 标志以归并成员变化，并以进程 UUID 区分 raw generation；旧进程记录在成功回放与完整核对前保守保留，绝不与新进程同值序号比较。恢复先保留旧义务，成功合并/覆盖后才删除对应范围。清单未完成、崩溃或日志写失败保持 fail-closed，不能提前确认 checkpoint。同步 journal 提交不得持 PhotoKit 状态锁或数据库锁等待另一个系统；旧 vector 不作为新 descriptor 的有效证据，必须通过待验证状态隔离。
+
 - [ ] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
 - [ ] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
 - [ ] **Step 3 — SQLite / coordinator。** 移除 generic full-reconcile 到全库 `vector=NULL` 的含义。保留已完成和待办事实、有效重试期限；未知表示留字节且不参与 publication。只有可靠删除/完整清单缺失才墓碑化。完整批次持久化后才确认 interval；每次 await 后复查相关有效性，最后用当前 context/index/covered endpoint 短 fence 发布。无关变化不使在途结果失效；已知相关/未知输入不 ready，物理结束后才释放。
