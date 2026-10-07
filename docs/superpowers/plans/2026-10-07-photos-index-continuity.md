@@ -37,13 +37,15 @@
 
 **Persistence decision:** 优先沿用表示 `state` 与非空 `vector` 分离：待验证设为不可查询状态但保留字节；task 的发行身份在真正替换时变更，无关对账不变。若有界变化集合需要新增持久表/字段，只能加到现有 SQLite，以事务迁移保留全部既有向量/成功历史，旧库撤销 publication 并重新建立覆盖证明；未知高版本继续拒绝。新增项须在编码前补入本计划的具体接口/迁移记录，说明为何已有表无法表示，不引入第二快照。未知区间不能靠默认“连续”字段升级成已证明连续。
 
-**实施前接口/迁移决定（2026-10-07）：** 当前 v5 的任务表不能可靠承载“通知尚未消费、描述尚未获取”的资产变化义务，故升至 v6，在同一个 SQLite 增加 `photos_content_change` 小表，按 `(context_id, context_epoch, asset_id)` 唯一记录内容待核验范围和覆盖代次。producer 将完整已知 ID 集合分批同步提交后才交付唤醒；大集合只升级清单核对，不升级全库内容失效。增加 `PhotosIndexGateway.attachIndexStore(_ store: SyncStore)`（兼容 fake 的默认 no-op）接线；稳定枚举接口为 `beginCatalogSession() -> PhotosCatalogSession`、`catalogPage(session:offset:limit:) -> RepresentationPage`、`catalogCoverage(session:) -> PhotosCatalogCoverage`，将基线身份与覆盖终点分开。最终签名随实际并发隔离加 `async throws`；旧适配方法仅作为显式保守兼容，不能绕过证据要求。
+**实施接口/迁移决定（2026-10-07）：** 当前 v5 的任务表不能可靠承载“通知尚未消费、描述尚未获取”的资产变化义务，故升至 v6，在同一个 SQLite 增加 `photos_content_change` 小表，按 `(context_id, context_epoch, run_id, asset_id)` 唯一记录内容待核验范围和覆盖代次。producer 将完整已知 ID 集合分批同步提交后才交付唤醒；大集合只升级清单核对，不升级全库内容失效。增加 `PhotosIndexGateway.attachIndexStore(_ store: SyncStore)`（兼容 fake 的默认 no-op）接线；最终稳定枚举接口为 `beginCatalogSession(expectedGeneration:) async throws -> PhotosCatalogSession`、`representationCatalog(session:offset:limit:) async throws -> RepresentationPage`、`catalogCoverage(session:) async throws -> Int`，将基线身份与覆盖终点分开；`catalogChanges(baselineGeneration:throughGeneration:afterAssetID:limit:)` 返回有界变化批次。`acknowledgeInventory(expectedGeneration:)` 仅确认已落库清单，`acknowledgeReconciliation` 仍拥有最终 ready 屏障。旧适配方法仅作为显式保守兼容，不能绕过证据要求。
 
 迁移须事务化同步两份 schema，保留全部已有数据并撤销旧 publication；旧库没有 journal 不能证明连续。journal 还记录 changed/deleted/content 标志以归并成员变化，并以进程 UUID 区分 raw generation；旧进程记录在成功回放与完整核对前保守保留，绝不与新进程同值序号比较。恢复先保留旧义务，成功合并/覆盖后才删除对应范围。清单未完成、崩溃或日志写失败保持 fail-closed，不能提前确认 checkpoint。同步 journal 提交不得持 PhotoKit 状态锁或数据库锁等待另一个系统；旧 vector 不作为新 descriptor 的有效证据，必须通过待验证状态隔离。
 
 metadata 中性更新仍可能改变含修改日期的 descriptor revision，不修改原摘要算法来制造全库版本变化。页级 `inputUnchangedAssetIDs` 必须来自 producer 的内容连续性和输入事实核验；仅此证据可在同一任务发行身份下更新描述 revision 并保留向量/期限。v6 为 `fingerprint_task` 增加 `issuance_revision`，旧记录以原 revision 为发行修订；`RepresentationTask.issuanceRevision` 带回不可变发行信息，完成时仍检查上下文、发行代次/修订、尺寸、等价关系和指纹版本。真正输入变化、删除重插或旧未知义务须更换发行身份，不能用后来的中性变化覆盖。
 
 会话采用明确 `PhotosCatalogSession` UUID 与 baselineGeneration，绑定当前图库上下文；即使 raw generation 相同，重开后旧 UUID 也失效。分批增量用 `PhotosIndexDeltaBatch` 表达完整 interval 和 offset/count，复用 `dedup_index_state.reconcile_cursor` 保存区间摘要及下一批游标，拒绝跳批/重复批/跨区间拼接，最后批之前不推进历史检查点。迁移引起的 `StoreTests.swift`、`LegacySkipReevaluationTests.swift` 固定版本/未来版本断言纳入 Task 1，限当前 schema 契约，不改无关行为。
+
+历史检查点与已覆盖 observer endpoint 是两个事实：整轮完整核对保存读取前捕获的保守 token，不能在归并结束后替换为 `currentChangeToken`。增量只覆盖局部资产，保留已有 durable token，不用本批读取前的新 token 越过无关资产的未送达通知；下一次完整核对再推进。完整核对中，基线前已转为待验证任务的未知义务不妨碍读取其后的完整已分类归并页，但不能提前解除验证，也不能放宽普通增量或基线后的未知事件检查。
 
 - [ ] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
 - [ ] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
@@ -60,4 +62,4 @@ metadata 中性更新仍可能改变含修改日期的 descriptor revision，不
 - [ ] **Step 1 — 一次深度审阅。** 对整个 Task 1 跨层差异做 spec+quality 审阅，特别检查上述五项风险、可信证据来源及存储候选 SQL；此审阅同时是该单一实施任务的最终集成审阅。只对后续修复差异复审，不重复同等门槛。
 - [ ] **Step 2 — 最终 canonical。** tester 在最后行为/测试快照运行 `python3 scripts/validate.py --output-dir "$PWD/work/validation-index-continuity-<unique>" --derived-data "$PWD/work/validation-index-continuity-<unique>-derived"`，保留完整 XCTest/Tools/实际模型/四档规模/竞态验证及前后源码身份。正常 Universal build 只在 canonical 未覆盖时补一次；不运行 Intel/Rosetta。若测试失败，定位修复后重新完成受影响门槛，不能跳过失败。
 - [ ] **Step 3 — 文档收口。** 记录实现提交、测试命令/结果、核对/复用/待验证/重算口径、证据与缺口；旧性能和真实失败原样保留。同步旧集成计划末尾到本计划，避免重跑已完成 P1–P14。
-- [ ] **Step 4 — 准备恢复真实只读验收。** 新实现需重建只读宿主、绑定新哈希、重新审阅读写边界后才能沿用既有授权继续；旧 READY/hash 不批准新二进制。先验证通知分类和索引收敛，完整 ready 后才 MobileBackup 扫描/盲审。真实验收单列结果，不以自动测试代替；不扩为写入验收。
+- [ ] **Step 4 — 准备恢复真实只读验收。** 新实现需重建只读宿主、绑定新哈希、重新审阅读写边界后才能沿用既有授权继续；旧 READY/hash 不批准新二进制。新宿主使用独立私有 run 目录，保留旧证据。Readonly wrapper 须显式转发 `attachIndexStore`、会话/覆盖/有界变化/清单确认接口，禁止因兼容默认 no-op 而静默绕过真实接线；生产 gateway 的 diagnostics 也接入私有轮转日志。构建核对 Core 的准确源码/二进制 SHA，不能直接拷贝旧 DerivedData 宣称新版本。先验证通知分类和索引收敛，完整 ready 后才 MobileBackup 扫描/盲审。真实验收单列结果，不以自动测试代替；不扩为写入验收。
