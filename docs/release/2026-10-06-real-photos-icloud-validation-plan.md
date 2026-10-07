@@ -10,7 +10,7 @@
 
 **Spec:** [高级判重 spec](../superpowers/specs/2026-09-28-photosync-0.2.0-advanced-dedup-design.md) §7.1、§7.4；[运行时契约](../specs/2026-09-18-runtime-state-and-recovery.md)；[历史系统验收](../../Design/Validation.md)。
 
-**状态：计划已按用户新约束修订，未执行。** 用户已授权本机生产图库用于测试，明确“先只读、最后写入、有防御、写后恢复原状”；不再要求独立账号或另一个图库，也不重复询问是否允许使用生产图库。具体路径、资产和运行基线在 V1 记录。实现基线 `bc27a425e2c7b6f1913c7f895104d35e57ddbd96` 已通过自动验收，详情见[当前验收记录](0.2.0-advanced-dedup-validation.md)。本轮仅改计划，不开始测试。
+**状态：V3-MB 已恢复至首批检查点，因重复核对／读取问题暂停后续批次；写入阶段未开启。** 用户已授权本机生产图库用于测试，明确“先只读、最后写入、有防御、写后恢复原状”；不再要求独立账号或另一个图库，也不重复询问是否允许使用生产图库。首次尝试使用 `bc27a425`，中断后按用户批准的设计完成连续性修复；当前恢复使用冻结代码 `387194748dd7e59aa3738a495ce272703d874be0` 和新只读宿主，自动验收见[连续性验证记录](2026-10-07-photos-index-continuity-validation.md)。历史结果与本次实测分开记录。
 
 **2026-10-07 新增执行授权：** 用户指定 `/Volumes/home/Photos/MobileBackup/`，要求用真实 Photos 建指纹库、扫描该目录并进行 metadata＋子代理看图的双向校验。当前开始执行下方 **V3-MB 只读内容评估**及其必要的只读准备；V4/V5 写入与清理仍未执行。此前“未执行”描述保留为 10 月 6 日状态，不覆盖此项新授权。
 
@@ -107,13 +107,13 @@
 
 ### Task V3-MB：MobileBackup 对真实 Photos 的双向内容评估（2026-10-07）
 
-**当前阻塞（10 月 7 日实测）：** Photos 清单及 ANE 数值自检通过，但两张不同资产首次取图时均出现 generation 增长／fullReconcileRequired，正常退出后重试仅取得 1 / 15,914 条指纹。尚无完整 ready token，MB3 及双向视觉校验不能开始；先定位原始 PhotoKit changeDetails／候选状态回退分支，不放松完整性门槛。详情见 `docs/research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md`。
+**首次尝试的阻塞（10 月 7 日实测）：** Photos 清单及 ANE 数值自检通过，但两张不同资产首次取图时均出现 generation 增长／fullReconcileRequired，正常退出后重试仅取得 1 / 15,914 条指纹。该旧运行没有完整 ready token，也没有 MB3 或双向视觉校验结果。保留原始记录，新运行须证明实际通知分类和完整索引收敛，不能用自动测试代替真实复验。详情见 `docs/research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md`。
 
-**10 月 7 日设计修订：** 用户要求将全量清单核对与指纹失效分离，权威要求见 spec §4.1–4.4。该修订尚未实施；原 QA／产品快照和单张成功不能替代新验收。继续 MB2 前，先在受控环境验证“保留向量但关闭 publication”和变化分类，再在本机只读宿主中记录原始 PhotoKit 详情与实际回退原因，证明真实通知被正确处理。不得忽略 observer、将修改时间相同当内容不变，或允许部分索引产生判不重结论。
+**10 月 7 日设计修订：** 用户要求将全量清单核对与指纹失效分离，权威要求见 spec §4.1–4.4。修订已实施，受控验证和完整自动验收通过，冻结代码为 `3871947`。继续 MB2 时，在本机新只读宿主中记录原始 PhotoKit 详情与实际回退原因，证明真实通知被正确处理。不得忽略 observer、将修改时间相同当内容不变，或允许部分索引产生判不重结论。
 
 **Goal / scope:** 仅对用户指定根目录递归只读扫描，以当前真实 Photos 中的 original/current 表示为候选，验证当前 FP16/0.98 内容判重。保留源目录只读、不跟随符号链接、独立 QA 数据、隐私及物理额度约束；本项不构建任何创建/编辑/删除入口，也不要求先实现未来写入/回退工具。用户明确要求本项测试，可在安全检查后直接执行。
 
-**Files:** 私有清单、Photos 清单/指纹数据库、决定及抽样记录、只读宿主/fake 测试与临时预览均在 `work/real-photos-icloud/20261007-mobilebackup/`；公开交付只保存脱敏汇总 `docs/release/2026-10-07-mobilebackup-readonly-validation.md`。源照片和私人图库图像、向量、路径/资产 ID 不进入 Git 或公开测试集。
+**Files:** 旧运行及已冻结的独立抽样保留在 `work/real-photos-icloud/20261007-mobilebackup/`；新运行的清单、Photos 指纹数据库、决定、宿主和预览放在 `work/real-photos-icloud/20261007-continuity-resume/`。恢复前核对来源清单未变并在新 scope 中绑定原抽样，不能静默替换样本或复用旧 partial vector。公开交付只保存脱敏汇总 `docs/release/2026-10-07-mobilebackup-readonly-validation.md`。源照片和私人图库图像、向量、路径/资产 ID 不进入 Git 或公开测试集。
 
 **测量口径：** 本项评估 **MobileBackup → Photos** 的内容识别，图库候选仅为 Photos 表示。目录中先扫描的照片不能成为后扫描照片的唯一本地命中而被算成 Photos 重复，生产成功历史也不能掩盖当前图库的内容漏检。因此使用全新 QA 研究库；不得把这个不含生产历史的内容评估说成完整导入准入或 `would_import` 通过。模型、ImageIO 预处理、归一化、Float32 精确评分、阈值及尺寸策略复用当前产品，不改产品 API/算法。
 
@@ -169,6 +169,18 @@ PhotoKit 目标尺寸、进度或返回长度不能证明固定下载字节；�
 
 初次只读尝试及中断事实见 [MobileBackup 实测](../research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md)。其后失效设计已按用户要求实施，冻结 `3871947`，完整自动验收通过；[当前验收记录](2026-10-07-photos-index-continuity-validation.md)包含源码/测试身份及性能边界。
 
-替换宿主位于私有 `work/real-photos-icloud/20261007-continuity-resume/`，源码审查、精确 archive 构建、38 项哈希核验、私有签名及 fake-only 自测通过。所有 17 个索引协议接口显式转发，特别是同库 journal 接线、UUID 会话/归并、两级确认和持久历史覆盖；producer 诊断进入私有日志。旧源码/二进制/日志/数据没有覆盖，新宿主未创建 READY，未执行真实读取。
+替换宿主位于私有 `work/real-photos-icloud/20261007-continuity-resume/`，源码审查、精确 archive 构建、38 项哈希核验、私有签名及 fake-only 自测通过。所有 17 个索引协议接口显式转发，特别是同库 journal 接线、UUID 会话/归并、两级确认和持久历史覆盖；producer 诊断进入私有日志。旧源码/二进制/日志/数据没有覆盖；离线准备完成时没有创建 READY 或执行真实读取。
 
-恢复时先核对该目录 `offline-build-report.md`、`host-review.md`、源码/Core/宿主哈希与现有范围文件，再按已授权只读阶段建立新执行门闩和运行绑定。新 bundle identity 为 `com.photosync.qa.readonly.continuity.20261007`；其系统授权状态须由正常授权入口确认，旧宿主的授权记录不冒充新身份已授权。先诊断实际通知分类并验证完整索引收敛，达到真实 ready 后再继续 V3-MB 来源扫描和既定盲审。旧候选抽样与失败日志保留，旧 partial vector 不能脱离当前内容证据直接当作 ready。此次仅完成恢复准备，V4/V5 写入和回退阶段均未开启。
+恢复时先核对该目录 `offline-build-report.md`、`host-review.md`、源码/Core/宿主哈希与现有范围文件，再按已授权只读阶段建立新执行门闩和运行绑定。新 bundle identity 为 `com.photosync.qa.readonly.continuity.20261007`；其系统授权状态须由正常授权入口确认，旧宿主的授权记录不冒充新身份已授权。先诊断实际通知分类并验证完整索引收敛，达到真实 ready 后再继续 V3-MB 来源扫描和既定盲审。旧候选抽样与失败日志保留，旧 partial vector 不能脱离当前内容证据直接当作 ready。V4/V5 写入和回退阶段均未开启。
+
+**恢复执行前检查：** 用户要求继续后，重新核验全部 38 项产物哈希及签名，产品/测试与冻结代码无差异。来源 4,986 条清单（4,881 文件、含根目录的 105 个目录）全部路径、类型、大小、mtime 一致，3,017 图片候选不变；无新增、缺失、符号链接或读取错误。确认没有旧 QA 进程后，将原始 inventory 与独立抽样绑定到新 scope，创建新只读 READY，并指定唯一 runner 通过 LaunchServices 后台执行授权检查，再进入首批 index-session。授权、索引和判重结果各自以本次新鲜证据为准。
+
+## 2026-10-07 首批恢复实测后的追加门槛
+
+新授权已确认，真实清单完成。首批 115 次表示读取均成功，但只涉及 49 个不同表示键，额外重复读取 66 次；累计 completion 接受 93 次，最终只有 48 个 ready 向量。一次 `candidate-baseline-gap` 撤销了全索引有效性；之后三个已知且输入未变的通知仍变成 full reconcile。向量字节被删除并未获证明，不能与 ready 状态撤回混为一谈。详情见[实测记录](../research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md)。保持原阈值、抽样、只读范围和批次上限；不继续用重复取图掩盖该问题。
+
+- [ ] **修复并回归清单确认与 ready 确认的分工。** 现有 `acknowledgeInventory` 完成后，stream dirty 仍等到全部指纹 ready 才清除。修复应限于现有 gateway/channel 确认职责；完整清单／历史／代次确认后解除已覆盖的 full-reconcile 标记，判重发布仍独立等待 ready。回归必须证明：指纹仍 pending 时，随后已知增量保持增量；较新或未分类事件不能被旧确认吞掉；既有向量不重算。
+- [ ] **验证候选基线竞态，避免猜测修复。** 构造 observer 代次前进、详情尚未排队或处理、并发 candidate snapshot 重建的受控交错；记录候选 indexedGeneration 与要求基线。现有日志只证实 guard 失败，未证实该交错。若复现，修复对应顺序／基线协调；若未复现，补最小诊断再验证，不放松未知内容的安全判断。
+- [ ] **再恢复有界真实批次。** 相关受控回归和独立审阅通过后绑定新宿主证据，保留这次 48 个向量及全部日志。通过正常持久历史／清单恢复证明哪些可复用，不直接提升旧行有效性；核对重复读取、保留数量和已知中性通知处理。完整 ready 后才进入 MB3、独立盲审及双向抽查。
+
+以上是本次实测暴露的修复／复验项。用户已批准先修订 spec/plan 并实施，执行步骤转入 [通知恢复修复计划](../superpowers/plans/2026-10-07-photos-index-notification-recovery.md)；模型、判重规则和实际测试范围不变，当前真实会话维持正常停止状态。
