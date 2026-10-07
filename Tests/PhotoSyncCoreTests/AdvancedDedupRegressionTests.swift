@@ -712,6 +712,30 @@ extension AdvancedDedupRegressionTests {
         try p11StopRowAudit(db)
     }
 
+    func testScaleFixtureHistoryProofRejectsForeignUnknownAndFutureIntervals() async throws {
+        let configuration = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
+        let photos = P9ScalePhotos(count: 1, image: try p9Image(style: 1), budget: ImageWorkBudget(limits: configuration.resources))
+        let firstValue = try await photos.contextCheckpoint(), first = try XCTUnwrap(firstValue)
+        _ = await photos.changeOne()
+        let currentValue = try await photos.contextCheckpoint(), current = try XCTUnwrap(currentValue)
+        let covered = try await photos.coverPersistentHistory(from: first, through: current)
+        XCTAssertTrue(covered, "the fixture owns the immutable pixels and every sequential generation transition")
+        let invalid = [
+            LibraryResumeCheckpoint(context: .init(id: UUID(), epoch: 1), archivedChangeToken: Data([9]), photosGeneration: 1),
+            LibraryResumeCheckpoint(context: first.context, archivedChangeToken: Data([8]), photosGeneration: 1),
+            LibraryResumeCheckpoint(context: first.context, archivedChangeToken: Data([9])),
+            LibraryResumeCheckpoint(context: first.context, archivedChangeToken: Data([9]), photosGeneration: 0),
+            LibraryResumeCheckpoint(context: first.context, archivedChangeToken: Data([9]), photosGeneration: 3)
+        ]
+        for checkpoint in invalid {
+            let acceptedFrom = try await photos.coverPersistentHistory(from: checkpoint, through: current)
+            let acceptedThrough = try await photos.coverPersistentHistory(from: first, through: checkpoint)
+            XCTAssertFalse(acceptedFrom); XCTAssertFalse(acceptedThrough)
+        }
+        let staleEndpoint = try await photos.coverPersistentHistory(from: first, through: first)
+        XCTAssertFalse(staleEndpoint)
+    }
+
     func testReadinessEndpointRejectsAcknowledgementFailureAfterCompletedInference() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -789,6 +813,16 @@ private actor P9ScalePhotos: PhotosIndexGateway {
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot { .init(generation: generation, candidates: []) }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { .init(context: context, archivedChangeToken: Data([9]), photosGeneration: generation) }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool { checkpoint.context == context }
+    func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool {
+        // This synthetic provider has one immutable bitmap. Its only mutations are
+        // the actor's sequential changeOne/addOne/removeAdded methods above; each
+        // updates the complete descriptor/membership view and emits that interval.
+        // Unlike real PhotoKit, there is no out-of-band content or delayed history.
+        guard previous.context == context, proposed.context == context,
+              previous.archivedChangeToken == Data([9]), proposed.archivedChangeToken == Data([9]),
+              let from = previous.photosGeneration, let through = proposed.photosGeneration else { return false }
+        return from >= 1 && from <= through && through == generation
+    }
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
         catalogRequests += 1
         let total = count + (hasAdded ? 1 : 0)
