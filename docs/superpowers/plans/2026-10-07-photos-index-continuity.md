@@ -43,6 +43,8 @@
 
 metadata 中性更新仍可能改变含修改日期的 descriptor revision，不修改原摘要算法来制造全库版本变化。页级 `inputUnchangedAssetIDs` 必须来自 producer 的内容连续性和输入事实核验；仅此证据可在同一任务发行身份下更新描述 revision 并保留向量/期限。v6 为 `fingerprint_task` 增加 `issuance_revision`，旧记录以原 revision 为发行修订；`RepresentationTask.issuanceRevision` 带回不可变发行信息，完成时仍检查上下文、发行代次/修订、尺寸、等价关系和指纹版本。真正输入变化、删除重插或旧未知义务须更换发行身份，不能用后来的中性变化覆盖。
 
+会话采用明确 `PhotosCatalogSession` UUID 与 baselineGeneration，绑定当前图库上下文；即使 raw generation 相同，重开后旧 UUID 也失效。分批增量用 `PhotosIndexDeltaBatch` 表达完整 interval 和 offset/count，复用 `dedup_index_state.reconcile_cursor` 保存区间摘要及下一批游标，拒绝跳批/重复批/跨区间拼接，最后批之前不推进历史检查点。迁移引起的 `StoreTests.swift`、`LegacySkipReevaluationTests.swift` 固定版本/未来版本断言纳入 Task 1，限当前 schema 契约，不改无关行为。
+
 - [ ] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
 - [ ] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
 - [ ] **Step 3 — SQLite / coordinator。** 移除 generic full-reconcile 到全库 `vector=NULL` 的含义。保留已完成和待办事实、有效重试期限；未知表示留字节且不参与 publication。只有可靠删除/完整清单缺失才墓碑化。完整批次持久化后才确认 interval；每次 await 后复查相关有效性，最后用当前 context/index/covered endpoint 短 fence 发布。无关变化不使在途结果失效；已知相关/未知输入不 ready，物理结束后才释放。
