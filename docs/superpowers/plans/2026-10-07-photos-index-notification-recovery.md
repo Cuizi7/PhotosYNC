@@ -64,3 +64,7 @@ dirty 清理时机已由实际日志和源码确认。`candidate-baseline-gap` �
 ## 执行状态
 
 Task1/2 完成，冻结 `b15742f`，独立审阅通过，完整552 XCTest（含2跳过）/94 Tools/33模型案例/4规模/2竞态及正常Universal构建通过。Task3 Step1 离线宿主与48向量恢复副本准备完成；真实只读恢复仍按后续步骤执行。详见[验收记录](../../release/2026-10-07-photos-notification-recovery-validation.md)。
+
+Task3 Step2 已完成当前宿主授权及首批 500 次请求：48 个旧向量均复用、本批新增 399、最终 ready 447；396 个 known 分类后没有再次 full reconciliation。但另有 99 次重复读取及 1 个 PhotoKit 读取错误，不能将 Step2 标为通过。首批已在物理图像／字节均为 0 的检查点正常停止并封存 READY，未开始 Step3。继续前先受控复现 coordinator 事件消费滞后的单项重复工作，并核对宿主失败事实的重试门槛；保留错误、向量和原始记录，不通过清库／忽略代次恢复。耗时拆分和边界见 [MobileBackup 实测](../../research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md)。
+
+后续受控三项探索已复现延迟消费中性 delta 导致第二次读取／推理（及时投递为一次，真实内容变化仍拒绝旧结果）；未做产品修复。用户要求继续原测试后，先实施真实验证计划中的 QA 精确错误摘要／检查点恢复入口，继续原先完整覆盖和判重检查，不将此探索视为效率要求已通过。单项重复工作的产品跟进保留开放，不借本次宿主修补扩大产品差异。

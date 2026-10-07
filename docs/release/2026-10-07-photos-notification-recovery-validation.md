@@ -46,4 +46,4 @@ xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -configuration Release
 
 fake-only self-test exit 0，写入独立 UUID 目录：写入调用 0、精确评分 oracle 405 matches、合成推理及覆盖／会话／物理租约检查通过。48 向量恢复库在自测前后哈希保持 `a23c9d048758c1841a9325e3a44d2f915709add2d62b15dbc87c31b49d66be2d`。详情在新目录 `offline-build-report.md`。
 
-真实恢复须重新核对来源、当前系统授权及图库历史；先确认进度保留和通知分类，再继续完整建库、MobileBackup 评分及盲审。当前文档仅证明代码与离线准备完成，真实进度见 [MobileBackup 实测](../research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md)。未做 Photos 写入、生产 App 启动、GUI／macOS 13 实机／Intel 实机、安装、打包发行、Developer ID 或公证；正常构建和私有 QA 签名不是发行验收。
+真实恢复已重新核对来源、当前系统授权及图库历史。首批 500 次请求保留全部 48 个旧向量并新增 399 条；396 个 known 分类后没有再次全量核对。但有 99 次重复读取及 1 个 PhotoKit 读取错误，已在检查点正常停止，完整建库、MobileBackup 评分及盲审仍未完成。真实进度、耗时拆分和待诊断项见 [MobileBackup 实测](../research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md)。未做 Photos 写入、生产 App 启动、GUI／macOS 13 实机／Intel 实机、安装、打包发行、Developer ID 或公证；正常构建和私有 QA 签名不是发行验收。
