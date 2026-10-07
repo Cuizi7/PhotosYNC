@@ -31,7 +31,7 @@
 
 ### Task 1: 完整实现事件证据、非破坏性核对及在途任务有效性
 
-**Files / ownership:** `Sources/PhotoSyncCore/Photos/PhotoKitGateway.swift`、`PhotosIndexGateway.swift`、`PhotosRepresentationReader.swift`（仅输入事实/修订的必要变化）；`Sources/PhotoSyncCore/Sync/PhotosIndexCoordinator.swift`；`Sources/PhotoSyncCore/Storage/SyncStore.swift`、`Schema.sql`（仅必要迁移）；`Matching/AdvancedDedupTypes.swift`；`Sources/PhotoSyncApp/SyncRuntime.swift`（仅接线）。测试限 `PhotoKitContractTests.swift`、`PhotosIndexCoordinatorTests.swift`、`AdvancedDedupStoreTests.swift`、`AdvancedDedupServiceTests.swift`、`AdvancedRuntimeTests.swift` 及其共享 fake/现有原生 progress 测试。若需抽出小型 Photos 连续性值类型文件，加入项目 target，不做无关文件拆分。
+**Files / ownership:** `Sources/PhotoSyncCore/Photos/PhotoKitGateway.swift`、`PhotosIndexGateway.swift`、`PhotosRepresentationReader.swift`（仅输入事实/修订的必要变化）；`Sources/PhotoSyncCore/Sync/PhotosIndexCoordinator.swift`；`Sources/PhotoSyncCore/Storage/SyncStore.swift`、`Schema.sql`（仅必要迁移）；`Matching/AdvancedDedupTypes.swift`；`Sources/PhotoSyncApp/SyncRuntime.swift`（仅接线）。测试限 `PhotoKitContractTests.swift`、`PhotosRepresentationTests.swift`、`PhotosIndexCoordinatorTests.swift`、`AdvancedDedupStoreTests.swift`、`AdvancedDedupServiceTests.swift`、`AdvancedRuntimeTests.swift` 及其共享 fake/现有原生 progress 测试。若需抽出小型 Photos 连续性值类型文件，加入项目 target，不做无关文件拆分。
 
 **Interfaces:** 保留 `PhotosIndexCoordinator.reconcile/processDueWork/libraryChanged/readyToken/progress` 调用边界、`SyncStore.completeRepresentation` 的任务发行校验和 `PhotosCandidateSnapshot` 最终提交 fence。演进 `PhotosIndexGateway` 清单接口以显式携带枚举身份和覆盖终点，不能继续把 raw generation 当固定全轮枚举身份。`PhotosIndexDelta` 的完整覆盖声明与批次必须区分：批次不是新的完整 interval。`PhotoKitLifecycle` 注入层必须覆盖真实 producer 分类逻辑，测试不能只向 coordinator 喂一个可信标签。
 
@@ -40,6 +40,8 @@
 **实施前接口/迁移决定（2026-10-07）：** 当前 v5 的任务表不能可靠承载“通知尚未消费、描述尚未获取”的资产变化义务，故升至 v6，在同一个 SQLite 增加 `photos_content_change` 小表，按 `(context_id, context_epoch, asset_id)` 唯一记录内容待核验范围和覆盖代次。producer 将完整已知 ID 集合分批同步提交后才交付唤醒；大集合只升级清单核对，不升级全库内容失效。增加 `PhotosIndexGateway.attachIndexStore(_ store: SyncStore)`（兼容 fake 的默认 no-op）接线；稳定枚举接口为 `beginCatalogSession() -> PhotosCatalogSession`、`catalogPage(session:offset:limit:) -> RepresentationPage`、`catalogCoverage(session:) -> PhotosCatalogCoverage`，将基线身份与覆盖终点分开。最终签名随实际并发隔离加 `async throws`；旧适配方法仅作为显式保守兼容，不能绕过证据要求。
 
 迁移须事务化同步两份 schema，保留全部已有数据并撤销旧 publication；旧库没有 journal 不能证明连续。journal 还记录 changed/deleted/content 标志以归并成员变化，并以进程 UUID 区分 raw generation；旧进程记录在成功回放与完整核对前保守保留，绝不与新进程同值序号比较。恢复先保留旧义务，成功合并/覆盖后才删除对应范围。清单未完成、崩溃或日志写失败保持 fail-closed，不能提前确认 checkpoint。同步 journal 提交不得持 PhotoKit 状态锁或数据库锁等待另一个系统；旧 vector 不作为新 descriptor 的有效证据，必须通过待验证状态隔离。
+
+metadata 中性更新仍可能改变含修改日期的 descriptor revision，不修改原摘要算法来制造全库版本变化。页级 `inputUnchangedAssetIDs` 必须来自 producer 的内容连续性和输入事实核验；仅此证据可在同一任务发行身份下更新描述 revision 并保留向量/期限。v6 为 `fingerprint_task` 增加 `issuance_revision`，旧记录以原 revision 为发行修订；`RepresentationTask.issuanceRevision` 带回不可变发行信息，完成时仍检查上下文、发行代次/修订、尺寸、等价关系和指纹版本。真正输入变化、删除重插或旧未知义务须更换发行身份，不能用后来的中性变化覆盖。
 
 - [ ] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
 - [ ] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
