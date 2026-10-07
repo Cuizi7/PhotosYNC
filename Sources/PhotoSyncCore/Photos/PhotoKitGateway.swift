@@ -231,7 +231,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     public func acknowledgeReconciliation(expectedGeneration: Int) async throws {
         let generation = try await usableGeneration()
         guard generation == expectedGeneration,
-              state.acknowledgeReconciliation(generation: expectedGeneration, { [changeChannel] in changeChannel.reconciled() }) else {
+              state.acknowledgeReconciliation(generation: expectedGeneration, admitHistory: true, { [changeChannel] in changeChannel.reconciled() }) else {
             throw PhotoKitGatewayError.libraryChanged
         }
     }
@@ -255,10 +255,48 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     public func contextCheckpoint() async throws -> LibraryResumeCheckpoint? {
-        let generation = try await usableGeneration()
-        guard let token = try lifecycle.archivedChangeToken() else { return nil }
-        try verifyUsable(generation: generation)
-        return LibraryResumeCheckpoint(context: state.snapshot().context, archivedChangeToken: token, photosGeneration: generation)
+        do {
+            let generation = try await usableGeneration()
+            guard let token = try lifecycle.archivedChangeToken() else {
+                state.invalidateHistoryAdmission(); state.invalidateAllRepresentations(); return nil
+            }
+            try verifyUsable(generation: generation)
+            return LibraryResumeCheckpoint(context: state.snapshot().context, archivedChangeToken: token, photosGeneration: generation)
+        } catch {
+            state.invalidateHistoryAdmission(); state.invalidateAllRepresentations(); throw error
+        }
+    }
+
+    public func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool {
+        // This closes existing snapshot/submit fences as well as future admission.
+        // No state lock is held during PhotoKit history or SQLite journal work.
+        let ticket = state.beginHistoryCoverage()
+        defer { state.finishChangeDetails() }
+        do {
+            guard state.hasStore, previous.context == proposed.context,
+                  proposed.context == ticket.context, proposed.photosGeneration == ticket.generation,
+                  lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
+                state.invalidateAllRepresentations(); return false
+            }
+            var persisted = true, unknown = false
+            let complete = try lifecycle.replayPersistentChanges(previous.archivedChangeToken, onChange: { event in
+                if event == .fullReconcileRequired || event == .contextInvalidated { unknown = true }
+            }, onContentChange: { [state, catalogBatchSize] ids in
+                if !state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) { persisted = false }
+            })
+            guard complete, persisted, !unknown, state.historyCoverageIsCurrent(ticket),
+                  lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
+                state.invalidateAllRepresentations()
+                diagnostics(["phase": "photos-history-coverage", "result": "unknown"])
+                return false
+            }
+            diagnostics(["phase": "photos-history-coverage", "result": "covered"])
+            return true
+        } catch {
+            state.invalidateAllRepresentations()
+            diagnostics(["phase": "photos-history-coverage", "result": "unknown", "reason": "history-unavailable"])
+            return false
+        }
     }
 
     public func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool {
@@ -270,7 +308,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
             guard try lifecycle.replayPersistentChanges(checkpoint.archivedChangeToken, onChange: { [state] event in
                 if event == .fullReconcileRequired || event == .contextInvalidated { state.invalidateAllRepresentations() }
             }, onContentChange: { [state, catalogBatchSize] ids in
-                state.recordContentChanges(ids, capacity: max(1, catalogBatchSize))
+                _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize))
             }), let adoptedGeneration = state.adoptContext(checkpoint.context, generation: generation) else {
                 state.invalidateContext(); changeChannel.send(.contextInvalidated); return false
             }
@@ -407,7 +445,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 case .fullReconcileRequired: state.invalidateAllRepresentations(); changeChannel.send(event)
                 }
             },
-            onContentChange: { [state, catalogBatchSize] ids in state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) },
+            onContentChange: { [state, catalogBatchSize] ids in _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) },
             didFinishDetails: { [state] in state.finishChangeDetails() },
             diagnostics: diagnostics
         )
@@ -779,6 +817,23 @@ private final class PhotoKitState: @unchecked Sendable {
     enum AdditionBlockReason { case checkpointFailed, unknownOutcome }
     private let lock = NSLock(); private var available = true; private var generation = 0; private var indexedGeneration: Int?; private var additionsBlocked: AdditionBlockReason?
     private var context = LibraryContext(id: UUID(), epoch: 0)
+    struct HistoryCoverageTicket { let context: LibraryContext; let generation: Int; let admissionRevision: UInt64 }
+    private var admissionRevision: UInt64 = 0
+    private var historyAdmissionBlocked = false
+    func invalidateHistoryAdmission() {
+        lock.lock(); admissionRevision &+= 1; historyAdmissionBlocked = true; indexedGeneration = nil; lock.unlock()
+    }
+    func beginHistoryCoverage() -> HistoryCoverageTicket {
+        lock.lock(); defer { lock.unlock() }
+        admissionRevision &+= 1; historyAdmissionBlocked = true
+        pendingChangeDetails += 1; indexedGeneration = nil
+        return .init(context: context, generation: generation, admissionRevision: admissionRevision)
+    }
+    func historyCoverageIsCurrent(_ ticket: HistoryCoverageTicket) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return available && context == ticket.context && generation == ticket.generation &&
+            admissionRevision == ticket.admissionRevision && pendingChangeDetails == 1
+    }
     private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext, invalidationTransferred: Bool)?
     func beginCatalogSession(expectedGeneration: Int) throws -> PhotosCatalogSession {
         lock.lock(); defer { lock.unlock() }
@@ -857,7 +912,8 @@ private final class PhotoKitState: @unchecked Sendable {
         return (generation, context)
     }
 
-    func recordContentChanges(_ ids: [String], capacity: Int) {
+    @discardableResult
+    func recordContentChanges(_ ids: [String], capacity: Int) -> Bool {
         invalidateActiveReads(Set(ids))
         lock.lock()
         let store = store, context = replayContext ?? context, generation = generation
@@ -873,7 +929,8 @@ private final class PhotoKitState: @unchecked Sendable {
         do {
             try store?.recordPhotosChanges(context: context, runID: runID, generation: generation,
                 changed: ids, deleted: [], content: Set(ids), batchSize: capacity)
-        } catch { invalidateAllRepresentations() }
+            return store != nil
+        } catch { invalidateAllRepresentations(); return false }
     }
     func invalidateAllRepresentations() {
         lock.lock(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll()
@@ -893,7 +950,7 @@ private final class PhotoKitState: @unchecked Sendable {
         return (try store?.photosContentChanges(context: context, assetIDs: pageAssetIDs) ?? fallback, all,
                 all && !permittingUnverifiedInputEvidence ? [] : try store?.photosInputUnchanged(context: context, assetIDs: pageAssetIDs) ?? [])
     }
-    func acknowledgeReconciliation(generation expected: Int, _ acknowledge: () -> Void) -> Bool {
+    func acknowledgeReconciliation(generation expected: Int, admitHistory: Bool = false, _ acknowledge: () -> Void) -> Bool {
         lock.lock()
         guard available, generation == expected, pendingChangeDetails == 0 else { lock.unlock(); return false }
         let store = store, context = context
@@ -903,6 +960,7 @@ private final class PhotoKitState: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard available, generation == expected, pendingChangeDetails == 0 else { return false }
         contentChangedIDs.removeAll(); allRepresentationsInvalid = false
+        if admitHistory { historyAdmissionBlocked = false }
         acknowledge()
         return true
     }
@@ -923,7 +981,8 @@ private final class PhotoKitState: @unchecked Sendable {
         allRepresentationsInvalid = true; contentChangedIDs.removeAll()
     }
     func validity(generation expected: Int) -> any PhotosCandidateValidity {
-        PhotoKitGenerationValidity(state: self, generation: expected)
+        lock.lock(); let revision = admissionRevision; lock.unlock()
+        return PhotoKitGenerationValidity(state: self, generation: expected, admissionRevision: revision)
     }
     func needsReindex(generation expected: Int) -> Bool { lock.lock(); defer { lock.unlock() }; return indexedGeneration != expected }
     func recordChange(expectingDetails: Bool = false) -> Int {
@@ -940,16 +999,17 @@ private final class PhotoKitState: @unchecked Sendable {
         switch additionsBlocked {
         case .checkpointFailed: return .blockedAfterCheckpointFailure
         case .unknownOutcome: return .blockedAfterUnknownOutcome
-        case nil: return available && generation == expected && indexedGeneration == expected ? .ready : .libraryChanged
+        case nil: return available && !historyAdmissionBlocked && pendingChangeDetails == 0 && generation == expected && indexedGeneration == expected ? .ready : .libraryChanged
         }
     }
     func isReady(generation expected: Int) -> Bool { admission(generation: expected) == .ready }
     func blockAdditions(_ reason: AdditionBlockReason) { lock.lock(); additionsBlocked = reason; lock.unlock() }
 
-    func commitIfCurrent(generation expected: Int, _ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
+    func commitIfCurrent(generation expected: Int, admissionRevision expectedRevision: UInt64, _ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard available, generation == expected else { return false }
+        guard available, generation == expected, admissionRevision == expectedRevision,
+              !historyAdmissionBlocked, pendingChangeDetails == 0 else { return false }
         try commit()
         return true
     }
@@ -958,14 +1018,16 @@ private final class PhotoKitState: @unchecked Sendable {
 private final class PhotoKitGenerationValidity: PhotosCandidateValidity, @unchecked Sendable {
     private let state: PhotoKitState
     private let generation: Int
+    private let admissionRevision: UInt64
 
-    init(state: PhotoKitState, generation: Int) {
+    init(state: PhotoKitState, generation: Int, admissionRevision: UInt64) {
         self.state = state
         self.generation = generation
+        self.admissionRevision = admissionRevision
     }
 
     func commitIfCurrent(_ commit: @escaping @Sendable () throws -> Void) throws -> Bool {
-        try state.commitIfCurrent(generation: generation, commit)
+        try state.commitIfCurrent(generation: generation, admissionRevision: admissionRevision, commit)
     }
 }
 

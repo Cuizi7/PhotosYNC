@@ -906,6 +906,8 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
         checkpointBeforeSnapshot = checkpointBeforeSnapshot && checkpointCaptured
         return .init(generation: generation, candidates: [])
     }
+    // This synthetic producer completely controls each descriptor/event interval.
+    func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool { true }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? {
         checkpointCaptured = true
         return .init(context: replacementContext ?? context, archivedChangeToken: Data([UInt8(generation)]), photosGeneration: generation)

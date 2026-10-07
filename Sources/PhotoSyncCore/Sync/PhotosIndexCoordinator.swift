@@ -66,7 +66,16 @@ public actor PhotosIndexCoordinator {
                     forceCacheInvalidation = try await !photos.resumeContext(checkpoint)
                 }
             }
+            let previousCheckpoint = try await store.libraryResumeCheckpoint()
+            // Capture the proposed upper token before replay. Metadata pages alone
+            // cannot prove that an already cached vector was unchanged through it.
             let checkpoint = try await photos.contextCheckpoint()
+            if let checkpoint {
+                if let previousCheckpoint {
+                    let covered = try await photos.coverPersistentHistory(from: previousCheckpoint, through: checkpoint)
+                    if !covered { forceCacheInvalidation = true }
+                } else { forceCacheInvalidation = true }
+            } else if previousCheckpoint != nil { forceCacheInvalidation = true }
             let snapshot = try await photos.candidateSnapshot()
             let session = try await photos.beginCatalogSession(expectedGeneration: snapshot.generation)
             var offset = 0

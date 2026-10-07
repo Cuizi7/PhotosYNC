@@ -141,9 +141,15 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// checkpoint is available. The caller persists a nonnil value only alongside
     /// successful inventory facts of its captured context. A full inventory may cover
     /// a later observer endpoint; its saved token remains the earlier pre-read token.
+    /// Cached-vector reuse additionally requires complete coverPersistentHistory from
+    /// the old durable token through this proposal; metadata equality is insufficient.
     /// Incremental inventory retains the previous durable token until another full pass.
     /// Replay is continuity evidence, never a stable physical-library identity or
     /// an index-ready flag. Fetching facts alone must not acknowledge reconciliation.
+    /// Replay complete persistent history from the durable prior token after capturing
+    /// `through`, durably retaining all affected IDs before allowing cached-vector reuse.
+    /// False is unknown coverage, never an empty history. Context must not be reset.
+    func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint?
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool
     /// Call only after complete same-generation full/delta reconciliation, durable facts and
@@ -270,6 +276,7 @@ public extension PhotosIndexGateway {
     }
     func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage { throw PhotoKitGatewayError.libraryChanged }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool { false }
+    func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool { false }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { nil }
     func acknowledgeReconciliation(expectedGeneration: Int) async throws {}
 }

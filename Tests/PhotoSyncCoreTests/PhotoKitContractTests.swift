@@ -107,6 +107,84 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testHistoryCoverageClosesExistingSnapshotFenceWithoutChangingRawGeneration() async throws {
+        let f = try continuityFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let before = try await f.gateway.candidateSnapshot()
+        let entered = expectation(description: "history paused"), release = DispatchSemaphore(value: 0)
+        f.lifecycle.afterReplay = { entered.fulfill(); release.wait() }
+        let work = Task { try await f.coordinator.reconcile() }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("old admission entered during history") }))
+        release.signal(); try await work.value
+        let after = try await f.gateway.candidateSnapshot()
+        XCTAssertEqual(after.generation, before.generation)
+        XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("old admission revived after history") }))
+        XCTAssertTrue(try after.candidateValidity.commitIfCurrent({}))
+    }
+
+    func testNoChangeHistoryReplayWritesNoRepresentationOrTaskRows() async throws {
+        let f = try continuityFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        try injectEngineSQL("CREATE TABLE history_writes(table_name TEXT);" + ["photos_representation", "fingerprint_task"].flatMap { table in
+            ["INSERT", "UPDATE", "DELETE"].map { operation in
+                "CREATE TRIGGER history_\(table)_\(operation) AFTER \(operation) ON \(table) BEGIN INSERT INTO history_writes VALUES ('\(table)'); END;"
+            }
+        }.joined(), at: f.db)
+        let replayCount = f.lifecycle.replayedTokens.count
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: Date())
+        XCTAssertEqual(f.lifecycle.replayedTokens.count, replayCount + 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM history_writes", at: f.db), 0)
+        let ready = try await f.coordinator.readyToken(); XCTAssertNotNil(ready)
+    }
+
+    func testIncompleteHistoryCoverageKeepsContextButInvalidatesCachedBytes() async throws {
+        for failureMode in 0..<3 {
+            let f = try continuityFixture()
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            try await f.coordinator.reconcile()
+            f.lifecycle.persistentToken = 2
+            if failureMode == 1 {
+                try injectEngineSQL("CREATE TRIGGER reject_history BEFORE INSERT ON photos_content_change BEGIN SELECT RAISE(ABORT,'history write failure'); END;", at: f.db)
+            } else if failureMode == 2 { f.lifecycle.providesToken = false }
+            else { f.lifecycle.completeReplay = false }
+            let before = try await f.gateway.candidateSnapshot()
+            try await f.coordinator.reconcile()
+            let checkpoint = try await f.gateway.contextCheckpoint()
+            if failureMode == 2 { XCTAssertNil(checkpoint) }
+            else { XCTAssertEqual(checkpoint?.context, f.context) }
+            XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("unknown history revived old admission") }))
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state<>'ready' AND vector IS NOT NULL", at: f.db), 4)
+            let ready = try await f.coordinator.readyToken(); XCTAssertNil(ready)
+        }
+    }
+
+    func testFullCheckpointCoversCachedContentEditedBeforeCaptureIncludingStartupReplayGap() async throws {
+        for startupGap in [false, true] {
+            let f = try continuityFixture()
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            if !startupGap { try await f.coordinator.reconcile() }
+            try f.store.recordPhotosChanges(context: f.context, runID: UUID(), generation: 999,
+                changed: ["page3"], deleted: [], content: ["page3"], batchSize: 1)
+            if startupGap { f.lifecycle.afterReplay = { f.lifecycle.persistentToken = 2 } }
+            else { f.lifecycle.persistentToken = 2 }
+            // No observer callback for page0: equal metadata must not hide its edit.
+            try await f.coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND vector IS NOT NULL", at: f.db), 1)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change", at: f.db), 0)
+            let ready = try await f.coordinator.readyToken(); XCTAssertNil(ready)
+            let reopened = try SyncStore(url: f.db), lifecycle = FakePhotoKitLifecycle()
+            lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }; lifecycle.persistentToken = 2
+            let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+            let coordinator = PhotosIndexCoordinator(store: reopened, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: f.configuration)
+            try await coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND vector IS NOT NULL", at: f.db), 1)
+            let afterRestart = try await coordinator.readyToken(); XCTAssertNil(afterRestart)
+        }
+    }
+
     func testConservativeCheckpointSurvivesObserverLagForFullAndIncrementalInventory() async throws {
         for fullMerge in [true, false] {
             let f = try continuityFixture()
@@ -143,7 +221,8 @@ final class PhotoKitContractTests: XCTestCase {
             let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
             let coordinator = PhotosIndexCoordinator(store: reopened, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: f.configuration)
             try await coordinator.reconcile()
-            XCTAssertEqual(lifecycle.replayedTokens, [1])
+            XCTAssertFalse(lifecycle.replayedTokens.isEmpty)
+            XCTAssertTrue(lifecycle.replayedTokens.allSatisfy { $0 == 1 })
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND vector IS NOT NULL", at: f.db), 1)
             let ready = try await coordinator.readyToken(); XCTAssertNil(ready)
         }
@@ -729,12 +808,16 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
             nextOffset: offset < 3 ? offset + 1 : nil)
     }
     var persistentToken: UInt8 = 1
+    var providesToken = true
     var replayedTokens: [UInt8] = []
-    func archivedChangeToken() throws -> Data? { Data([persistentToken]) }
+    var afterReplay: (() -> Void)?
+    var completeReplay = true
+    func archivedChangeToken() throws -> Data? { providesToken ? Data([persistentToken]) : nil }
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool {
         let from = token.first ?? 0; replayedTokens.append(from)
         if from < persistentToken { onContentChange(["page0"]) }
-        return true
+        afterReplay?()
+        return completeReplay
     }
     var deltaIDs: [[String]] = [], omitDeltaIDs = false
     var deltaRevision = "r1"
