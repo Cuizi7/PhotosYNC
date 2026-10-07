@@ -88,3 +88,12 @@ CREATE INDEX dedup_dependency_candidate ON dedup_dependency(candidate_file_id, f
 CREATE TABLE dedup_recheck_progress (
  target_policy_version TEXT PRIMARY KEY, cursor INTEGER, complete INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0
 );
+
+ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT;
+CREATE TABLE photos_content_change (
+ context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, run_id TEXT NOT NULL,
+ asset_id TEXT NOT NULL, generation INTEGER NOT NULL, removed INTEGER NOT NULL,
+ content_changed INTEGER NOT NULL,
+ PRIMARY KEY(context_id, context_epoch, run_id, asset_id)
+);
+CREATE INDEX photos_content_change_asset ON photos_content_change(context_id, context_epoch, asset_id, content_changed);

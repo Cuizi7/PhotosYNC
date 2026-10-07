@@ -512,7 +512,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE attempt_id = ''", at: db), 2)
             }
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 2)
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 5)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 6)
         }
     }
 
@@ -673,7 +673,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try makeV3(at: db)
         let before = try facts(at: db)
         let store = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 5)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 6)
         XCTAssertEqual(try facts(at: db), before)
         let generation = try await store.beginIndexReconciliation(context: LibraryContext(id: UUID(), epoch: 1), photosGeneration: 4, fingerprintVersion: "new-model")
         try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
@@ -692,9 +692,9 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 3)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE name = 'dedup_index_state'", at: db), 0)
         XCTAssertEqual(try facts(at: db), before)
-        try injectEngineSQL("PRAGMA user_version = 6", at: db)
+        try injectEngineSQL("PRAGMA user_version = 7", at: db)
         XCTAssertThrowsError(try SyncStore(url: db))
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 6)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 7)
     }
 
     func testStaleTaskCannotPublish() async throws {
@@ -950,6 +950,71 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try facts(at: db), before)
     }
 
+    func testV5MigrationPreservesVectorBytesAndRetryIssuanceAndRevokesPublication() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let a = descriptor(context, asset: "a"), b = descriptor(context, asset: "b")
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([a,b], generation: generation)
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: [a.key,b.key])
+        let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 2)
+        _ = try await store.completeRepresentation(tasks[0], fingerprint: fingerprint("v1"))
+        _ = try await store.failRepresentation(tasks[1], nextRetryAt: Date(timeIntervalSince1970: 9999999999), detail: "cloud")
+        try injectEngineSQL("""
+            CREATE TABLE before_vectors AS SELECT asset_id,vector FROM photos_representation;
+            CREATE TABLE before_tasks AS SELECT asset_id,revision,generation,retry_count,next_retry_at,last_error FROM fingerprint_task;
+            DROP TABLE photos_content_change;
+            ALTER TABLE fingerprint_task DROP COLUMN issuance_revision;
+            PRAGMA user_version=5;
+            """, at: db)
+        let reopened = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 6)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_vectors EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_tasks EXCEPT SELECT asset_id,revision,generation,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: db), 0)
+        let publication = try await reopened.indexPublication(); XCTAssertNil(publication)
+    }
+
+    func testJournalSeparatesProcessGenerationsAndKeepsUncoveredObligations() throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), oldRun = UUID(), newRun = UUID()
+        try store.recordPhotosChanges(context: context, runID: oldRun, generation: 100,
+            changed: ["old"], deleted: [], content: ["old"], batchSize: 1)
+        let reopened = try SyncStore(url: db)
+        try reopened.recordPhotosChanges(context: context, runID: newRun, generation: 1,
+            changed: ["neutral"], deleted: [], content: [], batchSize: 1)
+        try reopened.recordPhotosChanges(context: context, runID: newRun, generation: 2,
+            changed: ["later"], deleted: [], content: ["later"], batchSize: 1)
+        XCTAssertEqual(try reopened.photosContentChanges(context: context, assetIDs: ["old","neutral","later"]), ["later","old"])
+        let batch = try reopened.photosCatalogChanges(context: context, runID: newRun, afterGeneration: 0, throughGeneration: 1, afterAssetID: nil, limit: 128)
+        XCTAssertEqual(batch.changedAssetIDs, ["neutral"])
+        try reopened.acknowledgePhotosChanges(context: context, runID: newRun, throughGeneration: 1)
+        XCTAssertEqual(try reopened.photosContentChanges(context: context, assetIDs: ["old","neutral","later"]), ["later"])
+    }
+
+    func testPartialDeltaCrashCannotSkipABatchOrPublishTheInterval() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let values = ["a","b","c"].map { descriptor(context, asset: $0) }
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations(values, generation: generation)
+        let checkpoint = LibraryResumeCheckpoint(context: context, archivedChangeToken: Data([1]), photosGeneration: 1)
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(values.map(\.key)), checkpoint: checkpoint)
+        let interval = PhotosIndexDelta(context: context, fromGeneration: 1, toGeneration: 2, changedAssetIDs: ["a","b","c"], deletedAssetIDs: [])
+        func page(_ index: Int) -> RepresentationPage { .init(context: context, generation: 2, descriptors: [values[index]], nextOffset: nil, invalidatedAssetIDs: [values[index].key.assetID]) }
+        _ = try await store.applyIndexDeltaBatch(.init(interval: interval, offset: 0, count: 1), page: page(0), fingerprintVersion: "v1", checkpoint: nil)
+        let reopened = try SyncStore(url: db)
+        let oldCheckpoint = try await reopened.libraryResumeCheckpoint(); XCTAssertEqual(oldCheckpoint, checkpoint)
+        let publication = try await reopened.indexPublication(); XCTAssertNil(publication)
+        await XCTAssertThrowsErrorAsync(try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 2, count: 1), page: page(2), fingerprintVersion: "v1", checkpoint: nil))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0", at: db), 3)
+        _ = try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 1, count: 1), page: page(1), fingerprintVersion: "v1", checkpoint: nil)
+        _ = try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 2, count: 1), page: page(2), fingerprintVersion: "v1", checkpoint: .init(context: context, archivedChangeToken: Data([2]), photosGeneration: 2))
+        XCTAssertEqual(try engineSQLInteger("SELECT reconciliation_complete FROM dedup_index_state", at: db), 1)
+    }
+
     func testUnchangedTaskCanCompleteAcrossGlobalGeneration() async throws {
         let (root, _, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1057,7 +1122,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("UPDATE photos_representation SET tombstoned=0; PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS photos_representation_readiness", at: db)
         let upgraded = try SyncStore(url: db)
         XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 5)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 6)
         let after = try await upgraded.indexReadiness(); XCTAssertNil(after)
         let publication = try await upgraded.indexPublication()
         XCTAssertEqual(try photosVector(at: db), vector)
@@ -1086,7 +1151,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         // Reproduce the previous unreleased integration-v4 shape without its reverse index.
         try injectEngineSQL("PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS dedup_dependency_candidate;", at: db)
         let migrated = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 5)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 6)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
         try await assertEqual(try await migrated.state(of: dependent.fileID), .skipped)
         try assertReverseDependencyLookup(at: db)

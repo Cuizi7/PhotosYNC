@@ -304,6 +304,19 @@ struct PhotoKitRepresentationAsset: Sendable {
         return .safeSingleFrame
     }
 
+    /// Content detail false is necessary but insufficient: compare every public
+    /// input/eligibility fact used by this reader, excluding modification time.
+    func inputsUnchanged(from before: PhotoKitRepresentationAsset, assetContentChanged: Bool) -> Bool {
+        guard !assetContentChanged, identifier == before.identifier, playbackStyle == before.playbackStyle else { return false }
+        let normalized = PhotoKitRepresentationAsset(identifier: identifier, modificationDate: before.modificationDate,
+            playbackStyle: playbackStyle, resources: resources)
+        let context = LibraryContext(id: UUID(), epoch: 0)
+        return [RepresentationKind.original, .current].allSatisfy { kind in
+            before.descriptor(kind: kind, context: context) == normalized.descriptor(kind: kind, context: context) &&
+            (try? before.eligibility(kind)) == (try? normalized.eligibility(kind))
+        }
+    }
+
     func descriptor(kind: RepresentationKind, context: LibraryContext) -> RepresentationDescriptor {
         let resource = selected(kind)
         let edited = resources.contains { [.fullSizePhoto, .adjustmentData, .adjustmentBasePhoto].contains($0.type) }

@@ -22,6 +22,7 @@ enum PhotoKitSubmissionError: Error {
 struct PhotoKitCandidateAsset: Sendable {
     let identifier: String
     let candidates: [MatchCandidate]
+    var inputUnchanged: Bool = false
 }
 
 enum PhotoKitCandidateIndexChange: Sendable {
@@ -45,6 +46,7 @@ protocol PhotoKitLifecycle: Sendable {
         onPlaceholder: @escaping @Sendable (String) throws -> Void
     ) async throws -> PhotoKitSubmissionResult
     func fetch(identifier: String) throws -> Bool
+    func resetRepresentationCatalog()
     func representationCatalog(offset: Int, limit: Int, context: LibraryContext, generation: Int) throws -> RepresentationPage
     func representationDelta(assetIDs: [String], context: LibraryContext, generation: Int) throws -> RepresentationPage
     func archivedChangeToken() throws -> Data?
@@ -52,6 +54,7 @@ protocol PhotoKitLifecycle: Sendable {
 }
 
 extension PhotoKitLifecycle {
+    func resetRepresentationCatalog() {}
     func representationCatalog(offset: Int, limit: Int, context: LibraryContext, generation: Int) throws -> RepresentationPage {
         throw PhotosRepresentationError.unavailable
     }
@@ -69,21 +72,23 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private let representationReader: PhotosRepresentationReader?
     private let catalogBatchSize: Int
     private let changeChannel: PhotosIndexChangeChannel
+    private let diagnostics: @Sendable ([String: String]) -> Void
 
     public override convenience init() {
         let library = PHPhotoLibrary.shared()
         self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library), observedLibrary: library)
     }
 
-    public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget) {
+    public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         let library = PHPhotoLibrary.shared()
         let reader = PhotosRepresentationReader(requester: SystemPhotosRepresentationRequester(), budget: imageBudget,
                                                 limits: configuration.resources, targetSide: configuration.fingerprint.inputSide)
-        self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library, eventBatchSize: configuration.resources.catalogBatchSize), observedLibrary: library,
-                  representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize)
+        self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library, eventBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics), observedLibrary: library,
+                  representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics)
     }
 
-    init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0) {
+    init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        self.diagnostics = diagnostics
         self.representationReader = representationReader
         self.catalogBatchSize = catalogBatchSize
         changeChannel = PhotosIndexChangeChannel(capacity: max(1, catalogBatchSize))
@@ -93,7 +98,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     private init(lifecycle: any PhotoKitLifecycle, observedLibrary: PHPhotoLibrary,
-                 representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0) {
+                 representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        self.diagnostics = diagnostics
         self.representationReader = representationReader
         self.catalogBatchSize = catalogBatchSize
         changeChannel = PhotosIndexChangeChannel(capacity: max(1, catalogBatchSize))
@@ -137,24 +143,57 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     public func changes() -> AsyncStream<PhotosIndexChange> { changeChannel.stream() }
 
+    public func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession {
+        let session = try state.beginCatalogSession(expectedGeneration: expectedGeneration)
+        lifecycle.resetRepresentationCatalog()
+        return session
+    }
+    public func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage {
+        try state.validateCatalogSession(session)
+        let page = try await representationCatalog(offset: offset, limit: limit, expectedGeneration: session.baselineGeneration)
+        try state.validateCatalogSession(session)
+        return page
+    }
+    public func catalogCoverage(session: PhotosCatalogSession) async throws -> Int {
+        try state.validateCatalogSession(session)
+        let endpoint = try await catalogCoverage(baselineGeneration: session.baselineGeneration)
+        try state.validateCatalogSession(session)
+        return endpoint
+    }
+
+    public func attachIndexStore(_ store: SyncStore) { state.attach(store) }
+    public func acknowledgeInventory(expectedGeneration: Int) async throws {
+        guard state.acknowledgeReconciliation(generation: expectedGeneration, {}) else { throw PhotoKitGatewayError.libraryChanged }
+    }
+    public func catalogCoverage(baselineGeneration: Int) async throws -> Int {
+        _ = try await candidateSnapshot() // drains ordered producer classification
+        return try state.catalogCoverage(baseline: baselineGeneration)
+    }
+    public func catalogChanges(baselineGeneration: Int, throughGeneration: Int, afterAssetID: String?, limit: Int) async throws -> PhotosCatalogChangeBatch {
+        guard try state.catalogCoverage(baseline: baselineGeneration) == throughGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        return try state.catalogChanges(baseline: baselineGeneration, endpoint: throughGeneration, after: afterAssetID, limit: limit)
+    }
+
     public func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
         guard offset >= 0, limit > 0, limit <= catalogBatchSize else { throw PhotosRepresentationError.invalidPage }
         let generation = try await usableGeneration()
-        guard generation == expectedGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        if offset == 0 { guard generation == expectedGeneration else { throw PhotoKitGatewayError.libraryChanged } }
+        _ = try state.catalogCoverage(baseline: expectedGeneration)
         let context = state.snapshot().context
-        let page = try lifecycle.representationCatalog(offset: offset, limit: limit, context: context, generation: generation)
-        try verifyUsable(generation: generation)
-        guard page.context == context, page.generation == generation, page.descriptors.count + page.exclusions.count <= limit,
+        let page = try lifecycle.representationCatalog(offset: offset, limit: limit, context: context, generation: expectedGeneration)
+        _ = try await candidateSnapshot()
+        _ = try state.catalogCoverage(baseline: expectedGeneration)
+        guard page.context == context, page.generation == expectedGeneration, page.descriptors.count + page.exclusions.count <= limit,
               (page.descriptors + page.exclusions.map(\.descriptor)).allSatisfy({ $0.context == context }),
               page.nextOffset.map({ $0 > offset }) ?? true else { throw PhotosRepresentationError.invalidPage }
         // Reconciliation acknowledgement belongs to the caller after all pages,
         // persisted facts and derived index publish succeed; fetching a last page
         // alone is not sufficient to clear the sticky dirty bit.
-        let evidence = try state.invalidationEvidence(generation: generation,
+        let evidence = try state.invalidationEvidence(generation: state.snapshot().generation,
             pageAssetIDs: Set((page.descriptors + page.exclusions.map(\.descriptor)).map { $0.key.assetID }))
         return RepresentationPage(context: page.context, generation: page.generation, descriptors: page.descriptors,
                                   nextOffset: page.nextOffset, exclusions: page.exclusions,
-                                  invalidatedAssetIDs: evidence.ids, invalidateAllCachedRepresentations: evidence.all)
+                                  invalidatedAssetIDs: evidence.ids, invalidateAllCachedRepresentations: evidence.all, inputUnchangedAssetIDs: evidence.unchanged)
     }
 
     public func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage {
@@ -171,7 +210,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         let evidence = try state.invalidationEvidence(generation: generation, pageAssetIDs: Set(delta.changedAssetIDs))
         guard !evidence.all else { throw PhotoKitGatewayError.libraryChanged }
         return RepresentationPage(context: delta.context, generation: generation, descriptors: page.descriptors,
-            nextOffset: nil, exclusions: page.exclusions, invalidatedAssetIDs: evidence.ids)
+            nextOffset: nil, exclusions: page.exclusions, invalidatedAssetIDs: evidence.ids, inputUnchangedAssetIDs: evidence.unchanged)
     }
 
     public func acknowledgeReconciliation(expectedGeneration: Int) async throws {
@@ -191,6 +230,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
             state.representationReadIsCurrent(ticket, context: descriptor.context) &&
                 lifecycle.currentAccess() == .authorized && lifecycle.isAvailable()
         }
+        do { _ = try await candidateSnapshot() }
+        catch { await loaded.lease.finishPhysicalWork(); throw error }
         guard state.representationReadIsCurrent(ticket, context: descriptor.context),
               lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
             await loaded.lease.finishPhysicalWork(); throw PhotoKitGatewayError.libraryChanged
@@ -209,7 +250,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         do {
             _ = try await usableGeneration()
             let generation = state.recordChange(expectingDetails: true)
-            defer { state.finishChangeDetails() }
+            state.setReplayContext(checkpoint.context)
+            defer { state.finishChangeDetails(); state.setReplayContext(nil) }
             guard try lifecycle.replayPersistentChanges(checkpoint.archivedChangeToken, onChange: { [state] event in
                 if event == .fullReconcileRequired || event == .contextInvalidated { state.invalidateAllRepresentations() }
             }, onContentChange: { [state, catalogBatchSize] ids in
@@ -328,6 +370,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private func enqueueLibraryChange(_ change: PHChange?) {
         let recorded = state.recordObserverChange()
         let generation = recorded.generation
+        diagnostics(["phase": "photos-notification", "event": String(generation), "publication": "closed", "classification": "pending"])
         candidateIndex.enqueueChange(
             change,
             generation: generation,
@@ -337,13 +380,21 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 guard let self else { return false }
                 return self.state.markIndexed(generation: generation)
             },
-            onChange: { [state, changeChannel] event in
-                if event == .fullReconcileRequired || event == .contextInvalidated { state.invalidateAllRepresentations() }
-                if case .incremental(let delta) = event { state.invalidateActiveReads(Set(delta.changedAssetIDs + delta.deletedAssetIDs)) }
-                changeChannel.send(event)
+            onChange: { [state, changeChannel, catalogBatchSize] event in
+                switch event {
+                case .incremental(let delta):
+                    if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.invalidateAllRepresentations() }
+                    // A large complete scope is durable; stream buffers hold only a wakeup.
+                    if delta.changedAssetIDs.count + delta.deletedAssetIDs.count > max(1, catalogBatchSize / 2), state.hasStore {
+                        changeChannel.send(.fullReconcileRequired)
+                    } else { changeChannel.send(event) }
+                case .contextInvalidated: state.invalidateAllRepresentations(); changeChannel.send(event)
+                case .fullReconcileRequired: state.invalidateAllRepresentations(); changeChannel.send(event)
+                }
             },
             onContentChange: { [state, catalogBatchSize] ids in state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) },
-            didFinishDetails: { [state] in state.finishChangeDetails() }
+            didFinishDetails: { [state] in state.finishChangeDetails() },
+            diagnostics: diagnostics
         )
     }
 
@@ -415,7 +466,10 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     private var representationAssets: PHFetchResult<PHAsset>?
     private var representationGeneration: Int?
     private let eventBatchSize: Int
-    init(photoLibrary: PHPhotoLibrary, eventBatchSize: Int = 1) { self.photoLibrary = photoLibrary; self.eventBatchSize = eventBatchSize }
+    private let diagnostics: @Sendable ([String: String]) -> Void
+    init(photoLibrary: PHPhotoLibrary, eventBatchSize: Int = 1, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        self.photoLibrary = photoLibrary; self.eventBatchSize = eventBatchSize; self.diagnostics = diagnostics
+    }
 
     func currentAccess() -> PhotoKitAccess {
         switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
@@ -447,11 +501,19 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     }
 
     func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange {
-        guard let change, let before = fetchedAssets else { return .reload }
+        guard let change, let before = fetchedAssets else {
+            diagnostics(["phase": "photos-fetch-details", "fallback": "missing-change-or-fetch-baseline"])
+            return .reload
+        }
         guard let details = change.changeDetails(for: before) else {
             return .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
         }
-        guard details.hasIncrementalChanges, details.fetchResultBeforeChanges === before else { return .reload }
+        guard details.fetchResultBeforeChanges === before else {
+            diagnostics(["phase": "photos-fetch-details", "fallback": "fetch-before-identity-mismatch"])
+            return .reload
+        }
+        diagnostics(["phase": "photos-fetch-details", "incremental": String(details.hasIncrementalChanges),
+            "classification": "object-content-and-input-facts"])
         let after = details.fetchResultAfterChanges
         let makeCandidate: (PHAsset) -> PhotoKitCandidateAsset = { asset in
             PhotoKitCandidateAsset(identifier: asset.localIdentifier, candidates: PHAssetResource.assetResources(for: asset).compactMap { resource in
@@ -459,12 +521,39 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
                 return MatchCandidate(key: "photos:\(asset.localIdentifier):\(resource.originalFilename)", metadata: Self.metadata(asset: asset, filename: resource.originalFilename))
             })
         }
+        var removed = Set<String>(), inserted: [PhotoKitCandidateAsset] = [], changed: [PhotoKitCandidateAsset] = []
+        var beforeIDs = Set<String>(), incompleteObjectDetails = false
+        before.enumerateObjects { old, _, _ in
+            beforeIDs.insert(old.localIdentifier)
+            guard let object = change.changeDetails(for: old) else { return }
+            if object.objectWasDeleted { removed.insert(old.localIdentifier); return }
+            guard let current = object.objectAfterChanges else { incompleteObjectDetails = true; return }
+            var candidate = makeCandidate(current)
+            candidate.inputUnchanged = Self.sameRepresentationInputs(old, current, assetContentChanged: object.assetContentChanged)
+            changed.append(candidate)
+        }
+        guard !incompleteObjectDetails else {
+            diagnostics(["phase": "photos-fetch-details", "fallback": "missing-object-after-details"])
+            return .reload
+        }
+        after.enumerateObjects { asset, _, _ in
+            if !beforeIDs.contains(asset.localIdentifier) { inserted.append(makeCandidate(asset)) }
+        }
+        // A complete after membership is authoritative even for nonincremental details.
+        let afterIDs = Set((0..<after.count).map { after.object(at: $0).localIdentifier })
+        removed.formUnion(beforeIDs.subtracting(afterIDs))
         fetchedAssets = after
-        return .incremental(
-            removedAssetIDs: Set(details.removedObjects.map(\.localIdentifier)),
-            insertedAssets: details.insertedObjects.map(makeCandidate),
-            changedAssets: details.changedObjects.map(makeCandidate)
-        )
+        return .incremental(removedAssetIDs: removed, insertedAssets: inserted, changedAssets: changed)
+    }
+
+    private static func sameRepresentationInputs(_ before: PHAsset, _ after: PHAsset, assetContentChanged: Bool) -> Bool {
+        guard before.mediaType == after.mediaType, before.mediaSubtypes == after.mediaSubtypes,
+              before.pixelWidth == after.pixelWidth, before.pixelHeight == after.pixelHeight else { return false }
+        return PhotoKitRepresentationAsset(asset: after).inputsUnchanged(from: PhotoKitRepresentationAsset(asset: before),
+            assetContentChanged: assetContentChanged)
+    }
+    func resetRepresentationCatalog() {
+        representationQueue.sync { representationAssets = nil; representationGeneration = nil }
     }
     func representationCatalog(offset: Int, limit: Int, context: LibraryContext, generation: Int) throws -> RepresentationPage {
         try representationQueue.sync {
@@ -508,8 +597,11 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
             for i in 0..<assets.count {
                 let asset = assets.object(at: i)
                 // Full inventory remains image-only. A broad candidate event can contain video IDs.
-                guard asset.mediaType == .image else { throw PhotoKitGatewayError.libraryChanged }
                 let facts = PhotoKitRepresentationAsset(asset: asset)
+                if asset.mediaType != .image {
+                    exclusions.append(.init(descriptor: facts.descriptor(kind: .original, context: context), reason: .nonImage))
+                    continue
+                }
                 for kind in [RepresentationKind.original, .current] {
                     let descriptor = facts.descriptor(kind: kind, context: context)
                     do {
@@ -531,7 +623,12 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
         let result = try photoLibrary.fetchPersistentChanges(since: token)
         for change in result {
             let details = try change.changeDetails(for: .asset)
-            onContentChange(details.updatedLocalIdentifiers.sorted())
+            for ids in [details.updatedLocalIdentifiers, details.deletedLocalIdentifiers, details.insertedLocalIdentifiers] {
+                let ordered = ids.sorted()
+                for offset in stride(from: 0, to: ordered.count, by: max(1, eventBatchSize)) {
+                    onContentChange(Array(ordered[offset..<min(ordered.count, offset + max(1, eventBatchSize))]))
+                }
+            }
             // Persistent replay only supplies invalidation/continuity for the mandatory
             // restart inventory. It cannot manufacture a process-local live delta baseline.
 
@@ -592,14 +689,19 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                        didIndex: @escaping @Sendable (Int) -> Bool,
                        onChange: @escaping @Sendable (PhotosIndexChange) -> Void,
                        onContentChange: @escaping @Sendable ([String]) -> Void,
-                       didFinishDetails: @escaping @Sendable () -> Void) {
+                       didFinishDetails: @escaping @Sendable () -> Void,
+                       diagnostics: @escaping @Sendable ([String: String]) -> Void) {
         queue.async { [weak self] in
             defer { didFinishDetails() }
             guard let self else { return }
             guard case let .incremental(removed, inserted, changed) = (try? lifecycle.candidateIndexChange(for: change)) else {
+                diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "missing-or-unclassified-fetch-details", "contentScope": "unknown"])
                 onChange(.fullReconcileRequired); return
             }
-            guard self.indexedGeneration == generation - 1 else { onChange(.fullReconcileRequired); return }
+            guard self.indexedGeneration == generation - 1 else {
+                diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "candidate-baseline-gap", "contentScope": "unknown"])
+                onChange(.fullReconcileRequired); return
+            }
             let insertedIDs = Set(inserted.map(\.identifier))
             let changedIDs = Set(changed.map(\.identifier))
             guard insertedIDs.count == inserted.count,
@@ -609,13 +711,20 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                   insertedIDs.isDisjoint(with: changedIDs),
                   removed.allSatisfy({ self.byAsset[$0] != nil }),
                   inserted.allSatisfy({ self.byAsset[$0.identifier] == nil }),
-                  changed.allSatisfy({ self.byAsset[$0.identifier] != nil }) else { onChange(.fullReconcileRequired); return }
+                  changed.allSatisfy({ self.byAsset[$0.identifier] != nil }) else {
+                diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "malformed-membership-details", "contentScope": "unknown"])
+                onChange(.fullReconcileRequired); return
+            }
             for id in removed { self.remove(id) }
             for asset in changed { self.remove(asset.identifier); self.insert(asset) }
             for asset in inserted { self.insert(asset) }
             self.indexedGeneration = generation
             _ = didIndex(generation)
-            onContentChange(changed.map(\.identifier) + removed.sorted())
+            diagnostics(["phase": "photos-change-classification", "event": String(generation), "contentScope": "known",
+                "inserted": String(inserted.count), "deleted": String(removed.count),
+                "contentChanged": String(changed.filter { !$0.inputUnchanged }.count),
+                "inputUnchanged": String(changed.filter(\.inputUnchanged).count)])
+            onContentChange(changed.filter { !$0.inputUnchanged }.map(\.identifier) + removed.sorted())
             onChange(.incremental(.init(context: context, fromGeneration: generation - 1, toGeneration: generation,
                 changedAssetIDs: (inserted + changed).map(\.identifier).sorted(), deletedAssetIDs: removed.sorted())))
         }
@@ -655,7 +764,48 @@ private final class PhotoKitState: @unchecked Sendable {
     enum AdditionBlockReason { case checkpointFailed, unknownOutcome }
     private let lock = NSLock(); private var available = true; private var generation = 0; private var indexedGeneration: Int?; private var additionsBlocked: AdditionBlockReason?
     private var context = LibraryContext(id: UUID(), epoch: 0)
-    private var contentChangedIDs = Set<String>()
+    private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext)?
+    func beginCatalogSession(expectedGeneration: Int) throws -> PhotosCatalogSession {
+        lock.lock(); defer { lock.unlock() }
+        guard available, generation == expectedGeneration, pendingChangeDetails == 0 else { throw PhotoKitGatewayError.libraryChanged }
+        let session = PhotosCatalogSession(baselineGeneration: expectedGeneration)
+        catalogSession = (session, context)
+        return session
+    }
+    func validateCatalogSession(_ session: PhotosCatalogSession) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard available, catalogSession?.session == session, catalogSession?.context == context,
+              unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
+    }
+    private var contentChangedIDs = Set<String>() // fallback only, bounded by one catalog page
+    private var store: SyncStore?
+    private let runID = UUID()
+    private var unknownGeneration = -1
+    private var replayContext: LibraryContext?
+    var hasStore: Bool { lock.lock(); defer { lock.unlock() }; return store != nil }
+    func attach(_ store: SyncStore) { lock.lock(); self.store = store; lock.unlock() }
+    func catalogCoverage(baseline: Int) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        guard available, pendingChangeDetails == 0, baseline <= generation, unknownGeneration <= baseline else { throw PhotoKitGatewayError.libraryChanged }
+        return generation
+    }
+    func catalogChanges(baseline: Int, endpoint: Int, after: String?, limit: Int) throws -> PhotosCatalogChangeBatch {
+        lock.lock(); let store = store, context = context; lock.unlock()
+        guard let store else {
+            guard endpoint == baseline else { return .init(changedAssetIDs: [], deletedAssetIDs: [], nextAssetID: nil) }
+            return .init(changedAssetIDs: [], deletedAssetIDs: [], nextAssetID: nil)
+        }
+        return try store.photosCatalogChanges(context: context, runID: runID, afterGeneration: baseline,
+            throughGeneration: endpoint, afterAssetID: after, limit: limit)
+    }
+    func recordCatalogChanges(_ delta: PhotosIndexDelta, capacity: Int) -> Bool {
+        lock.lock(); let store = store; lock.unlock()
+        do {
+            try store?.recordPhotosChanges(context: delta.context, runID: runID, generation: delta.toGeneration,
+                changed: delta.changedAssetIDs, deleted: delta.deletedAssetIDs, content: [], batchSize: capacity)
+            return true
+        } catch { return false }
+    }
     private var allRepresentationsInvalid = false
     private var pendingChangeDetails = 0
 
@@ -668,7 +818,7 @@ private final class PhotoKitState: @unchecked Sendable {
     func endRepresentationRead(_ ticket: UUID) { lock.lock(); reads.removeValue(forKey: ticket); lock.unlock() }
     func representationReadIsCurrent(_ ticket: UUID, context expected: LibraryContext) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return available && context == expected && pendingChangeDetails == 0 && reads[ticket]?.valid == true
+        return available && context == expected && reads[ticket]?.valid == true
     }
     func invalidateActiveReads(_ ids: Set<String>) {
         lock.lock(); defer { lock.unlock() }
@@ -681,35 +831,55 @@ private final class PhotoKitState: @unchecked Sendable {
     }
 
     func recordContentChanges(_ ids: [String], capacity: Int) {
-        lock.lock(); defer { lock.unlock() }
-        guard !allRepresentationsInvalid else { return }
-        for id in ids {
-            contentChangedIDs.insert(id)
-            if contentChangedIDs.count > capacity {
-                allRepresentationsInvalid = true; contentChangedIDs.removeAll(); return
+        invalidateActiveReads(Set(ids))
+        lock.lock()
+        let store = store, context = replayContext ?? context, generation = generation
+        if store == nil {
+            for id in ids {
+                if contentChangedIDs.count >= capacity && !contentChangedIDs.contains(id) {
+                    allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll(); break
+                }
+                contentChangedIDs.insert(id)
             }
         }
+        lock.unlock()
+        do {
+            try store?.recordPhotosChanges(context: context, runID: runID, generation: generation,
+                changed: ids, deleted: [], content: Set(ids), batchSize: capacity)
+        } catch { invalidateAllRepresentations() }
     }
     func invalidateAllRepresentations() {
-        lock.lock(); allRepresentationsInvalid = true; contentChangedIDs.removeAll()
+        lock.lock(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll()
         for (ticket, read) in reads { reads[ticket] = (read.assetID, false) }
         lock.unlock()
     }
     func finishChangeDetails() {
         lock.lock(); pendingChangeDetails -= 1; lock.unlock()
     }
-    func invalidationEvidence(generation expected: Int, pageAssetIDs: Set<String>) throws -> (ids: [String], all: Bool) {
-        lock.lock(); defer { lock.unlock() }
-        guard available, generation == expected else { throw PhotoKitGatewayError.libraryChanged }
-        return (contentChangedIDs.intersection(pageAssetIDs).sorted(), allRepresentationsInvalid || pendingChangeDetails > 0)
+    func invalidationEvidence(generation expected: Int, pageAssetIDs: Set<String>) throws -> (ids: [String], all: Bool, unchanged: [String]) {
+        lock.lock()
+        let usable = available && generation == expected && pendingChangeDetails == 0
+        let store = store, context = context, fallback = contentChangedIDs.intersection(pageAssetIDs).sorted()
+        let all = allRepresentationsInvalid
+        lock.unlock()
+        guard usable else { throw PhotoKitGatewayError.libraryChanged }
+        return (try store?.photosContentChanges(context: context, assetIDs: pageAssetIDs) ?? fallback, all,
+                all ? [] : try store?.photosInputUnchanged(context: context, assetIDs: pageAssetIDs) ?? [])
     }
     func acknowledgeReconciliation(generation expected: Int, _ acknowledge: () -> Void) -> Bool {
+        lock.lock()
+        guard available, generation == expected, pendingChangeDetails == 0 else { lock.unlock(); return false }
+        let store = store, context = context
+        lock.unlock()
+        do { try store?.acknowledgePhotosChanges(context: context, runID: runID, throughGeneration: expected) }
+        catch { return false }
         lock.lock(); defer { lock.unlock() }
         guard available, generation == expected, pendingChangeDetails == 0 else { return false }
         contentChangedIDs.removeAll(); allRepresentationsInvalid = false
         acknowledge()
         return true
     }
+    func setReplayContext(_ value: LibraryContext?) { lock.lock(); replayContext = value; lock.unlock() }
     func snapshot() -> (available: Bool, generation: Int, context: LibraryContext) { lock.lock(); defer { lock.unlock() }; return (available, generation, context) }
     func adoptContext(_ context: LibraryContext, generation expected: Int) -> Int? {
         lock.lock(); defer { lock.unlock() }

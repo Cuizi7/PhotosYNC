@@ -13,8 +13,9 @@ public enum PhotosIndexChange: Equatable, Sendable {
 /// contain unique, nonempty, disjoint IDs: changed IDs require inventory inspection;
 /// deleted IDs require affirmative deletion evidence, never a missing fetch result.
 /// Both arrays may be empty for a valid advancing interval. Emit the whole interval,
-/// not independent batches; exceed `catalogBatchSize`, lose continuity or lack a
-/// complete baseline and emit full/context invalidation instead. Subscribers may
+/// not independent batches. Large producer scopes are durably journaled before a
+/// catalog-reconcile wakeup; bounded persistence uses PhotosIndexDeltaBatch.
+/// Lost continuity or an absent complete baseline requires reconciliation. Subscribers may
 /// receive the same interval more than once; duplicate delivery adds no new facts.
 public struct PhotosIndexDelta: Equatable, Sendable {
     public let context: LibraryContext
@@ -49,14 +50,61 @@ public struct RepresentationPage: Equatable, Sendable {
     /// in changedAssetIDs does not itself establish same-revision content validity.
     public let invalidatedAssetIDs: [String]
     public let invalidateAllCachedRepresentations: Bool
+    public let inputUnchangedAssetIDs: [String]
     public init(context: LibraryContext, generation: Int, descriptors: [RepresentationDescriptor], nextOffset: Int?, exclusions: [RepresentationCatalogExclusion] = [],
-                invalidatedAssetIDs: [String] = [], invalidateAllCachedRepresentations: Bool = false) {
+                invalidatedAssetIDs: [String] = [], invalidateAllCachedRepresentations: Bool = false, inputUnchangedAssetIDs: [String] = []) {
         self.context = context; self.generation = generation; self.descriptors = descriptors; self.nextOffset = nextOffset; self.exclusions = exclusions
         self.invalidatedAssetIDs = invalidatedAssetIDs; self.invalidateAllCachedRepresentations = invalidateAllCachedRepresentations
+        self.inputUnchangedAssetIDs = inputUnchangedAssetIDs
     }
 }
 
+/// A bounded slice of ONE complete interval. Its offset is durable sequencing,
+/// never another claim that a partial ID list covers fromGeneration...toGeneration.
+public struct PhotosIndexDeltaBatch: Sendable {
+    public let interval: PhotosIndexDelta
+    public let offset: Int
+    public let count: Int
+    public init(interval: PhotosIndexDelta, offset: Int, count: Int) {
+        self.interval = interval; self.offset = offset; self.count = count
+    }
+    var total: Int { interval.changedAssetIDs.count + interval.deletedAssetIDs.count }
+    var first: Bool { offset == 0 }
+    var last: Bool { offset + count == total }
+    var valid: Bool { interval.isValid && offset >= 0 && count >= 0 && offset <= total && count <= total - offset && (count > 0 || total == 0) }
+    var request: PhotosIndexDelta {
+        let ids = interval.changedAssetIDs + interval.deletedAssetIDs
+        let selected = Set(ids[offset..<offset + count])
+        return .init(context: interval.context, fromGeneration: interval.fromGeneration, toGeneration: interval.toGeneration,
+            changedAssetIDs: interval.changedAssetIDs.filter { selected.contains($0) },
+            deletedAssetIDs: interval.deletedAssetIDs.filter { selected.contains($0) })
+    }
+}
+
+public struct PhotosCatalogSession: Equatable, Sendable {
+    public let id: UUID
+    public let baselineGeneration: Int
+    public init(id: UUID = UUID(), baselineGeneration: Int) {
+        self.id = id; self.baselineGeneration = baselineGeneration
+    }
+}
+
+public struct PhotosCatalogChangeBatch: Sendable {
+    public let changedAssetIDs: [String]
+    public let deletedAssetIDs: [String]
+    public let nextAssetID: String?
+}
+
 public protocol PhotosIndexGateway: PhotosGateway {
+    func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession
+    func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage
+    func catalogCoverage(session: PhotosCatalogSession) async throws -> Int
+    /// Installed before subscription. Producer obligations share the fact database.
+    func attachIndexStore(_ store: SyncStore)
+    func acknowledgeInventory(expectedGeneration: Int) async throws
+    /// The original generation identifies a stable enumeration; this endpoint may advance.
+    func catalogCoverage(baselineGeneration: Int) async throws -> Int
+    func catalogChanges(baselineGeneration: Int, throughGeneration: Int, afterAssetID: String?, limit: Int) async throws -> PhotosCatalogChangeBatch
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage
     /// Fetch only changed IDs and return their COMPLETE representation eligibility
     /// inventory at delta.context/toGeneration: all eligible descriptors (including
@@ -131,6 +179,8 @@ public struct LoadedRepresentation: @unchecked Sendable {
 
 /// A bounded wake-up stream. Once any buffer overflows, every subsequent event
 /// becomes full-reconcile until a complete generation is explicitly acknowledged.
+/// This marks catalog delivery dirty only; the producer's durable journal retains
+/// content obligations and does not reinterpret overflow as changed image pixels.
 /// New subscribers also see the sticky dirty state, so a dropped event is never
 /// silently replaced by a later, narrower update.
 final class PhotosIndexChangeChannel: @unchecked Sendable {
@@ -153,7 +203,7 @@ final class PhotosIndexChangeChannel: @unchecked Sendable {
     func send(_ event: PhotosIndexChange) {
         lock.lock(); defer { lock.unlock() }
         if case .incremental(let delta) = event,
-           !delta.isValid || delta.changedAssetIDs.count + delta.deletedAssetIDs.count > capacity { dirty = true }
+           !delta.isValid { dirty = true }
         if event == .fullReconcileRequired || event == .contextInvalidated { dirty = true }
         guard !continuations.isEmpty else { dirty = true; return }
         var overflowed = false
@@ -183,6 +233,22 @@ public struct LibraryResumeCheckpoint: Codable, Equatable, Sendable {
 }
 
 public extension PhotosIndexGateway {
+    func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession { .init(baselineGeneration: expectedGeneration) }
+    func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage {
+        try await representationCatalog(offset: offset, limit: limit, expectedGeneration: session.baselineGeneration)
+    }
+    func catalogCoverage(session: PhotosCatalogSession) async throws -> Int { try await catalogCoverage(baselineGeneration: session.baselineGeneration) }
+    func attachIndexStore(_ store: SyncStore) {}
+    func acknowledgeInventory(expectedGeneration: Int) async throws {}
+    func catalogCoverage(baselineGeneration: Int) async throws -> Int {
+        let snapshot = try await candidateSnapshot()
+        guard snapshot.generation == baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        return baselineGeneration
+    }
+    func catalogChanges(baselineGeneration: Int, throughGeneration: Int, afterAssetID: String?, limit: Int) async throws -> PhotosCatalogChangeBatch {
+        guard baselineGeneration == throughGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        return .init(changedAssetIDs: [], deletedAssetIDs: [], nextAssetID: nil)
+    }
     func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage { throw PhotoKitGatewayError.libraryChanged }
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool { false }
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint? { nil }
@@ -190,6 +256,7 @@ public extension PhotosIndexGateway {
 }
 
 public enum RepresentationExclusionReason: Equatable, Sendable {
+    case nonImage
     case rawResource
     case conservative(RepresentationConservativeReason)
 }

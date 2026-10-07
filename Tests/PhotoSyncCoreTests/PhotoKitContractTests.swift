@@ -1,5 +1,6 @@
 import XCTest
 import Photos
+import ImageIO
 @testable import PhotoSyncCore
 
 final class PhotoKitContractTests: XCTestCase {
@@ -106,6 +107,128 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testRealGatewayCoordinatorMergesClassifiedEventsDuringEveryCatalogPage() async throws {
+        for membership in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = try SyncStore(url: root.appendingPathComponent("test.sqlite"))
+            let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: repository.appendingPathComponent("docs/research/advanced-dedup/integration-profile.json")))
+            let lifecycle = FakePhotoKitLifecycle()
+            lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }
+            let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+            lifecycle.catalogHook = { offset in
+                if membership && offset == 1 {
+                    lifecycle.nextChange = .incremental(removedAssetIDs: ["page1"], insertedAssets: [.init(identifier: "new", candidates: [candidate(key: "new")])], changedAssets: [])
+                } else { lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: []) }
+                gateway.recordLibraryChangeForTesting()
+            }
+            let coordinator = PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration)
+            try await coordinator.reconcile()
+            XCTAssertEqual(lifecycle.catalogOffsets, [0, 1, 2, 3])
+            let progress = await coordinator.progress()
+            XCTAssertTrue(progress.totalsKnown)
+            XCTAssertEqual(progress.totalRepresentations, 4)
+            let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 128)
+            XCTAssertEqual(Set(tasks.map { $0.descriptor.key.assetID }), membership ? ["page0", "page2", "page3", "new"] : ["page0", "page1", "page2", "page3"])
+        }
+    }
+
+    func testProducerClassifiesRawObjectContentAndInputsWithoutErasingEarlierContentObligation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SyncStore(url: root.appendingPathComponent("test.sqlite"))
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "a")]
+        let photos = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        photos.attachIndexStore(store)
+        let resource = PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "a.jpg", size: nil)
+        let before = PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(timeIntervalSince1970: 1), playbackStyle: .image, resources: [resource])
+        let after = PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(timeIntervalSince1970: 2), playbackStyle: .image, resources: [resource])
+        var snapshot = try await photos.candidateSnapshot()
+        for content in [false, true, false] {
+            lifecycle.rawInputChange = (before, after, content)
+            photos.recordLibraryChangeForTesting()
+            let latest = try await photos.candidateSnapshot()
+            let delta = PhotosIndexDelta(context: try await photos.representationCatalog(offset: 0, limit: 128, expectedGeneration: latest.generation).context,
+                fromGeneration: snapshot.generation, toGeneration: latest.generation, changedAssetIDs: ["a"], deletedAssetIDs: [])
+            let page = try await photos.representationDelta(delta)
+            if snapshot.generation == 0 {
+                XCTAssertEqual(page.inputUnchangedAssetIDs, ["a"])
+                XCTAssertEqual(page.invalidatedAssetIDs, [])
+            } else {
+                XCTAssertEqual(page.inputUnchangedAssetIDs, [])
+                XCTAssertEqual(page.invalidatedAssetIDs, ["a"])
+            }
+            snapshot = latest
+        }
+    }
+
+    func testAttachedGatewayPersists129KnownIDsAndPreservesOtherPageEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = root.appendingPathComponent("test.sqlite"), store = try SyncStore(url: db)
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = (0..<129).map { candidate(key: "a\($0)") }
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        gateway.attachIndexStore(store)
+        _ = try await gateway.candidateSnapshot()
+        var events = gateway.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: (0..<129).map {
+            .init(identifier: "a\($0)", candidates: [candidate(key: "a\($0)")])
+        })
+        gateway.recordLibraryChangeForTesting()
+        let latest = try await gateway.candidateSnapshot()
+        let event = await events.next(); XCTAssertEqual(event, .fullReconcileRequired)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change WHERE content_changed=1", at: db), 129)
+        let page = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: latest.generation)
+        XCTAssertFalse(page.invalidateAllCachedRepresentations)
+        XCTAssertEqual(page.invalidatedAssetIDs, []) // unrelated page0
+    }
+
+    func testCatalogSessionReplacementRejectsOldPageEvenAtSameRawGeneration() async throws {
+        let gateway = PhotoKitGateway(lifecycle: FakePhotoKitLifecycle(), catalogBatchSize: 128)
+        let snapshot = try await gateway.candidateSnapshot()
+        let first = try await gateway.beginCatalogSession(expectedGeneration: snapshot.generation)
+        _ = try await gateway.representationCatalog(session: first, offset: 0, limit: 128)
+        let second = try await gateway.beginCatalogSession(expectedGeneration: snapshot.generation)
+        XCTAssertNotEqual(first.id, second.id)
+        do { _ = try await gateway.representationCatalog(session: first, offset: 1, limit: 128); XCTFail("superseded fetch session") } catch {}
+        _ = try await gateway.representationCatalog(session: second, offset: 0, limit: 128)
+    }
+
+    func testNeutralProducerNotificationsKeepCatalogBaselineUsableBetweenEveryPage() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 2)
+        let baseline = try await gateway.candidateSnapshot()
+        _ = try await gateway.representationCatalog(offset: 0, limit: 2, expectedGeneration: baseline.generation)
+        for offset in 1...3 {
+            lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+            gateway.recordLibraryChangeForTesting()
+            _ = try await gateway.candidateSnapshot()
+            let page = try await gateway.representationCatalog(offset: offset, limit: 2, expectedGeneration: baseline.generation)
+            XCTAssertEqual(page.generation, baseline.generation)
+            XCTAssertFalse(page.invalidateAllCachedRepresentations)
+        }
+    }
+
+    func testKnown129AssetChangesRemainScopedInProducerEvidence() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = (0..<130).map { candidate(key: "a\($0)") }
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        _ = try await gateway.candidateSnapshot()
+        var events = gateway.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [],
+            changedAssets: (0..<129).map { .init(identifier: "a\($0)", candidates: [candidate(key: "a\($0)")]) })
+        gateway.recordLibraryChangeForTesting()
+        _ = try await gateway.candidateSnapshot()
+        guard case .incremental(let delta) = await events.next() else { return XCTFail("known complete scope must remain incremental") }
+        XCTAssertEqual(delta.changedAssetIDs.count, 129)
+    }
+
     func testGenerationBoundProducerSendsOneCompleteDeltaAndFetchesOnlyRequestedIDs() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         lifecycle.candidates = [candidate(key: "old"), candidate(key: "unchanged")]
@@ -126,7 +249,7 @@ final class PhotoKitContractTests: XCTestCase {
         do { _ = try await gateway.representationDelta(delta); XCTFail("missing requested IDs must fail closed") } catch {}
     }
 
-    func testEmptyIncrementalGenerationAndOversizedEventNeverSplitTransactions() async throws {
+    func testEmptyAndLargeIncrementalEventsKeepTheirCompleteInterval() async throws {
         let lifecycle = FakePhotoKitLifecycle()
         let photos = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 1)
         _ = try await photos.candidateSnapshot()
@@ -139,10 +262,12 @@ final class PhotoKitContractTests: XCTestCase {
         lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [
             .init(identifier: "a", candidates: []), .init(identifier: "b", candidates: [])], changedAssets: [])
         photos.recordLibraryChangeForTesting(); _ = try await photos.candidateSnapshot()
-        let overflow = await events.next(); XCTAssertEqual(overflow, .fullReconcileRequired)
+        guard case .incremental(let large) = await events.next() else { return XCTFail("whole interval required") }
+        XCTAssertEqual(large.changedAssetIDs, ["a", "b"])
         lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
         photos.recordLibraryChangeForTesting(); _ = try await photos.candidateSnapshot()
-        let sticky = await events.next(); XCTAssertEqual(sticky, .fullReconcileRequired)
+        guard case .incremental(let next) = await events.next() else { return XCTFail("known interval must not poison later events") }
+        XCTAssertEqual(next.fromGeneration, large.toGeneration)
     }
 
     func testGatewayErrorsKeepCheckpointFailureAndUnknownOutcomeSeparateFromDefiniteFailure() {
@@ -477,8 +602,22 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
         let grouped = Dictionary(grouping: snapshot, by: { $0.key })
         return grouped.map { PhotoKitCandidateAsset(identifier: $0.key, candidates: $0.value) }
     }
+    var rawInputChange: (PhotoKitRepresentationAsset, PhotoKitRepresentationAsset, Bool)?
     func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange {
-        nextChange
+        if let (before, after, content) = rawInputChange {
+            return .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [
+                .init(identifier: after.identifier, candidates: [candidate(key: after.identifier)],
+                      inputUnchanged: after.inputsUnchanged(from: before, assetContentChanged: content))])
+        }
+        return nextChange
+    }
+    var catalogHook: ((Int) -> Void)?
+    var catalogOffsets: [Int] = []
+    func representationCatalog(offset: Int, limit: Int, context: LibraryContext, generation: Int) throws -> RepresentationPage {
+        catalogOffsets.append(offset); catalogHook?(offset)
+        return .init(context: context, generation: generation, descriptors: [.init(key: .init(assetID: "page\(offset)", kind: .original),
+            context: context, revision: "r1", size: nil, equivalentToOriginal: false, revisionIsReliable: true)],
+            nextOffset: offset < 3 ? offset + 1 : nil)
     }
     var deltaIDs: [[String]] = [], omitDeltaIDs = false
     func representationDelta(assetIDs: [String], context: LibraryContext, generation: Int) throws -> RepresentationPage {
@@ -542,4 +681,11 @@ private final class NativeAdmissionSwitch: @unchecked Sendable {
     private var value = true
     func reject() { lock.lock(); value = false; lock.unlock() }
     var allowed: Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+private struct ContractNoReadModel: ImageFingerprinting {
+    func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        XCTFail("catalog reconciliation must not invoke image inference")
+        throw PhotosRepresentationError.unavailable
+    }
 }

@@ -48,6 +48,98 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
 
     private let now = Date(timeIntervalSince1970: 1_000)
 
+    func testMetadataOnlyRevisionChangePreservesInFlightIssuanceAndInference() async throws {
+        let f = try fixture(), gate = CoordinatorGate()
+        let a = descriptor(f.photos.context)
+        await f.photos.set([a]); try await f.coordinator.reconcile(); await f.model.setGate(gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered()
+        let delta = await f.photos.changeFacts([descriptor(f.photos.context, revision: "metadata-only")], changed: [a.key.assetID])
+        await f.photos.preserveDeltaInputs([a.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(delta))
+        await gate.release(); await work.value
+        try await assertNotNil(try await f.coordinator.readyToken())
+        await assertEqual(await f.model.count, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE revision='metadata-only' AND state='ready'", at: f.db), 1)
+    }
+
+    func testSingleEditIn100000ReadyRowsWritesOnlyAffectedAsset() async throws {
+        let f = try fixture()
+        let a = descriptor(f.photos.context, asset: "a0"), other = descriptor(f.photos.context, asset: "unrelated")
+        await f.photos.set([a, other]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        try injectEngineSQL("""
+            WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<99998)
+            INSERT INTO photos_representation(context_id,context_epoch,asset_id,kind,revision,width,height,equivalent_to_original,revision_is_reliable,seen_generation,state,fingerprint_version,vector,tombstoned)
+            SELECT context_id,context_epoch,'bulk'||n.x,kind,revision,width,height,equivalent_to_original,revision_is_reliable,seen_generation,state,fingerprint_version,vector,tombstoned
+            FROM photos_representation,n WHERE asset_id='unrelated';
+            """, at: f.db)
+        try installWriteAudit(at: f.db)
+        await f.model.reset(); await f.photos.resetReads()
+        let delta = await f.photos.changeFacts([descriptor(f.photos.context, asset: "a0", revision: "edit"), other], changed: ["a0"])
+        await f.coordinator.libraryChanged(.incremental(delta)); await f.coordinator.processDueWork(now: now)
+        try await assertNotNil(try await f.coordinator.readyToken())
+        await assertEqual(await f.model.count, 1)
+        await assertEqual(await f.photos.requestedLimits, [])
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db), 100000)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM p11_writes WHERE table_name='photos_representation'", at: f.db), 2)
+    }
+
+    func testUnknownContinuityRetainsExistingFailedRetryDeadline() async throws {
+        let f = try fixture()
+        let d = descriptor(f.photos.context)
+        await f.photos.set([d]); await f.photos.fail(d.key.assetID)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        try injectEngineSQL("CREATE TABLE retry_before AS SELECT asset_id,retry_count,next_retry_at,last_error FROM fingerprint_task", at: f.db)
+        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [d], nextOffset: nil, invalidateAllCachedRepresentations: true)])
+        try await f.coordinator.reconcile()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM retry_before EXCEPT SELECT asset_id,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: f.db), 0)
+        await f.photos.resetReads(); await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 0)
+    }
+
+    func testUnknownContentReconciliationRetainsBytesButBlocksReadiness() async throws {
+        let f = try fixture()
+        let original = descriptor(f.photos.context)
+        await f.photos.set([original]); try await f.coordinator.reconcile()
+        await f.coordinator.processDueWork(now: now)
+        try injectEngineSQL("CREATE TABLE retained_vectors AS SELECT asset_id, kind, vector FROM photos_representation", at: f.db)
+        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [original],
+            nextOffset: nil, invalidateAllCachedRepresentations: true)])
+        try await f.coordinator.reconcile()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE vector IS NOT NULL AND state <> 'ready'", at: f.db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM retained_vectors v JOIN photos_representation r USING(asset_id,kind) WHERE r.vector=v.vector", at: f.db), 1)
+        try await assertNil(try await f.coordinator.readyToken())
+    }
+
+    func test129ChangedAssetsUseBoundedDeltaBatchesWithoutTouchingUnrelatedRows() async throws {
+        let f = try fixture()
+        let all = (0..<140).flatMap { id in
+            [descriptor(f.photos.context, asset: "a\(id)"), descriptor(f.photos.context, asset: "a\(id)", kind: .current)]
+        }
+        let initial = try await f.store.beginIndexReconciliation(context: f.photos.context, photosGeneration: 1,
+            fingerprintVersion: f.configuration.fingerprint.version)
+        try await f.store.upsertRepresentations(all, generation: initial)
+        try await f.store.finishIndexReconciliation(generation: initial, seenKeys: Set(all.map(\.key)))
+        let fingerprint = try Fingerprint(version: f.configuration.fingerprint.version, values: [1] + Array(repeating: 0, count: 1023))
+        for task in try await f.store.nextRepresentationTasks(now: now, limit: 1000) {
+            _ = try await f.store.completeRepresentation(task, fingerprint: fingerprint)
+        }
+        await f.photos.setPaged(all, pageSize: 128)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        try installWriteAudit(at: f.db)
+        try injectEngineSQL("CREATE TABLE untouched AS SELECT * FROM photos_representation WHERE asset_id='a139'", at: f.db)
+        await f.photos.resetReads(); await f.model.reset()
+        let ids = (0..<129).map { "a\($0)" }
+        let delta = await f.photos.changeFacts(all, changed: ids)
+        await f.photos.invalidateDelta(ids)
+        await f.coordinator.libraryChanged(.incremental(delta))
+        await f.coordinator.processDueWork(now: now)
+        try await assertNotNil(try await f.coordinator.readyToken())
+        await assertEqual(await f.model.count, 258)
+        await assertEqual(await f.photos.requestedLimits, [])
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM untouched EXCEPT SELECT * FROM photos_representation)", at: f.db), 0)
+    }
+
     func testNoChangeReconciliationDoesNoImageIO() async throws {
         let f = try fixture()
         await f.photos.set([descriptor(f.photos.context)])
@@ -786,6 +878,17 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
         generation += 1
         pages = [.init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil)]
     }
+    func setPaged(_ descriptors: [RepresentationDescriptor], pageSize: Int) {
+        generation += 1
+        pages = stride(from: 0, to: descriptors.count, by: pageSize).enumerated().map { index, offset in
+            .init(context: context, generation: generation, descriptors: Array(descriptors[offset..<min(descriptors.count, offset + pageSize)]),
+                  nextOffset: offset + pageSize < descriptors.count ? index + 1 : nil)
+        }
+    }
+    private var deltaInputUnchanged: [String] = []
+    func preserveDeltaInputs(_ ids: [String]) { deltaInputUnchanged = ids }
+    private var deltaInvalidations: [String] = []
+    func invalidateDelta(_ ids: [String]) { deltaInvalidations = ids }
     func setPages(_ pages: [RepresentationPage]) { self.pages = pages; generation = pages.first?.generation ?? generation }
     func resetReads() { readCount = 0; readKinds = []; requestedLimits = [] }
     func fail(_ asset: String?) { failedAsset = asset }
@@ -835,7 +938,8 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
         let ids = Set(delta.changedAssetIDs)
         return .init(context: context, generation: generation,
             descriptors: missingDelta ? [] : pages.flatMap(\.descriptors).filter { ids.contains($0.key.assetID) }, nextOffset: nil,
-            exclusions: pages.flatMap(\.exclusions).filter { ids.contains($0.descriptor.key.assetID) })
+            exclusions: pages.flatMap(\.exclusions).filter { ids.contains($0.descriptor.key.assetID) },
+            invalidatedAssetIDs: deltaInvalidations.filter { ids.contains($0) }, inputUnchangedAssetIDs: deltaInputUnchanged.filter { ids.contains($0) })
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         readCount += 1; readKinds.append(descriptor.key.kind)

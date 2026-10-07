@@ -65,7 +65,7 @@ struct AdvancedRuntimeGraph: Sendable {
             try await model.prepareExecution()
             try Task.checkCancellation()
             let budget = ImageWorkBudget(limits: configuration.resources)
-            let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget)
+            let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget, diagnostics: { logger?.log($0) })
             return AdvancedRuntimeGraph(store: store, photos: photos, model: model,
                 configuration: configuration, executor: executor, budget: budget, directory: directory, now: now, logger: logger)
         }

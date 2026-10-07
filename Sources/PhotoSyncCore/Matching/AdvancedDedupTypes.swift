@@ -347,10 +347,12 @@ public struct RepresentationTask: Codable, Equatable, Sendable {
     /// later reconciliations if their persisted identity and full descriptor still
     /// match; replaced tasks reject late results even when revision strings match.
     public let indexGeneration: Int64
+    public let issuanceRevision: String
     public init(descriptor: RepresentationDescriptor, retryCount: Int, nextRetryAt: Date?,
-                fingerprintVersion: String, indexGeneration: Int64) {
+                fingerprintVersion: String, indexGeneration: Int64, issuanceRevision: String? = nil) {
         self.descriptor = descriptor; self.retryCount = retryCount; self.nextRetryAt = nextRetryAt
         self.fingerprintVersion = fingerprintVersion; self.indexGeneration = indexGeneration
+        self.issuanceRevision = issuanceRevision ?? descriptor.revision
     }
 }
 public struct IndexPublication: Codable, Equatable, Sendable {

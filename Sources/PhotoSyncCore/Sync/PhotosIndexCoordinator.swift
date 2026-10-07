@@ -30,6 +30,7 @@ public actor PhotosIndexCoordinator {
                 diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         self.store = store; self.photos = photos; self.fingerprinter = fingerprinter
         self.configuration = configuration; self.diagnostics = diagnostics
+        photos.attachIndexStore(store)
     }
 
     deinit { observer?.cancel() }
@@ -41,10 +42,12 @@ public actor PhotosIndexCoordinator {
         let startedAt = ProcessInfo.processInfo.systemUptime
         var counts = IndexMutationCounts()
         var complete = false
+        var retainedReady = 0, unverified = 0
         defer {
             reconciling = false
             diagnostics(["phase": "index-reconcile", "unit": "representationRows", "batch": complete ? "completed" : "aborted",
                 "added": String(counts.added), "changed": String(counts.changed), "deleted": String(counts.deleted),
+                "retainedReady": String(retainedReady), "unverified": String(unverified),
                 "timingMS.catalogReconciliation": String((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)])
         }
         do {
@@ -63,9 +66,9 @@ public actor PhotosIndexCoordinator {
                     forceCacheInvalidation = try await !photos.resumeContext(checkpoint)
                 }
             }
-            let serial = changeSerial
-            let checkpoint = try await photos.contextCheckpoint()
+            var checkpoint = try await photos.contextCheckpoint()
             let snapshot = try await photos.candidateSnapshot()
+            let session = try await photos.beginCatalogSession(expectedGeneration: snapshot.generation)
             var offset = 0
             var generation: Int64?
             var eligibleAssets = Set<String>(), excludedAssets = Set<String>()
@@ -76,8 +79,8 @@ public actor PhotosIndexCoordinator {
                 // Pause may arrive while the previous page/transaction was in flight.
                 // Preserve that page, but do not start another catalog request.
                 guard !paused else { throw CancellationError() }
-                let page = try await photos.representationCatalog(offset: offset,
-                    limit: configuration.resources.catalogBatchSize, expectedGeneration: snapshot.generation)
+                let page = try await photos.representationCatalog(session: session, offset: offset,
+                    limit: configuration.resources.catalogBatchSize)
                 guard page.generation == snapshot.generation, context == nil || context == page.context,
                       checkpoint == nil || checkpoint?.context == page.context else { throw PhotoKitGatewayError.libraryChanged }
                 guard page.descriptors.count + page.exclusions.count <= configuration.resources.catalogBatchSize,
@@ -96,33 +99,72 @@ public actor PhotosIndexCoordinator {
                 } else if !allInvalidated && !page.invalidatedAssetIDs.isEmpty {
                     try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: current)
                 }
-                let mutations = try await store.upsertRepresentations(page.descriptors, generation: current)
+                let mutations = try await store.upsertRepresentations(page.descriptors, generation: current, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
                 counts.added += mutations.added; counts.changed += mutations.changed
                 seenKeys.formUnion(page.descriptors.map(\.key))
                 eligibleAssets.formUnion(page.descriptors.map { $0.key.assetID })
-                excludedAssets.formUnion(page.exclusions.map { $0.descriptor.key.assetID })
+                excludedAssets.formUnion(page.exclusions.filter { $0.reason != .nonImage }.map { $0.descriptor.key.assetID })
                 if let next = page.nextOffset {
                     guard next > offset else { throw AdvancedDedupError.invalidConfiguration }
                     offset = next
                 } else { break }
             } while true
-            let latest = try await photos.candidateSnapshot()
-            guard latest.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
+            let endpoint = try await photos.catalogCoverage(session: session)
+            if endpoint != snapshot.generation {
+                var cursor: String?
+                repeat {
+                    let batch = try await photos.catalogChanges(baselineGeneration: snapshot.generation,
+                        throughGeneration: endpoint, afterAssetID: cursor, limit: max(1, configuration.resources.catalogBatchSize / 2))
+                    let affected = Set(batch.changedAssetIDs + batch.deletedAssetIDs)
+                    let delta = PhotosIndexDelta(context: context!, fromGeneration: snapshot.generation,
+                        toGeneration: endpoint, changedAssetIDs: batch.changedAssetIDs, deletedAssetIDs: batch.deletedAssetIDs)
+                    if !affected.isEmpty {
+                        let page = try await photos.representationDelta(delta)
+                        let facts = page.descriptors + page.exclusions.map(\.descriptor)
+                        guard page.context == context, page.generation == endpoint, page.nextOffset == nil,
+                              !page.invalidateAllCachedRepresentations,
+                              facts.count <= configuration.resources.catalogBatchSize,
+                              facts.allSatisfy({ $0.context == context }),
+                              Set(facts.map(\.key)).count == facts.count,
+                              Set(facts.map { $0.key.assetID }) == Set(batch.changedAssetIDs),
+                              Set(page.invalidatedAssetIDs).isSubset(of: Set(batch.changedAssetIDs)) else { throw PhotoKitGatewayError.libraryChanged }
+                        if !allInvalidated && !page.invalidatedAssetIDs.isEmpty {
+                            try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: generation!)
+                        }
+                        let mutations = try await store.upsertRepresentations(page.descriptors, generation: generation!, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
+                        counts.added += mutations.added; counts.changed += mutations.changed
+                        seenKeys = seenKeys.filter { !affected.contains($0.assetID) }
+                        seenKeys.formUnion(page.descriptors.map(\.key))
+                        eligibleAssets.subtract(affected); excludedAssets.subtract(affected)
+                        eligibleAssets.formUnion(page.descriptors.map { $0.key.assetID })
+                        excludedAssets.formUnion(page.exclusions.filter { $0.reason != .nonImage }.map { $0.descriptor.key.assetID })
+                    }
+                    cursor = batch.nextAssetID
+                } while cursor != nil
+                // Capture a token only after the complete known interval has been merged.
+                checkpoint = try await photos.contextCheckpoint()
+                try await store.advanceReconciliationEndpoint(generation: generation!, photosGeneration: endpoint)
+            }
+            guard try await photos.catalogCoverage(session: session) == endpoint else { throw PhotoKitGatewayError.libraryChanged }
             // Commit continuity even when the long initial fingerprint build is
             // unfinished; this checkpoint proves inventory history, never readiness.
             guard let finish = try await store.finishIndexReconciliation(generation: generation!, seenKeys: seenKeys, checkpoint: checkpoint,
                 excludedAssetIDs: excludedAssets.subtracting(eligibleAssets)) else { throw PhotoKitGatewayError.libraryChanged }
             counts.deleted += finish.deleted
+            try await photos.acknowledgeInventory(expectedGeneration: endpoint)
             complete = true
+            let storedProgress = try await store.indexProgress()
+            retainedReady = storedProgress.readyRepresentations
+            unverified = storedProgress.totalRepresentations - storedProgress.readyRepresentations
             let retainedCloudFailures = try await store.currentFailedRepresentations(Array(cloudWaiting.values),
                 fingerprintVersion: configuration.fingerprint.version)
             let retainedModelFailures = try await store.currentFailedRepresentations(Array(modelWaiting.values),
                 fingerprintVersion: configuration.fingerprint.version)
             guard !paused else { throw CancellationError() }
             let after = try await photos.candidateSnapshot()
-            guard after.generation == snapshot.generation, changeSerial == serial else { throw PhotoKitGatewayError.libraryChanged }
+            guard after.generation == endpoint else { throw PhotoKitGatewayError.libraryChanged }
             needsReconciliation = false; forceCacheInvalidation = false
-            reconciledGeneration = snapshot.generation; reconciledContext = context; issue = nil
+            reconciledGeneration = endpoint; reconciledContext = context; pendingDelta = nil; issue = nil
             cloudWaiting = Dictionary(uniqueKeysWithValues: retainedCloudFailures.map { (Self.waitKey($0), $0) })
             modelWaiting = Dictionary(uniqueKeysWithValues: retainedModelFailures.map { (Self.waitKey($0), $0) })
             try await publishIfComplete()
@@ -299,8 +341,7 @@ public actor PhotosIndexCoordinator {
     /// Both runtime wakeups and this actor's subscription may deliver the same event.
     /// A fully covered incremental delivery is idempotent; gaps/overlap/overflow are full.
     public func libraryChanged(_ event: PhotosIndexChange) async {
-        if case .incremental(let delta) = event, delta.isValid,
-           delta.changedAssetIDs.count + delta.deletedAssetIDs.count <= configuration.resources.catalogBatchSize {
+        if case .incremental(let delta) = event, delta.isValid {
             let through = pendingDelta?.toGeneration ?? reconciledGeneration
             if delta.context == reconciledContext, let through, delta.toGeneration <= through { return }
         }
@@ -309,6 +350,11 @@ public actor PhotosIndexCoordinator {
         case .incremental(let delta):
             if !needsReconciliation, !reconciling, delta.isValid, delta.context == reconciledContext,
                delta.fromGeneration == (pendingDelta?.toGeneration ?? reconciledGeneration) {
+                if pendingDelta == nil {
+                    pendingDelta = delta
+                    try? await store.invalidateIndexPublication()
+                    return
+                }
                 pendingReinsertedIDs.formUnion(Set(pendingDelta?.deletedAssetIDs ?? []).intersection(delta.changedAssetIDs))
                 var changed = Set(pendingDelta?.changedAssetIDs ?? [])
                 var deleted = Set(pendingDelta?.deletedAssetIDs ?? [])
@@ -336,15 +382,22 @@ public actor PhotosIndexCoordinator {
         do {
             let checkpoint = try await photos.contextCheckpoint()
             guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
-            let page = try await photos.representationDelta(delta)
-            guard !paused, serial == changeSerial,
-                  page.descriptors.count + page.exclusions.count <= configuration.resources.catalogBatchSize else { throw PhotoKitGatewayError.libraryChanged }
-            let effectivePage = RepresentationPage(context: page.context, generation: page.generation, descriptors: page.descriptors,
-                nextOffset: page.nextOffset, exclusions: page.exclusions,
-                invalidatedAssetIDs: Set(page.invalidatedAssetIDs).union(reinserted.intersection(delta.changedAssetIDs)).sorted(),
-                invalidateAllCachedRepresentations: page.invalidateAllCachedRepresentations)
-            _ = try await store.applyIndexDelta(delta, page: effectivePage,
-                fingerprintVersion: configuration.fingerprint.version, checkpoint: checkpoint)
+            let batchSize = max(1, configuration.resources.catalogBatchSize / 2)
+            let ids = delta.changedAssetIDs + delta.deletedAssetIDs
+            let offsets = ids.isEmpty ? [0] : Array(stride(from: 0, to: ids.count, by: batchSize))
+            for (index, offset) in offsets.enumerated() {
+                let slice = PhotosIndexDeltaBatch(interval: delta, offset: offset, count: min(batchSize, ids.count - offset))
+                let batch = slice.request
+                let page = try await photos.representationDelta(batch)
+                guard !paused, serial == changeSerial,
+                      page.descriptors.count + page.exclusions.count <= configuration.resources.catalogBatchSize else { throw PhotoKitGatewayError.libraryChanged }
+                let effectivePage = RepresentationPage(context: page.context, generation: page.generation, descriptors: page.descriptors,
+                    nextOffset: page.nextOffset, exclusions: page.exclusions,
+                    invalidatedAssetIDs: Set(page.invalidatedAssetIDs).union(reinserted.intersection(batch.changedAssetIDs)).sorted(),
+                    invalidateAllCachedRepresentations: page.invalidateAllCachedRepresentations, inputUnchangedAssetIDs: page.inputUnchangedAssetIDs)
+                _ = try await store.applyIndexDeltaBatch(slice, page: effectivePage,
+                    fingerprintVersion: configuration.fingerprint.version, checkpoint: index == offsets.count - 1 ? checkpoint : nil)
+            }
             guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
             let snapshot = try await photos.candidateSnapshot()
             guard !paused, serial == changeSerial, snapshot.generation == delta.toGeneration else { throw PhotoKitGatewayError.libraryChanged }
@@ -358,6 +411,7 @@ public actor PhotosIndexCoordinator {
             for descriptor in retainedModels { modelWaiting[Self.waitKey(descriptor)] = descriptor }
             cloudWaiting = cloudWaiting.filter { !affected.contains($0.value.key.assetID) }
             for descriptor in retained { cloudWaiting[Self.waitKey(descriptor)] = descriptor }
+            try await photos.acknowledgeInventory(expectedGeneration: delta.toGeneration)
             pendingDelta = nil; pendingReinsertedIDs.removeAll(); reconciledGeneration = delta.toGeneration; issue = nil
         } catch {
             pendingDelta = nil; pendingReinsertedIDs.removeAll(); needsReconciliation = true; acknowledgedGeneration = nil

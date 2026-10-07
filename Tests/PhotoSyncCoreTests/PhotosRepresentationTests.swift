@@ -334,8 +334,8 @@ final class PhotosRepresentationTests: XCTestCase {
         let task = Task { try await gateway.resumeContext(checkpoint) }
         await fulfillment(of: [entered], timeout: 2)
         let duringReplay = try await gateway.candidateSnapshot()
-        let page = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: duringReplay.generation)
-        XCTAssertTrue(page.invalidateAllCachedRepresentations, "replay details are still incomplete")
+        do { _ = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: duringReplay.generation)
+            XCTFail("incomplete replay must block catalog evidence") } catch {}
         do { try await gateway.acknowledgeReconciliation(expectedGeneration: duringReplay.generation); XCTFail("replay is in progress") } catch {}
         release.signal()
         let resumed = try await task.value
@@ -358,6 +358,51 @@ final class PhotosRepresentationTests: XCTestCase {
         let physical = await reader.physicalRequestCount
         XCTAssertEqual(physical, 0)
         await loaded.lease.finishPhysicalWork()
+    }
+
+    func testReadCallbackWaitsForDelayedClassificationAndKeepsNeutralResult() async throws {
+        for affected in [false, true] {
+            let lifecycle = RepresentationLifecycle()
+            let facts = PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(), playbackStyle: .image,
+                resources: [.init(type: .photo, uti: "public.jpeg", filename: "a.jpg", size: nil)])
+            lifecycle.assets = [facts]
+            let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+            let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128)
+            _ = try await gateway.candidateSnapshot()
+            let capturedCheckpoint = try await gateway.contextCheckpoint()
+            let checkpoint = try XCTUnwrap(capturedCheckpoint)
+            let d = facts.descriptor(kind: .original, context: checkpoint.context)
+            let read = Task { try await gateway.readRepresentation(d) }
+            await requester.started()
+            let entered = expectation(description: "details entered"), release = DispatchSemaphore(value: 0)
+            lifecycle.onChangeDetails = { entered.fulfill(); release.wait() }
+            lifecycle.nextIndexChange = .incremental(removedAssetIDs: [], insertedAssets: [],
+                changedAssets: [.init(identifier: "a", candidates: [], inputUnchanged: !affected)])
+            gateway.recordLibraryChangeForTesting()
+            await fulfillment(of: [entered], timeout: 2)
+            requester.send(.image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame))
+            release.signal()
+            do {
+                let loaded = try await read.value
+                await loaded.lease.finishPhysicalWork()
+                XCTAssertFalse(affected)
+            } catch { XCTAssertTrue(affected) }
+            let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+        }
+    }
+
+    func testContentDetailClassificationRequiresIdenticalRepresentationInputs() throws {
+        let photo = PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "a.jpg", size: try PixelSize(width: 4000, height: 3000))
+        let before = PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(timeIntervalSince1970: 1), playbackStyle: .image, resources: [photo])
+        let metadata = PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(timeIntervalSince1970: 2), playbackStyle: .image, resources: [photo])
+        XCTAssertTrue(metadata.inputsUnchanged(from: before, assetContentChanged: false))
+        XCTAssertFalse(metadata.inputsUnchanged(from: before, assetContentChanged: true))
+        for changed in [
+            PhotoKitRepresentationAsset(identifier: "a", modificationDate: before.modificationDate, playbackStyle: .imageAnimated, resources: [photo]),
+            PhotoKitRepresentationAsset(identifier: "a", modificationDate: before.modificationDate, playbackStyle: .image, resources: [photo,
+                .init(type: .adjustmentData, uti: "public.data", filename: "edit", size: nil)])
+        ] { XCTAssertFalse(changed.inputsUnchanged(from: before, assetContentChanged: false)) }
     }
 
     func testGatewayReadTicketSurvivesUnrelatedChangeButRejectsAffectedAsset() async throws {
@@ -457,9 +502,9 @@ final class PhotosRepresentationTests: XCTestCase {
         let before = try await gateway.candidateSnapshot()
         gateway.recordLibraryChangeForTesting()
         await fulfillment(of: [entered], timeout: 2)
-        let page = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: before.generation + 1)
-        XCTAssertTrue(page.invalidateAllCachedRepresentations)
-        do { try await gateway.acknowledgeReconciliation(expectedGeneration: page.generation); XCTFail("details still pending") } catch {}
+        do { _ = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: before.generation + 1)
+            XCTFail("unclassified details cannot become content evidence") } catch {}
+        do { try await gateway.acknowledgeReconciliation(expectedGeneration: before.generation + 1); XCTFail("details still pending") } catch {}
         release.signal()
         let after = try await gateway.candidateSnapshot()
         let resolved = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: after.generation)
