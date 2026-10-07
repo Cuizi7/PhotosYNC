@@ -51,11 +51,11 @@ metadata 中性更新仍可能改变含修改日期的 descriptor revision，不
 
 对应最小接口 `PhotosIndexGateway.coverPersistentHistory(from:through:) -> Bool` 使用两个明确检查点，兼容实现默认 false。proposed checkpoint 先捕获，真实 gateway 再从 prior durable token 完整回放并有界落库；不因这次检查切换图库上下文。每次完整核对（包含启动 resume 后）都覆盖这一间隙；失败不得从 metadata 相同推出内容未变。处理期间实际 Photos admission 保持关闭，旧 token/义务保留；同一接口由只读验收 wrapper 完整转发。
 
-- [ ] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
-- [ ] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
-- [ ] **Step 3 — SQLite / coordinator。** 移除 generic full-reconcile 到全库 `vector=NULL` 的含义。保留已完成和待办事实、有效重试期限；未知表示留字节且不参与 publication。只有可靠删除/完整清单缺失才墓碑化。完整批次持久化后才确认 interval；每次 await 后复查相关有效性，最后用当前 context/index/covered endpoint 短 fence 发布。无关变化不使在途结果失效；已知相关/未知输入不 ready，物理结束后才释放。
-- [ ] **Step 4 — GREEN 与补充回归。** 十万条单项变化；非增量但有充分内容连续性证据零重算；历史断档+相同 metadata 不复用；129-ID 两种表示容量/重复事件/删除重插；中性通知持续的初建收敛；未覆盖新增/内容/未知事件拒绝发布；分页/任务/迁移崩溃恢复；metadata/video 更新；进度保留。断言真实 SQLite 行写/向量字节、模型/读次数和租约，不只断言日志。
-- [ ] **Step 5 — 聚焦验证和提交。** 用独立 `work/index-continuity-*` DerivedData build-for-testing，再对相关 XCTest bundle/套件运行测试；保留准确退出码和数量。不在此重复 canonical/性能负载。提交 `fix: preserve Photos fingerprints across catalog reconciliation`，报告 RED/GREEN、接口/迁移决定、限制、自查。
+- [x] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
+- [x] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
+- [x] **Step 3 — SQLite / coordinator。** 移除 generic full-reconcile 到全库 `vector=NULL` 的含义。保留已完成和待办事实、有效重试期限；未知表示留字节且不参与 publication。只有可靠删除/完整清单缺失才墓碑化。完整批次持久化后才确认 interval；每次 await 后复查相关有效性，最后用当前 context/index/covered endpoint 短 fence 发布。无关变化不使在途结果失效；已知相关/未知输入不 ready，物理结束后才释放。
+- [x] **Step 4 — GREEN 与补充回归。** 十万条单项变化；非增量但有充分内容连续性证据零重算；历史断档+相同 metadata 不复用；129-ID 两种表示容量/重复事件/删除重插；中性通知持续的初建收敛；未覆盖新增/内容/未知事件拒绝发布；分页/任务/迁移崩溃恢复；metadata/video 更新；进度保留。断言真实 SQLite 行写/向量字节、模型/读次数和租约，不只断言日志。
+- [x] **Step 5 — 聚焦验证和提交。** 用独立 `work/index-continuity-*` DerivedData build-for-testing，再对相关 XCTest bundle/套件运行测试；保留准确退出码和数量。不在此重复 canonical/性能负载。提交 `fix: preserve Photos fingerprints across catalog reconciliation`，报告 RED/GREEN、接口/迁移决定、限制、自查。
 
 ### Task 2: 独立集成审阅、最终验收及交付证据
 
@@ -63,7 +63,13 @@ metadata 中性更新仍可能改变含修改日期的 descriptor revision，不
 
 **Interfaces:** 消费 Task 1 冻结提交及报告；通过当前 `scripts/validate.py` canonical 入口，不能拿历史 `bc27a425` 或 fake 测试声称真实 Photos 通过。
 
-- [ ] **Step 1 — 一次深度审阅。** 对整个 Task 1 跨层差异做 spec+quality 审阅，特别检查上述五项风险、可信证据来源及存储候选 SQL；此审阅同时是该单一实施任务的最终集成审阅。只对后续修复差异复审，不重复同等门槛。
-- [ ] **Step 2 — 最终 canonical。** tester 在最后行为/测试快照运行 `python3 scripts/validate.py --output-dir "$PWD/work/validation-index-continuity-<unique>" --derived-data "$PWD/work/validation-index-continuity-<unique>-derived"`，保留完整 XCTest/Tools/实际模型/四档规模/竞态验证及前后源码身份。正常 Universal build 只在 canonical 未覆盖时补一次；不运行 Intel/Rosetta。若测试失败，定位修复后重新完成受影响门槛，不能跳过失败。
-- [ ] **Step 3 — 文档收口。** 记录实现提交、测试命令/结果、核对/复用/待验证/重算口径、证据与缺口；旧性能和真实失败原样保留。同步旧集成计划末尾到本计划，避免重跑已完成 P1–P14。
-- [ ] **Step 4 — 准备恢复真实只读验收。** 新实现需重建只读宿主、绑定新哈希、重新审阅读写边界后才能沿用既有授权继续；旧 READY/hash 不批准新二进制。新宿主使用独立私有 run 目录，保留旧证据。Readonly wrapper 须显式转发 `attachIndexStore`、会话/覆盖/有界变化/清单确认接口，禁止因兼容默认 no-op 而静默绕过真实接线；生产 gateway 的 diagnostics 也接入私有轮转日志。构建核对 Core 的准确源码/二进制 SHA，不能直接拷贝旧 DerivedData 宣称新版本。先验证通知分类和索引收敛，完整 ready 后才 MobileBackup 扫描/盲审。真实验收单列结果，不以自动测试代替；不扩为写入验收。
+- [x] **Step 1 — 一次深度审阅。** 对整个 Task 1 跨层差异做 spec+quality 审阅，特别检查上述五项风险、可信证据来源及存储候选 SQL；此审阅同时是该单一实施任务的最终集成审阅。只对后续修复差异复审，不重复同等门槛。
+- [x] **Step 2 — 最终 canonical。** tester 在最后行为/测试快照运行 `python3 scripts/validate.py --output-dir "$PWD/work/validation-index-continuity-<unique>" --derived-data "$PWD/work/validation-index-continuity-<unique>-derived"`，保留完整 XCTest/Tools/实际模型/四档规模/竞态验证及前后源码身份。正常 Universal build 只在 canonical 未覆盖时补一次；不运行 Intel/Rosetta。若测试失败，定位修复后重新完成受影响门槛，不能跳过失败。
+- [x] **Step 3 — 文档收口。** 记录实现提交、测试命令/结果、核对/复用/待验证/重算口径、证据与缺口；旧性能和真实失败原样保留。同步旧集成计划末尾到本计划，避免重跑已完成 P1–P14。
+- [x] **Step 4 — 准备恢复真实只读验收。** 新实现需重建只读宿主、绑定新哈希、重新审阅读写边界后才能沿用既有授权继续；旧 READY/hash 不批准新二进制。新宿主使用独立私有 run 目录，保留旧证据。Readonly wrapper 须显式转发 `attachIndexStore`、会话/覆盖/有界变化/清单确认接口，禁止因兼容默认 no-op 而静默绕过真实接线；生产 gateway 的 diagnostics 也接入私有轮转日志。构建核对 Core 的准确源码/二进制 SHA，不能直接拷贝旧 DerivedData 宣称新版本。先验证通知分类和索引收敛，完整 ready 后才 MobileBackup 扫描/盲审。真实验收单列结果，不以自动测试代替；不扩为写入验收。
+
+## 执行结果
+
+Task 1、Task 2 完成；冻结 `3871947`，独立评审通过，完整 545 XCTest（2 跳过、0 失败）、94 Tools、33 例实际模型、四档规模和两项竞态验证通过，正常 Universal Release 编译通过。评审暴露并修复检查点越过延迟通知、未知恢复归并和公共批次构造问题；完整验收另修正合成规模网关的新协议适配，未放宽产品默认拒绝或性能断言。
+
+Task 2 Step 4 的完成指**新宿主已构建、源码审查/哈希/签名及离线 fake 自测通过**，不表示已恢复真实测试。READY 保持不存在；修复后的实际 Photos/iCloud 收敛及 MobileBackup 扫描仍属于下一系统阶段。具体源码、命令、性能和私有宿主绑定见[验收记录](../../release/2026-10-07-photos-index-continuity-validation.md)。本轮不合并、推送或发行；后续文档提交不改变冻结行为，也不重新运行同快照全量验证。

@@ -163,4 +163,12 @@ PhotoKit 目标尺寸、进度或返回长度不能证明固定下载字节；�
 
 公开接口依据：[deleteAssets](https://developer.apple.com/documentation/photos/phassetchangerequest/deleteassets%28_%3A%29) 仅请求删除指定资产；[performChanges](https://developer.apple.com/documentation/photos/phphotolibrary/performchanges%28_%3Acompletionhandler%3A%29) 的完成结果不构成跨 PhotoKit/QA 数据库的回滚事务。[Mac Photos 删除说明](https://support.apple.com/en-am/guide/photos/pht3bfab2f96/mac) 将最近删除和永久删除分别处理，永久清理使用 Photos 界面；[iCloud 删除说明](https://support.apple.com/en-nz/guide/icloud/mm8b32f3ae27/icloud) 明确同账号设备间传播。已核对本机 macOS 26.5 SDK，未找到公开的最近删除永久清除接口；不借私有接口绕过。
 
-真实十万资产、长期能耗、macOS 13 和所有媒体格式仍须按实际覆盖报告。本轮只交付修订计划；执行时沿用本次生产图库授权和既定子代理方式，缺具体路径或系统解锁时只补充必要信息，不重复询问已同意的测试范围。
+真实十万资产、长期能耗、macOS 13 和所有媒体格式仍须按实际覆盖报告。执行时沿用本次生产图库授权和既定子代理方式，缺具体路径或系统解锁时只补充必要信息，不重复询问已同意的测试范围。
+
+## 2026-10-07 连续性修复后的恢复准备
+
+初次只读尝试及中断事实见 [MobileBackup 实测](../research/advanced-dedup/2026-10-07-mobilebackup-real-photos-audit.md)。其后失效设计已按用户要求实施，冻结 `3871947`，完整自动验收通过；[当前验收记录](2026-10-07-photos-index-continuity-validation.md)包含源码/测试身份及性能边界。
+
+替换宿主位于私有 `work/real-photos-icloud/20261007-continuity-resume/`，源码审查、精确 archive 构建、38 项哈希核验、私有签名及 fake-only 自测通过。所有 17 个索引协议接口显式转发，特别是同库 journal 接线、UUID 会话/归并、两级确认和持久历史覆盖；producer 诊断进入私有日志。旧源码/二进制/日志/数据没有覆盖，新宿主未创建 READY，未执行真实读取。
+
+恢复时先核对该目录 `offline-build-report.md`、`host-review.md`、源码/Core/宿主哈希与现有范围文件，再按已授权只读阶段建立新执行门闩和运行绑定。新 bundle identity 为 `com.photosync.qa.readonly.continuity.20261007`；其系统授权状态须由正常授权入口确认，旧宿主的授权记录不冒充新身份已授权。先诊断实际通知分类并验证完整索引收敛，达到真实 ready 后再继续 V3-MB 来源扫描和既定盲审。旧候选抽样与失败日志保留，旧 partial vector 不能脱离当前内容证据直接当作 ready。此次仅完成恢复准备，V4/V5 写入和回退阶段均未开启。
