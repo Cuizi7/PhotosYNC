@@ -47,6 +47,10 @@ metadata 中性更新仍可能改变含修改日期的 descriptor revision，不
 
 历史检查点与已覆盖 observer endpoint 是两个事实：整轮完整核对保存读取前捕获的保守 token，不能在归并结束后替换为 `currentChangeToken`。增量只覆盖局部资产，保留已有 durable token，不用本批读取前的新 token 越过无关资产的未送达通知；下一次完整核对再推进。完整核对中，基线前已转为待验证任务的未知义务不妨碍读取其后的完整已分类归并页，但不能提前解除验证，也不能放宽普通增量或基线后的未知事件检查。
 
+若完整核对复用已有向量，单纯在 metadata 枚举前取新 token 仍不足：它可能已包含通知未送达的同摘要内容编辑。推进前必须完整回放旧 durable token 之后覆盖新区间的持久变化，并将 affected 义务落库；无覆盖证明时保留旧 token 或保持待验证。回归分别覆盖变化发生在本轮开始前、最后页面后，以及局部增量期间，并跨重启核对不能跳过编辑。
+
+对应最小接口 `PhotosIndexGateway.coverPersistentHistory(from:through:) -> Bool` 使用两个明确检查点，兼容实现默认 false。proposed checkpoint 先捕获，真实 gateway 再从 prior durable token 完整回放并有界落库；不因这次检查切换图库上下文。每次完整核对（包含启动 resume 后）都覆盖这一间隙；失败不得从 metadata 相同推出内容未变。处理期间实际 Photos admission 保持关闭，旧 token/义务保留；同一接口由只读验收 wrapper 完整转发。
+
 - [ ] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
 - [ ] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
 - [ ] **Step 3 — SQLite / coordinator。** 移除 generic full-reconcile 到全库 `vector=NULL` 的含义。保留已完成和待办事实、有效重试期限；未知表示留字节且不参与 publication。只有可靠删除/完整清单缺失才墓碑化。完整批次持久化后才确认 interval；每次 await 后复查相关有效性，最后用当前 context/index/covered endpoint 短 fence 发布。无关变化不使在途结果失效；已知相关/未知输入不 ready，物理结束后才释放。
