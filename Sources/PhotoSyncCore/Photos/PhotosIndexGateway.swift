@@ -89,16 +89,29 @@ public struct PhotosCatalogSession: Equatable, Sendable {
     }
 }
 
+/// One ascending, exclusive-cursor page from a completely classified interval.
+/// The caller owns the complete baseline...endpoint interval; a page never claims
+/// interval completion. Deleted IDs require affirmative deletion evidence. Return
+/// nil only on the final page; throw if coverage or the stable session is lost.
 public struct PhotosCatalogChangeBatch: Sendable {
     public let changedAssetIDs: [String]
     public let deletedAssetIDs: [String]
+    /// Last visited asset ID; pass it as afterAssetID to request strictly later IDs.
     public let nextAssetID: String?
+    public init(changedAssetIDs: [String], deletedAssetIDs: [String], nextAssetID: String?) {
+        self.changedAssetIDs = changedAssetIDs; self.deletedAssetIDs = deletedAssetIDs; self.nextAssetID = nextAssetID
+    }
 }
 
 public protocol PhotosIndexGateway: PhotosGateway {
     func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession
     func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage
     func catalogCoverage(session: PhotosCatalogSession) async throws -> Int
+    /// Called only after prior unknown obligations were durably marked non-queryable.
+    func catalogInvalidationTransferred(session: PhotosCatalogSession) async throws
+    /// Full-session merge facts may retain an older transferred verification obligation;
+    /// a new unknown event still invalidates the session. Normal deltas stay strict.
+    func representationCatalogDelta(session: PhotosCatalogSession, delta: PhotosIndexDelta) async throws -> RepresentationPage
     /// Installed before subscription. Producer obligations share the fact database.
     func attachIndexStore(_ store: SyncStore)
     func acknowledgeInventory(expectedGeneration: Int) async throws
@@ -117,16 +130,18 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// unchanged. Unknown scope, incomplete/oversized results, pagination, or context/
     /// generation drift must throw for caller-owned full reconciliation; do not turn
     /// uncertainty into exclusion/deletion or set invalidateAllCachedRepresentations
-    /// as a usable incremental result. This fetch neither persists a checkpoint nor
-    /// acknowledges readiness: the caller captures an optional checkpoint beforehand,
-    /// commits same-generation facts/checkpoint atomically, then publishes and calls
-    /// acknowledgeReconciliation only after those facts are complete and ready.
+    /// as a usable incremental result. This fetch neither advances a persistent-history
+    /// checkpoint nor acknowledges readiness. Incremental persistence retains the token
+    /// from the previous whole-inventory acquisition; its covered observer endpoint
+    /// advances independently. Publish/acknowledge only complete ready facts.
     func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage
     func changes() -> AsyncStream<PhotosIndexChange>
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation
-    /// Capture BEFORE catalog/delta/snapshot acquisition; nil means no resumable
+    /// Capture BEFORE the complete catalog acquisition; nil means no resumable
     /// checkpoint is available. The caller persists a nonnil value only alongside
-    /// successful inventory facts of its captured context and Photos generation.
+    /// successful inventory facts of its captured context. A full inventory may cover
+    /// a later observer endpoint; its saved token remains the earlier pre-read token.
+    /// Incremental inventory retains the previous durable token until another full pass.
     /// Replay is continuity evidence, never a stable physical-library identity or
     /// an index-ready flag. Fetching facts alone must not acknowledge reconciliation.
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint?
@@ -238,6 +253,10 @@ public extension PhotosIndexGateway {
         try await representationCatalog(offset: offset, limit: limit, expectedGeneration: session.baselineGeneration)
     }
     func catalogCoverage(session: PhotosCatalogSession) async throws -> Int { try await catalogCoverage(baselineGeneration: session.baselineGeneration) }
+    func catalogInvalidationTransferred(session: PhotosCatalogSession) async throws {}
+    func representationCatalogDelta(session: PhotosCatalogSession, delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        try await representationDelta(delta)
+    }
     func attachIndexStore(_ store: SyncStore) {}
     func acknowledgeInventory(expectedGeneration: Int) async throws {}
     func catalogCoverage(baselineGeneration: Int) async throws -> Int {

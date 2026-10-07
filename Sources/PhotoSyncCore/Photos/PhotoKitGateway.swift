@@ -161,6 +161,16 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         return endpoint
     }
 
+    public func catalogInvalidationTransferred(session: PhotosCatalogSession) async throws {
+        try state.markCatalogInvalidationTransferred(session)
+    }
+    public func representationCatalogDelta(session: PhotosCatalogSession, delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        try state.validateCatalogSession(session)
+        let page = try await representationDelta(delta, recoveringSession: session)
+        try state.validateCatalogSession(session)
+        return page
+    }
+
     public func attachIndexStore(_ store: SyncStore) { state.attach(store) }
     public func acknowledgeInventory(expectedGeneration: Int) async throws {
         guard state.acknowledgeReconciliation(generation: expectedGeneration, {}) else { throw PhotoKitGatewayError.libraryChanged }
@@ -197,6 +207,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     public func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage {
+        try await representationDelta(delta, recoveringSession: nil)
+    }
+    private func representationDelta(_ delta: PhotosIndexDelta, recoveringSession: PhotosCatalogSession?) async throws -> RepresentationPage {
         guard delta.isValid, delta.changedAssetIDs.count + delta.deletedAssetIDs.count <= catalogBatchSize else { throw PhotoKitGatewayError.libraryChanged }
         let generation = try await usableGeneration()
         guard generation == delta.toGeneration, state.snapshot().context == delta.context else { throw PhotoKitGatewayError.libraryChanged }
@@ -207,8 +220,10 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
               facts.count <= catalogBatchSize, facts.allSatisfy({ $0.context == delta.context }),
               Set(facts.map(\.key)).count == facts.count,
               Set(facts.map { $0.key.assetID }) == Set(delta.changedAssetIDs) else { throw PhotoKitGatewayError.libraryChanged }
-        let evidence = try state.invalidationEvidence(generation: generation, pageAssetIDs: Set(delta.changedAssetIDs))
-        guard !evidence.all else { throw PhotoKitGatewayError.libraryChanged }
+        let transferred = try recoveringSession.map { try state.hasTransferredCatalogInvalidation($0) } ?? false
+        let evidence = try state.invalidationEvidence(generation: generation, pageAssetIDs: Set(delta.changedAssetIDs),
+            permittingUnverifiedInputEvidence: transferred)
+        guard !evidence.all || transferred else { throw PhotoKitGatewayError.libraryChanged }
         return RepresentationPage(context: delta.context, generation: generation, descriptors: page.descriptors,
             nextOffset: nil, exclusions: page.exclusions, invalidatedAssetIDs: evidence.ids, inputUnchangedAssetIDs: evidence.unchanged)
     }
@@ -764,18 +779,30 @@ private final class PhotoKitState: @unchecked Sendable {
     enum AdditionBlockReason { case checkpointFailed, unknownOutcome }
     private let lock = NSLock(); private var available = true; private var generation = 0; private var indexedGeneration: Int?; private var additionsBlocked: AdditionBlockReason?
     private var context = LibraryContext(id: UUID(), epoch: 0)
-    private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext)?
+    private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext, invalidationTransferred: Bool)?
     func beginCatalogSession(expectedGeneration: Int) throws -> PhotosCatalogSession {
         lock.lock(); defer { lock.unlock() }
         guard available, generation == expectedGeneration, pendingChangeDetails == 0 else { throw PhotoKitGatewayError.libraryChanged }
         let session = PhotosCatalogSession(baselineGeneration: expectedGeneration)
-        catalogSession = (session, context)
+        catalogSession = (session, context, false)
         return session
     }
     func validateCatalogSession(_ session: PhotosCatalogSession) throws {
         lock.lock(); defer { lock.unlock() }
         guard available, catalogSession?.session == session, catalogSession?.context == context,
               unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
+    }
+    func markCatalogInvalidationTransferred(_ session: PhotosCatalogSession) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard available, catalogSession?.session == session, catalogSession?.context == context,
+              unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        catalogSession?.invalidationTransferred = true
+    }
+    func hasTransferredCatalogInvalidation(_ session: PhotosCatalogSession) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard available, catalogSession?.session == session, catalogSession?.context == context,
+              pendingChangeDetails == 0, unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
+        return catalogSession?.invalidationTransferred == true
     }
     private var contentChangedIDs = Set<String>() // fallback only, bounded by one catalog page
     private var store: SyncStore?
@@ -856,7 +883,7 @@ private final class PhotoKitState: @unchecked Sendable {
     func finishChangeDetails() {
         lock.lock(); pendingChangeDetails -= 1; lock.unlock()
     }
-    func invalidationEvidence(generation expected: Int, pageAssetIDs: Set<String>) throws -> (ids: [String], all: Bool, unchanged: [String]) {
+    func invalidationEvidence(generation expected: Int, pageAssetIDs: Set<String>, permittingUnverifiedInputEvidence: Bool = false) throws -> (ids: [String], all: Bool, unchanged: [String]) {
         lock.lock()
         let usable = available && generation == expected && pendingChangeDetails == 0
         let store = store, context = context, fallback = contentChangedIDs.intersection(pageAssetIDs).sorted()
@@ -864,7 +891,7 @@ private final class PhotoKitState: @unchecked Sendable {
         lock.unlock()
         guard usable else { throw PhotoKitGatewayError.libraryChanged }
         return (try store?.photosContentChanges(context: context, assetIDs: pageAssetIDs) ?? fallback, all,
-                all ? [] : try store?.photosInputUnchanged(context: context, assetIDs: pageAssetIDs) ?? [])
+                all && !permittingUnverifiedInputEvidence ? [] : try store?.photosInputUnchanged(context: context, assetIDs: pageAssetIDs) ?? [])
     }
     func acknowledgeReconciliation(generation expected: Int, _ acknowledge: () -> Void) -> Bool {
         lock.lock()

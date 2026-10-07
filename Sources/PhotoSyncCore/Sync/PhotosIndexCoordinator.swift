@@ -66,7 +66,7 @@ public actor PhotosIndexCoordinator {
                     forceCacheInvalidation = try await !photos.resumeContext(checkpoint)
                 }
             }
-            var checkpoint = try await photos.contextCheckpoint()
+            let checkpoint = try await photos.contextCheckpoint()
             let snapshot = try await photos.candidateSnapshot()
             let session = try await photos.beginCatalogSession(expectedGeneration: snapshot.generation)
             var offset = 0
@@ -95,6 +95,7 @@ public actor PhotosIndexCoordinator {
                 let current = generation!
                 if (forceCacheInvalidation || page.invalidateAllCachedRepresentations) && !allInvalidated {
                     try await store.invalidateRepresentations(assetIDs: nil, generation: current)
+                    try await photos.catalogInvalidationTransferred(session: session)
                     allInvalidated = true
                 } else if !allInvalidated && !page.invalidatedAssetIDs.isEmpty {
                     try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: current)
@@ -119,7 +120,7 @@ public actor PhotosIndexCoordinator {
                     let delta = PhotosIndexDelta(context: context!, fromGeneration: snapshot.generation,
                         toGeneration: endpoint, changedAssetIDs: batch.changedAssetIDs, deletedAssetIDs: batch.deletedAssetIDs)
                     if !affected.isEmpty {
-                        let page = try await photos.representationDelta(delta)
+                        let page = try await photos.representationCatalogDelta(session: session, delta: delta)
                         let facts = page.descriptors + page.exclusions.map(\.descriptor)
                         guard page.context == context, page.generation == endpoint, page.nextOffset == nil,
                               !page.invalidateAllCachedRepresentations,
@@ -141,8 +142,8 @@ public actor PhotosIndexCoordinator {
                     }
                     cursor = batch.nextAssetID
                 } while cursor != nil
-                // Capture a token only after the complete known interval has been merged.
-                checkpoint = try await photos.contextCheckpoint()
+                // Observer coverage and the conservative pre-read persistent token
+                // are separate: a newer current token may include unobserved edits.
                 try await store.advanceReconciliationEndpoint(generation: generation!, photosGeneration: endpoint)
             }
             guard try await photos.catalogCoverage(session: session) == endpoint else { throw PhotoKitGatewayError.libraryChanged }
@@ -380,7 +381,7 @@ public actor PhotosIndexCoordinator {
         let serial = changeSerial
         let reinserted = pendingReinsertedIDs
         do {
-            let checkpoint = try await photos.contextCheckpoint()
+            let checkpoint = try await store.libraryResumeCheckpoint()
             guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
             let batchSize = max(1, configuration.resources.catalogBatchSize / 2)
             let ids = delta.changedAssetIDs + delta.deletedAssetIDs

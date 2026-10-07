@@ -107,6 +107,115 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testConservativeCheckpointSurvivesObserverLagForFullAndIncrementalInventory() async throws {
+        for fullMerge in [true, false] {
+            let f = try continuityFixture()
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            if fullMerge {
+                try f.store.recordPhotosChanges(context: f.context, runID: UUID(), generation: 999,
+                    changed: ["page3"], deleted: [], content: ["page3"], batchSize: 1)
+                f.lifecycle.catalogHook = { offset in
+                    f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+                    f.gateway.recordLibraryChangeForTesting()
+                    if offset == 3 { f.lifecycle.persistentToken = 2 }
+                }
+            }
+            try await f.coordinator.reconcile()
+            if !fullMerge {
+                // A's equal-revision content edit is persistent, but its observer is delayed.
+                // The delivered event only names B; B's delta read cannot cover A.
+                f.lifecycle.persistentToken = 2
+                let before = try await f.gateway.candidateSnapshot()
+                f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [],
+                    changedAssets: [.init(identifier: "page1", candidates: [candidate(key: "page1")], inputUnchanged: true)])
+                f.gateway.recordLibraryChangeForTesting()
+                let after = try await f.gateway.candidateSnapshot()
+                await f.coordinator.libraryChanged(.incremental(.init(context: f.context,
+                    fromGeneration: before.generation, toGeneration: after.generation, changedAssetIDs: ["page1"], deletedAssetIDs: [])))
+                await f.coordinator.processDueWork(now: Date())
+            }
+            let saved = try await f.store.libraryResumeCheckpoint()
+            let checkpoint = try XCTUnwrap(saved)
+            XCTAssertEqual(checkpoint.archivedChangeToken, Data([1]), "must not skip an edit absent from the observer journal")
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change", at: f.db), 0)
+            let reopened = try SyncStore(url: f.db), lifecycle = FakePhotoKitLifecycle()
+            lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }; lifecycle.persistentToken = 2
+            let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+            let coordinator = PhotosIndexCoordinator(store: reopened, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: f.configuration)
+            try await coordinator.reconcile()
+            XCTAssertEqual(lifecycle.replayedTokens, [1])
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND vector IS NOT NULL", at: f.db), 1)
+            let ready = try await coordinator.readyToken(); XCTAssertNil(ready)
+        }
+    }
+
+    func testUnknownRecoveryMergesNonemptyNeutralPagesAndDeletionWithoutLosingBytesOrRetries() async throws {
+        let f = try continuityFixture(failedAsset: "page0")
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        try injectEngineSQL("CREATE TABLE retry_before AS SELECT asset_id,retry_count,next_retry_at,last_error FROM fingerprint_task", at: f.db)
+        f.lifecycle.nextChange = .reload
+        f.gateway.recordLibraryChangeForTesting()
+        let unknown = try await f.gateway.candidateSnapshot()
+        await f.coordinator.libraryChanged(.fullReconcileRequired)
+        let request = PhotosIndexDelta(context: f.context, fromGeneration: unknown.generation - 1,
+            toGeneration: unknown.generation, changedAssetIDs: ["page0"], deletedAssetIDs: [])
+        do { _ = try await f.gateway.representationDelta(request); XCTFail("normal delta cannot waive unknown coverage") } catch {}
+        let untransferred = try await f.gateway.beginCatalogSession(expectedGeneration: unknown.generation)
+        do { _ = try await f.gateway.representationCatalogDelta(session: untransferred, delta: request)
+            XCTFail("session alone cannot waive untransferred uncertainty") } catch {}
+        f.lifecycle.catalogOffsets = []
+        f.lifecycle.deltaRevision = "metadata-r2"
+        f.lifecycle.catalogHook = { offset in
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: offset == 1 ? ["page1"] : [], insertedAssets: [],
+                changedAssets: [.init(identifier: "page0", candidates: [candidate(key: "page0")], inputUnchanged: true)])
+            f.gateway.recordLibraryChangeForTesting()
+        }
+        try await f.coordinator.reconcile()
+        XCTAssertEqual(f.lifecycle.catalogOffsets, [0,1,2,3])
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0 AND vector IS NOT NULL AND state<>'ready'", at: f.db), 3)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page1' AND tombstoned=1", at: f.db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM retry_before EXCEPT SELECT asset_id,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: f.db), 0)
+        let unready = try await f.coordinator.readyToken(); XCTAssertNil(unready)
+        for task in try await f.store.nextRepresentationTasks(now: Date(timeIntervalSince1970: 9999999999), limit: 128) {
+            _ = try await f.store.completeRepresentation(task, fingerprint: f.fingerprint)
+        }
+        f.lifecycle.catalogHook = nil
+        await f.coordinator.processDueWork(now: Date())
+        let ready = try await f.coordinator.readyToken(); XCTAssertNotNil(ready)
+        // A later unknown event belongs to the session interval and must still abort it.
+        f.lifecycle.catalogHook = { offset in
+            if offset == 2 { f.lifecycle.nextChange = .reload; f.gateway.recordLibraryChangeForTesting() }
+        }
+        do { try await f.coordinator.reconcile(); XCTFail("new unknown must invalidate the stable session") } catch {}
+        let invalid = try await f.coordinator.readyToken(); XCTAssertNil(invalid)
+    }
+
+    private func continuityFixture(failedAsset: String? = nil) throws -> (root: URL, db: URL, store: SyncStore,
+        context: LibraryContext, lifecycle: FakePhotoKitLifecycle, gateway: PhotoKitGateway, configuration: DedupConfiguration,
+        fingerprint: Fingerprint, coordinator: PhotosIndexCoordinator) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let db = root.appendingPathComponent("test.sqlite"), store = try SyncStore(url: db)
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: repository.appendingPathComponent("docs/research/advanced-dedup/integration-profile.json")))
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let fingerprint = try Fingerprint(version: configuration.fingerprint.version, values: [1] + Array(repeating: 0, count: 1023))
+        let checkpoint = try JSONEncoder().encode(LibraryResumeCheckpoint(context: context, archivedChangeToken: Data([1]), photosGeneration: 0)).map { String(format: "%02x", $0) }.joined()
+        let vector = fingerprint.littleEndianFloat32.map { String(format: "%02x", $0) }.joined()
+        try injectEngineSQL("INSERT INTO dedup_index_state(id,context_id,context_epoch,generation,fingerprint_version,photos_generation,reconciliation_complete,resume_checkpoint) VALUES(1,'\(context.id.uuidString)',1,1,'\(configuration.fingerprint.version)',0,1,X'\(checkpoint)');", at: db)
+        for id in (0..<4).map({ "page\($0)" }) {
+            try injectEngineSQL("INSERT INTO photos_representation(context_id,context_epoch,asset_id,kind,revision,equivalent_to_original,revision_is_reliable,seen_generation,state,fingerprint_version,vector) VALUES('\(context.id.uuidString)',1,'\(id)','original','r1',0,1,1,'ready','\(configuration.fingerprint.version)',X'\(vector)');", at: db)
+        }
+        if let failedAsset {
+            try injectEngineSQL("UPDATE photos_representation SET state='failed' WHERE asset_id='\(failedAsset)'; INSERT INTO fingerprint_task(context_id,context_epoch,asset_id,kind,revision,fingerprint_version,generation,retry_count,next_retry_at,last_error) SELECT context_id,context_epoch,asset_id,kind,revision,fingerprint_version,seen_generation,2,9999999999,'cloud' FROM photos_representation WHERE asset_id='\(failedAsset)';", at: db)
+        }
+        let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
+            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration))
+    }
+
     func testRealGatewayCoordinatorMergesClassifiedEventsDuringEveryCatalogPage() async throws {
         for membership in [false, true] {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -619,11 +728,20 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
             context: context, revision: "r1", size: nil, equivalentToOriginal: false, revisionIsReliable: true)],
             nextOffset: offset < 3 ? offset + 1 : nil)
     }
+    var persistentToken: UInt8 = 1
+    var replayedTokens: [UInt8] = []
+    func archivedChangeToken() throws -> Data? { Data([persistentToken]) }
+    func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool {
+        let from = token.first ?? 0; replayedTokens.append(from)
+        if from < persistentToken { onContentChange(["page0"]) }
+        return true
+    }
     var deltaIDs: [[String]] = [], omitDeltaIDs = false
+    var deltaRevision = "r1"
     func representationDelta(assetIDs: [String], context: LibraryContext, generation: Int) throws -> RepresentationPage {
         deltaIDs.append(assetIDs)
         return .init(context: context, generation: generation, descriptors: omitDeltaIDs ? [] : assetIDs.map {
-            .init(key: .init(assetID: $0, kind: .original), context: context, revision: "r1", size: nil,
+            .init(key: .init(assetID: $0, kind: .original), context: context, revision: deltaRevision, size: nil,
                   equivalentToOriginal: false, revisionIsReliable: true)
         }, nextOffset: nil)
     }

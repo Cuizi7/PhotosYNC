@@ -950,6 +950,21 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try facts(at: db), before)
     }
 
+    func testFullInventoryCheckpointRequiresKnownConservativeCapture() async throws {
+        let (root, _, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 4, fingerprintVersion: "v1")
+        for capture in [nil, 5] as [Int?] {
+            await XCTAssertThrowsErrorAsync(try await store.finishIndexReconciliation(generation: generation, seenKeys: [],
+                checkpoint: .init(context: context, archivedChangeToken: Data([1]), photosGeneration: capture)))
+        }
+        let conservative = LibraryResumeCheckpoint(context: context, archivedChangeToken: Data([1]), photosGeneration: 2)
+        _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [], checkpoint: conservative)
+        let saved = try await store.libraryResumeCheckpoint(); XCTAssertEqual(saved, conservative)
+        let publication = try await store.indexPublication(); XCTAssertEqual(publication?.token.photosGeneration, 4)
+    }
+
     func testV5MigrationPreservesVectorBytesAndRetryIssuanceAndRevokesPublication() async throws {
         let (root, db, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1011,7 +1026,8 @@ final class AdvancedDedupStoreTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 2, count: 1), page: page(2), fingerprintVersion: "v1", checkpoint: nil))
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0", at: db), 3)
         _ = try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 1, count: 1), page: page(1), fingerprintVersion: "v1", checkpoint: nil)
-        _ = try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 2, count: 1), page: page(2), fingerprintVersion: "v1", checkpoint: .init(context: context, archivedChangeToken: Data([2]), photosGeneration: 2))
+        _ = try await reopened.applyIndexDeltaBatch(.init(interval: interval, offset: 2, count: 1), page: page(2), fingerprintVersion: "v1", checkpoint: checkpoint)
+        let retained = try await reopened.libraryResumeCheckpoint(); XCTAssertEqual(retained, checkpoint)
         XCTAssertEqual(try engineSQLInteger("SELECT reconciliation_complete FROM dedup_index_state", at: db), 1)
     }
 
@@ -1057,8 +1073,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
             checkpoint: .init(context: context, archivedChangeToken: Data([1]), photosGeneration: 1)))
         XCTAssertEqual(try engineSQLInteger("SELECT generation FROM dedup_index_state", at: db), Int(first))
         XCTAssertEqual(try engineSQLInteger("SELECT SUM(generation) FROM fingerprint_task", at: db), 2 * Int(first))
-        let next = try await store.applyIndexDelta(delta, page: valid, fingerprintVersion: "v1",
-            checkpoint: .init(context: context, archivedChangeToken: Data([2]), photosGeneration: 2))
+        let next = try await store.applyIndexDelta(delta, page: valid, fingerprintVersion: "v1", checkpoint: nil)
         XCTAssertGreaterThan(next, first)
         let oldA = try XCTUnwrap(tasks.first { $0.descriptor.key.assetID == "a" })
         let oldB = try XCTUnwrap(tasks.first { $0.descriptor.key.assetID == "b" })

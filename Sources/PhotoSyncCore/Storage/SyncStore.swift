@@ -1370,7 +1370,7 @@ public final class SyncStore: @unchecked Sendable {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
                       try self.int64(state[7]) == 0 else { return nil }
                 let context = try self.libraryContext(state)
-                try self.validateCheckpoint(checkpoint, context: context, photosGeneration: Int(self.int64(state[5])))
+                try self.validateCheckpoint(checkpoint, context: context, photosGeneration: Int(self.int64(state[5])), allowEarlierCapture: true)
                 let counts = try self.finishRepresentationKeys(seenKeys, context: context, generation: generation, assetIDs: nil)
                 try self.updateExclusions(excludedAssetIDs, context: context, affectedIDs: nil)
                 try self.finishInventory(checkpoint: checkpoint, context: context)
@@ -1414,7 +1414,9 @@ public final class SyncStore: @unchecked Sendable {
                       Set(facts.map { $0.key.assetID }) == changed,
                       Set(facts.map(\.key)).count == facts.count,
                       Set(page.invalidatedAssetIDs).isSubset(of: changed) else { throw PhotoKitGatewayError.libraryChanged }
-                try self.validateCheckpoint(checkpoint, context: delta.context, photosGeneration: delta.toGeneration)
+                let retainedCheckpoint = try self.libraryResumeCheckpointSync()
+                guard checkpoint == nil || checkpoint == retainedCheckpoint,
+                      retainedCheckpoint == nil || retainedCheckpoint?.context == delta.context else { throw PhotoKitGatewayError.libraryChanged }
                 let generation = try self.int64(state[2]) + (firstBatch ? 1 : 0)
                 try self.execute("UPDATE dedup_index_state SET generation = ?, photos_generation = ?, published_generation = NULL, reconciliation_complete = 0 WHERE id = 1",
                                  [.int64(generation), .int64(Int64(delta.toGeneration))])
@@ -1425,7 +1427,7 @@ public final class SyncStore: @unchecked Sendable {
                 _ = try self.finishRepresentationKeys(seen, context: delta.context, generation: generation, assetIDs: affected)
                 let excluded = Set(page.exclusions.filter { $0.reason != .nonImage }.map { $0.descriptor.key.assetID }).subtracting(seen.map(\.assetID))
                 try self.updateExclusions(excluded, context: delta.context, affectedIDs: affected)
-                if lastBatch { try self.finishInventory(checkpoint: checkpoint, context: delta.context) }
+                if lastBatch { try self.finishInventory(checkpoint: retainedCheckpoint, context: delta.context) }
                 else { try self.execute("UPDATE dedup_index_state SET reconcile_cursor = ? WHERE id=1", [.text("delta:\(digest):\(batch.offset + batch.count)")]) }
                 self.publishedIndexToken = nil
                 return generation
@@ -1433,9 +1435,11 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
-    private func validateCheckpoint(_ checkpoint: LibraryResumeCheckpoint?, context: LibraryContext, photosGeneration: Int) throws {
+    private func validateCheckpoint(_ checkpoint: LibraryResumeCheckpoint?, context: LibraryContext, photosGeneration: Int,
+                                    allowEarlierCapture: Bool = false) throws {
         if let checkpoint {
-            guard checkpoint.context == context, checkpoint.photosGeneration == photosGeneration else {
+            guard checkpoint.context == context, let captured = checkpoint.photosGeneration, captured >= 0,
+                  allowEarlierCapture ? captured <= photosGeneration : captured == photosGeneration else {
                 throw PhotoKitGatewayError.libraryChanged
             }
         }
@@ -1492,11 +1496,13 @@ public final class SyncStore: @unchecked Sendable {
 
     /// Durable history cursor belongs to a completed inventory, not vector readiness.
     public func libraryResumeCheckpoint() async throws -> LibraryResumeCheckpoint? {
-        try await perform {
-            guard let row = try self.one("SELECT resume_checkpoint FROM dedup_index_state WHERE id = 1", []),
-                  case .blob(let data) = row[0] else { return nil }
-            return try JSONDecoder().decode(LibraryResumeCheckpoint.self, from: data)
-        }
+        try await perform { try self.libraryResumeCheckpointSync() }
+    }
+
+    private func libraryResumeCheckpointSync() throws -> LibraryResumeCheckpoint? {
+        guard let row = try one("SELECT resume_checkpoint FROM dedup_index_state WHERE id = 1", []),
+              case .blob(let data) = row[0] else { return nil }
+        return try JSONDecoder().decode(LibraryResumeCheckpoint.self, from: data)
     }
 
     /// Page invalidation is authoritative even when a reliable metadata revision
