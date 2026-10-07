@@ -3,6 +3,9 @@ import Photos
 
 enum PhotoKitAccess: Sendable, Equatable { case notDetermined, authorized, denied }
 
+// Internal deterministic ordering probe; production construction leaves it nil.
+enum PhotoKitQueueSubmissionPhase: Sendable { case observerRecorded, snapshotContended }
+
 struct PhotoKitCreateCommand: Equatable, Sendable {
     let fileURL: URL
     let kind: MediaKind
@@ -68,7 +71,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private let lifecycle: any PhotoKitLifecycle
     private let photoLibrary: PHPhotoLibrary?
     private let state = PhotoKitState()
-    private let candidateIndex = PhotoKitCandidateIndex()
+    private let candidateIndex: PhotoKitCandidateIndex
     private let representationReader: PhotosRepresentationReader?
     private let catalogBatchSize: Int
     private let changeChannel: PhotosIndexChangeChannel
@@ -87,7 +90,10 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                   representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics)
     }
 
-    init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+    init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0,
+         diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in },
+         queueSubmissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil) {
+        candidateIndex = PhotoKitCandidateIndex(submissionProbe: queueSubmissionProbe)
         self.diagnostics = diagnostics
         self.representationReader = representationReader
         self.catalogBatchSize = catalogBatchSize
@@ -99,6 +105,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     private init(lifecycle: any PhotoKitLifecycle, observedLibrary: PHPhotoLibrary,
                  representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        candidateIndex = PhotoKitCandidateIndex()
         self.diagnostics = diagnostics
         self.representationReader = representationReader
         self.catalogBatchSize = catalogBatchSize
@@ -117,14 +124,15 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     public func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
         for attempt in 0..<Self.candidateLoadAttempts {
-            let generation = try await usableGeneration()
+            _ = try await usableGeneration()
             do {
-                let snapshot = try candidateIndex.snapshot(
-                    generation: generation,
+                let snapshot = try await candidateIndex.snapshot(
                     lifecycle: lifecycle,
-                    validity: state.validity(generation: generation),
-                    needsRebuild: { [state] in state.needsReindex(generation: generation) }
+                    currentGeneration: { [state] in state.snapshot().generation },
+                    validity: { [state] generation in state.validity(generation: generation) },
+                    needsRebuild: { [state] generation in state.needsReindex(generation: generation) }
                 )
+                let generation = snapshot.generation
                 try verifyUsable(generation: generation)
                 guard state.markIndexed(generation: generation) else {
                     // A change can arrive between verification and indexing. Recheck so
@@ -173,7 +181,12 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     public func attachIndexStore(_ store: SyncStore) { state.attach(store) }
     public func acknowledgeInventory(expectedGeneration: Int) async throws {
-        guard state.acknowledgeReconciliation(generation: expectedGeneration, {}) else { throw PhotoKitGatewayError.libraryChanged }
+        let generation = try await usableGeneration()
+        guard generation == expectedGeneration,
+              state.acknowledgeReconciliation(generation: expectedGeneration, { [changeChannel] in changeChannel.reconciled() }) else {
+            throw PhotoKitGatewayError.libraryChanged
+        }
+        diagnostics(["phase": "photos-inventory-ack", "event": String(expectedGeneration), "delivery": "reconciled", "historyAdmission": "unchanged"])
     }
     public func catalogCoverage(baselineGeneration: Int) async throws -> Int {
         _ = try await candidateSnapshot() // drains ordered producer classification
@@ -234,6 +247,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
               state.acknowledgeReconciliation(generation: expectedGeneration, admitHistory: true, { [changeChannel] in changeChannel.reconciled() }) else {
             throw PhotoKitGatewayError.libraryChanged
         }
+        diagnostics(["phase": "photos-ready-ack", "event": String(expectedGeneration), "delivery": "reconciled", "historyAdmission": "open"])
     }
 
     public func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
@@ -421,13 +435,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     func recordLibraryChangeForTesting() { enqueueLibraryChange(nil) }
 
     private func enqueueLibraryChange(_ change: PHChange?) {
-        let recorded = state.recordObserverChange()
-        let generation = recorded.generation
-        diagnostics(["phase": "photos-notification", "event": String(generation), "publication": "closed", "classification": "pending"])
         candidateIndex.enqueueChange(
             change,
-            generation: generation,
-            context: recorded.context,
+            recordChange: { [state] in state.recordObserverChange() },
             lifecycle: lifecycle,
             didIndex: { [weak self] generation in
                 guard let self else { return false }
@@ -717,33 +727,54 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
 
 private final class PhotoKitCandidateIndex: @unchecked Sendable {
     private let queue = DispatchQueue(label: "PhotoSync.PhotoKitCandidateIndex")
+    // Orders generation capture with queue insertion, never with physical work.
+    private let submissionLock = NSLock()
+    private let submissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)?
+    init(submissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil) {
+        self.submissionProbe = submissionProbe
+    }
     private var byAsset: [String: [MatchCandidate]] = [:]
     private var byFilename: [String: [MatchCandidate]] = [:]
     private var indexedGeneration: Int?
 
     func snapshot(
-        generation: Int,
         lifecycle: any PhotoKitLifecycle,
-        validity: any PhotosCandidateValidity,
-        needsRebuild: @escaping @Sendable () -> Bool
-    ) throws -> PhotosCandidateSnapshot {
-        try queue.sync {
-            if indexedGeneration != generation || needsRebuild() {
-                let assets = try lifecycle.loadCandidateAssets()
-                byAsset = Dictionary(uniqueKeysWithValues: assets.map { ($0.identifier, $0.candidates) })
-                byFilename = Self.buckets(byAsset)
-                indexedGeneration = generation
+        currentGeneration: @escaping @Sendable () -> Int,
+        validity: @escaping @Sendable (Int) -> any PhotosCandidateValidity,
+        needsRebuild: @escaping @Sendable (Int) -> Bool
+    ) async throws -> PhotosCandidateSnapshot {
+        try await withCheckedThrowingContinuation { continuation in
+            if !submissionLock.try() {
+                submissionProbe?(.snapshotContended)
+                submissionLock.lock()
             }
-            return PhotosCandidateSnapshot(generation: generation, candidatesByFilename: byFilename, validity: validity)
+            let generation = currentGeneration()
+            let snapshotValidity = validity(generation)
+            queue.async {
+                do {
+                    if self.indexedGeneration != generation || needsRebuild(generation) {
+                        let assets = try lifecycle.loadCandidateAssets()
+                        self.byAsset = Dictionary(uniqueKeysWithValues: assets.map { ($0.identifier, $0.candidates) })
+                        self.byFilename = Self.buckets(self.byAsset)
+                        self.indexedGeneration = generation
+                    }
+                    continuation.resume(returning: PhotosCandidateSnapshot(generation: generation,
+                        candidatesByFilename: self.byFilename, validity: snapshotValidity))
+                } catch { continuation.resume(throwing: error) }
+            }
+            submissionLock.unlock()
         }
     }
 
-    func enqueueChange(_ change: PHChange?, generation: Int, context: LibraryContext, lifecycle: any PhotoKitLifecycle,
+    func enqueueChange(_ change: PHChange?, recordChange: @Sendable () -> (generation: Int, context: LibraryContext), lifecycle: any PhotoKitLifecycle,
                        didIndex: @escaping @Sendable (Int) -> Bool,
                        onChange: @escaping @Sendable (PhotosIndexChange) -> Void,
                        onContentChange: @escaping @Sendable ([String]) -> Void,
                        didFinishDetails: @escaping @Sendable () -> Void,
                        diagnostics: @escaping @Sendable ([String: String]) -> Void) {
+        submissionLock.lock()
+        let (generation, context) = recordChange()
+        submissionProbe?(.observerRecorded)
         queue.async { [weak self] in
             defer { didFinishDetails() }
             guard let self else { return }
@@ -752,7 +783,8 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                 onChange(.fullReconcileRequired); return
             }
             guard self.indexedGeneration == generation - 1 else {
-                diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "candidate-baseline-gap", "contentScope": "unknown"])
+                diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "candidate-baseline-gap", "contentScope": "unknown",
+                    "expectedBaseline": String(generation - 1), "actualBaseline": self.indexedGeneration.map(String.init) ?? "none"])
                 onChange(.fullReconcileRequired); return
             }
             let insertedIDs = Set(inserted.map(\.identifier))
@@ -781,6 +813,10 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
             onChange(.incremental(.init(context: context, fromGeneration: generation - 1, toGeneration: generation,
                 changedAssetIDs: (inserted + changed).map(\.identifier).sorted(), deletedAssetIDs: removed.sorted())))
         }
+        submissionLock.unlock()
+        // Diagnostics may call injected hooks; admission is closed and ordered work
+        // is already queued before invoking them, with no lock held.
+        diagnostics(["phase": "photos-notification", "event": String(generation), "publication": "closed", "classification": "pending"])
     }
 
     private func remove(_ identifier: String) {

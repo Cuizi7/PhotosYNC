@@ -114,6 +114,9 @@ public protocol PhotosIndexGateway: PhotosGateway {
     func representationCatalogDelta(session: PhotosCatalogSession, delta: PhotosIndexDelta) async throws -> RepresentationPage
     /// Installed before subscription. Producer obligations share the fact database.
     func attachIndexStore(_ store: SyncStore)
+    /// Confirms durable inventory coverage and clears covered notification-delivery
+    /// dirtiness even while fingerprints remain pending. Does not admit history or
+    /// publish readiness; stale generations and unfinished details must be rejected.
     func acknowledgeInventory(expectedGeneration: Int) async throws
     /// The original generation identifies a stable enumeration; this endpoint may advance.
     func catalogCoverage(baselineGeneration: Int) async throws -> Int

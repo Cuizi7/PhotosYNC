@@ -270,7 +270,232 @@ final class PhotoKitContractTests: XCTestCase {
         let invalid = try await f.coordinator.readyToken(); XCTAssertNil(invalid)
     }
 
-    private func continuityFixture(failedAsset: String? = nil) throws -> (root: URL, db: URL, store: SyncStore,
+    func testInventoryAcknowledgementWhileFingerprintsPendingRestoresIncrementalDelivery() async throws {
+        let reads = ContractReadProbe()
+        let f = try continuityFixture(failedAsset: "page0", readProbe: reads)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        var events = f.gateway.changes().makeAsyncIterator()
+        f.lifecycle.nextChange = .reload
+        f.gateway.recordLibraryChangeForTesting()
+        _ = try await f.gateway.candidateSnapshot()
+        let full = await events.next(); XCTAssertEqual(full, .fullReconcileRequired)
+        await f.coordinator.libraryChanged(.fullReconcileRequired)
+        try await f.coordinator.reconcile()
+        let ready = try await f.coordinator.readyToken(); XCTAssertNil(ready)
+        XCTAssertGreaterThan(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task", at: f.db), 0)
+        for task in try await f.store.nextRepresentationTasks(now: Date(), limit: 128) {
+            _ = try await f.store.completeRepresentation(task, fingerprint: f.fingerprint)
+        }
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 3)
+        try injectEngineSQL("CREATE TABLE retained_vectors AS SELECT asset_id,vector FROM photos_representation", at: f.db)
+        let loads = f.lifecycle.loadCount
+        // A new subscription exposes sticky delivery state even with no event queued.
+        var later = f.gateway.changes().makeAsyncIterator()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        f.gateway.recordLibraryChangeForTesting()
+        _ = try await f.gateway.candidateSnapshot()
+        guard case .incremental(let delta) = await later.next() else {
+            return XCTFail("covered inventory must clear sticky full delivery before fingerprints finish")
+        }
+        await f.coordinator.libraryChanged(.incremental(delta))
+        await f.coordinator.processDueWork(now: Date())
+        XCTAssertEqual(f.lifecycle.loadCount, loads)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT asset_id,vector FROM retained_vectors EXCEPT SELECT asset_id,vector FROM photos_representation)", at: f.db), 0)
+        let stillPending = try await f.coordinator.readyToken(); XCTAssertNil(stillPending)
+        XCTAssertEqual(reads.count, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 3)
+    }
+
+    func testSnapshotDuringNotificationDiagnosticDoesNotConsumeUnqueuedGeneration() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "old")]
+        let entered = expectation(description: "observer entered")
+        let finished = expectation(description: "observer returned")
+        let release = DispatchSemaphore(value: 0)
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, diagnostics: { fields in
+            if fields["phase"] == "photos-notification" {
+                entered.fulfill()
+                _ = release.wait(timeout: .now() + 10)
+            }
+        })
+        let old = try await gateway.candidateSnapshot()
+        var events = gateway.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: ["old"],
+            insertedAssets: [.init(identifier: "new", candidates: [candidate(key: "new")])], changedAssets: [])
+        DispatchQueue.global().async { gateway.recordLibraryChangeForTesting(); finished.fulfill() }
+        await fulfillment(of: [entered], timeout: 3)
+        defer { release.signal() }
+        let current = try await gateway.candidateSnapshot()
+        release.signal()
+        await fulfillment(of: [finished], timeout: 3)
+        _ = try await gateway.candidateSnapshot() // drain producer after the callback resumes
+        guard case .incremental(let delta) = await events.next() else {
+            return XCTFail("snapshot must preserve the ordered candidate baseline")
+        }
+        XCTAssertEqual(delta.fromGeneration, old.generation)
+        XCTAssertEqual(delta.toGeneration, current.generation)
+        XCTAssertEqual(current.allCandidates.map(\.key), ["new"])
+        XCTAssertEqual(lifecycle.loadCount, 1)
+        let commits = CheckpointLog()
+        let accepted = try old.candidateValidity.commitIfCurrent { commits.append("committed") }
+        XCTAssertFalse(accepted); XCTAssertTrue(commits.values.isEmpty)
+    }
+
+    func testSnapshotContendingWithRecordedObserverPreservesUnconsumedBaseline() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "old")]
+        let recorded = expectation(description: "generation recorded before enqueue")
+        let callbackReturned = expectation(description: "observer finished")
+        let release = DispatchSemaphore(value: 0)
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, queueSubmissionProbe: { phase in
+            switch phase {
+            case .observerRecorded:
+                recorded.fulfill()
+                _ = release.wait(timeout: .now() + 10)
+            case .snapshotContended:
+                release.signal()
+            }
+        })
+        let before = try await gateway.candidateSnapshot()
+        var events = gateway.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: ["old"],
+            insertedAssets: [.init(identifier: "new", candidates: [candidate(key: "new")])], changedAssets: [])
+        DispatchQueue.global().async { gateway.recordLibraryChangeForTesting(); callbackReturned.fulfill() }
+        await fulfillment(of: [recorded], timeout: 3)
+        defer { release.signal() }
+        let after = try await gateway.candidateSnapshot()
+        release.signal() // also bounds the deliberately unserialized mutation
+        await fulfillment(of: [callbackReturned], timeout: 3)
+        _ = try await gateway.candidateSnapshot()
+        guard case .incremental(let delta) = await events.next() else {
+            return XCTFail("generation and queue insertion must be serialized, independently of log placement")
+        }
+        XCTAssertEqual(delta.fromGeneration, before.generation)
+        XCTAssertEqual(delta.toGeneration, after.generation)
+        XCTAssertEqual(after.allCandidates.map(\.key), ["new"])
+        XCTAssertEqual(lifecycle.loadCount, 1)
+        let commits = CheckpointLog()
+        XCTAssertFalse(try before.candidateValidity.commitIfCurrent { commits.append("stale") })
+        XCTAssertTrue(commits.values.isEmpty)
+    }
+
+    func testConcurrentNotificationsKeepCandidateAndDeltaOrder() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "unchanged")]
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        let firstEntered = expectation(description: "first callback remains in diagnostics")
+        let callbacksReturned = expectation(description: "both callbacks returned")
+        callbacksReturned.expectedFulfillmentCount = 2
+        let release = DispatchSemaphore(value: 0)
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, diagnostics: { fields in
+            if fields["phase"] == "photos-notification", fields["event"] == "1" {
+                firstEntered.fulfill()
+                _ = release.wait(timeout: .now() + 10)
+            }
+        })
+        let before = try await gateway.candidateSnapshot()
+        var events = gateway.changes().makeAsyncIterator()
+        DispatchQueue.global().async { gateway.recordLibraryChangeForTesting(); callbacksReturned.fulfill() }
+        await fulfillment(of: [firstEntered], timeout: 3)
+        defer { release.signal() }
+        // The second callback can enter while the first callback has not returned.
+        gateway.recordLibraryChangeForTesting(); callbacksReturned.fulfill()
+        let after = try await gateway.candidateSnapshot()
+        release.signal()
+        await fulfillment(of: [callbacksReturned], timeout: 3)
+        for generation in 1...2 {
+            guard case .incremental(let delta) = await events.next() else { return XCTFail("ordered complete interval required") }
+            XCTAssertEqual(delta.fromGeneration, generation - 1)
+            XCTAssertEqual(delta.toGeneration, generation)
+            XCTAssertEqual(delta.changedAssetIDs, [])
+            XCTAssertEqual(delta.deletedAssetIDs, [])
+        }
+        XCTAssertEqual(after.generation, 2)
+        XCTAssertEqual(after.allCandidates.map(\.key), ["unchanged"])
+        XCTAssertEqual(lifecycle.loadCount, 1)
+        let commits = CheckpointLog()
+        XCTAssertFalse(try before.candidateValidity.commitIfCurrent { commits.append("stale") })
+        XCTAssertTrue(commits.values.isEmpty)
+    }
+
+    func testInventoryAckRejectsPendingAndNewerDetailsWithoutOpeningHistoryAdmission() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        lifecycle.candidates = [candidate(key: "a")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        let baseline = try await gateway.candidateSnapshot()
+        lifecycle.providesToken = false
+        let unavailableCheckpoint = try await gateway.contextCheckpoint(); XCTAssertNil(unavailableCheckpoint)
+        let entered = expectation(description: "unclassified details block acknowledgement")
+        let release = DispatchSemaphore(value: 0)
+        lifecycle.changeHook = { entered.fulfill(); _ = release.wait(timeout: .now() + 10) }
+        lifecycle.nextChange = .reload
+        gateway.recordLibraryChangeForTesting()
+        await fulfillment(of: [entered], timeout: 3)
+        defer { release.signal() }
+        await assertThrows({ try await gateway.acknowledgeInventory(expectedGeneration: baseline.generation) })
+        await assertThrows({ try await gateway.acknowledgeInventory(expectedGeneration: baseline.generation + 1) })
+        release.signal()
+        let current = try await gateway.candidateSnapshot()
+        lifecycle.changeHook = nil
+        await assertThrows({ try await gateway.acknowledgeInventory(expectedGeneration: baseline.generation) })
+        var dirty = gateway.changes().makeAsyncIterator()
+        let sticky = await dirty.next(); XCTAssertEqual(sticky, .fullReconcileRequired)
+        try await gateway.acknowledgeInventory(expectedGeneration: current.generation)
+        let commits = CheckpointLog()
+        XCTAssertFalse(try current.candidateValidity.commitIfCurrent { commits.append("premature") })
+        XCTAssertTrue(commits.values.isEmpty)
+        var events = gateway.changes().makeAsyncIterator()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        gateway.recordLibraryChangeForTesting()
+        _ = try await gateway.candidateSnapshot()
+        guard case .incremental = await events.next() else { return XCTFail("covered dirty state must be cleared") }
+    }
+
+    func testInventoryAckRejectsAuthorizationLossAndUnavailableLibrary() async throws {
+        for authorizationLoss in [true, false] {
+            let lifecycle = FakePhotoKitLifecycle()
+            let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+            _ = try await gateway.candidateSnapshot()
+            gateway.recordLibraryChangeForTesting()
+            let current = try await gateway.candidateSnapshot()
+            if authorizationLoss { lifecycle.access = .denied } else { lifecycle.available = false }
+            await assertThrows({ try await gateway.acknowledgeInventory(expectedGeneration: current.generation) }, verify: { error in
+                XCTAssertEqual(error as? PhotoKitGatewayError, authorizationLoss ? .authorizationRequired : .libraryUnavailable)
+            })
+            var events = gateway.changes().makeAsyncIterator()
+            lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+            gateway.recordLibraryChangeForTesting()
+            let dirty = await events.next(); XCTAssertEqual(dirty, .fullReconcileRequired)
+        }
+    }
+
+    func testFailedInventoryJournalAcknowledgementKeepsDeliveryDirty() async throws {
+        let f = try continuityFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        f.lifecycle.nextChange = .reload
+        f.gateway.recordLibraryChangeForTesting()
+        _ = try await f.gateway.candidateSnapshot()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [],
+            changedAssets: [.init(identifier: "page0", candidates: [candidate(key: "page0")])])
+        f.gateway.recordLibraryChangeForTesting()
+        let current = try await f.gateway.candidateSnapshot()
+        try injectEngineSQL("CREATE TRIGGER reject_ack BEFORE DELETE ON photos_content_change BEGIN SELECT RAISE(ABORT,'controlled ack failure'); END;", at: f.db)
+        await assertThrows({ try await f.gateway.acknowledgeInventory(expectedGeneration: current.generation) })
+        var dirty = f.gateway.changes().makeAsyncIterator()
+        let sticky = await dirty.next(); XCTAssertEqual(sticky, .fullReconcileRequired)
+        XCTAssertGreaterThan(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change", at: f.db), 0)
+        try injectEngineSQL("DROP TRIGGER reject_ack", at: f.db)
+        try await f.gateway.acknowledgeInventory(expectedGeneration: current.generation)
+        var events = f.gateway.changes().makeAsyncIterator()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        f.gateway.recordLibraryChangeForTesting()
+        _ = try await f.gateway.candidateSnapshot()
+        guard case .incremental = await events.next() else { return XCTFail("successful retry acknowledges delivery") }
+    }
+
+    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil) throws -> (root: URL, db: URL, store: SyncStore,
         context: LibraryContext, lifecycle: FakePhotoKitLifecycle, gateway: PhotoKitGateway, configuration: DedupConfiguration,
         fingerprint: Fingerprint, coordinator: PhotosIndexCoordinator) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -290,7 +515,10 @@ final class PhotoKitContractTests: XCTestCase {
             try injectEngineSQL("UPDATE photos_representation SET state='failed' WHERE asset_id='\(failedAsset)'; INSERT INTO fingerprint_task(context_id,context_epoch,asset_id,kind,revision,fingerprint_version,generation,retry_count,next_retry_at,last_error) SELECT context_id,context_epoch,asset_id,kind,revision,fingerprint_version,seen_generation,2,9999999999,'cloud' FROM photos_representation WHERE asset_id='\(failedAsset)';", at: db)
         }
         let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }
-        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        let reader = readProbe.map { PhotosRepresentationReader(requester: $0,
+            budget: ImageWorkBudget(maxImages: 2, maxBytes: 100_000_000),
+            limits: configuration.resources, targetSide: configuration.fingerprint.inputSide) }
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128)
         return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
             PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration))
     }
@@ -791,7 +1019,9 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
         return grouped.map { PhotoKitCandidateAsset(identifier: $0.key, candidates: $0.value) }
     }
     var rawInputChange: (PhotoKitRepresentationAsset, PhotoKitRepresentationAsset, Bool)?
+    var changeHook: (@Sendable () -> Void)?
     func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange {
+        changeHook?()
         if let (before, after, content) = rawInputChange {
             return .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [
                 .init(identifier: after.identifier, candidates: [candidate(key: after.identifier)],
@@ -888,5 +1118,17 @@ private struct ContractNoReadModel: ImageFingerprinting {
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
         XCTFail("catalog reconciliation must not invoke image inference")
         throw PhotosRepresentationError.unavailable
+    }
+}
+
+private final class ContractReadProbe: PhotosRepresentationRequesting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return requests }
+    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+        lock.lock(); requests += 1; lock.unlock()
+        XCTFail("retained ready images must not be read again")
+        completion(.failure(PhotosRepresentationError.unavailable))
     }
 }
