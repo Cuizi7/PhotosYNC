@@ -1,5 +1,7 @@
 # PhotosYNC 0.2.0 高级照片判重集成 Implementation Plan
 
+> **2026-10-07 设计修订，待实施：** 用户要求图库变化时保留有效指纹。以 spec §4.1–4.4 的“清单核对／单项内容有效性／publication 分离”为新约束；本计划下方对应条款和文末后续工作约束同步更新，不表示已实施或授权直接执行新代码。P1–P14 的历史提交、勾选及验证记录保留，但不能替代新失效粒度的验收。真实 MobileBackup 只读验证已在取图时复现全量回退阻塞，不能继续用部分索引判不重。
+
 > **后续真实验收约束修订（2026-10-06）：** 用户确认没有独立环境，授权本机正在使用的生产图库和待导入目录测试，要求先只读、最后有防御的写入并恢复原状。以[修订后的真实 Photos＋iCloud 计划](../../release/2026-10-06-real-photos-icloud-validation-plan.md) V1–V5 为执行依据，替代本计划早期“独立测试图库/账号”的环境要求：隔离 QA 数据，真实目录 dry-run，最终最多 3 个新增，耐崩溃台账与精确 ID 回退；最近删除、并发正常变化、缓存及 iCloud 传播单列核验。这里只更新计划，未执行真实测试，已完成的 P1–P14 代码验收不重做。
 
 > **2026-10-06 P12–P14 收尾：** FP16＋ANE 优先、GPU 降级和原生状态修正已完成，最终实现冻结于 `bc27a425`。独立深度审阅通过；完整 canonical 通过 521 项 XCTest（2 项显式跳过、0 失败）、94 项 Tools、33 例实际模型回归、四档规模和两项恢复竞态。两条允许配置各通过四组数值自检及 33 例回归，正常 Universal Release 构建与资源核验通过。原生后台动作验证已做，完整 AX/键盘/VoiceOver/真实菜单弹出仍留缺口；Intel 实机跳过、macOS 13 无设备缺口保留。已另写[真实 Photos＋iCloud 验证计划](../../release/2026-10-06-real-photos-icloud-validation-plan.md)，本轮仅交付计划，未执行真实图库或发布操作。
@@ -123,7 +125,7 @@ XCTAssertFalse(published)
 
 **Files:** Create `Photos/PhotosIndexGateway.swift`, `Photos/PhotosRepresentationReader.swift`, `Fingerprinting/ImageWorkBudget.swift`, `Tests/PhotoSyncCoreTests/PhotosRepresentationTests.swift`, `docs/research/advanced-dedup/photokit-contract.md`; Modify `Photos/PhotoKitGateway.swift`, `Photos/PhotosGateway.swift`, `Sources/ReadExecutor.swift`, `PhotoSync.xcodeproj/project.pbxproj`。
 
-**Interfaces:** `protocol PhotosIndexGateway: PhotosGateway { func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage; func changes() -> AsyncStream<PhotosIndexChange>; func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation }`；`PhotosIndexChange = assetsChanged([String]) | assetsDeleted([String]) | fullReconcileRequired | contextInvalidated`。`RepresentationPage { context: LibraryContext, generation: Int, descriptors: [RepresentationDescriptor], nextOffset: Int? }` 是按固定代次拉取的有界页，末页 nextOffset=nil；代次改变抛 libraryChanged 而非丢页。现有 `PhotoKitGateway` 同时实现两个协议，只有一个 observer/generation 有效性门。`actor ImageWorkBudget` 产生 `acquire(bytes: Int64) async throws -> ImageLease`；`ImageLease.finishPhysicalWork()` 幂等释放，共享于来源解码和 Photos 读取；不能在逻辑超时 defer 中释放尚未完成的任务。
+**Interfaces:** `protocol PhotosIndexGateway: PhotosGateway { func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage; func changes() -> AsyncStream<PhotosIndexChange>; func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation }`；`PhotosIndexChange = assetsChanged([String]) | assetsDeleted([String]) | fullReconcileRequired | contextInvalidated`。`RepresentationPage { context: LibraryContext, generation: Int, descriptors: [RepresentationDescriptor], nextOffset: Int? }` 是历史示意接口。此次修订须显式区分稳定清单会话身份、原始通知序号与已覆盖事件终点（spec §4.1.3）；分页绑定同一枚举基线，末页 nextOffset=nil，基线失效才拒绝该枚举，不能单因中性通知序号前进就从头扫描。实际参数／字段需据此调整，不沿用一个 generation 同时承担三种语义。现有 `PhotoKitGateway` 同时实现两个协议，只有一个 observer/generation 有效性门。`actor ImageWorkBudget` 产生 `acquire(bytes: Int64) async throws -> ImageLease`；`ImageLease.finishPhysicalWork()` 幂等释放，共享于来源解码和 Photos 读取；不能在逻辑超时 defer 中释放尚未完成的任务。
 
 - [ ] **Step 1 — 写失败测试。** `testDegradedThenFinalPublishesOnce`：degraded 不返回，最终满足版本质量才完成一次；`testCancelThenLateFinalDoesNotPublishOrFreeEarly`：取消不创建 ready，物理结束前槽仍占用；`testEditedDimensionsBelongToEditedRepresentation`：原始 4000×3000、编辑 1000×1000，两个 descriptor 的尺寸不互借；`testUnknownRevisionCannotReuseCachedImage`：nil/不可靠修改线索导致失效；`testUnsupportedAndMultiFrameAreExplicitlyClassified`：无法证明安全单帧等价的 GIF/TIFF/组合资源不从第一帧生成跳过证据。
 ```swift
@@ -133,7 +135,7 @@ XCTAssertEqual(occupiedSlotsBeforePhysicalCompletion, 1)
 
 - [ ] **Step 2 — 跑 P2 红阶段命令。** 使用注入的 callback requester 和 fake catalog；不申请真实 Photos 权限。
 - [ ] **Step 3 — 实现协议与 SDK 契约核对。** 明确使用公开 `PHImageRequestOptions.version` 区分 original/current，以最终高质量回调为唯一完成输入，处理 error/nil/degraded/cancel 与 `isNetworkAccessAllowed=true`。回调给出的已定向位图标为 orientation=up，未定向像素才携带其真实方向，禁止二次应用 EXIF 旋转。记录 macOS 13 SDK 中实际可用签名、原图/当前版尺寸的可信来源和 Live Photo 静态资源范围到 photokit-contract.md。不能可靠拿到对应原尺寸则返回 nil，不能借缩略图或别的表示尺寸。无法通过公开证据证明多帧/复合静态内容等价的格式先视为“不能自动跳过的支持输入”，成功读取后保守导入并记录原因；不得把读取错误归为已确认排除或借此扩大 RAW 支持。
-- [ ] **Step 4 — 接入已有有效性和资源生命周期。** callback 立即使旧 Photos generation 失效，再向流合并事件；bounded 缓冲溢出设置不可被后续事件覆盖的 dirty 标记并升级 fullReconcileRequired，不能丢消息。源读取沿用 ReadExecutor 的 sourceID 公平/物理占用规则；共享图像字节预算与 PhotoKit request 上限另外约束。请求槽只在真实终止回调后释放，解码字节租约则由 LoadedRepresentation 持有到最后一次真实推理/消费完成，不能在收到 final 图像时提前释放。超尺寸结果不能继续生成无限额图像副本；记录实际返回尺寸和拒绝原因。预算统计覆盖 App 持有的图像，PhotoKit 内部缓存另实测，不声称可控制系统总内存。ImageIO 限制目标解码，不暂存图片到应用数据目录；请求目标大小不承诺 iCloud 字节上限。公开 API 若不能保证表示语义，报告并停止相关 skip 路径，不能伪称探针已验证。
+- [ ] **Step 4 — 接入已有有效性和资源生命周期。** callback 先撤销可能过期的判重发布权限，再分类和合并事件；全局通知代次变化不能独自使所有图像输入失效。bounded 缓冲溢出设置不可被窄事件覆盖的“清单需重查”标记，按 spec §4.1 保留已知影响范围和向量，不将 fullReconcileRequired 等同于全库内容变化。源读取沿用 ReadExecutor 的 sourceID 公平/物理占用规则；共享图像字节预算与 PhotoKit request 上限另外约束。请求槽只在真实终止回调后释放，解码字节租约则由 LoadedRepresentation 持有到最后一次真实推理/消费完成，不能在收到 final 图像时提前释放。超尺寸结果不能继续生成无限额图像副本；记录实际返回尺寸和拒绝原因。预算统计覆盖 App 持有的图像，PhotoKit 内部缓存另实测，不声称可控制系统总内存。ImageIO 限制目标解码，不暂存图片到应用数据目录；请求目标大小不承诺 iCloud 字节上限。公开 API 若不能保证表示语义，报告并停止相关 skip 路径，不能伪称探针已验证。
 - [ ] **Step 5 — 绿阶段与提交。** P2 单测绿，callback 多次/错误/晚回调及占槽门闩全部通过；仅记录本地 SDK/fake 证据，真实图库/iCloud 留待 P9。`git commit -m "feat: read versioned Photos representations with bounded resources"`。
 
 ### Task 3 (P3): 增量索引协调、清单对账与原子发布
@@ -149,7 +151,7 @@ XCTAssertEqual(secondUnchangedRoundInferenceCount, 0)
 ```
 
 - [ ] **Step 2 — 跑 P3 红阶段命令。** 以可控 change stream、注入时钟和模型调用计数断言，不使用 sleep 排序。
-- [ ] **Step 3 — 实现对账与工作循环。** 每次从 candidateSnapshot 取得 generation，再按该 generation 拉取 catalog 页并传给 beginIndexReconciliation。启动/恢复/fullReconcile/context 事件核对轻量清单，不按拍摄时间或总数判断增量。完整枚举结束才清除消失资产；context 无法确认延续则失效当前索引，但不清成功历史。事件观察到即使尺寸不变也失效；可靠 revision 和 same-context 才可复用。暂停仅阻止新工作，已完成结果符合修订时可落库；失败按批准退避期限继续处理其他任务。
+- [ ] **Step 3 — 实现对账与工作循环。** 建立上下文明确的稳定清单会话，按其身份分页；并持续保留从该基线到目标终点的完整变化集合，按 spec §4.1.3 顺序归并到 SQLite。已证实无成员／输入变化的通知仅推进覆盖终点，不使分页重启。未知缺口或基线失效仍阻断；完成后按最新覆盖终点和已提交索引版本作发布校验。启动/恢复/fullReconcile/context 事件核对轻量清单，不按拍摄时间或总数判断增量。完整枚举结束才清除消失资产；context 无法确认延续则关闭当前 publication，保留持久向量／任务／成功历史供后续核验。明确内容变化即使尺寸不变也使相关表示待重算；泛化的 fullReconcile 只触发非破坏性清单核对。复用须满足 spec §4.1.2 的上下文、指纹版本和内容连续性证据，不能仅看 revision 相等。暂停仅阻止新工作，已完成结果符合修订时可落库；失败按批准退避期限继续处理其他任务。
 - [ ] **Step 4 — 发布与恢复。** SQLite 提交完成 → 构造同代次 ExactVectorIndex → 事务确认该代次仍满足必需覆盖 → markIndexPublished；任何一步 crash 后启动重建派生索引而非清事实库。完整性/向量数与 generation 不一致时 readyToken=nil，永远不把空索引伪装就绪。测试在这三步之间分别中断重启、在发布前插入变化，以及模型/预处理版本失配重算；索引格式单变只重建派生结构。
 - [ ] **Step 5 — 绿阶段与提交。** 跑 P3 命令并核对最大在途值从未超出配置，`git commit -m "feat: maintain incremental Photos fingerprint generations"`。
 
@@ -303,7 +305,7 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 - Modify: `docs/release/0.2.0-advanced-dedup-validation.md` 和既有 scale/validate harness，仅补变化路径、真实终点与资源测量，不改门槛或跳过失败。
 
 **Decision and interfaces:**
-- 新值 `PhotosIndexDelta { context: LibraryContext, fromGeneration: Int, toGeneration: Int, changedAssetIDs: [String], deletedAssetIDs: [String] }`；`PhotosIndexChange` 传递完整 `.incremental(PhotosIndexDelta)` 或明确 full/context invalidation。同一增量含全部影响 ID；不可把部分 batch 当完整事务。单通知/待合并集合上限采用既有 `catalogBatchSize`，超出、缺基线、不连续或未知即 sticky full-reconcile。空 ID 的合法连续代次也须推进就绪屏障。
+- 新值 `PhotosIndexDelta { context: LibraryContext, fromGeneration: Int, toGeneration: Int, changedAssetIDs: [String], deletedAssetIDs: [String] }`；`PhotosIndexChange` 传递完整 `.incremental(PhotosIndexDelta)` 或明确 full/context invalidation。同一增量含全部影响 ID；不可把部分 batch 当完整事务。内存批次上限采用既有 `catalogBatchSize`，完整影响集合可分批持久合并，不能因数量超过批次容量就变成全库内容失效；缺基线、不连续或范围无法保全时 sticky full-reconcile 只要求重新核对清单。空 ID 的合法连续代次也须推进就绪屏障。
 - `PhotosIndexGateway.representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage`：只 fetch changed IDs，返回同上下文/目标代次的 descriptors、exclusions、内容失效集合；删除来自该可靠 delta。分页/超量/缺失 changed ID/代次变化不是删除证据，回退完整对账。原始/当前复用必须有可靠依据，不从尺寸/文件名不变推断；不能区分时允许该资产两表示均重算。
 - `SyncStore.applyIndexDelta(_ delta: PhotosIndexDelta, page: RepresentationPage, fingerprintVersion: String, checkpoint: LibraryResumeCheckpoint?) async throws -> Int64`：同一事务验证旧清单基线、上下文和 fromGeneration，只更新受影响表示/任务及有限全局状态，发行新全局索引代次。页面和 checkpoint 必须同上下文/目标代次；不完整/过期整体回滚。
 - 完整扫描 coordinator 临时保存 `Set<RepresentationKey>` 作为 eligible seen keys；exclusions 单独计数并使旧不再合格表示失效，不能把 excluded key 当作可保留候选。完整 finish 增加 seen keys 参数，遍历轻量持久键，仅墓碑真正缺失/被排除的表示。未完成扫描永不做缺失删除；重启重扫清单但复用有效 ready 向量。不要 TEMP 表/持久 seen 标记，也不要持久化第二份全库快照。
@@ -317,7 +319,7 @@ XCTAssertEqual(results.filter { $0.action == .skip }.count, 11)
 - [x] **Step 5 — 回到 P9 最终验收。** 更新既有受控 scale harness，覆盖 100k/150k/200k Photos 表示，以及 200k Photos + 100k 成功历史。热查询分段与 source prepare 分开；单项变化计时直到有效 ready token/Photos generation/表示数全部吻合，多次样本给 P50/P95/P99；初建、单变更、无变更 full、重启各标明真实/合成。最大档记录查询后 60 秒闲置的 footprint/RSS、再次查询延迟及查询/增量/无变更对账的逻辑 I/O/进程 I/O/写计数；查询零写不等于整个导入零写。沿用 `scripts/validate.py` 的完整 native/Tools/两个 continuation race/实际模型/规模门槛；失败仍退出非零并报告，不重跑已见统计校准或无限增加优化路线。
 - [x] **Step 6 — 最后集成审阅与交付记录。** 全分支审阅聚焦新查询与既有 commit/恢复、轻量 publication 和 delta 的组合风险；修复后补受影响验证。已知最大规模热查询风险必须以最终测量说明，达不到仍不能宣称完整性能验收或发行就绪。更新 spec/plan 实际完成状态与验证记录，交付本地源码提交；不发布、安装或启动真实应用。
 
-> P11 步骤完成表示实现、审阅和要求的测量均已执行并记录，不表示所有性能指标通过。最终 canonical 的失败与 P9 未关闭项目见文末；不继续扩展查询架构或放宽门槛来制造通过。
+> 上述 P11 勾选是 2026-10-06 历史完成事实；2026-10-07 的失效粒度修订尚未实施，新增约束不能由这些勾选宣称已验证。P11 步骤完成表示当时实现、审阅和要求的测量均已执行并记录，不表示所有性能指标通过。最终 canonical 的失败与 P9 未关闭项目见文末；不继续扩展查询架构或放宽门槛来制造通过。
 
 ## 自检覆盖与执行交接
 
@@ -452,3 +454,16 @@ P12/P13 按串行所有者实施，最终 tester 独占重负载。本节的授�
 - [真实 Photos＋iCloud 计划](../../release/2026-10-06-real-photos-icloud-validation-plan.md) 已编制 V1–V5，并随后按用户明确授权改为本机生产图库：先只读、最后限额写入和精确回退，执行时登记具体来源/资产及运行基线；没有合格云端前置就保留缺口。真实图库、长期资源与完整原生交互均未在本轮执行。公开素材/LFS/CI、发行版本和打包等后续事项仍见[合并准备记录](../../release/2026-10-06-0.2.0-merge-readiness.md)。
 
 控制线程最后仅更新 Markdown，未改变上述冻结实现或重跑同一源码；详细命令、数值与局限以[验收记录](../../release/0.2.0-advanced-dedup-validation.md)为准。本轮不合并、推送、发布或启动生产实例。
+
+## 2026-10-07 失效粒度修订：后续实施与验收约束（未执行）
+
+本节同步已修订的设计和待办范围，不是新的执行记录。详细实施任务应以修订后的书面 spec 为准继续展开；当前不改产品代码、不重启真实图库测试、不合并或发布。真实触发分支尚未定位，不能将“首次取图伴随通知”当成已证明的 iCloud 缓存事件。
+
+**涉及原任务：** P2 的通知／读取有效性、P3 的清单与 publication、P11 的增量／存储事实；P8 仅补现有日志和进度口径，P9/P14 补新快照验收。保持 SSCD/0.98、SQLite 精确评分和成功／unknown 保护，不扩判重模型、来源类型或 UI 操作。
+
+- [ ] **明确事件证据与数据契约。** 区分清单需重查、已知内容变化、已证明无输入变化、未知范围及上下文不可信。记录 producer 回退具体原因，而非仅 `libraryChanged`。审核公开 PhotoKit 证据能否支撑复用；当前修改日期／资源 SHA 不能冒充内容版本。对 API 无法确认的情况保持未知，不按通知名称猜 iCloud。
+- [ ] **非破坏性 reconciliation。** 优先复用现有 `invalidateIndexPublication`、`beginIndexReconciliation`、upsert 和任务接口；full-reconcile/事件积压不调用 `invalidateRepresentations(nil)` 清库。保留字节与判定可用性分离，已知改变只处理相关表示，未知记录在验证前不参与当前决定。对全量重建给出明确原因与影响数。仅在必要时扩充既有 schema，并同步迁移、Schema.sql 和崩溃恢复契约，禁止无关存储重构。
+- [ ] **初建与持续变化。** 对账/分类期间保留已完成向量和待办；稳定清单会话与通知覆盖终点分离，完整已分类变化可归并到终点，不要求全轮 raw generation 静止；已知变更集合分批持久处理，129 个 ID 不污染其他资产。无关在途任务可按本项证据完成；相关编辑／删除／任务替换的迟到结果必须拒绝。未知输入不发布，实际物理任务终结才释放资源；不靠重建 gateway 逃离占用。新事件到来时完整性屏障仍有效，但不把建设进度重置。
+- [ ] **聚焦 RED/GREEN。** 用门闩复现 raw notification、producer 回退、page invalidation、coordinator、真实 SQLite 的完整链路；清单会话与覆盖终点测试须在每页之间送达中性通知、不给整轮静默窗口，断言分页完成、终点覆盖及短发布屏障；未覆盖新增／内容／未知事件则拒绝旧终点。另覆盖十万条库单项变化、有证据的非增量无内容变化、未知历史下相同 metadata 不可复用、129-ID 分批、重复通知期间初建收敛、相关与无关在途结果、分页/崩溃恢复、最终 ready 检查失效。断言向量字节保留、实际行写及读取/模型调用，不能只给 fake 一个“无变化”标签跳过分类接线。新增原生进度断言但不改布局。
+- [ ] **独立审阅与完整验证。** 修复后按仓库规定在最终行为快照跑 canonical，并保留原有规模／数值门槛。历史 `bc27a425` 通过不代表本次通过。性能需分别报告清单核对、保留／验证／重算数量、取图与推理次数；不把 QA 每行审计落盘时长当产品耗时。
+- [ ] **恢复真实只读验证。** 先补原始 PhotoKit 变更详情／回退分支诊断，使用真实只读计划的同一安全边界。证明有充分证据的非内容通知不会清向量或反复中断初建；无法分类的通知仍等候，不能屏蔽 observer 制造成功。达到完整 ready 后才续跑 MobileBackup 全量扫描和既定盲审。既有测试快照不伪装成新实现结果；换实现后复用照片指纹需依据相同 fingerprintVersion、输入语义和当前内容证据，缺口如实保留。
