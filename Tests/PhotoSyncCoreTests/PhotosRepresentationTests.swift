@@ -51,8 +51,67 @@ final class PhotosRepresentationTests: XCTestCase {
             }
             let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
         }
-        let inCloud = SystemPhotosRepresentationRequester.classifyUnavailable(error: NSError(domain: NSCocoaErrorDomain, code: -1), inCloud: true)
-        guard case .iCloudUnavailable = inCloud as? PhotosRepresentationError else { return XCTFail("cloud wait must remain waiting") }
+        for cloudError in [NSError(domain: NSCocoaErrorDomain, code: -1), NSError(domain: NSURLErrorDomain, code: NSURLErrorBadServerResponse)] {
+            let inCloud = SystemPhotosRepresentationRequester.classifyUnavailable(error: cloudError, inCloud: true)
+            guard case .iCloudUnavailable = inCloud as? PhotosRepresentationError else { return XCTFail("cloud wait must remain waiting") }
+        }
+    }
+
+    func testNestedProtectedCallbacksKeepControlMeaningAndTopLevelDiagnostics() async throws {
+        let cases: [(NSError, String)] = [
+            (NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet,
+                userInfo: [NSLocalizedDescriptionKey: "synthetic network cause"]), "network"),
+            (NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.Code.accessUserDenied.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "synthetic authorization cause"]), "blocking"),
+            (NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.Code.libraryVolumeOffline.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "synthetic library cause"]), "blocking"),
+            (NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled), "cancelled")]
+        for (cause, meaning) in cases {
+            for depth in [1, 3] {
+                var outer = cause
+                for _ in 0..<depth {
+                    outer = NSError(domain: NSCocoaErrorDomain, code: -1,
+                        userInfo: [NSUnderlyingErrorKey: outer, NSLocalizedDescriptionKey: "synthetic outer callback detail"])
+                }
+                let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+                let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+                let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+                await requester.started(); requester.send(.failure(outer))
+                do { _ = try await task.value; XCTFail("nested terminal failure") }
+                catch {
+                    XCTAssertFalse((error as? PhotosRepresentationError)?.isIsolatableReadFailure == true, meaning)
+                    if meaning == "cancelled" { XCTAssertTrue(error is CancellationError) }
+                    else if meaning == "network" {
+                        guard case .iCloudUnavailable(let detail) = error as? PhotosRepresentationError else { return XCTFail("network must remain waiting") }
+                        XCTAssertTrue(detail.contains("synthetic outer callback detail")); XCTAssertTrue(detail.contains("synthetic network cause"))
+                        XCTAssertTrue(detail.contains(NSCocoaErrorDomain)); XCTAssertTrue(detail.contains(NSURLErrorDomain))
+                    } else {
+                        let preserved = error as NSError
+                        XCTAssertEqual(preserved.domain, NSCocoaErrorDomain); XCTAssertEqual(preserved.code, -1)
+                        XCTAssertTrue(String(describing: preserved).contains("synthetic outer callback detail"))
+                        XCTAssertNotNil(preserved.userInfo[NSUnderlyingErrorKey])
+                    }
+                }
+                let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+            }
+        }
+    }
+
+    func testUnknownFiniteCauseRemainsSoftButCyclesAndUnverifiedDeepChainsDoNot() throws {
+        let unknown = NSError(domain: "Synthetic.UnknownImageError", code: 123)
+        let wrapped = NSError(domain: NSCocoaErrorDomain, code: -1, userInfo: [NSUnderlyingErrorKey: unknown])
+        let allowed = SystemPhotosRepresentationRequester.classifyUnavailable(error: wrapped, inCloud: false)
+        XCTAssertTrue((allowed as? PhotosRepresentationError)?.isIsolatableReadFailure == true)
+        let cyclic = CyclicRepresentationCallbackError(domain: NSCocoaErrorDomain, code: -1)
+        let guarded = SystemPhotosRepresentationRequester.classifyUnavailable(error: cyclic, inCloud: false)
+        XCTAssertFalse((guarded as? PhotosRepresentationError)?.isIsolatableReadFailure == true)
+        let malformed = NSError(domain: NSCocoaErrorDomain, code: -1, userInfo: [NSUnderlyingErrorKey: "unverified cause"])
+        let rejected = SystemPhotosRepresentationRequester.classifyUnavailable(error: malformed, inCloud: false)
+        XCTAssertFalse((rejected as? PhotosRepresentationError)?.isIsolatableReadFailure == true)
+        var deep = unknown
+        for _ in 0..<128 { deep = NSError(domain: NSCocoaErrorDomain, code: -1, userInfo: [NSUnderlyingErrorKey: deep]) }
+        let unverified = SystemPhotosRepresentationRequester.classifyUnavailable(error: deep, inCloud: false)
+        XCTAssertFalse((unverified as? PhotosRepresentationError)?.isIsolatableReadFailure == true)
     }
 
     func testPreRequestInvalidImageErrorHasNoCallbackAuthorization() async throws {
@@ -807,4 +866,9 @@ private struct ValidationFailingRepresentationRequester: PhotosRepresentationReq
                  completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
         throw PhotosRepresentationError.invalidImage
     }
+}
+
+private final class CyclicRepresentationCallbackError: NSError, @unchecked Sendable {
+    override var userInfo: [String: Any] { [NSUnderlyingErrorKey: self] }
+    override var description: String { "synthetic cyclic callback" }
 }

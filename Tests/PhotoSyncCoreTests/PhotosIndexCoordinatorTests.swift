@@ -2,6 +2,7 @@ import XCTest
 import CoreML
 import CoreGraphics
 import ImageIO
+import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
@@ -24,6 +25,25 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='bad' AND retry_count=1", at: f.db), 1)
         let physical = await f.photos.budget.snapshot(); XCTAssertEqual(physical.images, 0)
     }
+    func testNestedKnownReadFailuresCannotPublishSoftGap() async throws {
+        for cause in [NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet),
+                      NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.Code.accessUserDenied.rawValue)] {
+            let log = CoordinatorDiagnostics(), f = try fixture(diagnostics: { log.record($0) })
+            let failed = descriptor(f.photos.context, asset: "bad"), healthy = descriptor(f.photos.context, asset: "good")
+            await f.photos.set([failed, healthy])
+            let wrapper = NSError(domain: NSCocoaErrorDomain, code: -1,
+                userInfo: [NSUnderlyingErrorKey: cause, NSLocalizedDescriptionKey: "synthetic wrapper detail"])
+            await f.photos.setCallbackFailure(wrapper, key: failed.key)
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            let p = await f.coordinator.progress()
+            XCTAssertEqual(p.state, .waiting); XCTAssertEqual(p.readyRepresentations, 1)
+            XCTAssertEqual(p.readErrorRepresentations, 0)
+            try await assertNil(try await f.coordinator.readyToken())
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='bad' AND failure_kind IS NULL", at: f.db), 1)
+            XCTAssertTrue(log.rows.contains { $0["stage"] == "photos-read" && $0["result"] == "waiting" && $0["error"]?.contains("synthetic wrapper detail") == true })
+        }
+    }
+
     func testOriginalAndCurrentReadErrorsAreIndependent() async throws {
         for failedKind in [RepresentationKind.original, .current] {
             let f = try fixture()

@@ -367,27 +367,55 @@ final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting,
         if let classified = error as? PhotosRepresentationError { return inCloud ? PhotosRepresentationError.iCloudUnavailable(String(describing: error)) : classified }
         if error is PhotoKitGatewayError || error is ReadExecutorError || error is ImageWorkBudgetError { return error }
         let native = error as NSError
-        if (native.domain == NSCocoaErrorDomain && native.code == NSUserCancelledError) ||
-           (native.domain == NSURLErrorDomain && native.code == NSURLErrorCancelled) ||
-           (native.domain == PHPhotosErrorDomain && native.code == PHPhotosError.Code.userCancelled.rawValue) {
-            return CancellationError()
-        }
-        if native.domain == PHPhotosErrorDomain {
-            let global: [PHPhotosError.Code] = [.libraryVolumeOffline, .relinquishingLibraryBundleToWriter,
-                .switchingSystemPhotoLibrary, .accessRestricted, .accessUserDenied, .operationInterrupted,
-                .identifierNotFound, .multipleIdentifiersFound, .notEnoughSpace,
-                .persistentChangeTokenExpired, .persistentChangeDetailsUnavailable, .libraryInFileProviderSyncRoot]
-            if global.contains(where: { $0.rawValue == native.code }) { return error }
-            if native.code == PHPhotosError.Code.networkAccessRequired.rawValue ||
-               native.code == PHPhotosError.Code.networkError.rawValue {
-                return PhotosRepresentationError.iCloudUnavailable(String(describing: error))
-            }
-        }
+        let global: [PHPhotosError.Code] = [.libraryVolumeOffline, .relinquishingLibraryBundleToWriter,
+            .switchingSystemPhotoLibrary, .accessRestricted, .accessUserDenied, .operationInterrupted,
+            .identifierNotFound, .multipleIdentifiersFound, .notEnoughSpace,
+            .persistentChangeTokenExpired, .persistentChangeDetailsUnavailable, .libraryInFileProviderSyncRoot]
         let networkCodes = [NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorCannotConnectToHost]
-        if inCloud || (native.domain == NSURLErrorDomain && networkCodes.contains(native.code)) {
-            return PhotosRepresentationError.iCloudUnavailable(String(describing: error))
+        var current: Error? = error
+        var seen = Set<ObjectIdentifier>()
+        var cancelled = false, blocking = false, network = inCloud, otherURLFailure = false
+        // Bound malformed error graphs before formatting their recursive NSError
+        // description. An unverified tail can never authorize an image-only gap.
+        func unverifiedChain() -> Error {
+            if cancelled { return CancellationError() }
+            return PhotosRepresentationError.requestFailed("PhotoKit error chain could not be fully checked: \(native.domain)/\(native.code), \(native.localizedDescription)")
         }
-        guard native.domain != NSURLErrorDomain else { return error }
+        for _ in 0..<64 {
+            guard let item = current else { break }
+            let cause = item as NSError
+            guard seen.insert(ObjectIdentifier(cause)).inserted else { return unverifiedChain() }
+            if item is CancellationError { cancelled = true }
+            if let classified = item as? PhotosRepresentationError {
+                if case .iCloudUnavailable = classified { network = true }
+                else if !classified.isIsolatableReadFailure { blocking = true }
+            }
+            if item is PhotoKitGatewayError || item is ReadExecutorError || item is ImageWorkBudgetError { blocking = true }
+            if (cause.domain == NSCocoaErrorDomain && cause.code == NSUserCancelledError) ||
+               (cause.domain == NSURLErrorDomain && cause.code == NSURLErrorCancelled) ||
+               (cause.domain == PHPhotosErrorDomain && cause.code == PHPhotosError.Code.userCancelled.rawValue) {
+                cancelled = true
+            }
+            if cause.domain == PHPhotosErrorDomain {
+                if global.contains(where: { $0.rawValue == cause.code }) { blocking = true }
+                if cause.code == PHPhotosError.Code.networkAccessRequired.rawValue ||
+                   cause.code == PHPhotosError.Code.networkError.rawValue { network = true }
+            }
+            if cause.domain == NSURLErrorDomain {
+                if networkCodes.contains(cause.code) { network = true }
+                else if cause.code != NSURLErrorCancelled { otherURLFailure = true }
+            }
+            guard let underlying = cause.userInfo[NSUnderlyingErrorKey] else { current = nil; break }
+            guard let underlyingError = underlying as? Error else { return unverifiedChain() }
+            current = underlyingError
+        }
+        guard current == nil else { return unverifiedChain() }
+        if cancelled { return CancellationError() }
+        if blocking { return error }
+        // Keep the original wrapper and complete verified cause chain in the
+        // existing diagnostics, rather than substituting only the deepest cause.
+        if network { return PhotosRepresentationError.iCloudUnavailable(String(describing: error)) }
+        if otherURLFailure { return error }
         return PhotosRepresentationError.imageReadFailed(domain: native.domain, code: native.code,
             detail: String(describing: native))
     }
