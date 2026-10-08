@@ -6,6 +6,64 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testTerminalCocoaCallbackPreservesErrorAndReleasesPhysicalLease() async throws {
+        let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started()
+        requester.send(.failure(NSError(domain: NSCocoaErrorDomain, code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "synthetic callback detail"])))
+        do { _ = try await task.value; XCTFail("terminal failure") }
+        catch {
+            guard case .imageReadFailed(let domain, let code, let detail) = error as? PhotosRepresentationError else { return XCTFail("explicit callback error: \(error)") }
+            XCTAssertEqual(domain, NSCocoaErrorDomain); XCTAssertEqual(code, -1)
+            XCTAssertTrue(detail.contains("synthetic callback detail"))
+        }
+        let occupied = await reader.physicalRequestCount, released = await budget.snapshot()
+        XCTAssertEqual(occupied, 0); XCTAssertEqual(released.images, 0)
+    }
+
+    func testKnownGlobalNetworkAndCancellationCallbacksCannotBeSoft() async throws {
+        let photosCodes: [PHPhotosError.Code] = [.libraryVolumeOffline, .relinquishingLibraryBundleToWriter,
+            .switchingSystemPhotoLibrary, .accessRestricted, .accessUserDenied, .operationInterrupted,
+            .identifierNotFound, .multipleIdentifiersFound, .networkAccessRequired, .networkError, .userCancelled]
+        let errors = photosCodes.map { NSError(domain: PHPhotosErrorDomain, code: $0.rawValue) } + [
+            NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError),
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled),
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost),
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorBadServerResponse)]
+        for native in errors {
+            let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+            let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+            await requester.started(); requester.send(.failure(native))
+            do { _ = try await task.value; XCTFail("callback failed") }
+            catch {
+                XCTAssertFalse((error as? PhotosRepresentationError)?.isIsolatableReadFailure == true, "\(native)")
+                if native.code == 3072 || native.code == -999 {
+                    XCTAssertTrue(error is CancellationError)
+                } else if native.code == 3164 || native.code == 3169 || native.code == -1005 {
+                    guard case .iCloudUnavailable = error as? PhotosRepresentationError else { return XCTFail("network wait: \(native)") }
+                } else {
+                    XCTAssertEqual((error as NSError).domain, native.domain)
+                    XCTAssertEqual((error as NSError).code, native.code)
+                }
+            }
+            let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+        }
+        let inCloud = SystemPhotosRepresentationRequester.classifyUnavailable(error: NSError(domain: NSCocoaErrorDomain, code: -1), inCloud: true)
+        guard case .iCloudUnavailable = inCloud as? PhotosRepresentationError else { return XCTFail("cloud wait must remain waiting") }
+    }
+
+    func testPreRequestInvalidImageErrorHasNoCallbackAuthorization() async throws {
+        let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: ValidationFailingRepresentationRequester(), budget: budget,
+            limits: try limits(), targetSide: 32)
+        do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("pre-request validation") }
+        catch { XCTAssertFalse((error as? PhotosRepresentationError)?.isIsolatableReadFailure == true) }
+        let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+    }
+
     func testDegradedThenFinalPublishesOnce() async throws {
         let requester = ControlledRepresentationRequester()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
@@ -742,4 +800,11 @@ private final class AccountingRasterRepresentation: NSImageRep {
     required init?(coder: NSCoder) { nil }
     override func cgImage(forProposedRect proposedDestRect: UnsafeMutablePointer<NSRect>?,
                           context: NSGraphicsContext?, hints: [NSImageRep.HintKey: Any]?) -> CGImage? { raster }
+}
+
+private struct ValidationFailingRepresentationRequester: PhotosRepresentationRequesting {
+    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+        throw PhotosRepresentationError.invalidImage
+    }
 }

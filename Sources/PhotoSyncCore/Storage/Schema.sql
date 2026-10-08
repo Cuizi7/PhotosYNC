@@ -90,6 +90,7 @@ CREATE TABLE dedup_recheck_progress (
 );
 
 ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT;
+ALTER TABLE fingerprint_task ADD COLUMN failure_kind TEXT CHECK(failure_kind IS NULL OR failure_kind = 'photos_read');
 CREATE TABLE photos_content_change (
  context_id TEXT NOT NULL, context_epoch INTEGER NOT NULL, run_id TEXT NOT NULL,
  asset_id TEXT NOT NULL, generation INTEGER NOT NULL, removed INTEGER NOT NULL,

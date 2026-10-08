@@ -1,5 +1,10 @@
 import Foundation
 
+private struct RepresentationStageFailure: Error {
+    let stage: String
+    let error: Error
+}
+
 /// Owns one bounded work loop and the durable-inventory → derived-index → Photos
 /// acknowledgement barrier. SQLite never waits for Photos or model work.
 public actor PhotosIndexCoordinator {
@@ -188,12 +193,13 @@ public actor PhotosIndexCoordinator {
     public func processDueWork(now: Date) async {
         guard !processing, !paused else { return }
         processing = true
-        var completed = 0, failed = 0
+        var completed = 0, failed = 0, readErrors = 0
         defer {
             processing = false
             if completed > 0 || failed > 0 {
                 diagnostics(["phase": "index-work", "unit": "representationTasks", "completed": String(completed),
-                             "failed": String(failed), "batch": paused || needsReconciliation ? "interrupted" : "completed"])
+                             "failed": String(failed), "readErrors": String(readErrors), "waiting": String(failed - readErrors),
+                             "batch": paused || needsReconciliation ? "interrupted" : "completed"])
             }
         }
         do {
@@ -233,7 +239,10 @@ public actor PhotosIndexCoordinator {
                             }
                             diagnostics(fields)
                         }
-                        var loaded: LoadedRepresentation? = try await photos.readRepresentation(task.descriptor)
+                        var loaded: LoadedRepresentation?
+                        do { loaded = try await photos.readRepresentation(task.descriptor) }
+                        catch is CancellationError { throw CancellationError() }
+                        catch { throw RepresentationStageFailure(stage: "photos-read", error: error) }
                         fields["timingMS.representationReadWait"] = String((ProcessInfo.processInfo.systemUptime - readStarted) * 1000)
                         let lease = loaded!.lease
                         do {
@@ -253,10 +262,12 @@ public actor PhotosIndexCoordinator {
                         } catch {
                             loaded = nil
                             await lease.finishPhysicalWork()
-                            throw error
+                            if error is CancellationError { throw error }
+                            throw RepresentationStageFailure(stage: "fingerprint", error: error)
                         }
                     }
                     let waitKey = Self.waitKey(task.descriptor)
+                    var completionStage = "currentness"
                     do {
                         let fingerprint = try await work.value
                         // Resolve observed changes before deciding whether this *task* is stale.
@@ -267,6 +278,7 @@ public actor PhotosIndexCoordinator {
                               latest.generation == reconciledGeneration else {
                             acknowledgedGeneration = nil; continue
                         }
+                        completionStage = "sqlite-completion"
                         if try await store.completeRepresentation(task, fingerprint: fingerprint) {
                             completed += 1; cloudWaiting.removeValue(forKey: waitKey); modelWaiting.removeValue(forKey: waitKey)
                         }
@@ -276,19 +288,29 @@ public actor PhotosIndexCoordinator {
                         // its lease; keep its existing durable issuance/deadline unchanged.
                         return
                     } catch {
+                        let stageFailure = error as? RepresentationStageFailure
+                        let underlying = stageFailure?.error ?? error
+                        let stage = stageFailure?.stage ?? completionStage
+                        let readFailure = stage == "photos-read" &&
+                            (underlying as? PhotosRepresentationError)?.isIsolatableReadFailure == true
                         let latest = try? await photos.candidateSnapshot()
                         if needsReconciliation || reconciling || pendingDelta != nil || latest?.generation != reconciledGeneration {
                             if pendingDelta == nil { needsReconciliation = true }; acknowledgedGeneration = nil
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
-                            let delay = error is ModelExecutionUnavailable ? 60 : delays[min(task.retryCount, delays.count - 1)]
-                            if try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay), detail: String(describing: error)) {
+                            let delay = underlying is ModelExecutionUnavailable ? 60 : delays[min(task.retryCount, delays.count - 1)]
+                            if try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay),
+                                detail: String(describing: underlying), failureKind: readFailure ? .photosRead : nil) {
                                 failed += 1
-                                diagnostics(["phase": "index-representation", "result": "waiting", "asset": task.descriptor.key.assetID,
-                                    "representation": task.descriptor.key.kind.rawValue, "error": String(describing: error)])
-                                if error is ModelExecutionUnavailable { modelWaiting[waitKey] = task.descriptor }
+                                if readFailure { readErrors += 1 }
+                                diagnostics(["phase": "index-representation", "stage": stage,
+                                    "result": readFailure ? "read-error" : "waiting", "asset": task.descriptor.key.assetID,
+                                    "representation": task.descriptor.key.kind.rawValue, "error": String(describing: underlying),
+                                    "retryCount": String(task.retryCount + 1),
+                                    "nextRetryAt": String(now.addingTimeInterval(delay).timeIntervalSince1970)])
+                                if underlying is ModelExecutionUnavailable { modelWaiting[waitKey] = task.descriptor }
                                 else { modelWaiting.removeValue(forKey: waitKey) }
-                                if case .iCloudUnavailable = error as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
+                                if case .iCloudUnavailable = underlying as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
                                 else { cloudWaiting.removeValue(forKey: waitKey) }
                             }
                         }
@@ -320,6 +342,7 @@ public actor PhotosIndexCoordinator {
             return IndexProgress(state: state, totalsKnown: stored.totalsKnown && !needsReconciliation,
                 totalAssets: stored.totalAssets, readyAssets: stored.readyAssets,
                 totalRepresentations: stored.totalRepresentations, readyRepresentations: stored.readyRepresentations,
+                readErrorRepresentations: stored.readErrorRepresentations,
                 excludedAssets: stored.excludedAssets, issue: aggregateIssue)
         } catch {
             return IndexProgress(state: paused ? .paused : .waiting, totalsKnown: false, totalAssets: 0,

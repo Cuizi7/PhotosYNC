@@ -328,15 +328,19 @@ public struct IndexProgress: Codable, Equatable, Sendable {
     public let readyAssets: Int
     public let totalRepresentations: Int
     public let readyRepresentations: Int
+    public let readErrorRepresentations: Int
     public let excludedAssets: Int
     public let issue: String?
     public init(state: IndexState, totalsKnown: Bool, totalAssets: Int, readyAssets: Int,
-                totalRepresentations: Int, readyRepresentations: Int, excludedAssets: Int, issue: String?) {
+                totalRepresentations: Int, readyRepresentations: Int, readErrorRepresentations: Int = 0,
+                excludedAssets: Int, issue: String?) {
         self.state = state; self.totalsKnown = totalsKnown; self.totalAssets = totalAssets
         self.readyAssets = readyAssets; self.totalRepresentations = totalRepresentations
         self.readyRepresentations = readyRepresentations; self.excludedAssets = excludedAssets; self.issue = issue
+        self.readErrorRepresentations = readErrorRepresentations
     }
 }
+public enum RepresentationFailureKind: String, Sendable { case photosRead = "photos_read" }
 public struct RepresentationTask: Codable, Equatable, Sendable {
     public let descriptor: RepresentationDescriptor
     public let retryCount: Int

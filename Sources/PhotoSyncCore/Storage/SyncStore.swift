@@ -1529,7 +1529,7 @@ public final class SyncStore: @unchecked Sendable {
             if asset == nil {
                 // Unknown continuity revokes issuance, not the existing failure's
                 // backoff. A confirmed content replacement below starts fresh work.
-                try self.execute("UPDATE fingerprint_task SET generation = ?, issuance_revision = NULL WHERE " + filter,
+                try self.execute("UPDATE fingerprint_task SET generation = ?, issuance_revision = NULL, failure_kind = NULL WHERE " + filter,
                     [.int64(generation)] + bindings)
             } else { try self.execute("DELETE FROM fingerprint_task WHERE " + filter, bindings) }
             // Earlier pages may already have been upserted in this generation.
@@ -1577,20 +1577,27 @@ public final class SyncStore: @unchecked Sendable {
             let context = try self.libraryContext(state)
             let bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
             let row = try self.one("""
-                SELECT COUNT(*), COALESCE(SUM(state = 'ready'), 0), COALESCE(SUM(state = 'failed'), 0), COUNT(DISTINCT asset_id)
+                SELECT COUNT(*), COALESCE(SUM(state = 'ready' AND (vector IS NULL) = 0), 0), COALESCE(SUM(state = 'failed'), 0), COUNT(DISTINCT asset_id)
                 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0
                 """, bindings)!
             let ready = try self.one("""
                 SELECT COUNT(*) FROM (SELECT asset_id FROM photos_representation WHERE context_id = ? AND context_epoch = ?
-                AND tombstoned = 0 GROUP BY asset_id HAVING MIN(state = 'ready') = 1)
+                AND tombstoned = 0 GROUP BY asset_id HAVING MIN(state = 'ready' AND (vector IS NULL) = 0) = 1)
                 """, bindings)!
+            let readErrors = try self.one("""
+                SELECT COUNT(*) FROM photos_representation r WHERE r.context_id = ? AND r.context_epoch = ?
+                AND r.tombstoned = 0 AND r.state = 'failed' AND (r.vector IS NULL) = 1
+                AND EXISTS (SELECT 1 FROM fingerprint_task t WHERE
+                """ + " " + Self.readFailureMatch + ")", bindings + [.int64(try self.int64(state[2])), .text(try self.text(state[4]))])!
+            let readErrorCount = Int(try self.int64(readErrors[0]))
+            let blockingFailures = Int(try self.int64(row[2])) - readErrorCount
             let excludedRow = try self.one("SELECT excluded_assets FROM dedup_index_state WHERE id = 1", [])!
             let excluded = Int(try self.int64(excludedRow[0]))
-            return IndexProgress(state: try self.int64(row[2]) > 0 ? .waiting : .updating,
+            return IndexProgress(state: blockingFailures > 0 ? .waiting : .updating,
                 totalsKnown: try self.int64(state[7]) != 0, totalAssets: Int(try self.int64(row[3])) + excluded,
                 readyAssets: Int(try self.int64(ready[0])), totalRepresentations: Int(try self.int64(row[0])),
-                readyRepresentations: Int(try self.int64(row[1])), excludedAssets: excluded,
-                issue: try self.int64(row[2]) > 0 ? "部分图库图像暂时无法读取，正在等待重试。" : nil)
+                readyRepresentations: Int(try self.int64(row[1])), readErrorRepresentations: readErrorCount, excludedAssets: excluded,
+                issue: blockingFailures > 0 ? "部分图库图像暂时无法读取，正在等待重试。" : nil)
         }
     }
 
@@ -1601,7 +1608,7 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
                 let token = try self.indexToken(state)
-                let row = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0",
+                let row = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND state = 'ready'",
                     [.text(token.context.id.uuidString), .int64(token.context.epoch)])!
                 return (token, Int(try self.int64(row[0])))
             }
@@ -1649,6 +1656,7 @@ public final class SyncStore: @unchecked Sendable {
         return try await perform {
             try self.transaction {
                 guard try self.representationTaskIsCurrent(task) else { return false }
+                if try self.taskHasReadFailure(task) { try self.revokeReadExclusionPublication() }
                 try self.execute("UPDATE photos_representation SET state = 'ready', vector = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.blob(fingerprint.littleEndianFloat32)] + self.representationBindings(task.descriptor))
                 try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", self.representationBindings(task.descriptor))
                 return true
@@ -1658,13 +1666,14 @@ public final class SyncStore: @unchecked Sendable {
 
     /// Stale failures are no-ops; retry state belongs to the same persisted task issuance.
     @discardableResult
-    public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String) async throws -> Bool {
+    public func failRepresentation(_ task: RepresentationTask, nextRetryAt: Date, detail: String, failureKind: RepresentationFailureKind? = nil) async throws -> Bool {
         try await perform {
             try self.transaction {
                 guard try self.representationTaskIsCurrent(task) else { return false }
                 let key = self.representationBindings(task.descriptor)
-                try self.execute("UPDATE photos_representation SET state = 'failed' WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
-                try self.execute("UPDATE fingerprint_task SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.double(nextRetryAt.timeIntervalSince1970), .text(detail)] + key)
+                if failureKind == nil, try self.taskHasReadFailure(task) { try self.revokeReadExclusionPublication() }
+                try self.execute("UPDATE photos_representation SET state = 'failed', vector = CASE WHEN ? = 'photos_read' THEN NULL ELSE vector END WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [failureKind.map { .text($0.rawValue) } ?? .null] + key)
+                try self.execute("UPDATE fingerprint_task SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, failure_kind = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.double(nextRetryAt.timeIntervalSince1970), .text(detail), failureKind.map { .text($0.rawValue) } ?? .null] + key)
                 return true
             }
         }
@@ -1676,7 +1685,7 @@ public final class SyncStore: @unchecked Sendable {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.indexFactsComplete(state) else { return nil }
                 let token = try self.indexToken(state)
-                let count = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0", [.text(token.context.id.uuidString), .int64(token.context.epoch)])!
+                let count = try self.one("SELECT COUNT(*) FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND state = 'ready'", [.text(token.context.id.uuidString), .int64(token.context.epoch)])!
                 return IndexPublication(token: token, representationCount: Int(try self.int64(count[0])))
             }
         }
@@ -1719,14 +1728,51 @@ public final class SyncStore: @unchecked Sendable {
         IndexToken(context: try libraryContext(row), photosGeneration: Int(try int64(row[5])),
                    indexGeneration: try int64(row[2]), localRevision: try int64(row[6]), fingerprintVersion: try text(row[4]))
     }
-    // Keep every integrity check. The explicit 0/1 comparison lets SQLite read
-    // the partial expression index instead of fetching each 4 KiB vector row.
+    // Evaluate only metadata; the expression index covers the vector-null check.
+    // A failed row and its task must prove the same current issuance. Both sides
+    // are checked so an orphan, stale or duplicate task cannot authorize a gap.
+    private static let readFailureMatch = """
+        t.context_id = r.context_id AND t.context_epoch = r.context_epoch
+        AND t.asset_id = r.asset_id AND t.kind = r.kind AND t.revision = r.revision
+        AND t.fingerprint_version = r.fingerprint_version AND t.generation = r.seen_generation
+        AND t.failure_kind = 'photos_read' AND r.state = 'failed'
+        AND t.retry_count > 0 AND t.next_retry_at IS NOT NULL AND t.last_error IS NOT NULL
+        AND r.tombstoned = 0 AND r.revision <> '' AND COALESCE(t.issuance_revision,t.revision) <> ''
+        AND t.generation > 0 AND t.generation <= ? AND t.fingerprint_version = ?
+        """
+
     private func indexFactsComplete(_ row: [Value]) throws -> Bool {
         guard try int64(row[7]) != 0 else { return false }
         let context = try libraryContext(row)
-        let incomplete = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <= 0 OR seen_generation > ? OR state <> 'ready' OR fingerprint_version <> ? OR (vector IS NULL) = 1) LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch), .int64(try int64(row[2])), .text(try text(row[4]))])
+        let bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch),
+            .int64(try int64(row[2])), .text(try text(row[4]))]
+        let invalidMetadata = try one("SELECT 1 FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND tombstoned = 0 AND (seen_generation <= 0 OR seen_generation > ? OR fingerprint_version <> ?) LIMIT 1", bindings)
+        guard invalidMetadata == nil else { return false }
+        let incomplete = try one("""
+            SELECT 1 FROM photos_representation r WHERE r.context_id = ? AND r.context_epoch = ?
+            AND r.tombstoned = 0 AND (r.state <> 'ready' OR (r.vector IS NULL) = 1)
+            AND ((r.vector IS NULL) = 0 OR NOT EXISTS (SELECT 1 FROM fingerprint_task t WHERE
+            """ + " " + Self.readFailureMatch + ")) LIMIT 1", bindings)
         guard incomplete == nil else { return false }
-        return try one("SELECT 1 FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? LIMIT 1", [.text(context.id.uuidString), .int64(context.epoch)]) == nil
+        // The preceding indexed pass already proves failed vectors are NULL.
+        // Rechecking that BLOB through this primary-key metadata lookup would
+        // force a vector column read for every remaining task.
+        let invalidTask = try one("""
+            SELECT 1 FROM fingerprint_task t WHERE t.context_id = ? AND t.context_epoch = ?
+            AND NOT EXISTS (SELECT 1 FROM photos_representation r WHERE
+            """ + " " + Self.readFailureMatch + ") LIMIT 1", bindings)
+        return invalidTask == nil
+    }
+
+    private func taskHasReadFailure(_ task: RepresentationTask) throws -> Bool {
+        try one("SELECT 1 FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ? AND failure_kind = 'photos_read' LIMIT 1", representationBindings(task.descriptor)) != nil
+    }
+
+    private func revokeReadExclusionPublication() throws {
+        guard let state = try indexStateRow(), try int64(state[2]) < Int64.max else {
+            throw SyncStoreError.constraint("Index generation overflow.")
+        }
+        try execute("UPDATE dedup_index_state SET generation = generation + 1, published_generation = NULL WHERE id = 1")
     }
     private func representationTaskIsCurrent(_ task: RepresentationTask) throws -> Bool {
         guard let state = try indexStateRow(), try libraryContext(state) == task.descriptor.context,
@@ -1747,8 +1793,16 @@ public final class SyncStore: @unchecked Sendable {
 
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 6 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 6 else { return }
+        guard version <= 7 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 7 else { return }
+        if version == 6 {
+            try transaction {
+                try addReadFailureKindColumn()
+                try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
+                try execute("PRAGMA user_version = 7")
+            }
+            return
+        }
         if version == 5 {
             try transaction {
                 try execute(Self.photosChangeSchema)
@@ -1756,7 +1810,8 @@ public final class SyncStore: @unchecked Sendable {
                     try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
                 }
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
-                try execute("PRAGMA user_version = 6")
+                try addReadFailureKindColumn()
+                try execute("PRAGMA user_version = 7")
             }
             return
         }
@@ -1784,7 +1839,8 @@ public final class SyncStore: @unchecked Sendable {
                 if !(try rows("PRAGMA table_info(fingerprint_task)", []).map { try text($0[1]) }).contains("issuance_revision") {
                     try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
                 }
-                try execute("PRAGMA user_version = 6")
+                try addReadFailureKindColumn()
+                try execute("PRAGMA user_version = 7")
                 try ensureLegacyRecheckSchema()
             }
             return
@@ -1803,10 +1859,17 @@ public final class SyncStore: @unchecked Sendable {
             try execute(Self.advancedSchema)
             try ensureLegacyRecheckSchema()
             try execute(Self.photosChangeSchema)
-                if !(try rows("PRAGMA table_info(fingerprint_task)", []).map { try text($0[1]) }).contains("issuance_revision") {
-                    try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
-                }
-                try execute("PRAGMA user_version = 6")
+            if !(try rows("PRAGMA table_info(fingerprint_task)", []).map { try text($0[1]) }).contains("issuance_revision") {
+                try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
+            }
+            try addReadFailureKindColumn()
+            try execute("PRAGMA user_version = 7")
+        }
+    }
+
+    private func addReadFailureKindColumn() throws {
+        if !(try rows("PRAGMA table_info(fingerprint_task)", []).map { try text($0[1]) }).contains("failure_kind") {
+            try execute("ALTER TABLE fingerprint_task ADD COLUMN failure_kind TEXT CHECK(failure_kind IS NULL OR failure_kind = 'photos_read')")
         }
     }
 

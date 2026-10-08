@@ -5,6 +5,113 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testTerminalCocoaReadFailureAllowsHealthySiblingPublication() async throws {
+        let log = CoordinatorDiagnostics()
+        let f = try fixture(diagnostics: { log.record($0) })
+        let failed = descriptor(f.photos.context, asset: "bad"), healthy = descriptor(f.photos.context, asset: "good")
+        await f.photos.set([failed, healthy])
+        await f.photos.setCallbackFailure(NSError(domain: NSCocoaErrorDomain, code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "synthetic terminal image failure"]), key: failed.key)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let progress = await f.coordinator.progress()
+        XCTAssertEqual(progress.state, .ready)
+        XCTAssertEqual(progress.readyRepresentations, 1)
+        XCTAssertEqual(progress.readErrorRepresentations, 1)
+        XCTAssertEqual(progress.excludedAssets, 0)
+        XCTAssertTrue(log.rows.contains { $0["stage"] == "photos-read" && $0["result"] == "read-error" && $0["error"]?.contains("NSCocoaErrorDomain") == true })
+        try await assertNotNil(try await f.coordinator.readyToken())
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='bad' AND state='failed' AND vector IS NULL", at: f.db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='bad' AND retry_count=1", at: f.db), 1)
+        let physical = await f.photos.budget.snapshot(); XCTAssertEqual(physical.images, 0)
+    }
+    func testOriginalAndCurrentReadErrorsAreIndependent() async throws {
+        for failedKind in [RepresentationKind.original, .current] {
+            let f = try fixture()
+            let original = descriptor(f.photos.context), current = descriptor(f.photos.context, kind: .current)
+            await f.photos.set([original, current])
+            await f.photos.setCallbackFailure(NSError(domain: NSCocoaErrorDomain, code: -1),
+                key: failedKind == .original ? original.key : current.key)
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            let p = await f.coordinator.progress()
+            XCTAssertEqual(p.state, .ready); XCTAssertEqual(p.readyRepresentations, 1)
+            XCTAssertEqual(p.readErrorRepresentations, 1); XCTAssertEqual(p.readyAssets, 0)
+            let publication = try await f.store.indexPublication(); XCTAssertEqual(publication?.representationCount, 1)
+            let readiness = try await f.store.indexReadiness(); XCTAssertEqual(readiness?.entryCount, 1)
+        }
+    }
+
+    func testSameReadErrorTypesFromModelRemainBlocking() async throws {
+        for error in [PhotosRepresentationError.invalidImage,
+                      .imageReadFailed(domain: NSCocoaErrorDomain, code: -1, detail: "same model error")] {
+            let f = try fixture(), log = CoordinatorDiagnostics()
+            let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: f.model,
+                configuration: f.configuration, diagnostics: { log.record($0) })
+            await f.photos.set([descriptor(f.photos.context)]); await f.model.setFailure(error)
+            try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+            let p = await coordinator.progress()
+            XCTAssertEqual(p.state, .waiting); XCTAssertEqual(p.readErrorRepresentations, 0)
+            try await assertNil(try await coordinator.readyToken())
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: f.db), 1)
+            XCTAssertTrue(log.rows.contains { $0["stage"] == "fingerprint" && $0["result"] == "waiting" })
+        }
+    }
+
+    func testSQLiteCompletionFailureCannotBecomeReadExclusion() async throws {
+        let f = try fixture(), log = CoordinatorDiagnostics()
+        let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: f.model,
+            configuration: f.configuration, diagnostics: { log.record($0) })
+        await f.photos.set([descriptor(f.photos.context)]); try await coordinator.reconcile()
+        try injectEngineSQL("CREATE TRIGGER fail_completion BEFORE UPDATE ON photos_representation WHEN NEW.state='ready' BEGIN SELECT RAISE(FAIL, 'synthetic completion failure'); END", at: f.db)
+        await coordinator.processDueWork(now: now)
+        let p = await coordinator.progress()
+        XCTAssertEqual(p.state, .waiting); XCTAssertEqual(p.readErrorRepresentations, 0)
+        try await assertNil(try await coordinator.readyToken())
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: f.db), 1)
+        XCTAssertTrue(log.rows.contains { $0["stage"] == "sqlite-completion" && $0["result"] == "waiting" })
+    }
+
+    func testStableReadFailureKeepsTokenAndRecoveredReadRevokesIt() async throws {
+        let f = try fixture(), d = descriptor(f.photos.context)
+        await f.photos.set([d]); await f.photos.setCallbackFailure(NSError(domain: NSCocoaErrorDomain, code: -1), key: d.key)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let oldValue = try await f.coordinator.readyToken(); let old = try XCTUnwrap(oldValue)
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
+        let repeated = try await f.coordinator.readyToken(); XCTAssertEqual(repeated, old)
+        XCTAssertEqual(try engineSQLInteger("SELECT retry_count FROM fingerprint_task", at: f.db), 2)
+        await f.photos.setCallbackFailure(nil, key: d.key)
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(20))
+        let recoveredValue = try await f.coordinator.readyToken(); let recovered = try XCTUnwrap(recoveredValue)
+        XCTAssertGreaterThan(recovered.indexGeneration, old.indexGeneration)
+        let oldValid = try await f.store.indexIsReady(token: old); XCTAssertFalse(oldValid)
+        let p = await f.coordinator.progress(); XCTAssertEqual(p.readErrorRepresentations, 0); XCTAssertEqual(p.readyRepresentations, 1)
+    }
+
+    func testSoftReadRetryBecomingModelFailureRevokesPublishedToken() async throws {
+        let f = try fixture(), d = descriptor(f.photos.context)
+        await f.photos.set([d]); await f.photos.setCallbackFailure(NSError(domain: NSCocoaErrorDomain, code: -1), key: d.key)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let oldValue = try await f.coordinator.readyToken(), old = try XCTUnwrap(oldValue)
+        await f.photos.setCallbackFailure(nil, key: d.key)
+        await f.model.setFailure(.imageReadFailed(domain: NSCocoaErrorDomain, code: -1, detail: "model stage"))
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
+        let p = await f.coordinator.progress()
+        XCTAssertEqual(p.state, .waiting); XCTAssertEqual(p.readErrorRepresentations, 0)
+        try await assertNil(try await f.coordinator.readyToken())
+        let stillValid = try await f.store.indexIsReady(token: old); XCTAssertFalse(stillValid)
+    }
+
+    func testInvalidAndOversizedReadBitmapsAreIsolated() async throws {
+        for error in [PhotosRepresentationError.invalidImage, .oversized(width: 8192, height: 8192)] {
+            let f = try fixture(), d = descriptor(f.photos.context)
+            await f.photos.set([d]); await f.photos.setReadFailures([d.key.assetID: error])
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            let p = await f.coordinator.progress()
+            XCTAssertEqual(p.state, .ready); XCTAssertEqual(p.readErrorRepresentations, 1)
+            XCTAssertEqual(p.readyRepresentations, 0)
+            let publication = try await f.store.indexPublication(); XCTAssertEqual(publication?.representationCount, 0)
+        }
+    }
+
     func testOwnedReadCompletedAfterPauseCannotStartLazyModelOrBecomeReadFailure() async throws {
         let f = try fixture(), gate = CoordinatorGate(), calls = CoordinatorPhysicalCount()
         let golden = (0..<4).map { _ in ModelSelfTestCase(input: Data(repeating: 0, count: 3 * 320 * 320 * 4),
@@ -569,12 +676,13 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
+    // A generic blocking lookup error is distinct from the now-isolated invalid bitmap.
     func testWaitingClassificationSurvivesReconciliationBeforeRetryDeadline() async throws {
         for cloud in [true, false] {
             let f = try fixture()
             let image = descriptor(f.photos.context)
             await f.photos.set([image])
-            await f.photos.setReadFailures([image.key.assetID: cloud ? .iCloudUnavailable("offline") : .invalidImage])
+            await f.photos.setReadFailures([image.key.assetID: cloud ? .iCloudUnavailable("offline") : .unavailable])
             try await f.coordinator.reconcile()
             await f.coordinator.processDueWork(now: now)
             let expected = cloud ? "正在等待 iCloud 图像，连接恢复后自动继续" : "部分图库图像暂时无法读取，正在等待重试。"
@@ -603,9 +711,9 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
     func testLastCloudRecoveryPreservesOtherGenericFailureAndDeadline() async throws {
         let f = try fixture()
         await f.photos.set([descriptor(f.photos.context, asset: "a-generic"), descriptor(f.photos.context, asset: "z-cloud")])
-        await f.photos.setReadFailures(["a-generic": .invalidImage, "z-cloud": .iCloudUnavailable("offline")])
+        await f.photos.setReadFailures(["a-generic": .unavailable, "z-cloud": .iCloudUnavailable("offline")])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
-        await f.photos.setReadFailures(["a-generic": .invalidImage])
+        await f.photos.setReadFailures(["a-generic": .unavailable])
         await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
         let progress = await f.coordinator.progress()
         XCTAssertEqual(progress.state, .waiting); XCTAssertEqual(progress.readyAssets, 1)
@@ -627,7 +735,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.set([descriptor(f.photos.context, asset: asset)])
         await f.photos.setReadFailures([asset: .iCloudUnavailable("offline")])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
-        await f.photos.setReadFailures([asset: .invalidImage])
+        await f.photos.setReadFailures([asset: .unavailable])
         await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
         let reclassified = await f.coordinator.progress()
         XCTAssertEqual(reclassified.state, .waiting)
@@ -646,7 +754,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
                 equivalent: change == "coalescing")
             let generic = descriptor(f.photos.context, asset: "generic")
             await f.photos.set([cloud, generic])
-            await f.photos.setReadFailures(["cloud": .iCloudUnavailable("offline"), "generic": .invalidImage])
+            await f.photos.setReadFailures(["cloud": .iCloudUnavailable("offline"), "generic": .unavailable])
             try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
             let failed = await f.coordinator.progress()
             XCTAssertEqual(failed.issue, "正在等待 iCloud 图像，连接恢复后自动继续", change)
@@ -798,7 +906,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let db: URL; let store: SyncStore; let photos: CoordinatorPhotos; let model: CoordinatorModel
         let configuration: DedupConfiguration; let coordinator: PhotosIndexCoordinator
     }
-    private func fixture() throws -> Fixture {
+    private func fixture(diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -808,7 +916,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let photos = CoordinatorPhotos(limits: configuration.resources), model = CoordinatorModel(version: configuration.fingerprint.version)
         return Fixture(db: db, store: store, photos: photos, model: model, configuration: configuration,
             coordinator: PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-                configuration: configuration))
+                configuration: configuration, diagnostics: diagnostics))
     }
     private func descriptor(_ context: LibraryContext, asset: String = "asset", kind: RepresentationKind = .original,
                             revision: String = "r1", equivalent: Bool = false) -> RepresentationDescriptor {
@@ -839,11 +947,14 @@ private actor CoordinatorModel: ImageFingerprinting {
     private(set) var count = 0
     private var gate: CoordinatorGate?
     private var unavailable = false
+    private var failure: PhotosRepresentationError?
+    func setFailure(_ error: PhotosRepresentationError?) { failure = error }
     func setUnavailable(_ value: Bool) { unavailable = value }
     init(version: String) { self.version = version }
     func setGate(_ gate: CoordinatorGate) { self.gate = gate }
     func reset() { count = 0 }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        if let failure { throw failure }
         if unavailable { throw ModelExecutionUnavailable(detail: "test index") }
         count += 1; if let gate { self.gate = nil; await gate.hold() }
         try Task.checkCancellation()
@@ -852,11 +963,15 @@ private actor CoordinatorModel: ImageFingerprinting {
 }
 
 private actor CoordinatorPhotos: PhotosIndexGateway {
+    private let limits: ResourceLimits
     nonisolated let context = LibraryContext(id: UUID(), epoch: 1)
     nonisolated let budget: ImageWorkBudget
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 128)
     private var pages: [RepresentationPage] = []
     private var readFailures: [String: PhotosRepresentationError] = [:]
+    private var callbackFailure: NSError?
+    private var callbackFailureKey: RepresentationKey?
+    func setCallbackFailure(_ error: NSError?, key: RepresentationKey) { callbackFailure = error; callbackFailureKey = key }
     private var replacementContext: LibraryContext?
     func setReadFailures(_ failures: [String: PhotosRepresentationError]) { readFailures = failures }
     func replaceContext(_ context: LibraryContext, descriptors: [RepresentationDescriptor]) {
@@ -873,7 +988,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     private(set) var maxImagesObserved = 0
     private var checkpointCaptured = false
     private(set) var checkpointBeforeSnapshot = true
-    init(limits: ResourceLimits) { budget = ImageWorkBudget(limits: limits) }
+    init(limits: ResourceLimits) { self.limits = limits; budget = ImageWorkBudget(limits: limits) }
     func set(_ descriptors: [RepresentationDescriptor]) {
         generation += 1
         pages = [.init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil)]
@@ -945,6 +1060,11 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         readCount += 1; readKinds.append(descriptor.key.kind)
+        if descriptor.key == callbackFailureKey, let callbackFailure {
+            let reader = PhotosRepresentationReader(requester: CoordinatorFailedRequester(error: callbackFailure),
+                budget: budget, limits: limits, targetSide: 32)
+            return try await reader.read(descriptor, isCurrent: { true })
+        }
         if let error = readFailures[descriptor.key.assetID] { throw error }
         if failedAsset == descriptor.key.assetID { throw PhotoKitGatewayError.libraryUnavailable }
         let lease = try await budget.acquire(bytes: 256)
@@ -965,6 +1085,14 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
 }
 
+private struct CoordinatorFailedRequester: PhotosRepresentationRequesting {
+    let error: NSError
+    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+        completion(.failure(error))
+    }
+}
+
 private final class CoordinatorPhysicalSession: ModelPredictionSession, @unchecked Sendable {
     func predict(_ input: MLMultiArray) throws -> [Float] { [1] + Array(repeating: 0, count: 1023) }
 }
@@ -972,4 +1100,11 @@ private final class CoordinatorPhysicalCount: @unchecked Sendable {
     private let lock = NSLock(); private var count = 0
     func increment() { lock.lock(); count += 1; lock.unlock() }
     var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
+private final class CoordinatorDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [[String: String]] = []
+    func record(_ row: [String: String]) { lock.lock(); values.append(row); lock.unlock() }
+    var rows: [[String: String]] { lock.lock(); defer { lock.unlock() }; return values }
 }

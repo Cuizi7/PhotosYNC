@@ -650,7 +650,8 @@ actor SyncRuntime {
             loggedProgress = p
             logger?.log(["phase": "index-progress", "state": p.state.rawValue, "unit": "representations",
                 "ready": String(p.readyRepresentations), "total": p.totalsKnown ? String(p.totalRepresentations) : "unknown",
-                "waiting": p.totalsKnown ? String(max(0, p.totalRepresentations - p.readyRepresentations)) : "unknown",
+                "readErrors": String(p.readErrorRepresentations),
+                "waiting": p.totalsKnown ? String(max(0, p.totalRepresentations - p.readyRepresentations - p.readErrorRepresentations)) : "unknown",
                 "readyAssets": String(p.readyAssets), "totalAssets": p.totalsKnown ? String(p.totalAssets) : "unknown"])
         }
         if !previousReady && publishedProgress?.state == .ready { pendingAdvancedScan = true }

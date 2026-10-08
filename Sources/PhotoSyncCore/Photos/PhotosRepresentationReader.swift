@@ -13,6 +13,16 @@ public enum PhotosRepresentationError: Error, Equatable, Sendable {
     case unsupportedRAW
     case invalidImage
     case oversized(width: Int, height: Int)
+    /// A terminal image callback, never a pre-request/catalog/model failure.
+    case imageReadFailed(domain: String, code: Int, detail: String)
+    case requestFailed(String)
+
+    var isIsolatableReadFailure: Bool {
+        switch self {
+        case .imageReadFailed, .invalidImage, .oversized: return true
+        default: return false
+        }
+    }
 }
 
 enum PhotosRepresentationCallback: @unchecked Sendable {
@@ -67,14 +77,22 @@ public actor PhotosRepresentationReader {
                         return
                     }
                     try requester.request(descriptor, targetSide: targetSide) { [self, state] event in
-                        guard let final = state.receive(event) else { return }
+                        let classified: PhotosRepresentationCallback
+                        if case .failure(let error) = event {
+                            classified = .failure(SystemPhotosRepresentationRequester.classifyUnavailable(error: error, inCloud: false))
+                        } else { classified = event }
+                        guard let final = state.receive(classified) else { return }
                         Task {
                             await self.completed()
                             await state.completePhysical(final)
                         }
                     }
                 } catch {
-                    if let final = state.receive(.failure(error)) {
+                    // A thrown validation/request error has no terminal image
+                    // callback evidence, even if it reuses an image error type.
+                    let requestError: Error = (error as? PhotosRepresentationError)?.isIsolatableReadFailure == true
+                        ? PhotosRepresentationError.requestFailed(String(describing: error)) : error
+                    if let final = state.receive(.failure(requestError)) {
                         Task {
                             self.completed()
                             await state.completePhysical(final)
@@ -345,12 +363,33 @@ final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting,
     private let manager: PHImageManager
     init(manager: PHImageManager = PHImageManager()) { self.manager = manager }
     static func classifyUnavailable(error: Error, inCloud: Bool) -> Error {
+        if error is CancellationError { return error }
+        if let classified = error as? PhotosRepresentationError { return inCloud ? PhotosRepresentationError.iCloudUnavailable(String(describing: error)) : classified }
+        if error is PhotoKitGatewayError || error is ReadExecutorError || error is ImageWorkBudgetError { return error }
         let native = error as NSError
+        if (native.domain == NSCocoaErrorDomain && native.code == NSUserCancelledError) ||
+           (native.domain == NSURLErrorDomain && native.code == NSURLErrorCancelled) ||
+           (native.domain == PHPhotosErrorDomain && native.code == PHPhotosError.Code.userCancelled.rawValue) {
+            return CancellationError()
+        }
+        if native.domain == PHPhotosErrorDomain {
+            let global: [PHPhotosError.Code] = [.libraryVolumeOffline, .relinquishingLibraryBundleToWriter,
+                .switchingSystemPhotoLibrary, .accessRestricted, .accessUserDenied, .operationInterrupted,
+                .identifierNotFound, .multipleIdentifiersFound, .notEnoughSpace,
+                .persistentChangeTokenExpired, .persistentChangeDetailsUnavailable, .libraryInFileProviderSyncRoot]
+            if global.contains(where: { $0.rawValue == native.code }) { return error }
+            if native.code == PHPhotosError.Code.networkAccessRequired.rawValue ||
+               native.code == PHPhotosError.Code.networkError.rawValue {
+                return PhotosRepresentationError.iCloudUnavailable(String(describing: error))
+            }
+        }
         let networkCodes = [NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorCannotConnectToHost]
         if inCloud || (native.domain == NSURLErrorDomain && networkCodes.contains(native.code)) {
             return PhotosRepresentationError.iCloudUnavailable(String(describing: error))
         }
-        return error
+        guard native.domain != NSURLErrorDomain else { return error }
+        return PhotosRepresentationError.imageReadFailed(domain: native.domain, code: native.code,
+            detail: String(describing: native))
     }
 
     func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
