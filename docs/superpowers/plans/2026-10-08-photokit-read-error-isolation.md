@@ -33,28 +33,32 @@
 
 **Interfaces:** 在现有 `PhotosRepresentationError` 中提供明确的回调读取错误及可隔离判定，保留 domain/code/detail；`failRepresentation` 增加默认 NULL 的失败分类参数。`IndexProgress` 增加默认 0 的 `readErrorRepresentations`，ready 计数保持真实向量数。具体 helper 命名可沿用项目习惯，但不能通过解析错误字符串分类。
 
-- [ ] **Step 1 — RED。** 用 fake PhotoKit callback 注入与实测同形的 Cocoa -1，证明一个失败和健康兄弟项最终能发布可用索引，失败项无候选，日志带单项读取阶段。先观察原代码对此行为失败；保留网络／模型／数据库／取消／占槽仍阻断的对照，避免仅测试计数。
-- [ ] **Step 2 — 最小实现。** 在终结回调／单图解码边界分类，coordinator 不把任意 catch 当读取错误；分离取图、推理和持久化失败语义。schema v7 在 fingerprint_task 增加 nullable failure_kind（约束 NULL/photos_read），所有旧版迁移同一事务并默认 NULL；不新增表或改表示状态 CHECK。
-- [ ] **Step 3 — 发布与重试。** 非阻塞错误保留 task/retry deadline；完整性校验同时核对错误任务与 failed 表示的上下文、修订、版本、代次及发行事实。只有 ready 行可检索，publication/entryCount 反映实际候选；错误恢复／转为阻塞时原子推进索引代次和撤销发布，稳定重复读错只更新错误和期限。未知失效清分类、中性变化保留；不延后无关任务。
-- [ ] **Step 4 — 日志与回归。** 新进度字段区分 read errors 与 waiting，coordinator 转发、runtime 日志计数一致；不用错误数充 ready/excludedAssets。覆盖重开库、各旧版迁移／回滚、未知高版本、陈旧任务／损坏分类、original/current 分别失败、恢复使旧准备结果失效、稳定读错不引发无效发布。资格／物理租约测试不退化。
-- [ ] **Step 5 — 聚焦 GREEN 与提交。** 正常 build-for-testing、相关无宿主 XCTest；只用 fake、自制图像和 UUID SQLite。记录 RED/GREEN、实际命令和返回码，提交这一整体实现，不在该阶段重复 canonical。
+- [x] **Step 1 — RED。** 用 fake PhotoKit callback 注入与实测同形的 Cocoa -1，证明一个失败和健康兄弟项最终能发布可用索引，失败项无候选，日志带单项读取阶段。先观察原代码对此行为失败；保留网络／模型／数据库／取消／占槽仍阻断的对照，避免仅测试计数。
+- [x] **Step 2 — 最小实现。** 在终结回调／单图解码边界分类，coordinator 不把任意 catch 当读取错误；分离取图、推理和持久化失败语义。schema v7 在 fingerprint_task 增加 nullable failure_kind（约束 NULL/photos_read），所有旧版迁移同一事务并默认 NULL；不新增表或改表示状态 CHECK。
+- [x] **Step 3 — 发布与重试。** 非阻塞错误保留 task/retry deadline；完整性校验同时核对错误任务与 failed 表示的上下文、修订、版本、代次及发行事实。只有 ready 行可检索，publication/entryCount 反映实际候选；错误恢复／转为阻塞时原子推进索引代次和撤销发布，稳定重复读错只更新错误和期限。未知失效清分类、中性变化保留；不延后无关任务。
+- [x] **Step 4 — 日志与回归。** 新进度字段区分 read errors 与 waiting，coordinator 转发、runtime 日志计数一致；不用错误数充 ready/excludedAssets。覆盖重开库、各旧版迁移／回滚、未知高版本、陈旧任务／损坏分类、original/current 分别失败、恢复使旧准备结果失效、稳定读错不引发无效发布。资格／物理租约测试不退化。
+- [x] **Step 5 — 聚焦 GREEN 与提交。** 正常 build-for-testing、相关无宿主 XCTest；只用 fake、自制图像和 UUID SQLite。记录 RED/GREEN、实际命令和返回码，提交这一整体实现，不在该阶段重复 canonical。
 
 ### Task 2: 独立审阅和最终集成验收
 
 **Ownership:** reviewer 只读本单元完整差异，原实现者负责范围内修复；tester 不改代码，root 更新文档和 ledger。
 
-- [ ] **Step 1 — 深度集成审阅。** 一次审阅覆盖 spec/quality、迁移、并发／publication、错误边界及调用方；满足本单元最终审阅，不重复旧大分支审阅。修复后只复核差异。
-- [ ] **Step 2 — 最终 canonical。** `python3 scripts/validate.py --output-dir "$PWD/work/validation-read-error-isolation-<unique>" --derived-data "$PWD/work/validation-read-error-isolation-<unique>-derived"`。完整 XCTest、Tools、实际模型、四档规模及续体探针；关注 readiness SQL 仍使用元数据索引、不加载全部向量。记录真实 skip/失败，不能放宽性能或数值门槛。必要时补正常 Universal Release 构建，Intel/macOS 13 实机仍保留既有缺口。
-- [ ] **Step 3 — 绑定结果。** 更新 PhotoKit contract、本计划／spec 状态、真实测试计划及脱敏验收记录；不把自动验证当成真实 Photos 通过。
+- [x] **Step 1 — 深度集成审阅。** 一次审阅覆盖 spec/quality、迁移、并发／publication、错误边界及调用方；满足本单元最终审阅，不重复旧大分支审阅。修复后只复核差异。
+- [x] **Step 2 — 最终 canonical。** `python3 scripts/validate.py --output-dir "$PWD/work/validation-read-error-isolation-<unique>" --derived-data "$PWD/work/validation-read-error-isolation-<unique>-derived"`。完整 XCTest、Tools、实际模型、四档规模及续体探针；关注 readiness SQL 仍使用元数据索引、不加载全部向量。记录真实 skip/失败，不能放宽性能或数值门槛。必要时补正常 Universal Release 构建，Intel/macOS 13 实机仍保留既有缺口。
+- [x] **Step 3 — 绑定结果。** 更新 PhotoKit contract、本计划／spec 状态、真实测试计划及脱敏验收记录；不把自动验证当成真实 Photos 通过。
 
 ### Task 3: 调整只读 QA 并恢复既定真实测试
 
 **Ownership:** 新的 ignored `work/real-photos-icloud/20261008-read-error-isolation/`；root 负责恢复副本／scope，单个实现者改宿主，reviewer 审变化，tester 验证并独占真实运行。
 
-- [ ] **Step 1 — QA 只容忍产品明确分类的错误。** 从已审阅宿主复制，绑定最终产品提交；539 向量／1 失败原库保留，复制后走真实 v7 迁移／历史核对。读取预算区分已分类单项错误与其他失败；正常批次继续条件可以接受前者，后者仍按原 gate 停止。旧精确许可机制若保留，摘要必须包含新增分类，不能用泛化许可掩盖全局失败。对 readiness／结果导出分别记录完整 metadata、可用向量、读取缺口，不声称全照片取图成功。
-- [ ] **Step 2 — 离线审阅和验证。** fake-only 验证单项读错／健康兄弟项可跨批推进、阻塞错误仍停止、到期恢复、旧控制拒绝、mutation=0；完整哈希／签名及恢复库未被自测改写。只有这些通过后才建立新执行门闩。
+- [x] **Step 1 — QA 只容忍产品明确分类的错误。** 从已审阅宿主复制，绑定最终产品提交；539 向量／1 失败原库保留，复制后走真实 v7 迁移／历史核对。读取预算区分已分类单项错误与其他失败；正常批次继续条件可以接受前者，后者仍按原 gate 停止。旧精确许可机制若保留，摘要必须包含新增分类，不能用泛化许可掩盖全局失败。对 readiness／结果导出分别记录完整 metadata、可用向量、读取缺口，不声称全照片取图成功。
+- [x] **Step 2 — 离线审阅和验证。** fake-only 验证单项读错／健康兄弟项可跨批推进、阻塞错误仍停止、到期恢复、旧控制拒绝、mutation=0；完整哈希／签名及恢复库未被自测改写。只有这些通过后才建立新执行门闩。
 - [ ] **Step 3 — 恢复 MB2–MB7。** 经 LaunchServices 正常授权入口启动唯一宿主，每批仍 500 请求／30 分钟，单物理消费者；检查点检查记录过的单项错误后可顺序继续。拿到新语义下的有效 token 后继续 MobileBackup 50 张试点、全量扫描和既定独立／双向盲审；报告所有缺口及分母。不重新调阈值、不写 Photos、不扩大为原片 fallback 测试。
 
 ## 执行状态
 
-用户已批准新错误隔离行为。此文档只记录待实施契约，产品及 QA 尚未按本计划修改；当前真实会话仍停止在 539 ready／1 failed 检查点。
+Task 1–2 已完成：产品快照 `a190279` 经独立深度评审及嵌套 NSError 修复复核通过，最终 canonical 为 571 项 XCTest（2 跳过、0 失败）、94 项工具测试、四档规模及两组恢复竞态全部通过；正常 Universal Release 构建通过。详见[验收记录](../../release/2026-10-08-photos-read-error-isolation-validation.md)。
+
+Task 3 的新只读宿主已完成静态审阅、固定快照构建／签名，以及三个最终 fake 模式验证（Photos mutation 为 0）。恢复副本已通过最终 Core 的真实 v6→v7 迁移，539 个向量的键／字节及所有旧重试数据保留，15,369 个历史 failure_kind 均为 NULL，旧库字节未变。
+
+已建立仅限当前已授权只读阶段的执行门闩，正在通过 LaunchServices 请求新宿主的 Photos 授权，尚未恢复建指纹。`/Volumes/home` 当前未挂载，源清单比较标记为未执行；Photos 索引可独立推进，source-metadata／扫描／导出阶段等待精确挂载恢复及清单核对，不能将该缺口写成源输入未变化。
