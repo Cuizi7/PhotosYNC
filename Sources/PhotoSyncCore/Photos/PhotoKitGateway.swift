@@ -286,31 +286,41 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         // No state lock is held during PhotoKit history or SQLite journal work.
         let ticket = state.beginHistoryCoverage()
         defer { state.finishChangeDetails() }
+        guard state.hasStore, previous.context == proposed.context,
+              proposed.context == ticket.context, let upperGeneration = proposed.photosGeneration,
+              upperGeneration >= 0, upperGeneration <= ticket.generation,
+              lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
+            state.invalidateAllRepresentations(); return false
+        }
+        var persisted = true, unknown = false
+        let complete: Bool
         do {
-            guard state.hasStore, previous.context == proposed.context,
-                  proposed.context == ticket.context, proposed.photosGeneration == ticket.generation,
-                  lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
-                state.invalidateAllRepresentations(); return false
-            }
-            var persisted = true, unknown = false
-            let complete = try lifecycle.replayPersistentChanges(previous.archivedChangeToken, onChange: { event in
+            complete = try lifecycle.replayPersistentChanges(previous.archivedChangeToken, onChange: { event in
                 if event == .fullReconcileRequired || event == .contextInvalidated { unknown = true }
             }, onContentChange: { [state, catalogBatchSize] ids in
                 if !state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) { persisted = false }
             })
-            guard complete, persisted, !unknown, state.historyCoverageIsCurrent(ticket),
-                  lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
-                state.invalidateAllRepresentations()
-                diagnostics(["phase": "photos-history-coverage", "result": "unknown"])
-                return false
-            }
-            diagnostics(["phase": "photos-history-coverage", "result": "covered"])
-            return true
         } catch {
             state.invalidateAllRepresentations()
             diagnostics(["phase": "photos-history-coverage", "result": "unknown", "reason": "history-unavailable"])
             return false
         }
+        let coverage = state.historyCoverageFacts(ticket)
+        guard complete, persisted, !unknown, coverage.valid,
+              lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
+            state.invalidateAllRepresentations()
+            diagnostics(["phase": "photos-history-coverage", "result": "unknown"])
+            return false
+        }
+        // A process-local fence can move while complete durable history is replayed.
+        // Keep admission closed and retry with a fresh checkpoint; no content scope
+        // has been proved unknown merely because observer details are unfinished.
+        if let reason = upperGeneration != ticket.generation ? "upper-generation-stale" : coverage.retryReason {
+            diagnostics(["phase": "photos-history-coverage", "result": "deferred", "reason": reason])
+            throw PhotoKitGatewayError.libraryChanged
+        }
+        diagnostics(["phase": "photos-history-coverage", "result": "covered"])
+        return true
     }
 
     public func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool {
@@ -865,10 +875,13 @@ private final class PhotoKitState: @unchecked Sendable {
         pendingChangeDetails += 1; indexedGeneration = nil
         return .init(context: context, generation: generation, admissionRevision: admissionRevision)
     }
-    func historyCoverageIsCurrent(_ ticket: HistoryCoverageTicket) -> Bool {
+    func historyCoverageFacts(_ ticket: HistoryCoverageTicket) -> (valid: Bool, retryReason: String?) {
         lock.lock(); defer { lock.unlock() }
-        return available && context == ticket.context && generation == ticket.generation &&
-            admissionRevision == ticket.admissionRevision && pendingChangeDetails == 1
+        guard available, context == ticket.context, store != nil, !allRepresentationsInvalid else { return (false, nil) }
+        if generation != ticket.generation { return (true, "upper-generation-stale") }
+        if pendingChangeDetails != 1 { return (true, "observer-details-pending") }
+        if admissionRevision != ticket.admissionRevision { return (true, "coverage-superseded") }
+        return (true, nil)
     }
     private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext, invalidationTransferred: Bool)?
     func beginCatalogSession(expectedGeneration: Int) throws -> PhotosCatalogSession {

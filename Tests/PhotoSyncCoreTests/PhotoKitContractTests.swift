@@ -140,6 +140,194 @@ final class PhotoKitContractTests: XCTestCase {
         let ready = try await f.coordinator.readyToken(); XCTAssertNotNil(ready)
     }
 
+    func testPendingNeutralObserverDuringCompleteHistoryReplayShouldDeferWithoutInvalidatingIndex() async throws {
+        let coverageGuardEvaluated = expectation(description: "history coverage result observed")
+        let classified = expectation(description: "neutral observer detail classified")
+        let allowCoverageToContinue = DispatchSemaphore(value: 0)
+        let allowClassificationToContinue = DispatchSemaphore(value: 0)
+        let trace = HistoryPendingTrace()
+        let f = try continuityFixture(failedAsset: "page0", diagnostics: { fields in
+            trace.append(fields)
+            if fields["phase"] == "photos-history-coverage", fields["result"] != nil, fields["result"] != "covered" {
+                coverageGuardEvaluated.fulfill()
+                _ = allowCoverageToContinue.wait(timeout: .now() + 10)
+            }
+            if fields["phase"] == "photos-change-classification", fields["contentScope"] == "known" {
+                classified.fulfill()
+            }
+        })
+        defer {
+            allowCoverageToContinue.signal()
+            allowClassificationToContinue.signal()
+            try? FileManager.default.removeItem(at: f.root)
+        }
+
+        try injectEngineSQL("UPDATE photos_representation SET vector=NULL WHERE asset_id='page0'; UPDATE fingerprint_task SET failure_kind='photos_read' WHERE asset_id='page0';", at: f.db)
+        try await f.coordinator.reconcile()
+        let initialToken = try await f.coordinator.readyToken()
+        XCTAssertNotNil(initialToken, "one classified photos_read gap is publishable")
+        let beforeEvent = try await f.gateway.candidateSnapshot()
+
+        // Record the observer generation, then hold its classification queue. This
+        // leaves a real pending-change marker while the history ticket replays.
+        f.lifecycle.completeReplay = true
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [],
+            changedAssets: [.init(identifier: "page1", candidates: [candidate(key: "page1")], inputUnchanged: true)])
+        let detailEntered = expectation(description: "observer detail remains pending")
+        f.lifecycle.changeHook = { detailEntered.fulfill(); _ = allowClassificationToContinue.wait(timeout: .now() + 10) }
+        f.lifecycle.persistentToken = 2
+        f.lifecycle.replayContentChangeIDs = ["page3"]
+        f.gateway.recordLibraryChangeForTesting()
+        await fulfillment(of: [detailEntered], timeout: 3)
+
+        let work = Task { try await f.coordinator.reconcile() }
+        await fulfillment(of: [coverageGuardEvaluated], timeout: 3)
+        XCTAssertFalse(try beforeEvent.candidateValidity.commitIfCurrent({ XCTFail("pending history must close old admission") }))
+        await assertThrows({ try await f.gateway.create(fileURL: f.root.appendingPathComponent("unused-synthetic.jpg"), kind: .image,
+            expectedGeneration: beforeEvent.generation + 1, beforeMutation: { true },
+            onPlaceholder: { _ in XCTFail("pending coverage entered PhotoKit submission") }) }, verify: { error in
+            XCTAssertTrue(error is PhotosAdmissionDeferred)
+        })
+        XCTAssertTrue(f.lifecycle.commands.isEmpty, "the history fence prevents actual submission")
+        XCTAssertEqual(f.lifecycle.access, .authorized)
+        XCTAssertTrue(f.lifecycle.available)
+        XCTAssertTrue(f.lifecycle.completeReplay, "persistent-history replay completed")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change WHERE asset_id='page3'", at: f.db), 1,
+            "history affected-ID persistence succeeded before the pending-detail guard")
+        XCTAssertFalse(trace.rows.contains { $0["phase"] == "photos-change-classification" },
+            "pending classification must not be published as inputUnchanged")
+
+        allowClassificationToContinue.signal()
+        await fulfillment(of: [classified], timeout: 3)
+        allowCoverageToContinue.signal()
+        var reconciliationDeferred = false
+        do { try await work.value }
+        catch {
+            XCTAssertEqual(error as? PhotoKitGatewayError, .libraryChanged)
+            reconciliationDeferred = true
+        }
+
+        let historyRows = trace.rows.filter { $0["phase"] == "photos-history-coverage" }
+        let readyVectors = try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db)
+        let retainedVectors = try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE vector IS NOT NULL", at: f.db)
+        let retainedReadGaps = try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind='photos_read'", at: f.db)
+        let coverageWasUnknown = historyRows.contains { $0["result"] == "unknown" }
+        let coverageWasDeferred = historyRows.contains { $0["result"] == "deferred" || $0["result"] == "pending" }
+
+        XCTAssertFalse(coverageWasUnknown,
+            "a pending observer detail after complete replay is a retry window, not unknown continuity")
+        XCTAssertTrue(coverageWasDeferred && reconciliationDeferred,
+            "pending history details must abort this reconciliation for a clean retry")
+        XCTAssertTrue(historyRows.contains { $0["result"] == "deferred" && $0["reason"] == "observer-details-pending" })
+        XCTAssertTrue(trace.rows.contains { $0["phase"] == "photos-change-classification" &&
+            $0["contentScope"] == "known" && $0["inputUnchanged"] == "1" },
+            "the observer becomes a known neutral detail only after the coverage guard")
+        XCTAssertEqual(readyVectors, 3,
+            "healthy vectors should survive the temporary coverage window")
+        XCTAssertEqual(retainedVectors, 3, "the temporary fence preserves cached bytes")
+        XCTAssertEqual(retainedReadGaps, 1,
+            "the existing classified read gap should survive")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='page0' AND failure_kind='photos_read' AND retry_count=2 AND next_retry_at=9999999999 AND last_error='cloud'", at: f.db), 1,
+            "temporary coverage preserves the existing read retry facts")
+        let postRaceToken = try await f.coordinator.readyToken()
+        XCTAssertNil(postRaceToken, "publication stays closed until fresh reconciliation")
+
+        if coverageWasDeferred && reconciliationDeferred {
+            _ = try await f.gateway.candidateSnapshot() // Drain observer details before the one-shot retry.
+            try await f.coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db), 2,
+                "fresh replay should revalidate the confirmed page3 content change only")
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id IN ('page1','page2') AND state='ready' AND vector IS NOT NULL", at: f.db), 2)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind='photos_read'", at: f.db), 1,
+                "a valid photos_read gap on an unrelated asset survives fresh history coverage")
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='page0' AND failure_kind='photos_read' AND retry_count=2 AND next_retry_at=9999999999 AND last_error='cloud'", at: f.db), 1)
+            let afterRetryToken = try await f.coordinator.readyToken()
+            XCTAssertNil(afterRetryToken, "the changed page remains unpublished until it is re-fingerprinted")
+        }
+    }
+
+    func testStaleProcessLocalHistoryUpperGenerationDefersWithoutInvalidation() async throws {
+        for changesDuringReplay in [false, true] {
+            let trace = HistoryPendingTrace()
+            let f = try continuityFixture(diagnostics: { trace.append($0) })
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            try await f.coordinator.reconcile()
+            let saved = try await f.gateway.contextCheckpoint()
+            let proposed = try XCTUnwrap(saved)
+            let before = try await f.gateway.candidateSnapshot()
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+            if changesDuringReplay {
+                f.lifecycle.afterReplay = { f.gateway.recordLibraryChangeForTesting() }
+            } else {
+                f.gateway.recordLibraryChangeForTesting()
+                _ = try await f.gateway.candidateSnapshot() // Drains the neutral classification queue.
+            }
+
+            do {
+                _ = try await f.gateway.coverPersistentHistory(from: proposed, through: proposed)
+                XCTFail("a stale process-local upper boundary must defer")
+            } catch { XCTAssertEqual(error as? PhotoKitGatewayError, .libraryChanged) }
+            f.lifecycle.afterReplay = nil
+            let after = try await f.gateway.candidateSnapshot()
+            XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("stale admission revived") }))
+            XCTAssertFalse(try after.candidateValidity.commitIfCurrent({ XCTFail("deferred coverage admitted snapshot") }))
+            let page = try await f.gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: after.generation)
+            XCTAssertFalse(page.invalidateAllCachedRepresentations, "neutral generation movement preserves cached work")
+            XCTAssertTrue(trace.rows.contains { $0["phase"] == "photos-history-coverage" &&
+                $0["result"] == "deferred" && $0["reason"] == "upper-generation-stale" })
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db), 4)
+            try await f.coordinator.reconcile()
+            let ready = try await f.coordinator.readyToken()
+            XCTAssertNotNil(ready, "fresh coverage of the neutral change reopens publication")
+        }
+    }
+
+    func testHistoryCoverageKeepsUnknownAndAccessFailureConservative() async throws {
+        for failure in ["history-error", "unknown-event", "context-event", "authorization", "unavailable", "context-mismatch", "missing-upper", "negative-upper", "invalid-upper"] {
+            let f = try continuityFixture()
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            try await f.coordinator.reconcile()
+            let saved = try await f.gateway.contextCheckpoint()
+            let checkpoint = try XCTUnwrap(saved)
+            var proposed = checkpoint
+            switch failure {
+            case "history-error": f.lifecycle.replayError = PhotoKitGatewayError.libraryUnavailable
+            case "unknown-event": f.lifecycle.replayEvent = .fullReconcileRequired
+            case "context-event": f.lifecycle.replayEvent = .contextInvalidated
+            case "authorization": f.lifecycle.afterReplay = { f.lifecycle.access = .denied }
+            case "unavailable": f.lifecycle.afterReplay = { f.lifecycle.available = false }
+            case "context-mismatch": proposed = .init(context: .init(id: UUID(), epoch: 0), archivedChangeToken: checkpoint.archivedChangeToken, photosGeneration: checkpoint.photosGeneration)
+            case "missing-upper": proposed = .init(context: checkpoint.context, archivedChangeToken: checkpoint.archivedChangeToken)
+            case "negative-upper": proposed = .init(context: checkpoint.context, archivedChangeToken: checkpoint.archivedChangeToken, photosGeneration: -1)
+            default: proposed = .init(context: checkpoint.context, archivedChangeToken: checkpoint.archivedChangeToken, photosGeneration: (checkpoint.photosGeneration ?? 0) + 1)
+            }
+            let covered = try await f.gateway.coverPersistentHistory(from: checkpoint, through: proposed)
+            XCTAssertFalse(covered, failure)
+            f.lifecycle.replayError = nil; f.lifecycle.replayEvent = nil; f.lifecycle.afterReplay = nil
+            f.lifecycle.access = .authorized; f.lifecycle.available = true
+            let snapshot = try await f.gateway.candidateSnapshot()
+            XCTAssertFalse(try snapshot.candidateValidity.commitIfCurrent({ XCTFail("unknown coverage admitted snapshot") }), failure)
+            let page = try await f.gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: snapshot.generation)
+            XCTAssertTrue(page.invalidateAllCachedRepresentations, failure)
+            try await f.coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state<>'ready' AND vector IS NOT NULL", at: f.db), 4, failure)
+            let ready = try await f.coordinator.readyToken(); XCTAssertNil(ready, failure)
+        }
+    }
+
+    func testHistoryCoverageWithoutJournalStoreCannotAdmitCache() async throws {
+        let lifecycle = FakePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
+        let saved = try await gateway.contextCheckpoint()
+        let checkpoint = try XCTUnwrap(saved)
+        let covered = try await gateway.coverPersistentHistory(from: checkpoint, through: checkpoint)
+        XCTAssertFalse(covered)
+        let snapshot = try await gateway.candidateSnapshot()
+        XCTAssertFalse(try snapshot.candidateValidity.commitIfCurrent({ XCTFail("missing journal admitted snapshot") }))
+        let page = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: snapshot.generation)
+        XCTAssertTrue(page.invalidateAllCachedRepresentations)
+    }
+
     func testIncompleteHistoryCoverageKeepsContextButInvalidatesCachedBytes() async throws {
         for failureMode in 0..<3 {
             let f = try continuityFixture()
@@ -495,7 +683,8 @@ final class PhotoKitContractTests: XCTestCase {
         guard case .incremental = await events.next() else { return XCTFail("successful retry acknowledges delivery") }
     }
 
-    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil) throws -> (root: URL, db: URL, store: SyncStore,
+    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil,
+                                   diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> (root: URL, db: URL, store: SyncStore,
         context: LibraryContext, lifecycle: FakePhotoKitLifecycle, gateway: PhotoKitGateway, configuration: DedupConfiguration,
         fingerprint: Fingerprint, coordinator: PhotosIndexCoordinator) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -518,9 +707,9 @@ final class PhotoKitContractTests: XCTestCase {
         let reader = readProbe.map { PhotosRepresentationReader(requester: $0,
             budget: ImageWorkBudget(maxImages: 2, maxBytes: 100_000_000),
             limits: configuration.resources, targetSide: configuration.fingerprint.inputSide) }
-        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128)
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, diagnostics: diagnostics)
         return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
-            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration))
+            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, diagnostics: diagnostics))
     }
 
     func testRealGatewayCoordinatorMergesClassifiedEventsDuringEveryCatalogPage() async throws {
@@ -993,6 +1182,13 @@ private final class CheckpointLog: @unchecked Sendable {
     var values: [String] { storage }
 }
 
+private final class HistoryPendingTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [[String: String]] = []
+    func append(_ row: [String: String]) { lock.lock(); storage.append(row); lock.unlock() }
+    var rows: [[String: String]] { lock.lock(); defer { lock.unlock() }; return storage }
+}
+
 private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
     var access: PhotoKitAccess = .authorized
     var available = true
@@ -1042,10 +1238,15 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
     var replayedTokens: [UInt8] = []
     var afterReplay: (() -> Void)?
     var completeReplay = true
+    var replayContentChangeIDs = ["page0"]
+    var replayError: Error?
+    var replayEvent: PhotosIndexChange?
     func archivedChangeToken() throws -> Data? { providesToken ? Data([persistentToken]) : nil }
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool {
+        if let replayError { throw replayError }
+        if let replayEvent { onChange(replayEvent) }
         let from = token.first ?? 0; replayedTokens.append(from)
-        if from < persistentToken { onContentChange(["page0"]) }
+        if from < persistentToken { onContentChange(replayContentChangeIDs) }
         afterReplay?()
         return completeReplay
     }
