@@ -1,16 +1,16 @@
 # PhotosYNC
 
-PhotosYNC v1 scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
+PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## Advanced dedup source branch (not released)
+## 0.2.0 beta preparation
 
-The 0.2 integration branch adds SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
+The 0.2.0 beta configuration adds SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
-Photos catalog reconciliation retains existing fingerprint bytes and pending work. Known changes affect their own assets; unverified entries remain excluded from decisions until content continuity is established. Stable catalog sessions and a bounded same-database change journal separate inventory progress from publication. Schema v6 preserves prior vectors and import history while withdrawing old publication; see the [continuity implementation and validation](docs/release/2026-10-07-photos-index-continuity-validation.md).
+Photos catalog reconciliation retains existing fingerprint bytes and pending work. Known changes affect their own assets; unverified entries remain excluded from decisions until content continuity is established. Stable catalog sessions and a bounded same-database change journal separate inventory progress from publication. Schema v7 preserves prior vectors and import history while withdrawing old publication, and classifies individual Photos read failures without stopping healthy siblings; see the [continuity implementation and validation](docs/release/2026-10-07-photos-index-continuity-validation.md) and [read-error isolation validation](docs/release/2026-10-08-photos-read-error-isolation-validation.md). Candidate scores use system SQLite + Accelerate exact Float32 queries.
 
 Fixed model weights use Git LFS; install Git LFS with repository-local filters (`git lfs install --local --skip-repo`) and hydrate the exact checkout before building. The package entry point verifies and hydrates archived pointers from local objects only, and fails on absent/corrupt resources. It does not download a model at App runtime.
 
-The user-selected threshold remains 0.98 with a 512 MiB decoded allowance and conservative original import for readable still images exceeding that allowance. This is not an independently calibrated statistical acceptance. See [current validation and limitations](docs/release/0.2.0-advanced-dedup-validation.md), including the reproduced and corrected R2 decode integration defect. Local validation includes six user attachments authorized only for local tests; never add them to the App or public CI. The released v1 behavior and version below remain historical distribution facts.
+The user-selected threshold remains 0.98 with a 512 MiB decoded allowance and conservative original import for readable still images exceeding that allowance. This is not an independently calibrated statistical acceptance. See [current validation and limitations](docs/release/0.2.0-advanced-dedup-validation.md), including the reproduced and corrected R2 decode integration defect. Local validation includes six user attachments authorized only for local tests; never add them to the App or public CI.
 
 ## Install a local build
 
@@ -24,11 +24,19 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Current local release: **0.1.0 stable (build 6)**. Artifacts are under
-`outputs/releases/0.1.0/`; see [release notes](docs/release/0.1.0.md)
-and the [changelog](CHANGELOG.md).
-The package includes Apple Silicon and Intel code, the compiled layered icon and
-an ICNS fallback for older macOS.
+Prepared release configuration: **0.2.0 beta (build 7)**, targeting
+`outputs/releases/0.2.0-beta/`; see [beta release notes](docs/release/0.2.0-beta.md)
+and the [changelog](CHANGELOG.md). This configuration does not prove that a package
+has been generated. The package entry point requires Apple Silicon and Intel code,
+the compiled layered icon and an ICNS fallback for older macOS. The previous
+0.1.0 stable build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
+
+Before first launch after upgrading, quit PhotosYNC normally and back up the complete
+`~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
+files. The app transactionally migrates schema v3 to v7; the old app rejects v7.
+Direct downgrade is not supported. Restoring an old database after new imports can
+lose success evidence and cause duplicate additions; see the beta notes for the
+backup and downgrade boundary. Packaging does not back up or migrate production data.
 
 Open the DMG, drag `PhotosYNC.app` to `Applications`, then launch it. The menu-bar app asks for read-write access to the **System Photo Library** only after you choose **Authorize Photos**. Once macOS grants that access and at least one source is enabled, PhotosYNC can scan and submit additions to that library. It does not select, migrate, or mount another library, and it does not change iCloud Photos settings.
 
@@ -36,7 +44,7 @@ Open the DMG, drag `PhotosYNC.app` to `Applications`, then launch it. The menu-b
 
 Choose one or more source folders in Settings. PhotosYNC scans at launch and then every 30 minutes. A manual scan is available from the menu bar; overlapping scans are ignored, and sleep recovery does not create a backlog. Pausing stops new scan work. A Photos submission already handed to the system is allowed to finish so its result can be recorded conservatively.
 
-Only supported bitmap images and videos are considered. RAW files, Live Photo pairing, transcoding, album mapping, media hashing, and source-file caching are out of scope. Duplicate decisions use exact filenames and conservative public metadata. A possible duplicate is skipped and logged rather than imported. An earlier successful import remains recorded even if the Photos asset is later removed, so it is not automatically re-imported. Removing a source in Settings hides and disables that configuration while retaining its import history; it does not delete any source files or Photos assets. Re-adding the same path restores that history.
+Only supported bitmap images and videos are considered. RAW files, Live Photo pairing, transcoding, album mapping, media hashing, and source-file caching are out of scope. Photos use visual fingerprints across filenames with the selected 0.98 threshold and resolution rules; videos retain exact-filename and conservative metadata matching. Eligible old suspected-duplicate photo skips are reconsidered under the new policy; successful imports and unknown submissions remain protected. A possible duplicate is skipped and logged rather than imported. An earlier successful import remains recorded even if the Photos asset is later removed, so it is not automatically re-imported. Removing a source in Settings hides and disables that configuration while retaining its import history; it does not delete any source files or Photos assets. Re-adding the same path restores that history.
 
 PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source file. It sends additions to Photos only. It also never deletes or overwrites a Photos asset. Import completion means PhotoKit accepted the addition; it does not mean the asset has finished syncing to iCloud.
 
@@ -52,9 +60,9 @@ If an import result is uncertain after an interruption, PhotosYNC keeps it in an
 
 ## Boundaries
 
-The user has authorized 0.2 validation on this Mac's actively used production System Photo Library because no separate environment is available. The [real Photos/iCloud validation plan](docs/release/2026-10-06-real-photos-icloud-validation-plan.md) requires read-only inspection and real-source dry runs first, isolated QA state, then a final bounded write phase with exact-ID rollback of only this run's additions. Existing assets and production application data are not edited or restored from an old snapshot. Recently Deleted and cloud/cache side effects have explicit recovery limits. Initial read-only catalog/index attempts exposed the continuity defect; the repaired implementation and replacement QA host have passed automatic/offline validation, but real-library retesting and write phases have not run. The older isolated-account/iCloud-off procedure in `Design/Validation.md` remains historical evidence, not the current environment requirement.
+The user has authorized 0.2 validation on this Mac's actively used production System Photo Library because no separate environment is available. The [real Photos/iCloud validation plan](docs/release/2026-10-06-real-photos-icloud-validation-plan.md) requires read-only inspection and real-source dry runs first, isolated QA state, then a final bounded write phase with exact-ID rollback of only this run's additions. Existing assets and production application data are not edited or restored from an old snapshot. Recently Deleted and cloud/cache side effects have explicit recovery limits. Read-only QA exposed continuity, notification and individual-read defects and drove automatic regression fixes. Full candidate coverage, MobileBackup end-to-end decisions, visual review and the final bounded write/rollback remain incomplete. A read gap can miss duplicates proven only by that representation. macOS 13 and Intel 0.2 runtime behavior remain unverified; Intel device testing is intentionally omitted. The older isolated-account/iCloud-off procedure in `Design/Validation.md` remains historical evidence, not the current environment requirement.
 
-PhotosYNC v1 does not synchronize deletions, re-import assets removed from Photos, manage Photos libraries, auto-mount network storage, or provide a media browser. A slow or disconnected network mount is treated as a source error or waiting condition, not as a reason to alter the mount or the source contents.
+PhotosYNC does not synchronize deletions, re-import assets removed from Photos, manage Photos libraries, auto-mount network storage, or provide a media browser. A slow or disconnected network mount is treated as a source error or waiting condition, not as a reason to alter the mount or the source contents.
 
 
 ## Automated acceptance and local release
