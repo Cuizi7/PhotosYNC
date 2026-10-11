@@ -215,6 +215,8 @@ actor SyncRuntime {
                 }.value
                 // Freeze the validated records once per process, even with no enabled
                 // source. Only expensive model/gateway construction waits for eligibility.
+                guard let store else { throw AdvancedDedupError.invalidConfiguration }
+                try await store.rebindEquivalentSourceFingerprints(to: configuration.fingerprint)
                 let authorization = authorized
                 advancedFactory = { store, executor, directory, now, logger in
                     try await AdvancedRuntimeGraph.load(store: store, executor: executor, directory: directory,

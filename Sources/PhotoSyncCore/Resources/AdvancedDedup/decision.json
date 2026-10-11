@@ -16,6 +16,7 @@
     "evidenceCandidateLimit": 200000,
     "fingerprint": {
       "colorSpace": "sRGB",
+      "inputContract": "encoded-resource-imageio-v1",
       "inputSide": 320,
       "mean": [
         0.485,
@@ -29,15 +30,17 @@
         0.224,
         0.225
       ],
-      "version": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
+      "version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
     },
-    "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
+    "policyVersion": "33036418cef48b6952faefc73f8d1e6a7a2c3a5115af2735a6464d1601e96e2e",
     "resources": {
       "batchSize": 1,
       "catalogBatchSize": 128,
       "decodeConcurrency": 1,
+      "freeSpaceReserveBytes": 134217728,
       "inferenceConcurrency": 1,
       "maxDecodedBytes": 536870912,
+      "maxEncodedBytes": 536870912,
       "maxInFlightTasks": 2,
       "photoRequestConcurrency": 1,
       "progressPublishIntervalSeconds": 1,
@@ -51,17 +54,18 @@
     },
     "weightPrecision": "float16"
   },
-  "date": "2026-10-06",
+  "date": "2026-10-11",
   "decision": "close_research_and_select_configuration_for_integration",
-  "executionPolicySHA256": "03e34635df8a05e5b9e7d519dc4c1a0577a8f83ea771e237d2b085c9eb11e90e",
+  "executionPolicySHA256": "8f852fd534ec48aad4a2dbdfc32fea6c47b5aa9d2326eb83f82a5c344cf96183",
+  "inputAcquisition": "Source original URL and PhotoKit selected encoded original/current resource; shared EncodedImageDecoder/ImageIO, never 320px Photos raster fallback.",
   "platformLimitations": [
     "macOS13 Apple Silicon physical validation unavailable",
     "Intel physical execution excluded"
   ],
-  "priorDecisionSHA256": "3406f95474feeb2b276259c4c01b18072954b8d2db74c164cdf241703f222382",
-  "realPhotosValidation": "not performed in P12",
+  "priorDecisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "realPhotosValidation": "Targeted real resource-path validation pending; no fresh real Photos claim in Task 2.",
   "schemaVersion": 1,
   "selectedThreshold": 0.98,
   "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
-  "userInstruction": "Approved option A: FP16, ANE-first with one serialized GPU fallback; retain threshold 0.98 and Float32 pipeline."
+  "userInstruction": "Approved original-resource/common ImageIO input integration; retain FP16 ANE-first/GPU fallback, threshold 0.98 and unchanged Float32 model pipeline."
 }

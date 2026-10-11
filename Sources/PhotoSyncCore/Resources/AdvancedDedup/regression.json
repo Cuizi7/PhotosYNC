@@ -2,7 +2,7 @@
   "actionFailures": [],
   "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
   "backend": "sqlite-exact-f32-v1",
-  "backendComparisonSHA256": "1dd010e89db483551a17a89d55e582751ead7fad643fe93cc886177a3dd31efd",
+  "backendComparisonSHA256": "297c471d19ade676797d9d13227084fc2b2c367a4db2d13d2a00f548db9e419c",
   "caseCount": 33,
   "cases": [
     {
@@ -832,20 +832,22 @@
     }
   ],
   "contentFailures": [],
-  "date": "2026-10-06",
-  "decisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "date": "2026-10-11",
+  "decisionSHA256": "686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab",
   "executionPolicyID": "fp16-ane-gpu-v1",
   "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
-  "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+  "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
   "independentValidation": false,
-  "integrationProfileSHA256": "25749a222f56277607a85004edb43b594a7595406d4a63112631dd4cc00f00d8",
+  "inputAcquisition": "Source original URL and PhotoKit selected encoded original/current resource; shared EncodedImageDecoder/ImageIO, never 320px Photos raster fallback.",
+  "inputContract": "encoded-resource-imageio-v1",
+  "integrationProfileSHA256": "8f3c2b481eaf7b192206e85725d3132506bca12b9ce7fc79ff78891384f06004",
   "kind": "fixed_user_threshold_actual_fp16_inference",
   "newImageInference": true,
   "passCount": 33,
-  "policyVersion": "33d9bbc9e60d521b07d29d6d6e508bb420f203bff5e3c2d1a3f1a146e1916b4d",
+  "policyVersion": "33036418cef48b6952faefc73f8d1e6a7a2c3a5115af2735a6464d1601e96e2e",
   "schemaVersion": 1,
-  "sourceReportSHA256": "86b9c4c9a4d56a2f85c99a06ff95a7d9f6a076146b35988bcc171715731b8332",
-  "sourceVectorManifestSHA256": "c6a0b3f0be99b0e1837f2d8cb09fa1bf00d016c729ececc72ac8146e0f8625ea",
+  "sourceReportSHA256": "745255f99c8a5ff13662a2e6fe6b59cbee3b672873d4b0dbbd50c15f5b165455",
+  "sourceVectorManifestSHA256": "9e283c729f3d83a16cd5b7a17378de3d5c6e2e858d96d7f6ddb98eb8c3b9e44d",
   "threshold": 0.98,
   "thresholdBasis": "explicit_user_choice_not_independent_calibration"
 }

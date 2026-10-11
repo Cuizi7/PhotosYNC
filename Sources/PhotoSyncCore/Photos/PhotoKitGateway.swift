@@ -85,7 +85,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         let library = PHPhotoLibrary.shared()
         let reader = PhotosRepresentationReader(requester: SystemPhotosRepresentationRequester(), budget: imageBudget,
-                                                configuration: configuration)
+                                                configuration: configuration,
+                                                resourceLimits: PhotosResourceLimits(maxEncodedBytes: configuration.resources.maxEncodedBytes,
+                                                    freeSpaceReserveBytes: configuration.resources.freeSpaceReserveBytes))
         self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library, eventBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics), observedLibrary: library,
                   representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics)
     }

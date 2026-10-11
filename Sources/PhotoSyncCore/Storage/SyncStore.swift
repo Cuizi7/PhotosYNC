@@ -645,6 +645,40 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// Only the unchanged, formal FP16 Source decoder is equivalent. Photos
+    /// representations must be regenerated under the new input contract.
+    public func rebindEquivalentSourceFingerprints(to configuration: FingerprintConfiguration) async throws {
+        let formal = try FingerprintConfiguration(
+            modelSHA256: "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+            inputSide: 320, resizeMode: .stretchFullFrame, colorSpace: "sRGB",
+            mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225])
+        guard configuration == formal else { throw AdvancedDedupError.invalidConfiguration }
+        let legacy = "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
+        try await perform {
+            try self.transaction {
+                guard try self.one("SELECT 1 FROM file_fingerprint WHERE fingerprint_version = ? LIMIT 1", [.text(legacy)]) != nil else { return }
+                // SQLite streams the comparison; no Swift collection of historical
+                // 4096-byte vectors, even for 100K+ Source rows.
+                let keys = "new.file_id = old.file_id AND new.size = old.size AND new.modified_ns = old.modified_ns AND new.purpose = old.purpose AND new.attempt_id = old.attempt_id"
+                guard try self.one("""
+                    SELECT 1 FROM file_fingerprint old JOIN file_fingerprint new ON \(keys)
+                    WHERE old.fingerprint_version = ? AND new.fingerprint_version = ?
+                    AND NOT (new.width IS old.width AND new.height IS old.height AND new.vector IS old.vector) LIMIT 1
+                    """, [.text(legacy), .text(formal.version)]) == nil else {
+                    throw SyncStoreError.invalidTransition("Equivalent Source fingerprint collision has different bytes or facts.")
+                }
+                // Identical collisions can merge without touching successful or
+                // unknown attempt relationships. All other versions remain intact.
+                try self.execute("""
+                    DELETE FROM file_fingerprint AS old WHERE old.fingerprint_version = ? AND EXISTS (
+                        SELECT 1 FROM file_fingerprint new WHERE \(keys) AND new.fingerprint_version = ?)
+                    """, [.text(legacy), .text(formal.version)])
+                try self.execute("UPDATE file_fingerprint SET fingerprint_version = ? WHERE fingerprint_version = ?", [.text(formal.version), .text(legacy)])
+                try self.execute("UPDATE dedup_index_state SET local_revision = local_revision + 1 WHERE id = 1")
+            }
+        }
+    }
+
     public func fingerprint(fileID: UUID, stamp: FileStamp, version: String) async throws -> Fingerprint? {
         try await perform {
             guard let row = try self.one("SELECT vector FROM file_fingerprint WHERE file_id = ? AND size = ? AND modified_ns = ? AND fingerprint_version = ? AND purpose = 'current'",
@@ -1793,13 +1827,22 @@ public final class SyncStore: @unchecked Sendable {
 
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 7 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 7 else { return }
+        guard version <= 8 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 8 else { return }
+        if version == 7 {
+            // Fence durable readiness before new-contract startup. An already-open
+            // legacy process is not revoked; normal instance ownership remains required.
+            try transaction {
+                try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
+                try execute("PRAGMA user_version = 8")
+            }
+            return
+        }
         if version == 6 {
             try transaction {
                 try addReadFailureKindColumn()
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
-                try execute("PRAGMA user_version = 7")
+                try execute("PRAGMA user_version = 8")
             }
             return
         }
@@ -1811,7 +1854,7 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
                 try addReadFailureKindColumn()
-                try execute("PRAGMA user_version = 7")
+                try execute("PRAGMA user_version = 8")
             }
             return
         }
@@ -1840,7 +1883,7 @@ public final class SyncStore: @unchecked Sendable {
                     try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
                 }
                 try addReadFailureKindColumn()
-                try execute("PRAGMA user_version = 7")
+                try execute("PRAGMA user_version = 8")
                 try ensureLegacyRecheckSchema()
             }
             return
@@ -1863,7 +1906,7 @@ public final class SyncStore: @unchecked Sendable {
                 try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
             }
             try addReadFailureKindColumn()
-            try execute("PRAGMA user_version = 7")
+            try execute("PRAGMA user_version = 8")
         }
     }
 

@@ -24,16 +24,18 @@
     "skipModelLoad": true
   },
   "coremltoolsVersion": "9.0",
-  "currentDecisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "currentDecisionSHA256": "686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab",
   "currentNumericalEvidence": {
-    "cpuAndGPU": "1dd010e89db483551a17a89d55e582751ead7fad643fe93cc886177a3dd31efd",
-    "cpuAndNeuralEngine": "86b9c4c9a4d56a2f85c99a06ff95a7d9f6a076146b35988bcc171715731b8332"
+    "cpuAndGPU": "297c471d19ade676797d9d13227084fc2b2c367a4db2d13d2a00f548db9e419c",
+    "cpuAndNeuralEngine": "745255f99c8a5ff13662a2e6fe6b59cbee3b672873d4b0dbbd50c15f5b165455"
   },
   "declaredUpstreamRevision": "95902662f2217a5f4aa45f2a3fc70a01dfd3b66a",
   "declaredUpstreamURL": "https://dl.fbaipublicfiles.com/sscd-copy-detection/sscd_disc_large.torchscript.pt",
   "executionPolicyID": "fp16-ane-gpu-v1",
-  "executionPolicySHA256": "03e34635df8a05e5b9e7d519dc4c1a0577a8f83ea771e237d2b085c9eb11e90e",
-  "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+  "executionPolicySHA256": "8f852fd534ec48aad4a2dbdfc32fea6c47b5aa9d2326eb83f82a5c344cf96183",
+  "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
+  "inputAcquisition": "Source original URL and PhotoKit selected encoded original/current resource; shared EncodedImageDecoder/ImageIO, never 320px Photos raster fallback.",
+  "inputContract": "encoded-resource-imageio-v1",
   "macOSSDKVersion": "26.5",
   "macOSVersion": "27.0",
   "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
@@ -47,7 +49,16 @@
     "macOS13 Apple Silicon physical validation unavailable",
     "Intel physical execution excluded"
   ],
+  "previousNumericalEvidence": {
+    "cpuAndGPU": "1dd010e89db483551a17a89d55e582751ead7fad643fe93cc886177a3dd31efd",
+    "cpuAndNeuralEngine": "86b9c4c9a4d56a2f85c99a06ff95a7d9f6a076146b35988bcc171715731b8332"
+  },
   "pythonVersion": "3.10.8",
+  "resourcePathEvidence": {
+    "nativeExecution": "Fresh CPU+ANE and CPU+GPU; four goldens and 33 content/action cases each.",
+    "realPhotoKitAcquisition": "not validated by this local native corpus run",
+    "sharedImageIODecoder": "Task 1 controlled encoded-resource tests; this fresh 33-case run exercises the unchanged Source/shared decoder numerical body."
+  },
   "selectedCandidateProvenanceSHA256": "1ab5ce2eab774695e9f4d25c15439fec719a6304ed2a1f5d1f4dc6f491c258fe",
   "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
   "status": "user-approved-fp16-product-integration",

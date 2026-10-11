@@ -5,6 +5,167 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testNewInputContractIsDefaultAndLegacyJSONKeepsExactIdentity() throws {
+        let old = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("docs/research/advanced-dedup/fp16-ane-gpu-v1/profile.json")))
+        XCTAssertEqual(old.fingerprint.version, "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d")
+        let fresh = try FingerprintConfiguration(modelSHA256: old.fingerprint.modelSHA256, inputSide: 320,
+            resizeMode: .stretchFullFrame, colorSpace: "sRGB", mean: old.fingerprint.mean, std: old.fingerprint.std)
+        XCTAssertNotEqual(fresh.version, old.fingerprint.version)
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(fresh)) as! [String: Any]
+        XCTAssertEqual(json["inputContract"] as? String, "encoded-resource-imageio-v1")
+    }
+
+    func testV7InputFenceRetainsFactsAndRevokesPublishedIndex() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let old = try await prepared(store, source, root, "success.jpg")
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: old.fileID, attemptID: attempt)
+        try await store.markImported(fileID: old.fileID, attemptID: attempt, identifier: "success", sourceFingerprint: old)
+        try await publishEmpty(store)
+        let before = try facts(at: db)
+        try injectEngineSQL("CREATE TABLE preserved_vectors AS SELECT * FROM file_fingerprint; PRAGMA user_version=7", at: db)
+        let reopened = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try facts(at: db), before)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM preserved_vectors EXCEPT SELECT * FROM file_fingerprint)", at: db), 0)
+        try await assertNil(try await reopened.indexReadiness())
+        try await assertNil(try await reopened.indexPublication())
+    }
+
+    func testEquivalentSourceRebindPreservesSuccessUnknownAndCollisionBytes() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
+        let oldVersion = "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
+        let source = try await store.registerSource(url: root)
+        let success = try await prepared(store, source, root, "success.jpg", version: oldVersion)
+        let unknown = try await prepared(store, source, root, "unknown.jpg", version: oldVersion)
+        let attempt = UUID(), unknownAttempt = UUID()
+        try await store.beginAttempt(fileID: success.fileID, attemptID: attempt)
+        try await store.markImported(fileID: success.fileID, attemptID: attempt, identifier: "retained", sourceFingerprint: success)
+        // Unknown submission has an immutable attempt vector, recovered after upgrade.
+        try injectEngineSQL("INSERT INTO file_fingerprint SELECT file_id,size,modified_ns,fingerprint_version,'attempt',width,height,vector,'\(unknownAttempt.uuidString)' FROM file_fingerprint WHERE file_id='\(unknown.fileID.uuidString)'", at: db)
+        try await store.beginAttempt(fileID: unknown.fileID, attemptID: unknownAttempt)
+        try injectEngineSQL("INSERT INTO file_fingerprint SELECT file_id,size,modified_ns,'\(config.fingerprint.version)',purpose,width,height,vector,attempt_id FROM file_fingerprint WHERE file_id='\(success.fileID.uuidString)' AND purpose='current'", at: db)
+        try await publishEmpty(store)
+        let before = try facts(at: db)
+        let revision = try engineSQLInteger("SELECT local_revision FROM dedup_index_state", at: db)
+        try injectEngineSQL("CREATE TABLE preserved_source AS SELECT file_id,size,modified_ns,purpose,width,height,hex(vector) AS bytes,attempt_id FROM file_fingerprint WHERE fingerprint_version='\(oldVersion)'", at: db)
+        try injectEngineSQL("PRAGMA user_version=7", at: db)
+        let upgraded = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        try await assertNil(try await upgraded.indexReadiness())
+        try await upgraded.rebindEquivalentSourceFingerprints(to: config.fingerprint)
+        XCTAssertEqual(try facts(at: db), before)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE fingerprint_version='\(oldVersion)'", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM preserved_source EXCEPT SELECT file_id,size,modified_ns,purpose,width,height,hex(vector),attempt_id FROM file_fingerprint)", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT local_revision FROM dedup_index_state", at: db), revision + 1)
+        try await upgraded.rebindEquivalentSourceFingerprints(to: config.fingerprint)
+        XCTAssertEqual(try engineSQLInteger("SELECT local_revision FROM dedup_index_state", at: db), revision + 1)
+        try await upgraded.markImported(fileID: unknown.fileID, attemptID: unknownAttempt, identifier: "late-success")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE purpose='success' AND fingerprint_version='\(config.fingerprint.version)'", at: db), 2)
+        try await assertFalse(try await upgraded.hasUnsupportedSuccessfulFingerprint(version: config.fingerprint.version))
+        let incoming = try await prepared(store, source, root, "incoming.jpg", version: config.fingerprint.version)
+        let candidates = try await upgraded.localVectorCandidates(beforeOrder: Int64.max, excluding: incoming.fileID, version: config.fingerprint.version)
+        XCTAssertEqual(candidates.entries.filter { $0.origin == .successHistory }.count, 2)
+    }
+
+    func testSourceRebindRollsBackDifferentVectorOrFactsAndRejectsNonformalTarget() async throws {
+        for corruption in ["width=999", "vector=zeroblob(4096)"] {
+            let (root, db, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let config = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
+            let source = try await store.registerSource(url: root)
+            _ = try await prepared(store, source, root, "first.jpg", version: "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d")
+            let colliding = try await prepared(store, source, root, "collision.jpg", version: "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d")
+            try injectEngineSQL("INSERT INTO file_fingerprint SELECT file_id,size,modified_ns,'\(config.fingerprint.version)',purpose,width,height,vector,attempt_id FROM file_fingerprint WHERE file_id='\(colliding.fileID.uuidString)'; UPDATE file_fingerprint SET \(corruption) WHERE fingerprint_version='\(config.fingerprint.version)'", at: db)
+            let bytes = try Data(contentsOf: db)
+            await XCTAssertThrowsErrorAsync(try await store.rebindEquivalentSourceFingerprints(to: config.fingerprint))
+            XCTAssertEqual(try Data(contentsOf: db), bytes)
+            let wrong = try FingerprintConfiguration(modelSHA256: String(repeating: "a", count: 64), inputSide: 320,
+                resizeMode: .stretchFullFrame, colorSpace: "sRGB", mean: [0,0,0], std: [1,1,1])
+            await XCTAssertThrowsErrorAsync(try await store.rebindEquivalentSourceFingerprints(to: wrong))
+        }
+    }
+
+    func testSourceRebindNeverRelabelsPhotosAndUnknownSuccessfulVersionStillBlocks() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
+        let old = "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
+        let source = try await store.registerSource(url: root)
+        let unsupported = try await prepared(store, source, root, "unknown-success.jpg", version: "not-allowlisted")
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: unsupported.fileID, attemptID: attempt)
+        try await store.markImported(fileID: unsupported.fileID, attemptID: attempt, identifier: "unknown-history", sourceFingerprint: unsupported)
+        _ = try await prepared(store, source, root, "allowlisted.jpg", version: old)
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let item = descriptor(context, asset: "old-photos")
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: old)
+        try await store.upsertRepresentations([item], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        let vector = try fingerprint(old)
+        try await assertTrue(try await store.completeRepresentation(task, fingerprint: vector))
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: [item.key])
+        try await store.rebindEquivalentSourceFingerprints(to: config.fingerprint)
+        XCTAssertEqual(try photosVector(at: db), vector)
+        try await assertTrue(try await store.hasUnsupportedSuccessfulFingerprint(version: config.fingerprint.version))
+        let rebuild = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: config.fingerprint.version)
+        try await store.upsertRepresentations([item], generation: rebuild)
+        try await assertNil(try await store.indexReadiness())
+        let replacement = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        XCTAssertEqual(replacement.fingerprintVersion, config.fingerprint.version)
+        try await assertTrue(try await store.completeRepresentation(replacement, fingerprint: fingerprint(config.fingerprint.version)))
+        try await store.finishIndexReconciliation(generation: rebuild, seenKeys: [item.key])
+        try await assertTrue(try await store.hasUnsupportedSuccessfulFingerprint(version: config.fingerprint.version))
+    }
+
+    func testNewProductJSONRejectsMissingLimitsAndMutatedInputContract() throws {
+        let root = try DedupConfiguration.bundledResourceDirectory()
+        let bytes = try Data(contentsOf: root.appendingPathComponent("profile.json"))
+        let json = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+        for key in ["maxEncodedBytes", "freeSpaceReserveBytes"] {
+            var changed = json, limits = json["resources"] as! [String: Any]
+            limits.removeValue(forKey: key); changed["resources"] = limits
+            XCTAssertThrowsError(try JSONDecoder().decode(DedupConfiguration.self, from: JSONSerialization.data(withJSONObject: changed)))
+        }
+        var changed = json, fp = json["fingerprint"] as! [String: Any]
+        fp["inputContract"] = "photos-raster-or-anything"; changed["fingerprint"] = fp
+        XCTAssertThrowsError(try JSONDecoder().decode(DedupConfiguration.self, from: JSONSerialization.data(withJSONObject: changed)))
+        for key in ["maxEncodedBytes", "freeSpaceReserveBytes"] {
+            let copy = try configurationFiles()
+            defer { try? FileManager.default.removeItem(at: copy) }
+            try mutate(copy, file: "decision.json") { record in
+                var selection = record["configuration"] as! [String: Any]
+                var limits = selection["resources"] as! [String: Any]; limits.removeValue(forKey: key)
+                selection["resources"] = limits; record["configuration"] = selection
+            }
+            try rebind(copy)
+            XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: copy), "Missing decision budget must not default to acceptance")
+        }
+        for key in ["maxEncodedBytes", "freeSpaceReserveBytes"] {
+            let copy = try configurationFiles()
+            defer { try? FileManager.default.removeItem(at: copy) }
+            for file in ["profile.json", "decision.json"] {
+                try mutate(copy, file: file) { record in
+                    if file == "profile.json" {
+                        var limits = record["resources"] as! [String: Any]; limits[key] = 1; record["resources"] = limits
+                    } else {
+                        var selection = record["configuration"] as! [String: Any]
+                        var limits = selection["resources"] as! [String: Any]; limits[key] = 1
+                        selection["resources"] = limits; record["configuration"] = selection
+                    }
+                }
+            }
+            try rebind(copy)
+            XCTAssertThrowsError(try DedupConfiguration.loadValidated(resourceDirectory: copy))
+        }
+    }
+
     func testOldSuccessfulFingerprintVersionIsRetainedAndNotSilentlyIgnored() async throws {
         let (root, db, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -512,7 +673,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE attempt_id = ''", at: db), 2)
             }
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 2)
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 7)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 8)
         }
     }
 
@@ -673,7 +834,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try makeV3(at: db)
         let before = try facts(at: db)
         let store = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 7)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
         XCTAssertEqual(try facts(at: db), before)
         let generation = try await store.beginIndexReconciliation(context: LibraryContext(id: UUID(), epoch: 1), photosGeneration: 4, fingerprintVersion: "new-model")
         try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
@@ -692,9 +853,9 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 3)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE name = 'dedup_index_state'", at: db), 0)
         XCTAssertEqual(try facts(at: db), before)
-        try injectEngineSQL("PRAGMA user_version = 8", at: db)
+        try injectEngineSQL("PRAGMA user_version = 9", at: db)
         XCTAssertThrowsError(try SyncStore(url: db))
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
     }
 
     func testStaleTaskCannotPublish() async throws {
@@ -1099,7 +1260,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 try await assertNil(try await reopened.indexPublication())
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: db), 1)
             }
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 7)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 8)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('fingerprint_task') WHERE name='failure_kind'", at: db), fail ? 0 : 1)
             XCTAssertEqual(try facts(at: db), before)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM vectors_before EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
@@ -1140,7 +1301,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
             PRAGMA user_version=5;
             """, at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 7)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_vectors EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_tasks EXCEPT SELECT asset_id,revision,generation,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: db), 0)
         let publication = try await reopened.indexPublication(); XCTAssertNil(publication)
@@ -1293,7 +1454,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("UPDATE photos_representation SET tombstoned=0; PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS photos_representation_readiness", at: db)
         let upgraded = try SyncStore(url: db)
         XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 7)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
         let after = try await upgraded.indexReadiness(); XCTAssertNil(after)
         let publication = try await upgraded.indexPublication()
         XCTAssertEqual(try photosVector(at: db), vector)
@@ -1322,7 +1483,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         // Reproduce the previous unreleased integration-v4 shape without its reverse index.
         try injectEngineSQL("PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS dedup_dependency_candidate;", at: db)
         let migrated = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 7)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
         try await assertEqual(try await migrated.state(of: dependent.fileID), .skipped)
         try assertReverseDependencyLookup(at: db)

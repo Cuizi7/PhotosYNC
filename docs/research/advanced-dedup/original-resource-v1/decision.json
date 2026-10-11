@@ -1,0 +1,71 @@
+{
+  "activeSuite": {
+    "caseCount": 33,
+    "expectedResultsSHA256": "9780f3b0dd059e5023a29f3b58937723b33dd406e1ed0e1dba2ba2aebce43555",
+    "humanReviewSHA256": "5db705debe0ca4c139f5d89c4e360456553d2bd8155105637349d749095177a7",
+    "imageCount": 42,
+    "manifestSHA256": "1d0999497eac360bc2d09215e8cbb2f0ee0156d5a24ea28f6a5608bb37a5a0ea",
+    "revision": "2026-10-04-no-information-panels",
+    "sha256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23"
+  },
+  "basis": "explicit_user_selected_threshold",
+  "comparison": "score >= threshold",
+  "configuration": {
+    "backend": "sqlite-exact-f32-v1",
+    "computeUnits": "fp16-ane-gpu-v1",
+    "evidenceCandidateLimit": 200000,
+    "fingerprint": {
+      "colorSpace": "sRGB",
+      "inputContract": "encoded-resource-imageio-v1",
+      "inputSide": 320,
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+      "resizeMode": "stretchFullFrame",
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
+    },
+    "policyVersion": "33036418cef48b6952faefc73f8d1e6a7a2c3a5115af2735a6464d1601e96e2e",
+    "resources": {
+      "batchSize": 1,
+      "catalogBatchSize": 128,
+      "decodeConcurrency": 1,
+      "freeSpaceReserveBytes": 134217728,
+      "inferenceConcurrency": 1,
+      "maxDecodedBytes": 536870912,
+      "maxEncodedBytes": 536870912,
+      "maxInFlightTasks": 2,
+      "photoRequestConcurrency": 1,
+      "progressPublishIntervalSeconds": 1,
+      "requestTimeoutSeconds": 30,
+      "retryDelaysSeconds": [
+        5,
+        15,
+        30,
+        60
+      ]
+    },
+    "weightPrecision": "float16"
+  },
+  "date": "2026-10-11",
+  "decision": "close_research_and_select_configuration_for_integration",
+  "executionPolicySHA256": "8f852fd534ec48aad4a2dbdfc32fea6c47b5aa9d2326eb83f82a5c344cf96183",
+  "inputAcquisition": "Source original URL and PhotoKit selected encoded original/current resource; shared EncodedImageDecoder/ImageIO, never 320px Photos raster fallback.",
+  "platformLimitations": [
+    "macOS13 Apple Silicon physical validation unavailable",
+    "Intel physical execution excluded"
+  ],
+  "priorDecisionSHA256": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
+  "realPhotosValidation": "Targeted real resource-path validation pending; no fresh real Photos claim in Task 2.",
+  "schemaVersion": 1,
+  "selectedThreshold": 0.98,
+  "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+  "userInstruction": "Approved original-resource/common ImageIO input integration; retain FP16 ANE-first/GPU fallback, threshold 0.98 and unchanged Float32 model pipeline."
+}

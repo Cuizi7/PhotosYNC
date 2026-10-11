@@ -552,7 +552,7 @@ from pathlib import Path
 names = ['cpuAndNeuralEngine','cpuAndGPU'] if platform.machine() == 'arm64' else ['cpuAndGPU']
 report = {'schemaVersion':1,'policyID':'fp16-ane-gpu-v1',
 'modelSHA256':'026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0',
-'fingerprintVersion':'ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d',
+'fingerprintVersion':'fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c',
 'selfTestManifestSHA256':'8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9',
 'configurations':[{'requested':name,'selfTests':[{'case':str(i),'result':'passed','maxAbs':'0.02','cosine':'0.999'} for i in range(4)]} for name in names]}
 Path(sys.argv[1]).write_text(json.dumps(report))
@@ -620,7 +620,7 @@ class ModelExecutionGateTests(unittest.TestCase):
 
         report = {"schemaVersion": 1, "policyID": "fp16-ane-gpu-v1",
             "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
-            "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+            "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
             "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
             "configurations": [{"requested": name, "selfTests": [{"case": str(i), "result": "passed", "maxAbs": "0.02", "cosine": "0.999"} for i in range(4)]}
                 for name in (["cpuAndNeuralEngine", "cpuAndGPU"] if module.platform.machine() == "arm64" else ["cpuAndGPU"])]}

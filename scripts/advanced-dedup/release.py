@@ -19,16 +19,7 @@ MODEL_SHA = "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0"
 WEIGHT_SHA = "be1b28a5be24ca216884b6a04db291f58bd484328ac5307f9577fd27295cb338"
 WEIGHT_SIZE = 88329408
 LICENSE_SHA = "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93"
-RECORD_HASHES = {
-    "decision.json": "b32b332696bb716942ef5274856ddcba6d3d4d8f4a05e2925e6e264b5da337da",
-    "profile.json": "25749a222f56277607a85004edb43b594a7595406d4a63112631dd4cc00f00d8",
-    "regression.json": "17da760deff666a9328c15d2f65e22b1a49adc8f1151a72ce24c16605b6cf6e5",
-    "closeout.json": "6d15fd23ce895a43e1707e4b1afba51a7b2cc98a6fb724a960f48803fd5ebf79",
-    "LICENSE-SSCD.txt": LICENSE_SHA,
-    "execution-policy.json": "03e34635df8a05e5b9e7d519dc4c1a0577a8f83ea771e237d2b085c9eb11e90e",
-    "ModelSelfTest/manifest.json": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
-    "model-provenance.json": "22f0e8b27ed5f7644831e5ec9de5dd2320457f319be29163a3dc757afcfcbf94",
-}
+RECORD_HASHES = {'decision.json': '686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab', 'profile.json': '8f3c2b481eaf7b192206e85725d3132506bca12b9ce7fc79ff78891384f06004', 'regression.json': '50d34a60bea55db493c817c890d7d9563f82cece66bc4363811472a7ee73e6a2', 'closeout.json': 'a9a382e406c3ca3014ea8531e0fc4eff8e04e33051ebcd19cfd8c3c546394ea9', 'LICENSE-SSCD.txt': 'da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93', 'execution-policy.json': '8f852fd534ec48aad4a2dbdfc32fea6c47b5aa9d2326eb83f82a5c344cf96183', 'ModelSelfTest/manifest.json': '8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9', 'model-provenance.json': '5417926c82f42963f8ad959d53cf6cd4078ef83b0cceb68797f7ce77bb0d3b52'}
 MODEL_FILES = {"Manifest.json", "Data/com.apple.CoreML/model.mlmodel", WEIGHT}
 
 
@@ -81,7 +72,9 @@ def verify_execution_resources(root: Path) -> None:
         "maxFallbacks": 1, "inputType": "float32", "outputType": "float32",
         "allowLowPrecisionAccumulationOnGPU": False, "retryIntervalSeconds": 60,
         "modelSHA256": MODEL_SHA,
-        "fingerprintVersion": "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+        "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
+        "inputContract": "encoded-resource-imageio-v1",
+        "inputContract": "encoded-resource-imageio-v1",
         "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
     }
     if policy != expected:
@@ -121,6 +114,24 @@ def verify_resources(root: Path) -> dict:
             raise ValueError(f"Missing or wrong SHA256: {name}")
         hashes[name] = expected
     verify_execution_resources(root)
+    profile = json.loads((root / "profile.json").read_bytes())
+    fingerprint, limits = profile.get("fingerprint", {}), profile.get("resources", {})
+    if (fingerprint.get("inputContract") != "encoded-resource-imageio-v1"
+            or fingerprint.get("version") != "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
+            or limits.get("maxEncodedBytes") != 536870912
+            or limits.get("freeSpaceReserveBytes") != 134217728
+            or limits.get("maxDecodedBytes") != 536870912
+            or limits.get("photoRequestConcurrency") != 1):
+        raise ValueError("Product input contract/resource budget mismatch")
+    profile = json.loads((root / "profile.json").read_bytes())
+    fingerprint, limits = profile.get("fingerprint", {}), profile.get("resources", {})
+    if (fingerprint.get("inputContract") != "encoded-resource-imageio-v1"
+            or fingerprint.get("version") != "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
+            or limits.get("maxEncodedBytes") != 536870912
+            or limits.get("freeSpaceReserveBytes") != 134217728
+            or limits.get("maxDecodedBytes") != 536870912
+            or limits.get("photoRequestConcurrency") != 1):
+        raise ValueError("Product input contract/resource budget mismatch")
     model = root / MODEL
     weight = model / WEIGHT
     if (
@@ -144,7 +155,9 @@ def verify_resources(root: Path) -> dict:
         or provenance.get("conversion", {}).get("computePrecision") != "float16"
         or provenance.get("conversion", {}).get("inputType") != "float32"
         or provenance.get("conversion", {}).get("outputType") != "float32"
-        or provenance.get("fingerprintVersion") != "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d"
+        or provenance.get("fingerprintVersion") != "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
+        or provenance.get("inputContract") != "encoded-resource-imageio-v1"
+        or provenance.get("inputContract") != "encoded-resource-imageio-v1"
         or provenance.get("executionPolicySHA256") != sha256(root / "execution-policy.json")
         or provenance.get("selfTestManifestSHA256") != sha256(root / "ModelSelfTest/manifest.json")
         or provenance.get("modelWeightsRedistributionLicenseStatus")
@@ -156,6 +169,10 @@ def verify_resources(root: Path) -> dict:
     hashes["model-provenance.json"] = sha256(provenance_path)
     return {
         "status": "passed",
+        "input_contract": "encoded-resource-imageio-v1",
+        "fingerprint_version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
+        "input_contract": "encoded-resource-imageio-v1",
+        "fingerprint_version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
         "model_sha256": MODEL_SHA,
         "weight_sha256": WEIGHT_SHA,
         "weight_bytes": WEIGHT_SIZE,

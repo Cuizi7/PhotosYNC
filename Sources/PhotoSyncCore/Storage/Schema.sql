@@ -98,3 +98,6 @@ CREATE TABLE photos_content_change (
  PRIMARY KEY(context_id, context_epoch, run_id, asset_id)
 );
 CREATE INDEX photos_content_change_asset ON photos_content_change(context_id, context_epoch, asset_id, content_changed);
+
+-- v8 revokes persisted readiness when opening the previous input contract.
+PRAGMA user_version = 8;

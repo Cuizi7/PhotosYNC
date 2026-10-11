@@ -34,6 +34,7 @@ public struct ModelExecutionPolicy: Decodable, Sendable {
     public let allowLowPrecisionAccumulationOnGPU: Bool
     public let retryIntervalSeconds: Double
     public let modelSHA256: String
+    public let inputContract: String
     public let fingerprintVersion: String
     public let selfTestManifestSHA256: String
 
@@ -57,7 +58,8 @@ public struct ModelExecutionPolicy: Decodable, Sendable {
               self.maxFallbacks == 1, self.inputType == "float32", self.outputType == "float32",
               !self.allowLowPrecisionAccumulationOnGPU, self.retryIntervalSeconds == 60,
               self.modelSHA256 == "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
-              self.fingerprintVersion == "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d",
+              self.inputContract == FingerprintConfiguration.encodedResourceInputContract,
+              self.fingerprintVersion == "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
               self.selfTestManifestSHA256 == "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9" else {
             throw AdvancedDedupError.invalidConfiguration
         }

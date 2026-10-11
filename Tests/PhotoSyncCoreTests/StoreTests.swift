@@ -741,14 +741,14 @@ final class StoreTests: XCTestCase {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(database.path, &handle), SQLITE_OK)
         defer { sqlite3_close(handle) }
-        XCTAssertEqual(sqlite3_exec(handle, "PRAGMA user_version = 8", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(handle, "PRAGMA user_version = 9", nil, nil, nil), SQLITE_OK)
 
         XCTAssertThrowsError(try SyncStore(url: database))
         var statement: OpaquePointer?
         XCTAssertEqual(sqlite3_prepare_v2(handle, "PRAGMA user_version", -1, &statement, nil), SQLITE_OK)
         defer { sqlite3_finalize(statement) }
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
-        XCTAssertEqual(sqlite3_column_int(statement, 0), 8)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 9)
     }
 
     private func makeRoot() throws -> URL {

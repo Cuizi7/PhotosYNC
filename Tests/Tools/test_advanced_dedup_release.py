@@ -18,6 +18,28 @@ spec.loader.exec_module(release)
 
 
 class AdvancedDedupReleaseTests(unittest.TestCase):
+    def test_product_profile_pins_encoded_contract_and_disk_budgets(self):
+        profile = json.loads((ROOT / release.RESOURCE_PATH / "profile.json").read_bytes())
+        self.assertEqual(profile["fingerprint"].get("inputContract"), "encoded-resource-imageio-v1")
+        self.assertEqual(profile["resources"].get("maxEncodedBytes"), 536870912)
+        self.assertEqual(profile["resources"].get("freeSpaceReserveBytes"), 134217728)
+        self.assertNotEqual(profile["fingerprint"]["version"], "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d")
+
+    def test_profile_semantics_reject_relabeled_budget_even_when_record_hash_is_rebound(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "resources"
+            shutil.copytree(ROOT / release.RESOURCE_PATH, root)
+            path = root / "profile.json"
+            original = json.loads(path.read_bytes())
+            for key in ["maxEncodedBytes", "freeSpaceReserveBytes"]:
+                profile = json.loads(json.dumps(original)); profile["resources"][key] = 1
+                path.write_text(json.dumps(profile))
+                hashes = dict(release.RECORD_HASHES); hashes["profile.json"] = release.sha256(path)
+                with patch.object(release, "RECORD_HASHES", hashes):
+                    with self.assertRaisesRegex(ValueError, "input contract/resource budget"):
+                        release.verify_resources(root)
+
     def test_execution_policy_rejects_cpu_io_threshold_and_tensor_corruption(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -30,7 +52,8 @@ class AdvancedDedupReleaseTests(unittest.TestCase):
             for key, value in [("arm64", ["cpuOnly"]), ("x86_64", ["all"]),
                                ("inputType", "float16"), ("outputType", "float16"),
                                ("allowLowPrecisionAccumulationOnGPU", True), ("retryIntervalSeconds", 1),
-                               ("modelSHA256", "0" * 64), ("selfTestManifestSHA256", "0" * 64)]:
+                               ("modelSHA256", "0" * 64), ("selfTestManifestSHA256", "0" * 64),
+                               ("inputContract", "legacy-photos-raster-v1"), ("fingerprintVersion", "ec805406fa61e91384e4bf29ae29a52694b80e3755afd7768da80a6db70c9a1d")]:
                 policy = json.loads(original_policy); policy[key] = value
                 policy_path.write_text(json.dumps(policy))
                 with self.assertRaises(ValueError, msg=key): release.verify_execution_resources(root)

@@ -33,6 +33,9 @@ public enum ResizeMode: String, Codable, Sendable {
 }
 
 public struct FingerprintConfiguration: Codable, Equatable, Sendable {
+    public static let encodedResourceInputContract = "encoded-resource-imageio-v1"
+    public static let legacyInputContract = "legacy-photos-raster-v1"
+    public let inputContract: String
     public let version: String
     public let modelSHA256: String
     public let inputSide: Int
@@ -42,12 +45,15 @@ public struct FingerprintConfiguration: Codable, Equatable, Sendable {
     public let std: [Float]
 
     public init(modelSHA256: String, inputSide: Int, resizeMode: ResizeMode,
-                colorSpace: String, mean: [Float], std: [Float]) throws {
-        guard modelSHA256.count == 64, modelSHA256.allSatisfy({ $0.isHexDigit }),
+                colorSpace: String, mean: [Float], std: [Float],
+                inputContract: String = Self.encodedResourceInputContract) throws {
+        guard [Self.encodedResourceInputContract, Self.legacyInputContract].contains(inputContract),
+              modelSHA256.count == 64, modelSHA256.allSatisfy({ $0.isHexDigit }),
               inputSide > 0, inputSide <= 4096, colorSpace == "sRGB",
               mean.count == 3, std.count == 3,
               mean.allSatisfy(\.isFinite), std.allSatisfy({ $0.isFinite && $0 > 0 })
         else { throw AdvancedDedupError.invalidConfiguration }
+        self.inputContract = inputContract
         self.modelSHA256 = modelSHA256.lowercased()
         self.inputSide = inputSide
         self.resizeMode = resizeMode
@@ -56,20 +62,20 @@ public struct FingerprintConfiguration: Codable, Equatable, Sendable {
         self.std = std
         self.version = Self.computeVersion(modelSHA256: self.modelSHA256, inputSide: inputSide,
                                            resizeMode: resizeMode, colorSpace: colorSpace,
-                                           mean: mean, std: std)
+                                           mean: mean, std: std, inputContract: inputContract)
     }
 
     private static func computeVersion(modelSHA256: String, inputSide: Int, resizeMode: ResizeMode,
-                                       colorSpace: String, mean: [Float], std: [Float]) -> String {
+                                       colorSpace: String, mean: [Float], std: [Float], inputContract: String) -> String {
         // Fixed ordering and Float32 bit patterns avoid locale/JSON-number drift across runs.
-        let fields = ["sscd-preprocess-v1", modelSHA256, String(inputSide), resizeMode.rawValue,
-                      colorSpace] + mean.map { String($0.bitPattern) } + std.map { String($0.bitPattern) }
+        let namespace = inputContract == legacyInputContract ? ["sscd-preprocess-v1"] : ["sscd-preprocess-v2", inputContract]
+        let fields = namespace + [modelSHA256, String(inputSide), resizeMode.rawValue, colorSpace] + mean.map { String($0.bitPattern) } + std.map { String($0.bitPattern) }
         return SHA256.hash(data: Data(fields.joined(separator: "\n").utf8))
             .map { String(format: "%02x", $0) }.joined()
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, modelSHA256, inputSide, resizeMode, colorSpace, mean, std
+        case version, modelSHA256, inputSide, resizeMode, colorSpace, mean, std, inputContract
     }
 
     public init(from decoder: Decoder) throws {
@@ -78,7 +84,8 @@ public struct FingerprintConfiguration: Codable, Equatable, Sendable {
                       inputSide: c.decode(Int.self, forKey: .inputSide),
                       resizeMode: c.decode(ResizeMode.self, forKey: .resizeMode),
                       colorSpace: c.decode(String.self, forKey: .colorSpace),
-                      mean: c.decode([Float].self, forKey: .mean), std: c.decode([Float].self, forKey: .std))
+                      mean: c.decode([Float].self, forKey: .mean), std: c.decode([Float].self, forKey: .std),
+                      inputContract: c.decodeIfPresent(String.self, forKey: .inputContract) ?? Self.legacyInputContract)
         guard version == (try c.decode(String.self, forKey: .version)) else {
             throw AdvancedDedupError.invalidConfiguration
         }
@@ -179,6 +186,8 @@ public struct DuplicateEvaluation: Codable, Equatable, Sendable {
 public struct ResourceLimits: Codable, Equatable, Sendable {
     public let decodeConcurrency: Int
     public let photoRequestConcurrency: Int
+    public let maxEncodedBytes: Int64
+    public let freeSpaceReserveBytes: Int64
     public let maxDecodedBytes: Int64
     public let requestTimeoutSeconds: Double
     public let retryDelaysSeconds: [Double]
@@ -191,8 +200,10 @@ public struct ResourceLimits: Codable, Equatable, Sendable {
     public init(decodeConcurrency: Int, photoRequestConcurrency: Int, maxDecodedBytes: Int64,
                 requestTimeoutSeconds: Double, retryDelaysSeconds: [Double], catalogBatchSize: Int,
                 maxInFlightTasks: Int, progressPublishIntervalSeconds: Double,
-                inferenceConcurrency: Int, batchSize: Int) throws {
+                inferenceConcurrency: Int, batchSize: Int,
+                maxEncodedBytes: Int64 = 536870912, freeSpaceReserveBytes: Int64 = 134217728) throws {
         guard decodeConcurrency > 0, photoRequestConcurrency > 0, maxDecodedBytes > 0,
+              maxEncodedBytes > 0, freeSpaceReserveBytes >= 0,
               requestTimeoutSeconds.isFinite, requestTimeoutSeconds > 0,
               !retryDelaysSeconds.isEmpty, retryDelaysSeconds.allSatisfy({ $0.isFinite && $0 > 0 }),
               catalogBatchSize > 0, maxInFlightTasks > 0,
@@ -200,6 +211,7 @@ public struct ResourceLimits: Codable, Equatable, Sendable {
               inferenceConcurrency == 1, batchSize == 1
         else { throw AdvancedDedupError.invalidConfiguration }
         self.decodeConcurrency = decodeConcurrency; self.photoRequestConcurrency = photoRequestConcurrency
+        self.maxEncodedBytes = maxEncodedBytes; self.freeSpaceReserveBytes = freeSpaceReserveBytes
         self.maxDecodedBytes = maxDecodedBytes; self.requestTimeoutSeconds = requestTimeoutSeconds
         self.retryDelaysSeconds = retryDelaysSeconds; self.catalogBatchSize = catalogBatchSize
         self.maxInFlightTasks = maxInFlightTasks
@@ -207,10 +219,10 @@ public struct ResourceLimits: Codable, Equatable, Sendable {
         self.inferenceConcurrency = inferenceConcurrency; self.batchSize = batchSize
     }
 
-    private enum CodingKeys: String, CodingKey {
+    fileprivate enum CodingKeys: String, CodingKey {
         case decodeConcurrency, photoRequestConcurrency, maxDecodedBytes, requestTimeoutSeconds
         case retryDelaysSeconds, catalogBatchSize, maxInFlightTasks, progressPublishIntervalSeconds
-        case inferenceConcurrency, batchSize
+        case inferenceConcurrency, batchSize, maxEncodedBytes, freeSpaceReserveBytes
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -223,7 +235,9 @@ public struct ResourceLimits: Codable, Equatable, Sendable {
                       maxInFlightTasks: c.decode(Int.self, forKey: .maxInFlightTasks),
                       progressPublishIntervalSeconds: c.decode(Double.self, forKey: .progressPublishIntervalSeconds),
                       inferenceConcurrency: c.decode(Int.self, forKey: .inferenceConcurrency),
-                      batchSize: c.decode(Int.self, forKey: .batchSize))
+                      batchSize: c.decode(Int.self, forKey: .batchSize),
+                      maxEncodedBytes: c.decodeIfPresent(Int64.self, forKey: .maxEncodedBytes) ?? 536870912,
+                      freeSpaceReserveBytes: c.decodeIfPresent(Int64.self, forKey: .freeSpaceReserveBytes) ?? 134217728)
     }
 }
 
@@ -273,7 +287,15 @@ public struct DedupConfiguration: Codable, Equatable, Sendable {
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(fingerprint: c.decode(FingerprintConfiguration.self, forKey: .fingerprint),
+        let fingerprint = try c.decode(FingerprintConfiguration.self, forKey: .fingerprint)
+        if fingerprint.inputContract == FingerprintConfiguration.encodedResourceInputContract {
+            let limits = try c.nestedContainer(keyedBy: ResourceLimits.CodingKeys.self, forKey: .resources)
+            guard limits.contains(.maxEncodedBytes), limits.contains(.freeSpaceReserveBytes),
+                  try !limits.decodeNil(forKey: .maxEncodedBytes), try !limits.decodeNil(forKey: .freeSpaceReserveBytes) else {
+                throw AdvancedDedupError.invalidConfiguration
+            }
+        }
+        try self.init(fingerprint: fingerprint,
                       policyVersion: c.decode(String.self, forKey: .policyVersion),
                       threshold: c.decode(Double.self, forKey: .threshold),
                       backend: c.decode(String.self, forKey: .backend),
@@ -478,12 +500,14 @@ extension DedupConfiguration {
               decision.executionPolicySHA256 == executionID,
               decision.selfTestManifestSHA256 == execution.selfTestManifestSHA256,
               d.resources.decodeConcurrency == 1, d.resources.photoRequestConcurrency == 1,
+              d.resources.maxEncodedBytes == 536870912, d.resources.freeSpaceReserveBytes == 134217728,
               d.resources.maxDecodedBytes == 536870912, d.resources.requestTimeoutSeconds == 30,
               d.resources.retryDelaysSeconds == [5, 15, 30, 60], d.resources.catalogBatchSize == 128,
               d.resources.maxInFlightTasks == 2, d.resources.progressPublishIntervalSeconds == 1,
               d.resources.inferenceConcurrency == 1, d.resources.batchSize == 1,
               d.evidenceCandidateLimit == 200000,
               d.fingerprint.modelSHA256 == execution.modelSHA256, d.fingerprint.version == execution.fingerprintVersion,
+              d.fingerprint.inputContract == FingerprintConfiguration.encodedResourceInputContract,
               d.fingerprint.inputSide == 320, d.fingerprint.resizeMode == .stretchFullFrame,
               d.fingerprint.colorSpace == "sRGB", d.fingerprint.mean == [0.485, 0.456, 0.406],
               d.fingerprint.std == [0.229, 0.224, 0.225], d.backend == "sqlite-exact-f32-v1",
@@ -537,6 +561,24 @@ private struct IntegrationDecision: Decodable {
         let policyVersion: String, backend: String, computeUnits: String, weightPrecision: String
         let resources: ResourceLimits
         let evidenceCandidateLimit: Int
+        private enum CodingKeys: String, CodingKey {
+            case fingerprint, policyVersion, backend, computeUnits, weightPrecision, resources, evidenceCandidateLimit
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            fingerprint = try c.decode(FingerprintConfiguration.self, forKey: .fingerprint)
+            let limits = try c.nestedContainer(keyedBy: ResourceLimits.CodingKeys.self, forKey: .resources)
+            guard limits.contains(.maxEncodedBytes), limits.contains(.freeSpaceReserveBytes),
+                  try !limits.decodeNil(forKey: .maxEncodedBytes), try !limits.decodeNil(forKey: .freeSpaceReserveBytes) else {
+                throw AdvancedDedupError.invalidConfiguration
+            }
+            resources = try c.decode(ResourceLimits.self, forKey: .resources)
+            policyVersion = try c.decode(String.self, forKey: .policyVersion)
+            backend = try c.decode(String.self, forKey: .backend)
+            computeUnits = try c.decode(String.self, forKey: .computeUnits)
+            weightPrecision = try c.decode(String.self, forKey: .weightPrecision)
+            evidenceCandidateLimit = try c.decode(Int.self, forKey: .evidenceCandidateLimit)
+        }
     }
     struct Suite: Decodable { let sha256: String, expectedResultsSHA256: String; let caseCount: Int }
 }
