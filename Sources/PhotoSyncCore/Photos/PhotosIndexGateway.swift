@@ -193,7 +193,8 @@ public struct LoadedRepresentation: @unchecked Sendable {
     /// The producer must reserve sufficient bytes before creating/retaining the
     /// image. Ownership of that lease transfers with the result; the consumer
     /// calls `await lease.finishPhysicalWork()` only after its last real image/
-    /// inference use. Logical cancellation or timeout never proves that use ended.
+    /// inference use. For encoded Photos resources the same lease also retains
+    /// private backing bytes through any lazy ImageIO consumption. Logical cancellation or timeout never proves that use ended.
     public init(image: CGImage, orientation: CGImagePropertyOrientation, descriptor: RepresentationDescriptor,
                 lease: ImageLease, eligibility: RepresentationEligibility) {
         self.image = image; self.orientation = orientation; self.descriptor = descriptor

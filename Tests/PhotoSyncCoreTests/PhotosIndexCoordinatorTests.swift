@@ -6,6 +6,23 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testDecoderConservativeReadGapLetsHealthySiblingPublishWithoutVector() async throws {
+        for reason in [RepresentationConservativeReason.decodedResourceLimit, .multiFrameOrCompound] {
+            let log = CoordinatorDiagnostics(), f = try fixture(diagnostics: { log.record($0) })
+            let failed = descriptor(f.photos.context, asset: "unsupported"), healthy = descriptor(f.photos.context, asset: "good")
+            await f.photos.set([failed, healthy])
+            await f.photos.setReadFailures([failed.key.assetID: .unsupportedRepresentation(reason)])
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            let progress = await f.coordinator.progress()
+            XCTAssertEqual(progress.state, .ready); XCTAssertEqual(progress.readyRepresentations, 1)
+            XCTAssertEqual(progress.readErrorRepresentations, 1)
+            try await assertNotNil(try await f.coordinator.readyToken())
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='unsupported' AND state='failed' AND vector IS NULL", at: f.db), 1)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='unsupported' AND failure_kind='photos_read' AND last_error LIKE '%\(reason.rawValue)%'", at: f.db), 1)
+            XCTAssertTrue(log.rows.contains { $0["stage"] == "photos-read" && $0["result"] == "read-error" && $0["error"]?.contains(reason.rawValue) == true })
+        }
+    }
+
     func testTerminalCocoaReadFailureAllowsHealthySiblingPublication() async throws {
         let log = CoordinatorDiagnostics()
         let f = try fixture(diagnostics: { log.record($0) })
@@ -61,7 +78,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
     }
 
     func testSameReadErrorTypesFromModelRemainBlocking() async throws {
-        for error in [PhotosRepresentationError.invalidImage,
+        for error in [PhotosRepresentationError.invalidImage, .unsupportedRepresentation(.decodedResourceLimit),
                       .imageReadFailed(domain: NSCocoaErrorDomain, code: -1, detail: "same model error")] {
             let f = try fixture(), log = CoordinatorDiagnostics()
             let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: f.model,
@@ -1081,8 +1098,12 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         readCount += 1; readKinds.append(descriptor.key.kind)
         if descriptor.key == callbackFailureKey, let callbackFailure {
+            let c = try p8Configuration()
+            let configuration = try DedupConfiguration(fingerprint: c.fingerprint, policyVersion: c.policyVersion,
+                threshold: c.threshold, backend: c.backend, resources: limits,
+                evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
             let reader = PhotosRepresentationReader(requester: CoordinatorFailedRequester(error: callbackFailure),
-                budget: budget, limits: limits, targetSide: 32)
+                budget: budget, configuration: configuration)
             return try await reader.read(descriptor, isCurrent: { true })
         }
         if let error = readFailures[descriptor.key.assetID] { throw error }
@@ -1107,9 +1128,10 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
 
 private struct CoordinatorFailedRequester: PhotosRepresentationRequesting {
     let error: NSError
-    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
-                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+    func request(_ descriptor: RepresentationDescriptor,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws -> @Sendable () -> Void {
         completion(.failure(error))
+        return {}
     }
 }
 

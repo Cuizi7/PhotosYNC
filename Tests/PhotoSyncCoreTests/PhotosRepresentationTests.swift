@@ -3,12 +3,51 @@ import AppKit
 import Photos
 import CoreGraphics
 import ImageIO
+import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testEncodedStreamUsesIdenticalSourceTensorAndUnappliedOrientation() async throws {
+        let configuration = try p8Configuration()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for type in ["public.jpeg", "public.png"] {
+            let url = root.appendingPathComponent(type == "public.jpeg" ? "fixture.jpg" : "fixture.png")
+            let context = try XCTUnwrap(CGContext(data: nil, width: 41, height: 23, bitsPerComponent: 8, bytesPerRow: 164,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            context.setFillColor(NSColor.red.cgColor); context.fill(CGRect(x: 0, y: 0, width: 21, height: 23))
+            context.setFillColor(NSColor.blue.cgColor); context.fill(CGRect(x: 21, y: 0, width: 20, height: 23))
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, type as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()),
+                [kCGImagePropertyOrientation: 6] as CFDictionary)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            let sourceBudget = ImageWorkBudget(limits: configuration.resources)
+            let source = try await MetadataReader().readForFingerprint(url: url, configuration: configuration, budget: sourceBudget)
+            if type == "public.jpeg" { XCTAssertEqual(source.value.orientation, .right) }
+            let requester = ControlledRepresentationRequester()
+            let budget = ImageWorkBudget(limits: configuration.resources)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: configuration)
+            let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+            await requester.started()
+            let data = try Data(contentsOf: url)
+            requester.send(.chunk(data.prefix(data.count / 2)))
+            requester.send(.chunk(data.suffix(data.count - data.count / 2)))
+            requester.send(.complete(eligibility: .safeSingleFrame))
+            let photos = try await task.value
+            XCTAssertEqual(photos.orientation, source.value.orientation)
+            XCTAssertEqual(photos.returnedSize, try PixelSize(width: 41, height: 23))
+            XCTAssertEqual(photos.eligibility, source.value.eligibility)
+            let a = try ImagePreprocessor.prepare(image: source.value.image, orientation: source.value.orientation, configuration: configuration.fingerprint)
+            let b = try ImagePreprocessor.prepare(image: photos.image, orientation: photos.orientation, configuration: configuration.fingerprint)
+            XCTAssertEqual(Data(bytes: a.dataPointer, count: a.count * 4), Data(bytes: b.dataPointer, count: b.count * 4))
+            await source.lease.finishPhysicalWork(); await photos.lease.finishPhysicalWork()
+        }
+    }
+
     func testTerminalCocoaCallbackPreservesErrorAndReleasesPhysicalLease() async throws {
         let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
         let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
         await requester.started()
         requester.send(.failure(NSError(domain: NSCocoaErrorDomain, code: -1,
@@ -34,7 +73,7 @@ final class PhotosRepresentationTests: XCTestCase {
             NSError(domain: NSURLErrorDomain, code: NSURLErrorBadServerResponse)]
         for native in errors {
             let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-            let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
             let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
             await requester.started(); requester.send(.failure(native))
             do { _ = try await task.value; XCTFail("callback failed") }
@@ -74,7 +113,7 @@ final class PhotosRepresentationTests: XCTestCase {
                         userInfo: [NSUnderlyingErrorKey: outer, NSLocalizedDescriptionKey: "synthetic outer callback detail"])
                 }
                 let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-                let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+                let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
                 let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
                 await requester.started(); requester.send(.failure(outer))
                 do { _ = try await task.value; XCTFail("nested terminal failure") }
@@ -117,19 +156,19 @@ final class PhotosRepresentationTests: XCTestCase {
     func testPreRequestInvalidImageErrorHasNoCallbackAuthorization() async throws {
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
         let reader = PhotosRepresentationReader(requester: ValidationFailingRepresentationRequester(), budget: budget,
-            limits: try limits(), targetSide: 32)
+            configuration: try configuration())
         do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("pre-request validation") }
         catch { XCTAssertFalse((error as? PhotosRepresentationError)?.isIsolatableReadFailure == true) }
         let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
     }
 
-    func testDegradedThenFinalPublishesOnce() async throws {
+    func testChunksThenTerminalPublishesOnce() async throws {
         let requester = ControlledRepresentationRequester()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
         let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
         await requester.started()
-        requester.send(.degraded)
+        requester.send(.chunk(Data()))
         let occupied = await reader.physicalRequestCount
         XCTAssertEqual(occupied, 1)
         requester.send(.image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame))
@@ -146,7 +185,7 @@ final class PhotosRepresentationTests: XCTestCase {
     func testCancelThenLateFinalDoesNotPublishOrFreeEarly() async throws {
         let requester = ControlledRepresentationRequester()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
         let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
         await requester.started()
         task.cancel()
@@ -170,7 +209,7 @@ final class PhotosRepresentationTests: XCTestCase {
         let requester = ControlledRepresentationRequester()
         let current = LockedRepresentationFlag()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
         let task = Task { try await reader.read(descriptor(), isCurrent: { current.value }) }
         await requester.started()
         current.invalidate()
@@ -215,47 +254,6 @@ final class PhotosRepresentationTests: XCTestCase {
             }
             let animated = PhotoKitRepresentationAsset(identifier: "asset", modificationDate: Date(), playbackStyle: .imageAnimated, resources: [resource])
             XCTAssertEqual(try animated.eligibility(.original), .conservative(.multiFrameOrCompound))
-        }
-    }
-
-    func testNativeDrawingNormalizesAllEXIFOrientations() throws {
-        let context = try XCTUnwrap(CGContext(data: nil, width: 24, height: 16, bitsPerComponent: 8, bytesPerRow: 96,
-            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-        for (rect, color) in [(CGRect(x: 0, y: 0, width: 12, height: 8), NSColor.red),
-                              (CGRect(x: 12, y: 0, width: 12, height: 8), NSColor.green),
-                              (CGRect(x: 0, y: 8, width: 12, height: 8), NSColor.blue),
-                              (CGRect(x: 12, y: 8, width: 12, height: 8), NSColor.yellow)] {
-            context.setFillColor(color.cgColor); context.fill(rect)
-        }
-        let raw = try XCTUnwrap(context.makeImage())
-        for orientation in 1...8 {
-            let bytes = NSMutableData()
-            let destination = try XCTUnwrap(CGImageDestinationCreateWithData(bytes, "public.jpeg" as CFString, 1, nil))
-            CGImageDestinationAddImage(destination, raw, [kCGImagePropertyOrientation: orientation, kCGImageDestinationLossyCompressionQuality: 1] as CFDictionary)
-            XCTAssertTrue(CGImageDestinationFinalize(destination))
-            let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes, nil))
-            let expected = try XCTUnwrap(CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: 32] as CFDictionary))
-            let expectedDrawn = try PhotosBitmapNormalizer.normalize(NSImage(cgImage: expected, size: NSSize(width: expected.width, height: expected.height)), targetSide: 32)
-            let actual = try PhotosBitmapNormalizer.normalize(try XCTUnwrap(NSImage(data: bytes as Data)), targetSide: 32)
-            XCTAssertEqual(actual.width, expectedDrawn.width, "orientation \(orientation)")
-            XCTAssertEqual(actual.height, expectedDrawn.height, "orientation \(orientation)")
-            let actualBytes = try XCTUnwrap(actual.dataProvider?.data) as Data
-            let expectedBytes = try XCTUnwrap(expectedDrawn.dataProvider?.data) as Data
-            XCTAssertEqual(actualBytes.count, expectedBytes.count)
-            // Sample quadrant centers, avoiding JPEG edge interpolation differences.
-            if actual.width == expectedDrawn.width && actual.height == expectedDrawn.height {
-                for y in [actual.height / 4, actual.height * 3 / 4] {
-                    for x in [actual.width / 4, actual.width * 3 / 4] {
-                        for c in 0..<3 {
-                            let a = Int(actualBytes[y * actual.bytesPerRow + x * 4 + c])
-                            let b = Int(expectedBytes[y * expectedDrawn.bytesPerRow + x * 4 + c])
-                            XCTAssertLessThan(abs(a - b), 24, "orientation \(orientation), corner \(x),\(y), channel \(c)")
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -359,12 +357,11 @@ final class PhotosRepresentationTests: XCTestCase {
         // acknowledgement; this test covers the gateway's shared generation gate.
     }
 
-    func testErrorNilCancellationAndOversizeFinishWithoutPublishing() async throws {
-        for event in [PhotosRepresentationCallback.failure(PhotosRepresentationError.invalidImage), .cancelled,
-                      .image(try largeBitmap(), orientation: .up, eligibility: .safeSingleFrame)] {
+    func testErrorAndCancellationFinishWithoutPublishing() async throws {
+        for event in [TestRepresentationCallback.failure(PhotosRepresentationError.invalidImage), .cancelled] {
             let requester = ControlledRepresentationRequester()
             let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-            let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
             let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
             await requester.started()
             requester.send(event)
@@ -376,19 +373,14 @@ final class PhotosRepresentationTests: XCTestCase {
         }
     }
 
-    private func largeBitmap() throws -> CGImage {
-        try XCTUnwrap(CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 256,
-            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.makeImage())
-    }
-
-    func testTimeoutAfterDegradedKeepsPhysicalRequestUntilLateTerminal() async throws {
+    func testTimeoutAfterChunksKeepsPhysicalRequestUntilLateTerminal() async throws {
         let requester = ControlledRepresentationRequester()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(timeout: 0.01), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(timeout: 0.01))
         let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
         await requester.started()
-        requester.send(.degraded)
-        do { _ = try await task.value; XCTFail("only degraded is not ready") }
+        requester.send(.chunk(Data()))
+        do { _ = try await task.value; XCTFail("chunks without terminal completion are not ready") }
         catch { XCTAssertEqual(error as? ReadExecutorError, .timedOut) }
         let occupied = await reader.physicalRequestCount
         XCTAssertEqual(occupied, 1)
@@ -407,7 +399,7 @@ final class PhotosRepresentationTests: XCTestCase {
         lifecycle.assets = [PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(), playbackStyle: .image,
             resources: [PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "a", size: nil)])]
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
         let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128)
         let snapshot = try await gateway.candidateSnapshot()
         let page = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: snapshot.generation)
@@ -469,7 +461,7 @@ final class PhotosRepresentationTests: XCTestCase {
         let requester = ControlledRepresentationRequester()
         requester.immediateEvent = .image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame)
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
         let loaded = try await reader.read(descriptor(), isCurrent: { true })
         XCTAssertEqual(loaded.returnedSize, try PixelSize(width: 4, height: 4))
         let physical = await reader.physicalRequestCount
@@ -484,7 +476,7 @@ final class PhotosRepresentationTests: XCTestCase {
                 resources: [.init(type: .photo, uti: "public.jpeg", filename: "a.jpg", size: nil)])
             lifecycle.assets = [facts]
             let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-            let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
             let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128)
             _ = try await gateway.candidateSnapshot()
             let capturedCheckpoint = try await gateway.contextCheckpoint()
@@ -529,7 +521,7 @@ final class PhotosRepresentationTests: XCTestCase {
                 resources: [.init(type: .photo, uti: "public.jpeg", filename: "a.jpg", size: nil)])
             lifecycle.assets = [facts]
             let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-            let reader = PhotosRepresentationReader(requester: requester, budget: budget, limits: try limits(), targetSide: 32)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
             let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128)
             _ = try await gateway.candidateSnapshot()
             let checkpoint = try await gateway.contextCheckpoint()
@@ -629,103 +621,347 @@ final class PhotosRepresentationTests: XCTestCase {
         try await gateway.acknowledgeReconciliation(expectedGeneration: after.generation)
     }
 
-    func testPaddedMultipleBitmapBackingsRejectBeforeDrawing() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 2, height: 32))
-        for width in [1, 2] {
-            let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: 32,
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                colorSpaceName: .deviceRGB, bytesPerRow: 256, bitsPerPixel: 32))
-            let single = RecordingDrawImage(size: image.size)
-            single.addRepresentation(representation)
-            XCTAssertNoThrow(try PhotosBitmapNormalizer.normalize(single, targetSide: 32))
-            XCTAssertEqual(single.drawCount, 1, "each 8 KiB backing fits the 12 KiB input allowance")
-            image.addRepresentation(representation)
+    private func configuration(timeout: Double = 30, allowance: Int64 = 1_000_000) throws -> DedupConfiguration {
+        let c = try p8Configuration()
+        let f = try FingerprintConfiguration(modelSHA256: c.fingerprint.modelSHA256, inputSide: 32,
+            resizeMode: c.fingerprint.resizeMode, colorSpace: c.fingerprint.colorSpace, mean: c.fingerprint.mean, std: c.fingerprint.std)
+        return try DedupConfiguration(fingerprint: f,
+            policyVersion: DedupConfiguration.computePolicyVersion(fingerprintVersion: f.version, threshold: c.threshold, backend: c.backend), threshold: c.threshold,
+            backend: c.backend, resources: ResourceLimits(decodeConcurrency: 1, photoRequestConcurrency: 1, maxDecodedBytes: allowance,
+                requestTimeoutSeconds: timeout, retryDelaysSeconds: [5, 15, 30, 60], catalogBatchSize: 128,
+                maxInFlightTasks: 2, progressPublishIntervalSeconds: 1, inferenceConcurrency: 1, batchSize: 1),
+            evidenceCandidateLimit: c.evidenceCandidateLimit, acceptanceID: c.acceptanceID)
+    }
+
+    func testEncodedCapAndLateChunkRetainPartialUntilTerminal() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(),
+            resourceLimits: PhotosResourceLimits(maxEncodedBytes: 4, freeSpaceReserveBytes: 0), storage: PhotosResourceStorage(root: root))
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started()
+        requester.send(.chunk(Data([1, 2, 3])))
+        requester.send(.chunk(Data([4, 5])))
+        do { _ = try await task.value; XCTFail("encoded cap") }
+        catch { XCTAssertEqual(error as? PhotosRepresentationError, .encodedResourceLimit) }
+        requester.send(.chunk(Data([9])))
+        let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        let file = try XCTUnwrap(entries.first).appendingPathComponent("encoded")
+        XCTAssertEqual(try Data(contentsOf: file), Data([1, 2, 3]))
+        let held = await budget.snapshot(), occupied = await reader.physicalRequestCount
+        XCTAssertEqual(held.images, 1); XCTAssertEqual(occupied, 1)
+        requester.send(.cancelled); requester.send(.cancelled)
+        await waitForDrain(reader, budget: budget)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testSpaceShortageWaitsAndDoesNotGenerateImage() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reader = PhotosRepresentationReader(requester: ValidationFailingRepresentationRequester(),
+            budget: ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000), configuration: try configuration(),
+            resourceLimits: PhotosResourceLimits(maxEncodedBytes: 4, freeSpaceReserveBytes: 128),
+            storage: PhotosResourceStorage(root: root, availableBytes: { 127 }))
+        do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("insufficient space") }
+        catch { guard case .resourceStorageUnavailable = error as? PhotosRepresentationError else { return XCTFail("storage wait: \(error)") } }
+    }
+
+    func testCleanupPreservesReplacedEncodedFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = PhotosResourceStorage(root: root)
+        let resource = try storage.create(limits: PhotosResourceLimits(freeSpaceReserveBytes: 0))
+        try resource.append(Data([1, 2])); try resource.closeStream()
+        let moved = root.appendingPathComponent("original-preserved")
+        try FileManager.default.moveItem(at: resource.url, to: moved)
+        try Data([9]).write(to: resource.url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: resource.url.path)
+        resource.remove()
+        XCTAssertEqual(try Data(contentsOf: resource.url), Data([9]), "cleanup must not remove a substituted file")
+        let next = try storage.create(limits: PhotosResourceLimits(freeSpaceReserveBytes: 0))
+        next.remove()
+        XCTAssertEqual(try Data(contentsOf: resource.url), Data([9]), "startup cleanup must also prove encoded file ownership")
+    }
+
+    func testDecodeAndCancellationKeepPhysicalOwnerThroughActualDecode() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entered = expectation(description: "real decoder entered"), release = DispatchSemaphore(value: 0)
+        let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(),
+            storage: PhotosResourceStorage(root: root), decode: { url, configuration, allowance in
+                entered.fulfill(); release.wait()
+                XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+                return try EncodedImageDecoder.decode(url: url, configuration: configuration, decodedAllowance: allowance)
+            })
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); requester.send(.image(try bitmap(), orientation: .right, eligibility: .safeSingleFrame))
+        await fulfillment(of: [entered], timeout: 2)
+        let occupied = await reader.physicalRequestCount
+        XCTAssertEqual(occupied, 1, "terminal callback alone cannot release decode slot")
+        task.cancel()
+        do { _ = try await task.value; XCTFail("cancelled during decoder") } catch { XCTAssertTrue(error is CancellationError) }
+        let held = await budget.snapshot(); XCTAssertEqual(held.bytes, 1_000_000)
+        let entries = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        let file = try XCTUnwrap(entries.first).appendingPathComponent("encoded")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        release.signal(); await waitForDrain(reader, budget: budget)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testCancellationBeforeRequestReturnsIsSentOnceAndDoesNotInventTerminal() async throws {
+        let requester = ControlledRepresentationRequester(), release = DispatchSemaphore(value: 0)
+        requester.beforeReturn = { release.wait() }
+        let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); task.cancel(); release.signal()
+        do { _ = try await task.value; XCTFail("cancelled before cancellation ID") } catch { XCTAssertTrue(error is CancellationError) }
+        await requester.cancellationRequested()
+        XCTAssertEqual(requester.cancellationCount, 1)
+        let occupied = await reader.physicalRequestCount, held = await budget.snapshot()
+        XCTAssertEqual(occupied, 1); XCTAssertEqual(held.images, 1)
+        requester.send(.chunk(Data([7]))); requester.send(.cancelled); requester.send(.cancelled)
+        await waitForDrain(reader, budget: budget)
+        await requester.cancellationRequested()
+        XCTAssertEqual(requester.cancellationCount, 1)
+    }
+
+    func testSuccessfulLeaseProtectsPrivateLazyBackingAndCleansIdempotently() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requester = ControlledRepresentationRequester(), c = try configuration()
+        let budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, storage: PhotosResourceStorage(root: root))
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); requester.send(.image(try bitmap(), orientation: .right, eligibility: .safeSingleFrame))
+        let loaded = try await task.value
+        let directory = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).first)
+        let file = directory.appendingPathComponent("encoded")
+        XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: root.path)[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: directory.path)[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        // Real common preprocessing may trigger lazy ImageIO file consumption.
+        _ = try ImagePreprocessor.prepare(image: loaded.image, orientation: loaded.orientation, configuration: c.fingerprint)
+        let other = try PhotosResourceStorage(root: root).create(limits: PhotosResourceLimits())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "startup cleanup must skip an active owner")
+        other.remove()
+        await loaded.lease.finishPhysicalWork(); await loaded.lease.finishPhysicalWork()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+    }
+
+    func testPrivateStorageRejectsSymlinkAndPreservesUnknownDirectories() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let link = base.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: base)
+        XCTAssertThrowsError(try PhotosResourceStorage(root: link).create(limits: PhotosResourceLimits()))
+        let root = base.appendingPathComponent("private")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let unknown = root.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: unknown, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let file = unknown.appendingPathComponent("personal-file")
+        try Data([3]).write(to: file)
+        let active = try PhotosResourceStorage(root: root).create(limits: PhotosResourceLimits())
+        active.remove()
+        XCTAssertEqual(try Data(contentsOf: file), Data([3]))
+    }
+
+    func testOnlyInactiveKnownOwnedRemnantIsCleaned() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let old = root.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: old, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let encoded = old.appendingPathComponent("encoded"), owner = old.appendingPathComponent("owner")
+        try Data([1]).write(to: encoded)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: encoded.path)
+        let fd = open(encoded.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        let marker = try PhotosResourceStorage.ownerMarker(encodedFD: fd); close(fd)
+        try marker.write(to: owner)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: owner.path)
+        let next = try PhotosResourceStorage(root: root).create(limits: PhotosResourceLimits())
+        next.remove()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+    }
+
+    func testDiskSpaceLossDuringChunkStaysWaitingUntilTerminalDrain() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let capacity = LockedRepresentationFlag()
+        let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(),
+            resourceLimits: PhotosResourceLimits(maxEncodedBytes: 1000, freeSpaceReserveBytes: 100),
+            storage: PhotosResourceStorage(root: root, availableBytes: { capacity.value ? 1000 : 100 }))
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); requester.send(.chunk(Data([1, 2]))); capacity.invalidate()
+        requester.send(.chunk(Data([3])))
+        do { _ = try await task.value; XCTFail("volume reserve") }
+        catch {
+            XCTAssertFalse((error as? PhotosRepresentationError)?.isIsolatableReadFailure == true)
+            guard case .resourceStorageUnavailable = error as? PhotosRepresentationError else { return XCTFail("storage waiting: \(error)") }
         }
-        XCTAssertEqual(image.representations.count, 2)
-        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
-        XCTAssertEqual(image.drawCount, 0, "reject retained backing before normalized bitmap drawing")
+        await requester.cancellationRequested()
+        XCTAssertEqual(requester.cancellationCount, 1)
+        let held = await budget.snapshot(); XCTAssertEqual(held.images, 1)
+        requester.send(.cancelled); await waitForDrain(reader, budget: budget)
     }
 
-    func testPlanarBackingCountsEveryPlaneBeforeDrawing() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 8, height: 32))
-        let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 32,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: true,
-            colorSpaceName: .deviceRGB, bytesPerRow: 256, bitsPerPixel: 8))
-        XCTAssertEqual(representation.numberOfPlanes, 4)
-        image.addRepresentation(representation)
-        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
-        XCTAssertEqual(image.drawCount, 0)
-    }
-
-    func testUnavailablePublicRasterRejectsBeforeNativeImageDrawing() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 8, height: 8))
-        image.addRepresentation(AccountingRasterRepresentation(raster: nil, width: 8, height: 8))
-        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
-        XCTAssertEqual(image.drawCount, 0)
-    }
-
-    func testOrdinaryCGImageBackedNSImageRemainsSupported() throws {
-        let raw = try bitmap()
-        let image = NSImage(cgImage: raw, size: NSSize(width: raw.width, height: raw.height))
-        let normalized = try PhotosBitmapNormalizer.normalize(image, targetSide: 32)
-        XCTAssertEqual(normalized.width, 32)
-        XCTAssertEqual(normalized.height, 32)
-        XCTAssertLessThanOrEqual(normalized.bytesPerRow * normalized.height, 32 * 32 * 4)
-    }
-
-    func testPublicRasterDimensionsAreIndependentOfRepresentationDisplayScale() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 24, height: 16))
-        let raw = try XCTUnwrap(CGContext(data: nil, width: 24, height: 16, bitsPerComponent: 8, bytesPerRow: 96,
-            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.makeImage())
-        // NSImage(cgImage:size:) can expose 2x display-derived rep dimensions
-        // while its public accessor still returns the original 24x16 raster.
-        image.addRepresentation(AccountingRasterRepresentation(raster: raw, width: 48, height: 32))
-        let normalized = try PhotosBitmapNormalizer.normalize(image, targetSide: 32)
-        XCTAssertEqual(normalized.width, 32)
-        XCTAssertEqual(normalized.height, 21)
-        XCTAssertEqual(image.drawCount, 1)
-    }
-
-    func testOversizedBitmapBackingRejectsBeforeNativeImageDrawing() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 24, height: 16))
-        let representation = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 48, pixelsHigh: 32,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 192, bitsPerPixel: 32))
-        image.addRepresentation(representation)
-        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32)) { error in
-            XCTAssertEqual(error as? PhotosRepresentationError, .oversized(width: 48, height: 32))
+    func testProductEncodedAllowanceAdmitsSelfMadeImageLargerThan64MiB() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("large.png")
+        try autoreleasepool {
+            let side = 5000
+            var bytes = Data(count: side * side * 4)
+            bytes.withUnsafeMutableBytes { buffer in
+                let words = buffer.bindMemory(to: UInt32.self)
+                var state: UInt32 = 123456789
+                for i in 0..<words.count {
+                    state ^= state << 13; state ^= state >> 17; state ^= state << 5
+                    words[i] = state | 0xff000000
+                }
+            }
+            let provider = try XCTUnwrap(CGDataProvider(data: bytes as CFData))
+            let image = try XCTUnwrap(CGImage(width: side, height: side, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: side * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, image, nil); XCTAssertTrue(CGImageDestinationFinalize(destination))
         }
-        XCTAssertEqual(image.drawCount, 0)
+        let encodedBytes = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as! NSNumber).int64Value
+        XCTAssertGreaterThan(encodedBytes, 67108864)
+        XCTAssertLessThan(encodedBytes, PhotosResourceLimits().maxEncodedBytes)
+        let c = try p8Configuration(), requester = ControlledRepresentationRequester()
+        let budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c,
+            storage: PhotosResourceStorage(root: root.appendingPathComponent("scratch")))
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started()
+        let input = try FileHandle(forReadingFrom: url)
+        while let chunk = try input.read(upToCount: 1048576), !chunk.isEmpty { requester.send(.chunk(chunk)) }
+        try input.close(); requester.send(.complete(eligibility: .safeSingleFrame))
+        let result = try await task.value
+        XCTAssertEqual(result.returnedSize, try PixelSize(width: 4096, height: 4096))
+        XCTAssertEqual(result.eligibility, .safeSingleFrame)
+        _ = try ImagePreprocessor.prepare(image: result.image, orientation: result.orientation, configuration: c.fingerprint)
+        await result.lease.finishPhysicalWork()
     }
 
-    func testPublicRasterActualDimensionsOverrideSmallRepresentationHints() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 8, height: 8))
-        image.addRepresentation(AccountingRasterRepresentation(raster: try largeBitmap(), width: 8, height: 8))
-        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32)) { error in
-            XCTAssertEqual(error as? PhotosRepresentationError, .oversized(width: 64, height: 64))
+    func testLogicalCancellationDoesNotWaitForBlockedPhysicalWriter() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writing = expectation(description: "physical space check blocked")
+        let cancelled = expectation(description: "logical cancellation returned")
+        let release = DispatchSemaphore(value: 0), gate = LockedRepresentationFlag()
+        let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(),
+            resourceLimits: PhotosResourceLimits(maxEncodedBytes: 1000, freeSpaceReserveBytes: 0),
+            storage: PhotosResourceStorage(root: root, availableBytes: {
+                if !gate.value { writing.fulfill(); release.wait() }; return 1000
+            }))
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); gate.invalidate()
+        let write = Task.detached { requester.send(.chunk(Data([1]))) }
+        await fulfillment(of: [writing], timeout: 2)
+        let observer = Task {
+            do { _ = try await task.value; XCTFail("logical cancellation") } catch { XCTAssertTrue(error is CancellationError) }
+            cancelled.fulfill()
         }
-        XCTAssertEqual(image.drawCount, 0)
+        DispatchQueue.global().async { task.cancel() }
+        await fulfillment(of: [cancelled], timeout: 1)
+        let held = await budget.snapshot(); XCTAssertEqual(held.images, 1)
+        release.signal(); await write.value; await observer.value
+        requester.send(.cancelled); await waitForDrain(reader, budget: budget)
     }
 
-    func testPublicRasterAndBitmapBackingShareOneAggregateLimit() throws {
-        let image = RecordingDrawImage(size: NSSize(width: 2, height: 32))
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 32,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 256, bitsPerPixel: 32))
-        image.addRepresentation(bitmap)
-        let provider = try XCTUnwrap(CGDataProvider(data: Data(repeating: 0, count: 256 * 32) as CFData))
-        let raster = try XCTUnwrap(CGImage(width: 2, height: 32, bitsPerComponent: 8, bitsPerPixel: 32,
-            bytesPerRow: 256, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
-        image.addRepresentation(AccountingRasterRepresentation(raster: raster, width: 2, height: 32))
-        for representation in image.representations {
-            let single = RecordingDrawImage(size: image.size)
-            single.addRepresentation(representation)
-            XCTAssertNoThrow(try PhotosBitmapNormalizer.normalize(single, targetSide: 32))
-            XCTAssertEqual(single.drawCount, 1, "each 8 KiB backing fits the 12 KiB input allowance")
+    func testConcurrentLeaseFinishCannotReleaseBudgetBeforeOwnedCleanupEnds() async throws {
+        let entered = expectation(description: "owned cleanup entered"), release = DispatchSemaphore(value: 0)
+        let secondStarted = expectation(description: "second release entered")
+        let secondFinished = expectation(description: "second release must remain blocked")
+        secondFinished.isInverted = true
+        let budget = ImageWorkBudget(maxImages: 1, maxBytes: 64)
+        let lease = try await budget.acquire(bytes: 64)
+        lease.retainPhysicalResource { entered.fulfill(); release.wait() }
+        let first = Task.detached { await lease.finishPhysicalWork() }
+        await fulfillment(of: [entered], timeout: 2)
+        let second = Task.detached { secondStarted.fulfill(); await lease.finishPhysicalWork(); secondFinished.fulfill() }
+        await fulfillment(of: [secondStarted], timeout: 2)
+        await fulfillment(of: [secondFinished], timeout: 0.1)
+        let held = await budget.snapshot(); XCTAssertEqual(held.images, 1)
+        release.signal(); await first.value; await second.value
+        let final = await budget.snapshot(); XCTAssertEqual(final.images, 0)
+    }
+
+    func testCorruptEncodedResourceIsIsolatedOnlyAfterTerminalAndDrains() async throws {
+        let requester = ControlledRepresentationRequester(), budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration())
+        let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); requester.send(.chunk(Data([1, 2, 3])))
+        let occupied = await reader.physicalRequestCount; XCTAssertEqual(occupied, 1)
+        requester.send(.complete(eligibility: .safeSingleFrame))
+        do { _ = try await task.value; XCTFail("corrupt encoded image") }
+        catch { XCTAssertEqual(error as? PhotosRepresentationError, .invalidImage) }
+        await waitForDrain(reader, budget: budget)
+    }
+
+    func testExactResourceSelectionNeverBorrowsMissingOrAmbiguousEditedBytes() throws {
+        let original = PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "same.jpg", size: try PixelSize(width: 41, height: 23))
+        let edit = PhotoKitRepresentationResource(type: .fullSizePhoto, uti: "public.png", filename: "same.jpg", size: try PixelSize(width: 17, height: 13))
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let unedited = PhotoKitRepresentationAsset(identifier: "asset", modificationDate: Date(), playbackStyle: .image, resources: [original])
+        XCTAssertEqual(unedited.selected(.current), original)
+        XCTAssertTrue(unedited.descriptor(kind: .current, context: context).equivalentToOriginal)
+        let edited = PhotoKitRepresentationAsset(identifier: "asset", modificationDate: Date(), playbackStyle: .image, resources: [original, edit])
+        XCTAssertEqual(edited.selected(.original), original); XCTAssertEqual(edited.selected(.current), edit)
+        XCTAssertFalse(edited.descriptor(kind: .current, context: context).equivalentToOriginal)
+        let ambiguous = PhotoKitRepresentationAsset(identifier: "asset", modificationDate: Date(), playbackStyle: .image, resources: [original, edit, edit])
+        XCTAssertNil(ambiguous.selected(.current)); XCTAssertEqual(try ambiguous.eligibility(.current), .conservative(.ambiguousResource))
+        let ambiguousOriginal = PhotoKitRepresentationAsset(identifier: "asset", modificationDate: Date(), playbackStyle: .image, resources: [original, original])
+        XCTAssertNil(ambiguousOriginal.selected(.original))
+    }
+
+    func testDecoderDiscoveredConservativeResourceNeverPublishesAndDrains() async throws {
+        for (type, count, allowance, reason) in [("public.png", 1, Int64(256), RepresentationConservativeReason.decodedResourceLimit),
+                                                 ("com.compuserve.gif", 2, Int64(1_000_000), .multiFrameOrCompound)] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fixture = root.appendingPathComponent("fixture")
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(fixture as CFURL, type as CFString, count, nil))
+            for _ in 0..<count { CGImageDestinationAddImage(destination, try bitmap(), nil) }
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            let c = try configuration(allowance: allowance)
+            let source = try EncodedImageDecoder.decode(url: fixture, configuration: c, decodedAllowance: allowance)
+            XCTAssertEqual(source.eligibility, .conservative(reason), "Source's eligibility is preserved")
+            let scratch = root.appendingPathComponent("scratch"), requester = ControlledRepresentationRequester()
+            let budget = ImageWorkBudget(limits: c.resources)
+            let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c,
+                storage: PhotosResourceStorage(root: scratch))
+            let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+            await requester.started(); requester.send(.chunk(try Data(contentsOf: fixture)))
+            requester.send(.complete(eligibility: .safeSingleFrame))
+            do {
+                let result = try await task.value
+                await result.lease.finishPhysicalWork()
+                XCTFail("decoder conservative result cannot become a fingerprint image")
+            } catch { XCTAssertEqual(error as? PhotosRepresentationError, .unsupportedRepresentation(reason)) }
+            await waitForDrain(reader, budget: budget)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.path), [])
         }
-        XCTAssertThrowsError(try PhotosBitmapNormalizer.normalize(image, targetSide: 32))
-        XCTAssertEqual(image.drawCount, 0)
+    }
+
+    private func waitForDrain(_ reader: PhotosRepresentationReader, budget: ImageWorkBudget) async {
+        for _ in 0..<10000 {
+            if await budget.snapshot().images == 0, await reader.physicalRequestCount == 0 { return }
+            await Task.yield()
+        }
+        XCTFail("physical work did not drain")
     }
 
     private func limits(timeout: Double = 30) throws -> ResourceLimits {
@@ -774,16 +1010,41 @@ private final class LockedRepresentationFlag: @unchecked Sendable {
     func invalidate() { lock.lock(); valid = false; lock.unlock() }
 }
 
+private enum TestRepresentationCallback {
+    // Convenience for existing fixtures: encode real PNG bytes for the stream.
+    case image(CGImage, orientation: CGImagePropertyOrientation, eligibility: RepresentationEligibility)
+    case chunk(Data)
+    case complete(eligibility: RepresentationEligibility)
+    case failure(Error)
+    case cancelled
+}
+
 private final class ControlledRepresentationRequester: PhotosRepresentationRequesting, @unchecked Sendable {
     private let lock = NSLock()
     private var callback: (@Sendable (PhotosRepresentationCallback) -> Void)?
     private var waiters: [CheckedContinuation<Void, Never>] = []
-    var immediateEvent: PhotosRepresentationCallback?
-    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
-                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+    var immediateEvent: TestRepresentationCallback?
+    var beforeReturn: (@Sendable () -> Void)?
+    private var cancellations = 0
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+    var cancellationCount: Int { lock.lock(); defer { lock.unlock() }; return cancellations }
+    func request(_ descriptor: RepresentationDescriptor,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws -> @Sendable () -> Void {
         lock.lock(); callback = completion; let pending = waiters; waiters = []; lock.unlock()
         for waiter in pending { waiter.resume() }
-        if let immediateEvent { completion(immediateEvent) }
+        if let immediateEvent { send(immediateEvent) }
+        beforeReturn?()
+        return { [self] in
+            lock.lock(); cancellations += 1; let pending = cancellationWaiters; cancellationWaiters = []; lock.unlock()
+            for waiter in pending { waiter.resume() }
+        }
+    }
+    func cancellationRequested() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if cancellations > 0 { lock.unlock(); continuation.resume() }
+            else { cancellationWaiters.append(continuation); lock.unlock() }
+        }
     }
     func started() async {
         await withCheckedContinuation { continuation in
@@ -792,9 +1053,20 @@ private final class ControlledRepresentationRequester: PhotosRepresentationReque
             else { waiters.append(continuation); lock.unlock() }
         }
     }
-    func send(_ event: PhotosRepresentationCallback) {
+    func send(_ event: TestRepresentationCallback) {
         lock.lock(); let callback = callback; lock.unlock()
-        callback?(event)
+        switch event {
+        case .chunk(let data): callback?(.chunk(data))
+        case .complete(let eligibility): callback?(.complete(eligibility: eligibility))
+        case .failure(let error): callback?(.failure(error))
+        case .cancelled: callback?(.cancelled)
+        case .image(let image, let orientation, let eligibility):
+            let data = NSMutableData()
+            let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
+            CGImageDestinationAddImage(destination, image, [kCGImagePropertyOrientation: orientation.rawValue] as CFDictionary)
+            guard CGImageDestinationFinalize(destination) else { callback?(.failure(PhotosRepresentationError.invalidImage)); return }
+            callback?(.chunk(data as Data)); callback?(.complete(eligibility: eligibility))
+        }
     }
 }
 
@@ -832,38 +1104,9 @@ private final class RepresentationLifecycle: PhotoKitLifecycle, @unchecked Senda
     }
 }
 
-private final class RecordingDrawCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
-    func increment() { lock.lock(); count += 1; lock.unlock() }
-}
-
-private final class RecordingDrawImage: NSImage {
-    private let counter = RecordingDrawCounter()
-    var drawCount: Int { counter.value }
-    override func draw(in rect: NSRect, from fromRect: NSRect, operation op: NSCompositingOperation,
-                       fraction delta: CGFloat, respectFlipped: Bool, hints: [NSImageRep.HintKey: Any]?) {
-        counter.increment()
-    }
-}
-
-private final class AccountingRasterRepresentation: NSImageRep {
-    private let raster: CGImage?
-    init(raster: CGImage?, width: Int, height: Int) {
-        self.raster = raster
-        super.init()
-        pixelsWide = width; pixelsHigh = height
-        size = NSSize(width: width, height: height)
-    }
-    required init?(coder: NSCoder) { nil }
-    override func cgImage(forProposedRect proposedDestRect: UnsafeMutablePointer<NSRect>?,
-                          context: NSGraphicsContext?, hints: [NSImageRep.HintKey: Any]?) -> CGImage? { raster }
-}
-
 private struct ValidationFailingRepresentationRequester: PhotosRepresentationRequesting {
-    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
-                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+    func request(_ descriptor: RepresentationDescriptor,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws -> @Sendable () -> Void {
         throw PhotosRepresentationError.invalidImage
     }
 }

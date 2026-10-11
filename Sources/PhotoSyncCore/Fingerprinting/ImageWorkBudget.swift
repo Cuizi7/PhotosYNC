@@ -51,12 +51,36 @@ public final class ImageLease: @unchecked Sendable {
     public let reservedBytes: Int64
     private let budget: ImageWorkBudget
     private let id: UUID
+    private let ownershipLock = NSLock()
+    private var cleanup: (@Sendable () -> Void)?
+    private var finished = false
 
     fileprivate init(budget: ImageWorkBudget, id: UUID, reservedBytes: Int64) {
         self.budget = budget; self.id = id; self.reservedBytes = reservedBytes
     }
-    public func finishPhysicalWork() async { await budget.release(id) }
+    /// Attach encoded backing while a lazy decoded image can still consume it.
+    func retainPhysicalResource(cleanup: @escaping @Sendable () -> Void) {
+        ownershipLock.lock()
+        precondition(!finished && self.cleanup == nil)
+        self.cleanup = cleanup
+        ownershipLock.unlock()
+    }
+    private func finishOwnership() {
+        ownershipLock.lock()
+        guard !finished else { ownershipLock.unlock(); return }
+        let cleanup = self.cleanup; self.cleanup = nil
+        // A concurrent idempotent finish must also wait for backing cleanup,
+        // otherwise it could return the shared budget while cleanup still runs.
+        cleanup?()
+        finished = true
+        ownershipLock.unlock()
+    }
+    public func finishPhysicalWork() async {
+        finishOwnership()
+        await budget.release(id)
+    }
     deinit {
+        finishOwnership()
         let budget = budget, id = id
         Task { await budget.release(id) }
     }

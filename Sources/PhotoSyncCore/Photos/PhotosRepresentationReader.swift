@@ -1,4 +1,3 @@
-import AppKit
 import CryptoKit
 import CoreGraphics
 import Foundation
@@ -12,113 +11,121 @@ public enum PhotosRepresentationError: Error, Equatable, Sendable {
     case invalidPage
     case unsupportedRAW
     case invalidImage
+    case unsupportedRepresentation(RepresentationConservativeReason)
     case oversized(width: Int, height: Int)
-    /// A terminal image callback, never a pre-request/catalog/model failure.
+    case encodedResourceLimit
+    case ambiguousResource
+    case resourceStorageUnavailable(String)
+    /// A terminal resource callback, never a pre-request/catalog/model failure.
     case imageReadFailed(domain: String, code: Int, detail: String)
     case requestFailed(String)
 
     var isIsolatableReadFailure: Bool {
         switch self {
-        case .imageReadFailed, .invalidImage, .oversized: return true
+        case .imageReadFailed, .invalidImage, .oversized, .encodedResourceLimit, .ambiguousResource, .unsupportedRepresentation: return true
         default: return false
         }
     }
 }
 
 enum PhotosRepresentationCallback: @unchecked Sendable {
-    case degraded
-    case image(CGImage, orientation: CGImagePropertyOrientation, eligibility: RepresentationEligibility)
+    case chunk(Data)
+    case complete(eligibility: RepresentationEligibility)
     case failure(Error)
     case cancelled
 }
 
 protocol PhotosRepresentationRequesting: Sendable {
-    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
-                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws
+    /// Throw only before starting physical work. Returned cancellation is a
+    /// request, never evidence of completion; it may arrive after callbacks.
+    func request(_ descriptor: RepresentationDescriptor,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws -> @Sendable () -> Void
 }
 
 public actor PhotosRepresentationReader {
     private let requester: any PhotosRepresentationRequesting
     private let budget: ImageWorkBudget
-    private let limits: ResourceLimits
-    private let targetSide: Int
-    private var occupied = 0
-    public var physicalRequestCount: Int { occupied }
+    private let configuration: DedupConfiguration
+    private let resourceLimits: PhotosResourceLimits
+    private let storage: PhotosResourceStorage
+    private let decode: @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage
+    private var active: [UUID: RepresentationRequestState] = [:]
+    public var physicalRequestCount: Int { active.count }
 
-    init(requester: any PhotosRepresentationRequesting, budget: ImageWorkBudget, limits: ResourceLimits, targetSide: Int) {
-        precondition(targetSide > 0 && targetSide <= 4096)
-        self.requester = requester; self.budget = budget; self.limits = limits; self.targetSide = targetSide
+    init(requester: any PhotosRepresentationRequesting, budget: ImageWorkBudget, configuration: DedupConfiguration,
+         resourceLimits: PhotosResourceLimits = PhotosResourceLimits(), storage: PhotosResourceStorage = PhotosResourceStorage(),
+         decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage = {
+             try EncodedImageDecoder.decode(url: $0, configuration: $1, decodedAllowance: $2)
+         }) {
+        self.requester = requester; self.budget = budget; self.configuration = configuration
+        self.resourceLimits = resourceLimits; self.storage = storage; self.decode = decode
     }
 
     public func read(_ descriptor: RepresentationDescriptor,
                      isCurrent: @escaping @Sendable () -> Bool) async throws -> LoadedRepresentation {
         try Task.checkCancellation()
-        guard occupied < limits.photoRequestConcurrency else { throw ReadExecutorError.resourceExhausted }
-        // Aggregate exposed input rasters plus two normalized RGBA footprints.
-        let lease = try await budget.acquire(bytes: Int64(targetSide) * Int64(targetSide) * 20)
-        guard occupied < limits.photoRequestConcurrency else {
-            await lease.finishPhysicalWork(); throw ReadExecutorError.resourceExhausted
-        }
+        guard active.isEmpty else { throw ReadExecutorError.resourceExhausted }
+        let lease = try await budget.acquire(bytes: configuration.resources.maxDecodedBytes)
+        guard active.isEmpty else { await lease.finishPhysicalWork(); throw ReadExecutorError.resourceExhausted }
         guard !Task.isCancelled, isCurrent() else {
             await lease.finishPhysicalWork()
             if Task.isCancelled { throw CancellationError() }
             throw PhotoKitGatewayError.libraryChanged
         }
-        occupied += 1
-        let state = RepresentationRequestState(descriptor: descriptor, lease: lease, side: targetSide, isCurrent: isCurrent)
+        let resource: OwnedPhotosResource
+        do { resource = try storage.create(limits: resourceLimits) }
+        catch { await lease.finishPhysicalWork(); throw PhotosRepresentationError.resourceStorageUnavailable(String(describing: error)) }
+        let id = UUID()
+        let state = RepresentationRequestState(descriptor: descriptor, lease: lease, resource: resource,
+            configuration: configuration, decode: decode, isCurrent: isCurrent)
+        // Retain state even if cancellation makes PhotoKit discard its callbacks.
+        // Only trustworthy terminal completion removes the physical owner.
+        active[id] = state
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                state.install(continuation, timeout: .seconds(limits.requestTimeoutSeconds))
+                state.install(continuation, timeout: .seconds(configuration.resources.requestTimeoutSeconds))
+                let finish: @Sendable (Result<LoadedRepresentation, Error>) -> Void = { [self, state] result in
+                    Task { await self.completed(id); await state.completePhysical(result) }
+                }
+                guard state.beginRequest() else { state.receive(.cancelled, finish: finish); return }
                 do {
-                    guard state.beginRequest() else {
-                        if let final = state.receive(.cancelled) {
-                            Task { self.completed(); await state.completePhysical(final) }
-                        }
-                        return
-                    }
-                    try requester.request(descriptor, targetSide: targetSide) { [self, state] event in
-                        let classified: PhotosRepresentationCallback
-                        if case .failure(let error) = event {
-                            classified = .failure(SystemPhotosRepresentationRequester.classifyUnavailable(error: error, inCloud: false))
-                        } else { classified = event }
-                        guard let final = state.receive(classified) else { return }
-                        Task {
-                            await self.completed()
-                            await state.completePhysical(final)
-                        }
-                    }
+                    let cancel = try requester.request(descriptor) { [state] event in state.receive(event, finish: finish) }
+                    state.installCancellation(cancel)
                 } catch {
-                    // A thrown validation/request error has no terminal image
-                    // callback evidence, even if it reuses an image error type.
+                    // No framework work started: a thrown validation error is not
+                    // evidence authorizing isolation as a damaged image.
                     let requestError: Error = (error as? PhotosRepresentationError)?.isIsolatableReadFailure == true
                         ? PhotosRepresentationError.requestFailed(String(describing: error)) : error
-                    if let final = state.receive(.failure(requestError)) {
-                        Task {
-                            self.completed()
-                            await state.completePhysical(final)
-                        }
-                    }
+                    state.receive(.failure(requestError), finish: finish)
                 }
             }
         } onCancel: { state.cancel() }
     }
-    private func completed() { occupied -= 1 }
+    private func completed(_ id: UUID) { active.removeValue(forKey: id) }
 }
 
 private final class RepresentationRequestState: @unchecked Sendable {
     private let lock = NSLock()
+    private let writerLock = NSLock()
     private let descriptor: RepresentationDescriptor
     private let lease: ImageLease
-    private let side: Int
+    private let resource: OwnedPhotosResource
+    private let configuration: DedupConfiguration
+    private let decode: @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage
     private let isCurrent: @Sendable () -> Bool
     private var continuation: CheckedContinuation<LoadedRepresentation, Error>?
     private var logicalError: Error?
-    private var physicalEnded = false
+    private var streamError: Error?
+    private var streamEnded = false
     private var delivered = false
+    private var cancelRequest: (@Sendable () -> Void)?
+    private var cancelSent = false
     private var timeoutTask: Task<Void, Never>?
 
-    init(descriptor: RepresentationDescriptor, lease: ImageLease, side: Int, isCurrent: @escaping @Sendable () -> Bool) {
-        self.descriptor = descriptor; self.lease = lease; self.side = side; self.isCurrent = isCurrent
+    init(descriptor: RepresentationDescriptor, lease: ImageLease, resource: OwnedPhotosResource,
+         configuration: DedupConfiguration, decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage, isCurrent: @escaping @Sendable () -> Bool) {
+        self.descriptor = descriptor; self.lease = lease; self.resource = resource
+        self.configuration = configuration; self.decode = decode; self.isCurrent = isCurrent
     }
     func install(_ continuation: CheckedContinuation<LoadedRepresentation, Error>, timeout: Duration) {
         lock.lock()
@@ -129,8 +136,15 @@ private final class RepresentationRequestState: @unchecked Sendable {
         }
         lock.unlock()
     }
-    func beginRequest() -> Bool {
-        lock.lock(); defer { lock.unlock() }; return logicalError == nil
+    func beginRequest() -> Bool { lock.lock(); defer { lock.unlock() }; return logicalError == nil }
+    func installCancellation(_ cancellation: @escaping @Sendable () -> Void) {
+        lock.lock(); cancelRequest = cancellation
+        let cancel = takeCancellation(); lock.unlock()
+        if let cancel { DispatchQueue.global(qos: .utility).async(execute: cancel) }
+    }
+    private func takeCancellation() -> (@Sendable () -> Void)? {
+        guard logicalError != nil, !streamEnded, !cancelSent, let cancelRequest else { return nil }
+        cancelSent = true; return cancelRequest
     }
     func cancel(_ error: Error = CancellationError()) {
         lock.lock()
@@ -138,28 +152,63 @@ private final class RepresentationRequestState: @unchecked Sendable {
         logicalError = error
         let continuation = self.continuation; self.continuation = nil
         let timer = timeoutTask; timeoutTask = nil
-        lock.unlock()
-        timer?.cancel()
-        continuation?.resume(throwing: error)
-        // Do not cancelImageRequest: PhotoKit may suppress all callbacks. A late
-        // terminal callback is the evidence which releases the physical slot.
+        let cancel = takeCancellation(); lock.unlock()
+        timer?.cancel(); continuation?.resume(throwing: error)
+        // A framework cancel can reenter its terminal handler; keep this logical
+        // handler independent of the writer and callback drain.
+        if let cancel { DispatchQueue.global(qos: .utility).async(execute: cancel) }
     }
-    func receive(_ event: PhotosRepresentationCallback) -> Result<LoadedRepresentation, Error>? {
-        lock.lock(); defer { lock.unlock() }
-        guard !physicalEnded else { return nil }
-        if case .degraded = event { return nil }
-        physicalEnded = true
-        switch event {
-        case .image(let image, let orientation, let eligibility):
-            guard image.width <= side, image.height <= side,
-                  image.bytesPerRow <= Int(lease.reservedBytes) / max(image.height, 1) else {
-                return .failure(PhotosRepresentationError.oversized(width: image.width, height: image.height))
+    func receive(_ event: PhotosRepresentationCallback, finish: @escaping @Sendable (Result<LoadedRepresentation, Error>) -> Void) {
+        // Publication/cancellation never waits for local disk I/O. This lock
+        // serializes writes with terminal closure while the separate state lock
+        // only protects short continuation and request-state transitions.
+        writerLock.lock(); lock.lock()
+        guard !streamEnded else { lock.unlock(); writerLock.unlock(); return }
+        if case .chunk(let data) = event {
+            guard logicalError == nil, streamError == nil else { lock.unlock(); writerLock.unlock(); return }
+            lock.unlock()
+            do { try resource.append(data); writerLock.unlock() }
+            catch {
+                lock.lock(); streamError = error; lock.unlock()
+                writerLock.unlock(); cancel(error)
             }
-            return .success(LoadedRepresentation(image: image, orientation: orientation, descriptor: descriptor,
-                                                 lease: lease, eligibility: eligibility))
-        case .failure(let error): return .failure(error)
-        case .cancelled: return .failure(CancellationError())
-        case .degraded: return nil
+            return
+        }
+        streamEnded = true
+        var error = streamError
+        switch event {
+        case .failure(let failure):
+            if error == nil { error = SystemPhotosRepresentationRequester.classifyUnavailable(error: failure, inCloud: false) }
+        case .cancelled: if error == nil { error = CancellationError() }
+        case .complete: break
+        case .chunk: break
+        }
+        lock.unlock()
+        do { try resource.closeStream() } catch let closeError { if error == nil { error = closeError } }
+        lock.lock(); let finalError = error ?? logicalError; lock.unlock()
+        writerLock.unlock()
+        // Physical ownership includes close, real decode and every lazy pixel
+        // consumer. Decoding never runs on the actor or framework callback queue.
+        DispatchQueue.global(qos: .utility).async { [self] in
+            if let finalError { resource.remove(); finish(.failure(finalError)); return }
+            let result: Result<LoadedRepresentation, Error> = Result {
+                let decoded: SourceImage
+                do { decoded = try decode(resource.url, configuration, lease.reservedBytes) }
+                catch { throw PhotosRepresentationError.invalidImage }
+                guard case .complete(let eligibility) = event else { throw PhotosRepresentationError.invalidImage }
+                if case .conservative(let reason) = decoded.eligibility {
+                    // Header/decode evidence can be narrower than catalog facts.
+                    // Retain the exact reason as an item gap, never a vector or
+                    // a global library-change claim; Source policy is unchanged.
+                    throw PhotosRepresentationError.unsupportedRepresentation(reason)
+                }
+                let combined = eligibility == .safeSingleFrame ? decoded.eligibility : eligibility
+                lease.retainPhysicalResource { [resource] in resource.remove() }
+                return LoadedRepresentation(image: decoded.image, orientation: decoded.orientation,
+                    descriptor: descriptor, lease: lease, eligibility: combined)
+            }
+            if case .failure = result { resource.remove() }
+            finish(result)
         }
     }
     func completePhysical(_ result: Result<LoadedRepresentation, Error>) async {
@@ -184,104 +233,13 @@ private final class RepresentationRequestState: @unchecked Sendable {
         switch result {
         case .success(let value):
             guard let continuation else { return .failure(CancellationError(), nil) }
-            delivered = true
-            return .success(value, continuation)
+            delivered = true; return .success(value, continuation)
         case .failure(let error): return .failure(error, continuation)
         }
     }
 }
 
-/// Draw the NSImage's displayed content rather than extracting an un-oriented
-/// backing representation. The destination has known sRGB/8-bit RGBA pixels.
-enum PhotosBitmapNormalizer {
-    static func normalize(_ image: NSImage, targetSide: Int) throws -> CGImage {
-        try autoreleasepool { try normalizeCallbackImage(image, targetSide: targetSide) }
-    }
-
-    private static func normalizeCallbackImage(_ image: NSImage, targetSide: Int) throws -> CGImage {
-        guard image.size.width.isFinite, image.size.height.isFinite,
-              image.size.width > 0, image.size.height > 0, !image.representations.isEmpty else {
-            throw PhotosRepresentationError.invalidImage
-        }
-        let (targetPixels, pixelOverflow) = Int64(targetSide).multipliedReportingOverflow(by: Int64(targetSide))
-        // The existing 20 B/target-pixel lease includes both the 4 B/px
-        // CGContext and 4 B/px result: do not assume makeImage shares storage.
-        let (incomingLimit, limitOverflow) = targetPixels.multipliedReportingOverflow(by: 12)
-        guard targetSide > 0, !pixelOverflow, !limitOverflow else { throw PhotosRepresentationError.invalidImage }
-        var incomingBytes: Int64 = 0
-        // Public access can materialize an AppKit raster. Keep those accounted
-        // temporaries local; only the normalized result crosses the async boundary.
-        var materializations: [CGImage] = []
-        for representation in image.representations {
-            let width = representation.pixelsWide, height = representation.pixelsHigh
-            guard width > 0, height > 0 else {
-                throw PhotosRepresentationError.oversized(width: width, height: height)
-            }
-            let backingBytes: Int64
-            if let bitmap = representation as? NSBitmapImageRep {
-                guard width <= targetSide, height <= targetSide else {
-                    throw PhotosRepresentationError.oversized(width: width, height: height)
-                }
-                // Count every existing bitmap plane/stride rather than replacing
-                // its padded storage with an estimate from a smaller conversion.
-                guard bitmap.bytesPerRow > 0, bitmap.bytesPerPlane > 0, bitmap.numberOfPlanes > 0 else {
-                    throw PhotosRepresentationError.invalidImage
-                }
-                let (rowSpan, rowOverflow) = Int64(bitmap.bytesPerRow).multipliedReportingOverflow(by: Int64(height))
-                guard !rowOverflow else { throw PhotosRepresentationError.invalidImage }
-                let planeSpan = max(rowSpan, Int64(bitmap.bytesPerPlane))
-                let (storage, planeOverflow) = planeSpan.multipliedReportingOverflow(by: Int64(bitmap.numberOfPlanes))
-                guard !planeOverflow else { throw PhotosRepresentationError.invalidImage }
-                backingBytes = storage
-            } else {
-                // Non-bitmap rep dimensions can reflect display scaling rather
-                // than backing pixels (including NSImage(cgImage:size:)). Use
-                // the public raster's actual dimensions for the same bound.
-                // Accounting only: extraction does not establish orientation.
-                // Hints are not a framework-allocation guarantee; validate the
-                // exposed raster, and still use native drawing for final pixels.
-                var proposed = NSRect(x: 0, y: 0, width: targetSide, height: targetSide)
-                guard let raster = representation.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
-                      raster.width > 0, raster.height > 0, raster.bytesPerRow > 0 else {
-                    throw PhotosRepresentationError.invalidImage
-                }
-                guard raster.width <= targetSide, raster.height <= targetSide else {
-                    throw PhotosRepresentationError.oversized(width: raster.width, height: raster.height)
-                }
-                let (storage, overflow) = Int64(raster.bytesPerRow).multipliedReportingOverflow(by: Int64(raster.height))
-                guard !overflow else { throw PhotosRepresentationError.invalidImage }
-                backingBytes = storage
-                materializations.append(raster)
-            }
-            let (totalBytes, totalOverflow) = incomingBytes.addingReportingOverflow(backingBytes)
-            guard !totalOverflow, totalBytes <= incomingLimit else {
-                throw PhotosRepresentationError.oversized(width: width, height: height)
-            }
-            incomingBytes = totalBytes
-        }
-        let scale = min(CGFloat(targetSide) / image.size.width, CGFloat(targetSide) / image.size.height)
-        let width = max(1, Int((image.size.width * scale).rounded()))
-        let height = max(1, Int((image.size.height * scale).rounded()))
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
-                                      bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            throw PhotosRepresentationError.invalidImage
-        }
-        NSGraphicsContext.saveGraphicsState()
-        defer {
-            NSGraphicsContext.restoreGraphicsState()
-            withExtendedLifetime(materializations) {}
-        }
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
-        image.draw(in: CGRect(x: 0, y: 0, width: width, height: height), from: .zero,
-                   operation: .copy, fraction: 1, respectFlipped: false,
-                   hints: [.interpolation: NSImageInterpolation.high])
-        guard let result = context.makeImage() else { throw PhotosRepresentationError.invalidImage }
-        return result
-    }
-}
-
-struct PhotoKitRepresentationResource: Sendable {
+struct PhotoKitRepresentationResource: Equatable, Sendable {
     let type: PHAssetResourceType
     let uti: String
     let filename: String
@@ -360,8 +318,8 @@ struct PhotoKitRepresentationAsset: Sendable {
 }
 
 final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting, @unchecked Sendable {
-    private let manager: PHImageManager
-    init(manager: PHImageManager = PHImageManager()) { self.manager = manager }
+    private let manager: PHAssetResourceManager
+    init(manager: PHAssetResourceManager = PHAssetResourceManager.default()) { self.manager = manager }
     static func classifyUnavailable(error: Error, inCloud: Bool) -> Error {
         if error is CancellationError { return error }
         if let classified = error as? PhotosRepresentationError { return inCloud ? PhotosRepresentationError.iCloudUnavailable(String(describing: error)) : classified }
@@ -420,8 +378,8 @@ final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting,
             detail: String(describing: native))
     }
 
-    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
-                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+    func request(_ descriptor: RepresentationDescriptor,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws -> @Sendable () -> Void {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [descriptor.key.assetID], options: nil).firstObject,
               asset.mediaType == .image else { throw PhotosRepresentationError.unavailable }
         let facts = PhotoKitRepresentationAsset(asset: asset)
@@ -429,41 +387,26 @@ final class SystemPhotosRepresentationRequester: PhotosRepresentationRequesting,
             throw PhotoKitGatewayError.libraryChanged
         }
         let eligibility = try facts.eligibility(descriptor.key.kind)
-        let options = PHImageRequestOptions()
-        options.version = descriptor.key.kind == .original ? .original : .current
-        options.deliveryMode = .highQualityFormat
-        options.resizeMode = .exact
-        options.isNetworkAccessAllowed = true
-        options.isSynchronous = false
-        let finalGate = RepresentationFinalCallbackGate()
-        manager.requestImage(for: asset, targetSize: CGSize(width: targetSide, height: targetSide), contentMode: .aspectFit,
-                             options: options) { image, info in
-            let error = info?[PHImageErrorKey] as? Error
-            let cancelled = (info?[PHImageCancelledKey] as? Bool) == true
-            if error == nil, !cancelled, (info?[PHImageResultIsDegradedKey] as? Bool) == true { completion(.degraded); return }
-            guard finalGate.take() else { return }
-            if let error {
-                completion(.failure(Self.classifyUnavailable(error: error,
-                    inCloud: (info?[PHImageResultIsInCloudKey] as? Bool) == true)))
-                return
-            }
-            if cancelled { completion(.cancelled); return }
-            guard let image else {
-                completion(.failure(Self.classifyUnavailable(error: PhotosRepresentationError.invalidImage,
-                    inCloud: (info?[PHImageResultIsInCloudKey] as? Bool) == true)))
-                return
-            }
-            do { completion(.image(try PhotosBitmapNormalizer.normalize(image, targetSide: targetSide), orientation: .up, eligibility: eligibility)) }
-            catch { completion(.failure(error)) }
+        guard let selected = facts.selected(descriptor.key.kind) else { throw PhotosRepresentationError.ambiguousResource }
+        let resources = PHAssetResource.assetResources(for: asset)
+        let exact = resources.filter {
+            $0.type == selected.type && $0.uniformTypeIdentifier == selected.uti && $0.originalFilename == selected.filename &&
+            ($0.pixelWidth > 0 && $0.pixelHeight > 0 ? try? PixelSize(width: $0.pixelWidth, height: $0.pixelHeight) : nil) == selected.size
         }
-    }
-}
-
-private final class RepresentationFinalCallbackGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var ended = false
-    func take() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard !ended else { return false }; ended = true; return true
+        guard exact.count == 1 else { throw PhotosRepresentationError.ambiguousResource }
+        let options = PHAssetResourceRequestOptions(); options.isNetworkAccessAllowed = true
+        let requestID = manager.requestData(for: exact[0], options: options, dataReceivedHandler: { completion(.chunk($0)) }) { error in
+            if let error { completion(.failure(Self.classifyUnavailable(error: error, inCloud: false))); return }
+            guard let current = PHAsset.fetchAssets(withLocalIdentifiers: [descriptor.key.assetID], options: nil).firstObject else {
+                completion(.failure(PhotoKitGatewayError.libraryChanged)); return
+            }
+            let after = PhotoKitRepresentationAsset(asset: current)
+            guard after.descriptor(kind: descriptor.key.kind, context: descriptor.context) == descriptor,
+                  (try? after.eligibility(descriptor.key.kind)) == eligibility else {
+                completion(.failure(PhotoKitGatewayError.libraryChanged)); return
+            }
+            completion(.complete(eligibility: eligibility))
+        }
+        return { [manager] in manager.cancelDataRequest(requestID) }
     }
 }

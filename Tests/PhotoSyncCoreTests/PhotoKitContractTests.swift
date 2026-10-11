@@ -705,8 +705,8 @@ final class PhotoKitContractTests: XCTestCase {
         }
         let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }
         let reader = readProbe.map { PhotosRepresentationReader(requester: $0,
-            budget: ImageWorkBudget(maxImages: 2, maxBytes: 100_000_000),
-            limits: configuration.resources, targetSide: configuration.fingerprint.inputSide) }
+            budget: ImageWorkBudget(limits: configuration.resources),
+            configuration: configuration) }
         let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, diagnostics: diagnostics)
         return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
             PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, diagnostics: diagnostics))
@@ -1326,10 +1326,11 @@ private final class ContractReadProbe: PhotosRepresentationRequesting, @unchecke
     private let lock = NSLock()
     private var requests = 0
     var count: Int { lock.lock(); defer { lock.unlock() }; return requests }
-    func request(_ descriptor: RepresentationDescriptor, targetSide: Int,
-                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws {
+    func request(_ descriptor: RepresentationDescriptor,
+                 completion: @escaping @Sendable (PhotosRepresentationCallback) -> Void) throws -> @Sendable () -> Void {
         lock.lock(); requests += 1; lock.unlock()
         XCTFail("retained ready images must not be read again")
         completion(.failure(PhotosRepresentationError.unavailable))
+        return {}
     }
 }
