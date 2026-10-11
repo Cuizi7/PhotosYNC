@@ -74,7 +74,6 @@ def verify_execution_resources(root: Path) -> None:
         "modelSHA256": MODEL_SHA,
         "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
         "inputContract": "encoded-resource-imageio-v1",
-        "inputContract": "encoded-resource-imageio-v1",
         "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
     }
     if policy != expected:
@@ -123,15 +122,6 @@ def verify_resources(root: Path) -> dict:
             or limits.get("maxDecodedBytes") != 536870912
             or limits.get("photoRequestConcurrency") != 1):
         raise ValueError("Product input contract/resource budget mismatch")
-    profile = json.loads((root / "profile.json").read_bytes())
-    fingerprint, limits = profile.get("fingerprint", {}), profile.get("resources", {})
-    if (fingerprint.get("inputContract") != "encoded-resource-imageio-v1"
-            or fingerprint.get("version") != "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
-            or limits.get("maxEncodedBytes") != 536870912
-            or limits.get("freeSpaceReserveBytes") != 134217728
-            or limits.get("maxDecodedBytes") != 536870912
-            or limits.get("photoRequestConcurrency") != 1):
-        raise ValueError("Product input contract/resource budget mismatch")
     model = root / MODEL
     weight = model / WEIGHT
     if (
@@ -157,7 +147,6 @@ def verify_resources(root: Path) -> dict:
         or provenance.get("conversion", {}).get("outputType") != "float32"
         or provenance.get("fingerprintVersion") != "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
         or provenance.get("inputContract") != "encoded-resource-imageio-v1"
-        or provenance.get("inputContract") != "encoded-resource-imageio-v1"
         or provenance.get("executionPolicySHA256") != sha256(root / "execution-policy.json")
         or provenance.get("selfTestManifestSHA256") != sha256(root / "ModelSelfTest/manifest.json")
         or provenance.get("modelWeightsRedistributionLicenseStatus")
@@ -169,8 +158,6 @@ def verify_resources(root: Path) -> dict:
     hashes["model-provenance.json"] = sha256(provenance_path)
     return {
         "status": "passed",
-        "input_contract": "encoded-resource-imageio-v1",
-        "fingerprint_version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
         "input_contract": "encoded-resource-imageio-v1",
         "fingerprint_version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
         "model_sha256": MODEL_SHA,
