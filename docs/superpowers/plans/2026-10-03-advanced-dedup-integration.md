@@ -469,3 +469,17 @@ P12/P13 按串行所有者实施，最终 tester 独占重负载。本节的授�
 - [ ] **恢复真实只读验证。** 先补原始 PhotoKit 变更详情／回退分支诊断，使用真实只读计划的同一安全边界。证明有充分证据的非内容通知不会清向量或反复中断初建；无法分类的通知仍等候，不能屏蔽 observer 制造成功。达到完整 ready 后才续跑 MobileBackup 全量扫描和既定盲审。既有测试快照不伪装成新实现结果；换实现后复用照片指纹需依据相同 fingerprintVersion、输入语义和当前内容证据，缺口如实保留。
 
 实施与自动验收已完成，冻结 `3871947`，详细结果见[连续性修复验收](../../release/2026-10-07-photos-index-continuity-validation.md)。最后一项真实复测保持未完成：新宿主已完成离线准备，尚未实际恢复 Photos/iCloud 和 MobileBackup 扫描。
+
+## 2026-10-11 后续取图路径修订
+
+用户要求规划原始尺寸取图、两边共用缩图，并实测冻结的 19 组副本。本轮先执行[原始编码资源只读验证计划](2026-10-11-original-resource-19-validation.md)，依据为[共同解码设计](../specs/2026-10-11-original-resource-common-decoder-design.md)与主 spec §5。保持 SSCD、FP16 ANE/GPU、0.98 和原标签；不重新执行 P1–P14，不将私人探针的通过当作产品已修复。
+
+先行只读验证已完成，独立 artifact/计时复核 PASS：**19/19** 正例达到 0.98、18 组张量逐字节相同，active33 内容 **33/33**；[实验结果](../../research/advanced-dedup/2026-10-11-original-resource-19-results.md)。用户随后授权产品实施，执行见[原始资源集成计划](2026-10-11-original-resource-integration.md)，最终行为冻结 `cd32bd6`，当前产品验收见[实施结果](../../release/2026-10-11-original-resource-integration-validation.md)。
+
+**产品实施范围及验收状态：**
+
+- [x] 将 `MetadataReader.readForFingerprint` 的编码图像解析/有界解码提取为 `EncodedImageDecoder`，Source 与 Photos URL 均调用同一实现；保留 Source 元数据/stamp/只读责任。最长边 4096、512 MiB allowance、方向/sRGB/全画面 320×320 和物理并发规则不变。
+- [x] `PhotosRepresentationReader` 改为选定 `.photo` / `.fullSizePhoto` 的流式编码资源读取，加入私有临时文件所有权、配额/空间检查、取消前后 ID 竞争、实际 callback drain、错误隔离及崩溃遗留清理。未完成读取不产生向量，不自动发布低分辨率预览；当前编辑版不能冒充原始版。正式编码上限 512 MiB，同卷保留 128 MiB，独立于解码 allowance；有 >64 MiB 自制媒体行为证据。
+- [x] 配置/资源证据、fingerprintVersion 和 release 校验绑定 `encoded-resource-imageio-v1`；Photos 旧 320 表示重建，拒绝混用。Source 仅对精确已知等价 FP16 版本的 current/attempt/success 行事务重绑定，schema v8 兼容门禁保留成功/unknown 和其他版本保护；不清空数据库或重扫停用来源。
+- [x] 受控 RED/GREEN、独立任务/跨块 review 及最终产品 canonical 已完成：589 XCTest（2 跳过、0 失败）、96 Tools、active33、8 个请求后端 golden 检查、四档规模和两项 continuation 回归均通过。新产品只读宿主实际执行固定 19 正例与 31 负例；原片取得、共享输入、分数、动作和真实 drain 的分母/证据独立记录，不借用旧探针结果。
+- [ ] 当前编辑版/撤销及确定网络必需资源的获取/断开恢复仍缺本次可靠真实素材和证据；受控合成覆盖不能冒充它们。固定配对不等于全库检索或置信上限验收，不能由成功读取推断实际 iCloud 字节来源。写入 canary、合并和发布仍保持既定授权及防御边界，本次产品路径交付未执行这些操作。
