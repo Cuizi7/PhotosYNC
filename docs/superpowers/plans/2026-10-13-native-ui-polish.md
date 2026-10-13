@@ -23,6 +23,8 @@
 
 ## Review Focus
 
+人工验收反馈第 1 轮：修正等宽主按钮与有分隔线的纯文字次操作；分析计数和 info 在条上、删除重复小标题；详情扫描改为对齐的名称/值行。重做受影响明暗截图与原型对照，异常系统材质图不得标为视觉通过。保留此前目录统一 caption 字号修订与全部冻结范围；最后代码再次运行完整 canonical 验证。首次送验未通过，用户确认仍为必需关卡。
+
 1. pending/importing/retryPending、退役历史和本轮计数混合时分母仍只用活动来源互斥状态；Task 1 固定 `150/200` 及新增记录后的回退测试。
 2. nil/0/过期汇总、满条但来源失效/提交未知时不得假装完成或显示最新统计；Task 1 加状态/尺寸用例，Task 4 对照实际渲染标题和警告。
 3. Unicode/根路径/超长末级名称和设置按钮挤占宽度时仍只有两行，完整路径可取；Task 2 测单行边界，Task 4 用真实 tooltip 截图验收。
@@ -228,12 +230,12 @@ git diff f467ed49f5c34637437aa936dbe13f8c91ef2b33 -- \
 
 执行方式：Task1–3依次交给新的implementer，每任务完成后做spec与quality评审；最终review只补新的集成风险。Task4的视觉一致性检查由主线程统筹，必要修正仍交implementer并复核；截图提交后等待用户明确验收。
 
-## 2026-10-13 实施结果与剩余关卡
+## 2026-10-13 首轮候选记录（人工验收未通过）
 
 - 最终行为/测试提交 `e3e3a3f19c9b8e89f5795287bb5f9fcd2c1e2acc`；之后仅更新计划和验收记录。菜单分段进度、详情、两行目录与设置局部滚动均已实现；目录按用户最新指令全行caption/相同字重，仅颜色区别。
 - 独立task评审与完整集成评审通过；一轮修复后定向复核无遗留阻断问题。未改Core、AppModel、runtime、现有统计接口、入口/Info或Core目标成员。
 - `scripts/validate.py` 在全新 `work/validation-native-ui-final-retry1` / `-derived` 完整通过：599项XCTest（2项显式门控跳过，0失败）、96项Tools、四组优化规模和两组续体竞态、模型/资源检查；源码清单前后相同。首轮LFS前置失败保留，精确本地对象恢复后才重跑，没有绕过门槛。
-- 最终真实截图：`work/ui-polish/review-e3e3a3f-final` 70张主体，`probe-e3e3a3f-final-retry1` 四张实际原生组合窗口图，manifest均绑定干净e3e3a3f。`work/ui-polish/comparison`保存六组配对图与差异说明；主体视觉对照无已知规格偏差。
+- 首轮真实截图：`work/ui-polish/review-e3e3a3f-final` 70张主体，`probe-e3e3a3f-final-retry1` 四张实际原生组合窗口图，manifest均绑定干净e3e3a3f。用户已指出按钮、分析区、详情扫描排版及浮层截图偏差，相关视觉通过结论撤回；`work/ui-polish/comparison`已标出正在修正。
 - Task3Step4为**部分完成**：实际点击popover/确认框与取消已捕获；物理hover、完整路径tooltip、独立键盘固定、真实Escape/外部关闭/焦点恢复与active材质仍未验证，非key宿主本地popover Escape失败事实保留。
-- Task4维持待人工验收，不能由评审/自动回归代签；原生交互与外观缺口没有标为通过。当前结论为“完整自动验证通过，等待前端人工验收”。
+- Task4首轮人工验收未通过，不能由评审/自动回归代签；修正后重做视觉对照和最后源码的完整验证。原生交互与外观缺口没有标为通过。
 - 完整证据与差异：[验收记录](../../release/2026-10-13-native-ui-acceptance.md)。本轮没有合并、推送、安装、打包/发布或启动生产App。
