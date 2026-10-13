@@ -36,17 +36,48 @@ struct StatusMenu: View {
 
     private var statusContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(model.statusDescription, systemImage: model.status.symbol)
-                .font(.headline).accessibilityLabel(model.statusDescription)
-                .accessibilityIdentifier("photosync-status")
+            HStack {
+                Label(model.statusDescription, systemImage: model.status.symbol)
+                    .font(.headline).accessibilityLabel(model.statusDescription)
+                    .accessibilityIdentifier("photosync-status")
+                Spacer()
+                if model.analysis != nil || !model.state.sources.contains(where: \.enabled) {
+                    SyncDetailsButton(snapshot: model.state.snapshot)
+                }
+                if model.state.snapshot.activeWork {
+                    ProgressView().controlSize(.small)
+                }
+            }
             if model.isGUIQA {
                 Text(model.qaModeDescription).font(.caption).foregroundStyle(.orange)
             }
-            if model.state.snapshot.activeWork {
-                ProgressView().controlSize(.small)
+            if let detail = model.syncDetail {
+                Group {
+                    if model.status == .error {
+                        Label(detail, systemImage: "exclamationmark.triangle")
+                    } else {
+                        Text(detail)
+                    }
+                }
+                .font(.caption).lineLimit(3)
+                .help(model.syncDetailHelp ?? detail)
+            }
+            if let hint = model.recoveryAdvice {
+                Text(hint).font(.caption).foregroundStyle(.secondary)
             }
             if let analysis = model.analysis {
-                LibraryAnalysisView(analysis: analysis)
+                LibraryAnalysisView(analysis: analysis).tint(.accentColor)
+                if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
+                    Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if model.state.sources.contains(where: \.enabled) {
+                SyncProgressView(summary: model.state.snapshot.summary,
+                    stale: model.state.snapshot.summaryError != nil)
+                    .overlay(alignment: .topTrailing) {
+                        SyncDetailsButton(snapshot: model.state.snapshot)
+                    }
+            } else if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
+                Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
                 // The line is plain language; the raw system text stays in the tooltip so the
@@ -73,32 +104,11 @@ struct StatusMenu: View {
                     .help(source.url.path)
                 }
             }
-            StatusMenuSingleLine(text: model.counters)
-                .accessibilityIdentifier("sync-counters")
-            ForEach(model.counterNotes, id: \.self) { note in
-                Text(note).font(.caption).foregroundStyle(.secondary)
-            }
-            Text(model.scanDescription).font(.caption).foregroundStyle(.secondary)
             if let warning = model.notificationWarning {
                 Label(warning, systemImage: "bell.slash")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if let detail = model.syncDetail {
-                Group {
-                    if model.status == .error {
-                        Label(detail, systemImage: "exclamationmark.triangle")
-                    } else {
-                        Text(detail)
-                    }
-                }
-                .font(.caption).lineLimit(3)
-                // Diagnosis stays one hover away instead of occupying the headline.
-                .help(model.syncDetailHelp ?? detail)
-            }
-            if let hint = model.recoveryAdvice {
-                Text(hint).font(.caption).foregroundStyle(.secondary)
-            }
-            if let next = model.state.nextScan {
+            if let next = model.state.nextScan, !model.state.snapshot.activeWork {
                 Text("下次扫描：\(next.formatted(date: .omitted, time: .shortened))").font(.caption)
             }
         }
@@ -106,22 +116,27 @@ struct StatusMenu: View {
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Button("立即扫描", action: model.scan)
-                .accessibilityIdentifier("scan-now")
-                .disabled(!model.ready || model.state.snapshot.activeWork || model.state.snapshot.isPaused || !model.state.authorized || model.demo)
-            Button(model.state.snapshot.isPaused ? "继续同步" : "暂停同步", action: model.togglePause)
-                .accessibilityIdentifier("toggle-pause")
-                .disabled(!model.canTogglePause)
-            if #available(macOS 14.0, *) {
-                SettingsLink { Text("设置…") }
-                    .simultaneousGesture(TapGesture().onEnded { NSApp.activate(ignoringOtherApps: true) })
-                    .accessibilityIdentifier("open-settings")
-            } else {
-                Button("设置…", action: model.openSettingsWindow)
-                    .accessibilityIdentifier("open-settings")
+            HStack {
+                Button("立即扫描", action: model.scan)
+                    .accessibilityIdentifier("scan-now")
+                    .disabled(!model.ready || model.state.snapshot.activeWork || model.state.snapshot.isPaused || !model.state.authorized || model.demo)
+                Spacer()
+                Button(model.state.snapshot.isPaused ? "继续同步" : "暂停同步", action: model.togglePause)
+                    .accessibilityIdentifier("toggle-pause")
+                    .disabled(!model.canTogglePause)
             }
-            Divider().padding(.vertical, 2)
-            Button("退出 PhotosYNC", action: model.quit).keyboardShortcut("q")
+            HStack {
+                if #available(macOS 14.0, *) {
+                    SettingsLink { Text("设置") }
+                        .simultaneousGesture(TapGesture().onEnded { NSApp.activate(ignoringOtherApps: true) })
+                        .accessibilityIdentifier("open-settings")
+                } else {
+                    Button("设置", action: model.openSettingsWindow)
+                        .accessibilityIdentifier("open-settings")
+                }
+                Spacer()
+                Button("退出 PhotosYNC", action: model.quit).keyboardShortcut("q")
+            }
         }
     }
 }

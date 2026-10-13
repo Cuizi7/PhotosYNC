@@ -141,6 +141,77 @@ final class AppViewTests: XCTestCase {
 }
 
 extension AppViewTests {
+    func testProgressCountsAllUnfinishedStatesButNotHistoryOrRoundEvents() throws {
+        let summary = SyncStatusSummary(imported: 120, skipped: 30, pending: 40,
+            importing: 1, retryPending: 9, retainedImported: 500)
+        let p = try XCTUnwrap(SyncProgressMetrics(summary: summary))
+        XCTAssertEqual(p.known, 200)
+        XCTAssertEqual(p.processed, 150)
+        XCTAssertEqual(p.incomplete, 50)
+        XCTAssertEqual(p.importedFraction, 0.6, accuracy: 0.000001)
+        XCTAssertEqual(p.skippedFraction, 0.15, accuracy: 0.000001)
+        XCTAssertEqual(p.incompleteFraction, 0.25, accuracy: 0.000001)
+    }
+
+    func testProgressNilZeroAndDiscoveryGrowth() throws {
+        XCTAssertNil(SyncProgressMetrics(summary: nil))
+        let zero = try XCTUnwrap(SyncProgressMetrics(summary: SyncStatusSummary()))
+        XCTAssertEqual(zero.known, 0)
+        XCTAssertEqual(zero.importedFraction + zero.skippedFraction + zero.incompleteFraction, 0)
+        let grown = try XCTUnwrap(SyncProgressMetrics(summary:
+            SyncStatusSummary(imported: 120, skipped: 30, pending: 249, importing: 1)))
+        XCTAssertEqual(grown.known, 400)
+        XCTAssertEqual(grown.processed, 150)
+        XCTAssertEqual(grown.importedFraction + grown.skippedFraction, 0.375)
+    }
+
+    func testProgressPreservesBlockingHeadlineAndStaleSummary() async throws {
+        let model = try await makeModel(sourceCount: 1)
+        model.state.snapshot.summary = SyncStatusSummary(imported: 200)
+        XCTAssertEqual(model.statusDescription, "等待恢复")
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
+            XCTAssertEqual(size.width, 320, accuracy: 1)
+            XCTAssertLessThanOrEqual(size.height, 680)
+            try renderMenu(model, name: "progress-full-unavailable-\(appearance.rawValue)", appearance: appearance)
+        }
+        model.state.snapshot.waitingSources = [:]
+        model.state.snapshot.blockingSummary = "Photos 提交结果尚未确认。"
+        model.state.snapshot.blockingError = "synthetic unknown result"
+        model.state.snapshot.recoveryHint = .uncertainSubmission(message: "synthetic unknown result")
+        XCTAssertEqual(model.statusDescription, "需要处理错误")
+        model.state.snapshot.summaryError = "synthetic stale summary"
+        XCTAssertEqual(try XCTUnwrap(SyncProgressMetrics(summary: model.state.snapshot.summary)).processed, 200)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
+            XCTAssertEqual(size.width, 320, accuracy: 1)
+            XCTAssertLessThanOrEqual(size.height, 680)
+            try renderMenu(model, name: "progress-blocked-stale-\(appearance.rawValue)", appearance: appearance)
+        }
+    }
+
+    func testProgressLargeCountsAndAnalysisStatesRemainBounded() async throws {
+        let model = try await makeModel(sourceCount: 1)
+        model.state.snapshot.waitingSources = [:]
+        model.state.snapshot.summary = SyncStatusSummary(imported: 999999, skipped: 999999,
+            pending: 999999, importing: 3, retryPending: 4, retainedImported: 5)
+        let p = try XCTUnwrap(SyncProgressMetrics(summary: model.state.snapshot.summary))
+        XCTAssertEqual(p.known, 3000004)
+        XCTAssertEqual(p.processed, 1999998)
+        let summary = NSHostingView(rootView: StatusMenuSingleLine(text: "已处理 1999998 / 已发现 3000004"))
+        XCTAssertLessThanOrEqual(summary.fittingSize.width, 266)
+        for totalsKnown in [true, false] {
+            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: totalsKnown,
+                totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
+                readyRepresentations: 100000, excludedAssets: 0, issue: nil)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
+                XCTAssertEqual(size.width, 320, accuracy: 1)
+                XCTAssertLessThanOrEqual(size.height, 680)
+            }
+        }
+    }
+
     func testUnavailableSourceKeepsRecoveryHeadlineAndAnalysisInNativeMenu() async throws {
         let model = try await makeModel(sourceCount: 1)
         for state in [IndexState.preparing, .updating, .waiting, .ready] {
@@ -165,13 +236,15 @@ extension AppViewTests {
         model.state.snapshot.summary = SyncStatusSummary(imported: 999999, skipped: 999999,
             pending: 999999, importing: 3, retryPending: 4, retainedImported: 5)
         let cloud = "正在等待 iCloud 图像，连接恢复后自动继续"
-        for text in [model.counters, cloud] {
+        for text in ["已处理 1999998 / 已发现 3000004", cloud] {
             let row = NSHostingView(rootView: StatusMenuSingleLine(text: text))
             let size = row.fittingSize
             XCTAssertLessThanOrEqual(size.width, 292, "Critical row must fit at native caption size: \(text)")
             XCTAssertLessThanOrEqual(size.height, 16, "Critical row must remain a single native line")
         }
         XCTAssertEqual(model.counterNotes.count, 3)
+        let details = NSHostingView(rootView: SyncDetailsContent(snapshot: model.state.snapshot))
+        XCTAssertLessThanOrEqual(details.fittingSize.width, 320)
         for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
             model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
                 totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
