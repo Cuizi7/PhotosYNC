@@ -188,7 +188,7 @@ struct SourceSettings: View {
         if summary == "同步统计暂时读不到，稍后会自动重试。" { details.append(model.state.snapshot.summaryError) }
         if summary == model.state.message { details.append(model.state.messageDetail) }
         if summary == model.state.warning { details.append(model.state.warningDetail) }
-        if summary == model.syncDetail || summary == model.error { details.append(model.syncDetailHelp) }
+        if summary == model.syncDetail { details.append(model.syncDetailHelp) }
         return details.compactMap { $0 }.reduce(into: [String]()) { result, detail in
             if !result.contains(detail) { result.append(detail) }
         }.joined(separator: "\n")

@@ -10,7 +10,7 @@
 | --- | --- |
 | `work/ui-polish/review-d1ea044-final/index.html` / `manifest.json` | **70 张**真实主体 PNG；sourceCommit 为上述 d1ea044，生成时 sourceStatus 为空。17 场景 × 浅/深 × 菜单/设置 = 68，另 many 设置底部 2 张 |
 | `work/ui-polish/probe-d1ea044-native-appearance/index.html` / `probe-manifest.json` | 最新真实瞬态窗口图册；产品源仍 d1ea044；dirty 仅 Task 3 的 `ReviewHost.swift` / `run-ui-review.sh`，清单记录全部编译文件 hash。校准字号修正后的 212pt menu，给本测试 app/window 设置所选原生外观，不改变系统外观 |
-| 同目录 `compositor-syncing-light-47565.png` / `compositor-syncing-dark-47571.png` | 实际点击打开的统计 popover，WindowServer 原图包含其父测试宿主组合；两种原生外观均已核对 |
+| 同目录 `compositor-syncing-light-47565.png` / `compositor-syncing-dark-47571.png` | 实际点击打开的统计 popover，WindowServer 原图包含其父测试宿主组合；两种原生外观均已核对。浅色原图仍有明显灰色/材质断层，不能据此验收 active 材质 |
 | 同目录 `compositor-many-light-47575.png` / `compositor-many-dark-47582.png` | 实际打开的移除确认框；只取消，未确认移除。两种原生外观均已核对 |
 | `work/ui-polish/task2-caption-build.log` / `task2-caption-tests.log` | 用户字号修正后的 build-for-testing 与 15 项 AppViewTests 结果；由 Task 2 所有者运行，本轮已读取正常结束/数量/失败数 |
 
@@ -43,6 +43,8 @@
 
 实际 popover 的 cacheDisplay PNG 包含透明/系统材质限制，图册在对应浅/深背景展示原 PNG。确认框 view bitmap 近乎空白，被明确拒绝；已有 Screen Recording 许可下的 `screencapture -x -o -l <verified-own-ID>` 捕获了真实确认框及其父测试宿主组合。没有请求或更改录屏/Accessibility 权限，没有个人桌面截图，也没有拼装静态详情冒充浮层。
 
+最新浅色 compositor popover `compositor-syncing-light-47565.png` 本身也有明显灰色/材质断层；限制不只存在于 cacheDisplay。compositor 的 `captured` 仅确认本进程窗口的捕获取得和组合几何有效，不证明 active 窗口的系统材质外观可接受。宿主未激活，保留原图和该限制，不据此修改产品样式。
+
 菜单/来源的 actionable identifier 与 help text 未被公开本进程 AX 遍历暴露；探针保留该事实，仅在视检 PNG 的固定尺寸中使用本宿主 hitTest/mouse 输入，尺寸变化则拒绝 fallback。实际 alert 的公开 AX 节点包含取消/移除来源。
 
 尚未验证：物理 hover→进入 popover、完整路径系统 tooltip、独立 Space/Return 固定、外部点击关闭、系统键盘焦点环及焦点恢复、实际 active 窗口下的系统材质。`--interactive` 仅提供用户控制的测试会话；不主动激活，不等于自动验收通过。
@@ -68,4 +70,4 @@ bash Tests/UIReview/run-ui-review.sh \
   --interactive --scenario syncing --appearance light
 ```
 
-本轮未做真实 Photos、来源/网络/原片验收、macOS 13/14 实机、通知/登录项/权限、生产配置变更、发布打包、安装/启动生产 App、合并或推送。冻结 Core、AppModel、SyncRuntime、SyncStatusPresentation、PhotoSyncApp、Info.plist 相对冻结基线 diff 为空；Xcode 仅新增 test-target fixture 成员。
+本轮未做真实 Photos、来源/网络/原片验收、macOS 13/14 实机、通知/登录项/权限、生产配置变更、发布打包、安装/启动生产 App、合并或推送。冻结 Core、AppModel、SyncRuntime、SyncStatusPresentation、PhotoSyncApp、Info.plist 相对冻结基线 diff 为空；Task 3 的 Xcode 变更仅新增 test-target fixture 成员，整条分支另含 Task 1/2 新视图的 app/test target 成员，未加入 Core。
