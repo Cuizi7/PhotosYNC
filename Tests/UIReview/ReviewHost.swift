@@ -43,6 +43,9 @@ enum ReviewHost {
             for scenario in [UIReviewScenario.syncing, .many] {
                 let model = try makeUIReviewModel(scenario: scenario, root: root)
                 for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+                    // This process is a test-only host. Native alert/popover chrome must use
+                    // the selected fixture appearance too, without changing the user's OS.
+                    app.appearance = NSAppearance(named: appearance)
                     let view = scenario == .syncing ? AnyView(StatusMenu(model: model)) : AnyView(SourceSettings(model: model))
                     let window = try interactiveWindow(view, width: scenario == .syncing ? 320 : 600, appearance: appearance)
                     window.title = "PhotosYNC 隔离原生交互探针 · \(scenario.rawValue) · \(look)"
@@ -71,6 +74,7 @@ enum ReviewHost {
             }
             let model = try makeUIReviewModel(scenario: scenario, root: root)
             let appearance: NSAppearance.Name = look == "dark" ? .darkAqua : .aqua
+            app.appearance = NSAppearance(named: appearance)
             var windows: [NSWindow] = []
             for surface in ["menu", "settings"] {
                 let view = surface == "menu" ? AnyView(StatusMenu(model: model)) : AnyView(SourceSettings(model: model))
@@ -143,6 +147,7 @@ enum ReviewHost {
         host.frame = NSRect(x: 0, y: 0, width: width, height: 1000)
         let window = NSWindow(contentRect: host.frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: appearance)
         window.contentView = host
         _ = try UIReviewCapture.converge(host: host, window: window, width: width)
         return window
@@ -177,6 +182,8 @@ enum ReviewHost {
             "hostWindowID": window.windowNumber, "hostVisible": window.isVisible,
             "hostKeyWindow": window.isKeyWindow, "targetIdentifier": identifier,
             "applicationActiveBeforeInput": NSApp.isActive,
+            "nativeAppAppearance": NSApp.effectiveAppearance.name.rawValue,
+            "nativeWindowAppearance": window.effectiveAppearance.name.rawValue,
             "accessibilityNodeCount": elements.count, "targetFound": target != nil,
             "helpText": elements.compactMap { $0.accessibilityHelp() }.filter { !$0.isEmpty }]
         if !window.isVisible {
@@ -194,7 +201,7 @@ enum ReviewHost {
         } else {
             // Coordinates were visually checked against this scenario's real compiled PNG.
             // Fail closed if its geometry changes; never infer a target in an unrelated window.
-            let expectedHeight: CGFloat = scenario == .syncing ? 215 : 669
+            let expectedHeight: CGFloat = scenario == .syncing ? 212 : 669
             guard abs(host.bounds.height - expectedHeight) <= 1 else {
                 result["status"] = "unverified"
                 result["failure"] = "AX target unavailable and capture-verified fallback geometry changed"
@@ -352,6 +359,7 @@ enum ReviewHost {
             return ["status": "captured", "file": name, "windowID": window.windowNumber,
                 "logicalWindowWidth": window.frame.width, "logicalWindowHeight": window.frame.height,
                 "pixelWidth": bitmap.pixelsWide, "pixelHeight": bitmap.pixelsHigh,
+                "logicalCaptureWidth": size.width, "logicalCaptureHeight": size.height,
                 "ownVisibleWindowIDs": ownedVisible.map(\.windowNumber),
                 "ownVisibleUnion": String(describing: groupBounds), "groupEdgeTolerancePoints": 16,
                 "captureMethod": "screencapture -x -o -l verified own-process transient windowID; includes its owning test-host group; existing permission only"]

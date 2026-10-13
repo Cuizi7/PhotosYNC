@@ -93,7 +93,9 @@ for probe in m['interactions']:
         for item in [presentation, presentation.get('compositor', {})]:
             if item.get('file') and (out/item['file']).is_file():
                 f=html.escape(item['file'])
-                parts.append('<figure><a href="'+f+'">原始 PNG</a><br><img src="'+f+'"></figure>')
+                width=item.get('logicalCaptureWidth',item.get('logicalWidth'))
+                size=' width="'+str(width)+'"' if width else ''
+                parts.append('<figure><a href="'+f+'">原始 PNG</a><br><img src="'+f+'"'+size+'></figure>')
     parts.append('<pre>'+html.escape(json.dumps(probe,ensure_ascii=False,indent=2))+'</pre></section>')
 parts.append('</html>')
 (out/'index.html').write_text('\n'.join(parts))
