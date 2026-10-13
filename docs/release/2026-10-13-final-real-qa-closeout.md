@@ -36,4 +36,8 @@
 
 本地交付目标为 0.2.0 beta／build 7，完整归档验收、Universal 构建和产物身份由统一入口及本次包内 provenance 记录。macOS 13 与 Intel 实机验证按用户指示不执行；最低 macOS 13、Universal 构建和部署目标核验保留。明确需联网场景、完整原生键盘／VoiceOver／popover、其他端云同步及长期规模行为仍有覆盖缺口。本次恢复不承诺 iCloud 他端传播或系统缓存逐字节归零。没有合并、推送、公开发行、安装或启动生产 App，也没有 Developer ID 签名／公证。
 
-首次从 `e40b6de` 执行统一发布入口，归档完整验收通过589项 XCTest（2跳过、0失败）、96项 Tools、33例模型、四档规模和两项竞态；正常 Universal Release 构建、资源与签名检查也通过。随后本机 `lipo` 的双架构参数核验报错，包装退出1，脚本正常回收暂存目录与锁，没有生成发行包。App 和 Core 实际都含 arm64／x86_64。最小修复逐个验证两架构，真实工具回归覆盖 Universal 成功及 App／Core 各缺一种架构的四种拒绝，15项相关工具测试通过；最终包仍须从修复后提交重新经过完整统一入口，不能复用这次旧成功标记。
+首次从 `e40b6de` 执行统一发布入口，归档完整验收通过589项 XCTest（2跳过、0失败）、96项 Tools、33例模型、四档规模和两项竞态；正常 Universal Release 构建、资源与签名检查也通过。随后本机 `lipo` 的双架构参数核验报错，包装退出1，脚本正常回收暂存目录与锁，没有生成发行包。App 和 Core 实际都含 arm64／x86_64。最小修复逐个验证两架构，真实工具回归覆盖 Universal 成功及 App／Core 各缺一种架构的四种拒绝，15项相关工具测试通过；最终包重新执行完整统一入口，未复用这次旧成功标记。
+
+最终从干净已提交源码 **`d6702f9ba3d3146277d2321bf0fcb1125ff43544`** 执行 `scripts/package-release.sh`，退出0。该归档完整验收通过589项 XCTest（2跳过、0失败）、97项 Tools、33例模型、两种请求配置各4项数值自检、runtime、四档规模及两项 continuation 的 GREEN／RED 验证。正常 Universal Release 构建、模型资源、图标、逐层 ad-hoc 签名、DMG 和849项文件校验通过；独立产物核验未发现阻塞。验收前后及发行构建后的源码清单均为 `94d4a30fa55d8ce88cc2be6bce8b1c20b5df82621aa7f8fa8f99788ca78eee4d`。
+
+本地交付为 `outputs/releases/0.2.0-beta/` 中的 `PhotosYNC.app` 和 `PhotosYNC-0.2.0-beta.dmg`，版本0.2.0 beta／build 7，App 和 Core 均含 arm64／x86_64，最低部署版本13.0。DMG为90,253,712字节，SHA256为 `92d5b8b437326e006ad843f670a6598f45f77afc5358704e57ed0c26f6916504`；确切源码、归档验收及脚本摘要记录在包内 `PhotosYNC.provenance`，全体文件摘要见 `SHA256SUMS`。随后仅更新收尾文档和计划完成标记；交付包仍绑定上述提交，保留归档原始字节。
