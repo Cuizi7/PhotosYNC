@@ -122,9 +122,9 @@ enum ReviewHost {
                             if NSApp.isActive, let transient {
                                 observation["transientWindowID"] = transient.windowNumber
                                 observation["transientKeyWindow"] = transient.isKeyWindow
-                                observation["compositor"] = try compositorCapture(window: transient, output: output,
+                                let acquisition = try compositorCapture(window: transient, output: output,
                                     name: "user-open-\(raw)-\(look)-\(transient.windowNumber).png")
-                                observation["status"] = "Captured user-opened native presentation; visual acceptance requires inspection"
+                                observation.merge(userOpenCaptureResult(acquisition), uniquingKeysWith: { _, new in new })
                             } else {
                                 observation["status"] = "unverified"
                                 observation["failure"] = "No active, user-opened own-host presentation before bounded timeout"
@@ -377,6 +377,19 @@ enum ReviewHost {
             ? "Local AX/mouse/keyboard dispatch produced no observable native presentation in non-key host"
             : "Actual presentation captured; non-key host cannot certify physical hover, outside click or visible focus ring"
         result["missing"] = ["physical hover/tooltip", "independent Space/Return pin verification", "outside click dismissal", "system keyboard focus/ring", "focus restoration acceptance", "compositor/frame/material appearance"]
+        return result
+    }
+
+    static func userOpenCaptureResult(_ acquisition: [String: Any]) -> [String: Any] {
+        var result: [String: Any] = ["compositor": acquisition]
+        if acquisition["status"] as? String == "captured" {
+            result["status"] = "captured"
+            result["visualAcceptance"] = "Acquisition only; requires inspection"
+        } else {
+            result["status"] = "unverified"
+            result["failure"] = acquisition["failure"]
+                ?? "Capture acquisition did not return an accepted result"
+        }
         return result
     }
 
