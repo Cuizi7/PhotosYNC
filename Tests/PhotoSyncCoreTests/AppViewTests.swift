@@ -65,6 +65,80 @@ final class AppViewTests: XCTestCase {
         }
     }
 
+    func testSourcePathStaysOneLineAtConstrainedWidths() throws {
+        let paths = ["/", "/照片/旅行", "/Volumes/非常长的父目录/2026/旅行照片",
+            "/家人/旅行👨‍👩‍👧‍👦/假日e\u{301}", "/照片/" + String(repeating: "很长末级目录", count: 20)]
+        for path in paths {
+            for width in [CGFloat(180), 292, 360] {
+                let size = try measure(SourcePathLabel(url: URL(fileURLWithPath: path))
+                    .frame(width: width), width: width, minimumHeight: 0)
+                XCTAssertEqual(size.width, width, accuracy: 1)
+                XCTAssertLessThanOrEqual(size.height, 20)
+            }
+        }
+    }
+
+    func testSourceRowKeepsFileFailureCountInTwoLines() throws {
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let size = try measure(SourceRowLabel(
+                url: URL(fileURLWithPath: "/Volumes/非常长的父目录/旅行与家庭照片归档"),
+                status: String(repeating: "来源目录暂时不可用，正在等待恢复。", count: 12),
+                detail: "synthetic raw detail", fileIssueCount: 7).frame(width: 292),
+                width: 292, appearance: appearance, minimumHeight: 0,
+                inspect: { try self.capture($0, name: "source-row-\(appearance.rawValue)") })
+            XCTAssertEqual(size.width, 292, accuracy: 1)
+            XCTAssertLessThanOrEqual(size.height, 42)
+        }
+    }
+
+    func testSettingsSourceViewportBoundsThirtyMixedSources() async throws {
+        var sizes: [NSSize] = []
+        for count in [0, 1, 30] {
+            let model = try await makeModel(sourceCount: count)
+            model.state.sources = model.state.sources.enumerated().map { index, source in
+                RegisteredSource(id: source.id, url: source.url, enabled: index.isMultiple(of: 2))
+            }
+            model.loginNeedsApproval = true
+            model.error = String(repeating: "来源暂时不可用，请检查连接后重试。", count: 3)
+            for source in model.state.sources { model.state.snapshot.sourceFileIssueCounts[source.id] = 7 }
+            let size = try measure(SourceSettings(model: model), width: 600, inspect: { host in
+                try self.capture(host, name: "settings-\(count)-top")
+                if count == 30 {
+                    let overflowing = self.scrollViews(in: host).filter {
+                        ($0.documentView?.bounds.height ?? 0) > $0.contentView.bounds.height + 1
+                    }
+                    XCTAssertEqual(overflowing.count, 1, "Only the source list should scroll in this normal mixed-source fixture")
+                    let list = try XCTUnwrap(overflowing.first)
+                    XCTAssertLessThanOrEqual(list.frame.height, 280)
+                    XCTAssertGreaterThanOrEqual(list.frame.height, 44)
+                    let bottom = (list.documentView?.bounds.height ?? 0) - list.contentView.bounds.height
+                    list.contentView.scroll(to: NSPoint(x: 0, y: bottom))
+                    list.reflectScrolledClipView(list.contentView)
+                    host.layoutSubtreeIfNeeded()
+                    try self.capture(host, name: "settings-30-bottom")
+                }
+            })
+            XCTAssertEqual(size.width, 600, accuracy: 1)
+            XCTAssertLessThanOrEqual(size.height, 680)
+            sizes.append(size)
+        }
+        XCTAssertLessThan(sizes[0].height, sizes[2].height)
+        XCTAssertLessThan(sizes[1].height, sizes[2].height)
+    }
+
+    private func scrollViews(in view: NSView) -> [NSScrollView] {
+        ((view as? NSScrollView).map { [$0] } ?? [])
+            + view.subviews.flatMap { scrollViews(in: $0) }
+    }
+
+    private func capture(_ host: NSView, name: String) throws {
+        guard let directory = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] else { return }
+        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("native-\(name).png"))
+    }
+
     private func makeModel(sourceCount: Int) async throws -> AppModel {
         // Rendering needs source descriptors, not 30 files or a running scan. Keep an actual
         // injected runtime for the view's model; the descriptor URLs are never traversed.
@@ -101,10 +175,13 @@ final class AppViewTests: XCTestCase {
     }
 
     private func measure<V: View>(
-        _ view: V, width: CGFloat, appearance: NSAppearance.Name = .aqua
+        _ view: V, width: CGFloat, appearance: NSAppearance.Name = .aqua,
+        minimumHeight: CGFloat = 100, inspect: ((NSView) throws -> Void)? = nil
     ) throws -> NSSize {
         NSApplication.shared.setActivationPolicy(.prohibited)
-        let host = NSHostingView(rootView: view)
+        let host = NSHostingView(rootView: view
+            .environment(\.colorScheme, appearance == .darkAqua ? .dark : .light)
+            .background(Color(nsColor: .windowBackgroundColor)))
         host.appearance = NSAppearance(named: appearance)
         host.frame = NSRect(x: 0, y: 0, width: width, height: 1000)
         let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -125,7 +202,7 @@ final class AppViewTests: XCTestCase {
             window.displayIfNeeded()
             let size = host.fittingSize
             if abs(size.width - previous.width) < 0.5,
-               abs(size.height - previous.height) < 0.5, size.height > 100 {
+               abs(size.height - previous.height) < 0.5, size.height > minimumHeight {
                 stablePasses += 1
             } else {
                 stablePasses = 0
@@ -133,6 +210,9 @@ final class AppViewTests: XCTestCase {
             previous = size
             if stablePasses >= 4 {
                 XCTAssertFalse(window.isVisible)
+                host.setFrameSize(size)
+                host.layoutSubtreeIfNeeded()
+                try inspect?(host)
                 return size
             }
         }

@@ -80,28 +80,12 @@ struct StatusMenu: View {
                 Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
-                // The line is plain language; the raw system text stays in the tooltip so the
-                // menu never greets a person with "The file “home” couldn’t be opened…".
                 if let issue = model.enabledWaiting[source.id] {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(source.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
-                        Text(issue.summary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                        // TODO: Add a separate bounded file-issue inspection surface. Do not
-                        // expand this menu into one row per failed file; large sources can have many.
-                        // Unreadable files keep no record, so this count is the only standing trace
-                        // of them beyond the journal; it disappears with the next clean scan.
-                        if model.fileIssueCount(for: source.id) > 0 {
-                            Text("另有 \(model.fileIssueCount(for: source.id)) 个文件读取失败")
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                    .help("\(source.url.path)\n\(issue.detail)\n\(issue.summary)")
+                    SourceRowLabel(url: source.url, status: issue.summary, detail: issue.detail,
+                        fileIssueCount: model.fileIssueCount(for: source.id))
                 } else if let phase = model.state.snapshot.advancedWaitingReasons[source.id] ?? model.state.snapshot.sourcePhases[source.id] {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(source.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
-                        Text(phase).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                    }
-                    .help(source.url.path)
+                    SourceRowLabel(url: source.url, status: phase,
+                        fileIssueCount: model.fileIssueCount(for: source.id))
                 }
             }
             if let warning = model.notificationWarning {
