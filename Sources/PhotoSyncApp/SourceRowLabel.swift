@@ -9,7 +9,7 @@ struct SourcePathLabel: View {
         let basename = url.lastPathComponent.isEmpty ? "/" : url.lastPathComponent
         let prefix = path == "/" ? "" : String(path.dropLast(basename.count))
         return Text(prefix).font(.caption).foregroundColor(.secondary)
-            + Text(basename).font(.body).foregroundColor(.primary)
+            + Text(basename).font(.caption).foregroundColor(.primary)
     }
 
     var body: some View {

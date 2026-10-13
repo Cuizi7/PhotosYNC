@@ -152,7 +152,7 @@ func testSourcePathStaysOneLineAtConstrainedWidths() throws {
   新增 `testSourceRowKeepsFileFailureCountInTwoLines`：292pt 宽，长中文 status + fileIssueCount=7，明暗渲染高度≤42pt；静态测量之外，后续人工验证数量和完整 tooltip。新增 `testSettingsSourceViewportBoundsThirtyMixedSources`：0/1/30来源，30来源夹杂停用、登录待批准、长错误，600pt宽和≤680pt高；比较短列表自然收缩。为列表上下滚动位置的固定“同步选项/诊断”留下截图夹具，不能只断言总高度就称固定位置通过。
 
 - [ ] **Step 2: 执行聚焦 RED。** 按统一命令重建，核对新类型/断言失败；记录当前三行来源或整页长滚动的基线图作为前后比较。
-- [ ] **Step 3: 实现并接入共享行与设置结构。** 单个 rich `Text` 将 prefix `.caption/.secondary` 与 basename `.body/.primary` 拼在同一基线，`.lineLimit(1).truncationMode(.head)`；不把 path 拆成多个相互争宽的 HStack Text。单独对路径 `.help(url.path)` 和完整 accessibility label；第二行单行状态，fileIssueCount>0 时同一行尾部保留“读取失败 N 个”，状态先截断，完整摘要/raw detail 在 help 可取。菜单、设置、demo 三处共用，保留来源顺序和现有问题/阶段选择。
+- [ ] **Step 3: 实现并接入共享行与设置结构。** 单个 rich `Text` 将 prefix `.caption/.secondary` 与 basename `.caption/.primary` 拼在同一基线，整行字号和字重一致，仅通过颜色突出末级（2026-10-13 用户实施中修订），`.lineLimit(1).truncationMode(.head)`；不把 path 拆成多个相互争宽的 HStack Text。单独对路径 `.help(url.path)` 和完整 accessibility label；第二行单行状态，fileIssueCount>0 时同一行尾部保留“读取失败 N 个”，状态先截断，完整摘要/raw detail 在 help 可取。菜单、设置、demo 三处共用，保留来源顺序和现有问题/阶段选择。
 
   设置改为顶部状态/权限 → 独立来源标题与受限列表 → 同步选项 → 诊断/版本。列表最高280pt，并用静态区实测高度缩小，正常30来源不推走底部；极长静态内容按 spec §6 退回外层有界滚动。同一权限说明只在顶部出现，其他错误及关闭动作不能丢。保留 onAppear 系统刷新、confirmationDialog、pendingRemoval 生命周期、各按钮 disabled 与 identifier；高度回调只在实际变化时触发，避免测量环。
 - [ ] **Step 4: 重建并跑聚焦 GREEN。** 既有 AppModel/SyncStatusPresentation 测试必须保持通过。仅因用户明确变更的视图结构更新测试，不能放宽680pt上限或移除未知提交/历史保护断言。
