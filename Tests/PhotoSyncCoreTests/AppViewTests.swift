@@ -5,6 +5,68 @@ import XCTest
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    // An empty/default fixture must not silently erase counts, source rows or isolation.
+    func testReviewScenariosStayIsolatedAndHaveExpectedCounts() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for scenario in UIReviewScenario.allCases {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            XCTAssertFalse(model.allowsSystemIntegrations, scenario.rawValue)
+            if scenario == .syncing || scenario == .completed {
+                let summary = try XCTUnwrap(model.state.snapshot.summary)
+                XCTAssertEqual(summary.imported, scenario == .syncing ? 120 : 170)
+                XCTAssertEqual(summary.skipped, 30)
+                XCTAssertEqual(summary.pending, scenario == .syncing ? 49 : 0)
+                XCTAssertEqual(summary.importing, scenario == .syncing ? 1 : 0)
+                XCTAssertEqual(summary.retryPending, 0)
+                XCTAssertEqual(try XCTUnwrap(SyncProgressMetrics(summary: summary)).known, 200)
+            }
+            if scenario == .unknown { XCTAssertEqual(model.state.snapshot.summary?.importing, 1) }
+            if scenario == .many { XCTAssertEqual(model.state.sources.count, 30) }
+        }
+    }
+
+    // A missing/nonconvergent renderer must fail even when output is not requested.
+    func testRenderAllReviewScenarios() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for scenario in UIReviewScenario.allCases {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                for (surface, view, width) in [("menu", AnyView(StatusMenu(model: model)), CGFloat(320)),
+                    ("settings", AnyView(SourceSettings(model: model)), CGFloat(600))] {
+                    let size = try UIReviewCapture.render(view, width: width, appearance: appearance) { host, _ in
+                        // Validation runs even without PHOTOSYNC_UI_OUTPUT.
+                        let temporary = root.appendingPathComponent("checked.png")
+                        _ = try UIReviewCapture.write(host, to: temporary)
+                        if let directory = ProcessInfo.processInfo.environment["PHOTOSYNC_UI_OUTPUT"] {
+                            try self.capture(host, name: "\(scenario.rawValue)-\(appearance.rawValue)-\(surface)", directory: directory)
+                            if scenario == .many, surface == "settings" {
+                                try UIReviewCapture.scrollToBottom(host)
+                                try self.capture(host, name: "many-\(appearance.rawValue)-settings-bottom", directory: directory)
+                            }
+                        }
+                    }
+                    XCTAssertEqual(size.width, width, accuracy: 1)
+                    XCTAssertGreaterThan(size.height, 100)
+                    XCTAssertLessThanOrEqual(size.height, 681)
+                }
+            }
+        }
+    }
+
+    func testReviewCaptureRejectsMissingBlankAndWrongGeometry() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        XCTAssertThrowsError(try UIReviewCapture.validateFile(root.appendingPathComponent("absent.png"), logicalSize: NSSize(width: 10, height: 10)))
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 10, pixelsHigh: 10,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        for x in 0..<10 { for y in 0..<10 { bitmap.setColor(.white, atX: x, y: y) } }
+        XCTAssertThrowsError(try UIReviewCapture.validate(bitmap, logicalSize: NSSize(width: 10, height: 10)))
+        XCTAssertThrowsError(try UIReviewCapture.validate(bitmap, logicalSize: .zero))
+        XCTAssertThrowsError(try UIReviewCapture.validate(bitmap, logicalSize: NSSize(width: 320, height: 240)))
+    }
     // Removing the menu's bounded viewport must fail this comparison: long menus may not
     // grow with every source, while one-row menus must not reserve the full scroll height.
     func testMenuBoundsLongListsAndLetsSmallMenusShrink() async throws {
@@ -133,10 +195,11 @@ final class AppViewTests: XCTestCase {
 
     private func capture(_ host: NSView, name: String) throws {
         guard let directory = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] else { return }
-        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
-        host.cacheDisplay(in: host.bounds, to: bitmap)
-        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-        try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("native-\(name).png"))
+        try capture(host, name: name, directory: directory)
+    }
+
+    private func capture(_ host: NSView, name: String, directory: String) throws {
+        _ = try UIReviewCapture.write(host, to: URL(fileURLWithPath: directory).appendingPathComponent("native-\(name).png"))
     }
 
     private func makeModel(sourceCount: Int) async throws -> AppModel {
