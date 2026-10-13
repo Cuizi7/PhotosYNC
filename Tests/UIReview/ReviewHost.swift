@@ -40,14 +40,14 @@ enum ReviewHost {
         manifest["controlActiveStateOverride"] = "SwiftUI environment controlActiveState=.active; affects control appearance only; does not activate app/window or certify focus/hover"
         if args.contains("--probe") {
             var observations: [[String: Any]] = []
-            for scenario in [UIReviewScenario.syncing, .many] {
+            for scenario in [UIReviewScenario.syncing, .analyzing, .many] {
                 let model = try makeUIReviewModel(scenario: scenario, root: root)
                 for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
                     // This process is a test-only host. Native alert/popover chrome must use
                     // the selected fixture appearance too, without changing the user's OS.
                     app.appearance = NSAppearance(named: appearance)
-                    let view = scenario == .syncing ? AnyView(StatusMenu(model: model)) : AnyView(SourceSettings(model: model))
-                    let window = try interactiveWindow(view, width: scenario == .syncing ? 320 : 600, appearance: appearance)
+                    let view = scenario != .many ? AnyView(StatusMenu(model: model)) : AnyView(SourceSettings(model: model))
+                    let window = try interactiveWindow(view, width: scenario != .many ? 320 : 600, appearance: appearance)
                     window.title = "PhotosYNC 隔离原生交互探针 · \(scenario.rawValue) · \(look)"
                     window.orderFront(nil)
                     guard let host = window.contentView else { throw UIReviewError.invalid("Missing probe host") }
@@ -75,20 +75,76 @@ enum ReviewHost {
             let model = try makeUIReviewModel(scenario: scenario, root: root)
             let appearance: NSAppearance.Name = look == "dark" ? .darkAqua : .aqua
             app.appearance = NSAppearance(named: appearance)
+            let surface = argument("--surface")
+            guard surface == nil || surface == "menu" || surface == "settings" else {
+                throw UIReviewError.invalid("Interactive --surface must be menu or settings")
+            }
+            let captureUserOpen = args.contains("--capture-user-open")
+            let timeout = argument("--capture-timeout").flatMap(TimeInterval.init) ?? 180
+            guard timeout > 0, timeout <= 180 else {
+                throw UIReviewError.invalid("Capture timeout must be within 0–180 seconds")
+            }
             var windows: [NSWindow] = []
-            for surface in ["menu", "settings"] {
+            for surface in surface.map({ [$0] }) ?? ["menu", "settings"] {
                 let view = surface == "menu" ? AnyView(StatusMenu(model: model)) : AnyView(SourceSettings(model: model))
                 let window = try interactiveWindow(view, width: surface == "menu" ? 320 : 600, appearance: appearance)
                 window.title = "PhotosYNC 测试审阅 · \(scenario.rawValue) · \(surface) · \(look)"
                 window.orderFront(nil) // Does not activate or request system keyboard focus.
                 windows.append(window)
             }
-            manifest["interactive"] = ["scenario": raw, "appearance": look,
+            manifest["interactive"] = ["scenario": raw, "appearance": look, "surface": surface ?? "both",
                 "pid": ProcessInfo.processInfo.processIdentifier,
                 "windowIDs": windows.map(\.windowNumber), "activationRequested": false,
+                "captureOnUserOpen": captureUserOpen, "captureTimeoutSeconds": timeout,
                 "status": "User-controlled fixture session; interactions not automatically certified"]
             try save(manifest, output: output, name: "interactive-manifest.json")
+            var observer: Timer?
+            if captureUserOpen {
+                let initialIDs = Set(NSApp.windows.map(\.windowNumber))
+                let deadline = Date().addingTimeInterval(timeout)
+                let timer = Timer(timeInterval: 0.25, repeats: true) { timer in
+                    Task { @MainActor in
+                        // Observe only the user's activation and actual new native presentation.
+                        // No event injection, window activation or key-window forcing occurs here.
+                        let transient = NSApp.windows.first {
+                            $0.isVisible && !initialIDs.contains($0.windowNumber) &&
+                            $0.contentView != nil && $0.frame.width >= 100 && $0.frame.height >= 100
+                        }
+                        guard (NSApp.isActive && transient != nil) || Date() >= deadline else { return }
+                        timer.invalidate()
+                        do {
+                            var observation: [String: Any] = ["applicationActive": NSApp.isActive,
+                                "hostWindowIDs": windows.map(\.windowNumber),
+                                "hostKeyWindows": windows.map(\.isKeyWindow),
+                                "ownVisibleWindowIDs": NSApp.windows.filter(\.isVisible).map(\.windowNumber),
+                                "pid": ProcessInfo.processInfo.processIdentifier, "inputInjected": false,
+                                "activationRequested": false]
+                            if NSApp.isActive, let transient {
+                                observation["transientWindowID"] = transient.windowNumber
+                                observation["transientKeyWindow"] = transient.isKeyWindow
+                                observation["compositor"] = try compositorCapture(window: transient, output: output,
+                                    name: "user-open-\(raw)-\(look)-\(transient.windowNumber).png")
+                                observation["status"] = "Captured user-opened native presentation; visual acceptance requires inspection"
+                            } else {
+                                observation["status"] = "unverified"
+                                observation["failure"] = "No active, user-opened own-host presentation before bounded timeout"
+                            }
+                            manifest["userOpenCapture"] = observation
+                            try save(manifest, output: output, name: "interactive-manifest.json")
+                        } catch {
+                            manifest["userOpenCapture"] = ["status": "unverified", "failure": String(describing: error)]
+                            try? save(manifest, output: output, name: "interactive-manifest.json")
+                        }
+                        try? FileManager.default.removeItem(at: root)
+                        app.terminate(nil)
+                    }
+                }
+                observer = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
             withExtendedLifetime((model, windows)) { app.run() }
+            observer?.invalidate()
+            for window in windows { window.contentView = nil; window.close() }
             return
         }
         var captures: [[String: Any]] = []
@@ -136,6 +192,10 @@ enum ReviewHost {
             "imported": s.map { $0.imported as Any } ?? NSNull(), "skipped": s.map { $0.skipped as Any } ?? NSNull(),
             "pending": s.map { $0.pending as Any } ?? NSNull(), "importing": s.map { $0.importing as Any } ?? NSNull(),
             "retryPending": s.map { $0.retryPending as Any } ?? NSNull(),
+            "checkedCandidates": model.state.snapshot.latestScan.checkedCandidates,
+            "newlyImported": model.state.snapshot.latestScan.newlyImported,
+            "analysisReadyAssets": model.state.snapshot.indexProgress.map { $0.readyAssets as Any } ?? NSNull(),
+            "analysisTotalAssets": model.state.snapshot.indexProgress.map { $0.totalAssets as Any } ?? NSNull(),
             "status": model.statusDescription, "fixtureDate": "2026-10-13"]
     }
 
@@ -175,7 +235,7 @@ enum ReviewHost {
         appearance: String, output: URL) throws -> [String: Any] {
         var visited: Set<ObjectIdentifier> = []
         let elements = accessibility(in: host, visited: &visited)
-        let identifier = scenario == .syncing ? "sync-details" : "remove-source-\(model.state.sources.first!.id.uuidString)"
+        let identifier = scenario != .many ? "sync-details" : "remove-source-\(model.state.sources.first!.id.uuidString)"
         let target = elements.first { $0.accessibilityIdentifier() == identifier }
         let before = Set(NSApp.windows.map(\.windowNumber))
         var result: [String: Any] = ["scenario": scenario.rawValue, "appearance": appearance,
@@ -201,13 +261,14 @@ enum ReviewHost {
         } else {
             // Coordinates were visually checked against this scenario's real compiled PNG.
             // Fail closed if its geometry changes; never infer a target in an unrelated window.
-            let expectedHeight: CGFloat = scenario == .syncing ? 212 : 669
+            let expectedHeight: CGFloat = scenario == .many ? 669 : (scenario == .syncing ? 213 : 225)
             guard abs(host.bounds.height - expectedHeight) <= 1 else {
                 result["status"] = "unverified"
                 result["failure"] = "AX target unavailable and capture-verified fallback geometry changed"
                 return result
             }
-            let topPoint = scenario == .syncing ? NSPoint(x: 298, y: 47) : NSPoint(x: 535, y: 165)
+            let topPoint = scenario == .many ? NSPoint(x: 535, y: 165)
+                : NSPoint(x: scenario == .syncing ? 138 : 151, y: 47)
             let local = NSPoint(x: topPoint.x, y: host.isFlipped ? topPoint.y : host.bounds.height - topPoint.y)
             point = host.convert(local, to: nil)
             hitView = host.hitTest(point)
@@ -289,6 +350,10 @@ enum ReviewHost {
             capture["accessibleLabels"] = nodes.compactMap { $0.accessibilityLabel() }
             capture["compositor"] = try compositorCapture(window: transient, output: output,
                 name: "compositor-\(scenario.rawValue)-\(appearance)-\(transient.windowNumber).png")
+            if scenario != .many {
+                capture["parentCompositor"] = try compositorCapture(window: window, output: output,
+                    name: "parent-compositor-\(scenario.rawValue)-\(appearance)-\(window.windowNumber).png")
+            }
             presented.append(capture)
             if scenario == .many {
                 result["cancelAccessibilityPressAccepted"] = nodes.first { $0.accessibilityLabel() == "取消" }?.accessibilityPerformPress() ?? false
@@ -322,6 +387,12 @@ enum ReviewHost {
         guard NSApp.windows.contains(where: { $0 === window }), window.isVisible else {
             throw UIReviewError.invalid("Compositor target must be a visible window owned by this test host")
         }
+        let windowID = CGWindowID(window.windowNumber)
+        let visibleWindows = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]] ?? []
+        guard visibleWindows.contains(where: {
+            ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID &&
+            ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ProcessInfo.processInfo.processIdentifier
+        }) else { throw UIReviewError.invalid("WindowServer target PID/ID does not match this test host") }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         process.arguments = ["-x", "-o", "-l", String(window.windowNumber), "-t", "png", output.appendingPathComponent(name).path]
@@ -361,8 +432,9 @@ enum ReviewHost {
                 "pixelWidth": bitmap.pixelsWide, "pixelHeight": bitmap.pixelsHigh,
                 "logicalCaptureWidth": size.width, "logicalCaptureHeight": size.height,
                 "ownVisibleWindowIDs": ownedVisible.map(\.windowNumber),
+                "verifiedOwnerPID": ProcessInfo.processInfo.processIdentifier,
                 "ownVisibleUnion": String(describing: groupBounds), "groupEdgeTolerancePoints": 16,
-                "captureMethod": "screencapture -x -o -l verified own-process transient windowID; includes its owning test-host group; existing permission only"]
+                "captureMethod": "screencapture -x -o -l verified own-process windowID; includes its owning test-host group; existing permission only"]
         } catch { return ["status": "unverified", "failure": String(describing: error), "diagnostic": diagnostic] }
     }
 

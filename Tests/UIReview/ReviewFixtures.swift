@@ -31,8 +31,8 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
     let date = Date(timeIntervalSince1970: 1_791_878_400) // 2026-10-13 08:00 UTC
     state.snapshot.latestScan.startedAt = date
     state.snapshot.latestScan.endedAt = date.addingTimeInterval(60)
-    state.snapshot.latestScan.checkedCandidates = 200
-    state.snapshot.latestScan.newlyImported = 120
+    state.snapshot.latestScan.checkedCandidates = 86
+    state.snapshot.latestScan.newlyImported = 24
     state.nextScan = date.addingTimeInterval(1_800)
     switch scenario {
     case .syncing:
@@ -44,9 +44,10 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         state.snapshot.activeWork = true
         state.snapshot.indexProgress = IndexProgress(
             state: scenario == .preparing ? .preparing : (scenario == .icloud ? .waiting : .updating),
-            totalsKnown: scenario != .preparing, totalAssets: 200, readyAssets: 120,
-            totalRepresentations: 300, readyRepresentations: 180, excludedAssets: 3,
+            totalsKnown: scenario != .preparing, totalAssets: 100000, readyAssets: 42680,
+            totalRepresentations: 150000, readyRepresentations: 64020, excludedAssets: 3,
             issue: scenario == .icloud ? "正在等待 iCloud 图像，连接恢复后自动继续" : nil)
+        if let first { state.snapshot.advancedWaitingReasons[first] = "等待图库分析完成后继续" }
     case .paused, .pausing:
         state.snapshot.isPaused = true
         state.snapshot.activeWork = scenario == .pausing

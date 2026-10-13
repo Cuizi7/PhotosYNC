@@ -25,15 +25,14 @@ struct SyncProgressMetrics {
 struct SyncProgressView: View {
     let summary: SyncStatusSummary?
     let stale: Bool
+    let snapshot: EngineSnapshot
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let summary, let metrics = SyncProgressMetrics(summary: summary) {
-                StatusMenuSingleLine(text: metrics.known == 0
+                counters(metrics.known == 0
                     ? "已发现 0 个文件"
                     : "已处理 \(metrics.processed) / 已发现 \(metrics.known)")
-                    .padding(.trailing, 26)
-                    .accessibilityIdentifier("sync-counters")
                 GeometryReader { proxy in
                     HStack(spacing: 0) {
                         segment(.accentColor, fraction: metrics.importedFraction, width: proxy.size.width)
@@ -55,13 +54,18 @@ struct SyncProgressView: View {
                     Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
                 }
             } else {
-                StatusMenuSingleLine(text: stale ? "同步统计暂不可用" : "正在读取同步统计…")
-                    .padding(.trailing, 26)
-                    .accessibilityIdentifier("sync-counters")
+                counters(stale ? "同步统计暂不可用" : "正在读取同步统计…")
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sync-progress")
+    }
+
+    private func counters(_ text: String) -> some View {
+        HStack(spacing: 6) {
+            StatusMenuSingleLine(text: text).accessibilityIdentifier("sync-counters")
+            SyncDetailsButton(snapshot: snapshot)
+        }
     }
 
     @ViewBuilder private func segment(_ color: Color, fraction: Double, width: CGFloat) -> some View {
@@ -107,11 +111,27 @@ struct SyncDetailsContent: View {
             }
             Divider()
             Text("本次扫描").font(.headline)
-            Text(SyncStatusPresentation(snapshot: snapshot).scan)
-                .font(.caption).fixedSize(horizontal: false, vertical: true)
-            if let started = snapshot.latestScan.startedAt, snapshot.latestScan.endedAt != nil {
-                Text("开始：\(started.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption).foregroundStyle(.secondary)
+            if snapshot.latestScan.state == .notStarted {
+                Text("尚未扫描").font(.caption).foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 5) {
+                    count("检查候选", snapshot.latestScan.checkedCandidates)
+                    count("新增导入", snapshot.latestScan.newlyImported)
+                    row("状态", scanState)
+                    if snapshot.latestScan.failedFiles > 0 {
+                        row("本次读取失败", "\(snapshot.latestScan.failedFiles) 个文件")
+                    }
+                    let unavailableSources = snapshot.waitingSources.values.filter(\.isSourceAvailability).count
+                    if unavailableSources > 0 {
+                        row("来源等待恢复", "\(unavailableSources) 个来源")
+                    }
+                    if let date = snapshot.latestScan.endedAt ?? snapshot.latestScan.startedAt {
+                        row("时间", date.formatted(date: .abbreviated, time: .shortened))
+                    }
+                    if let started = snapshot.latestScan.startedAt, snapshot.latestScan.endedAt != nil {
+                        row("开始", started.formatted(date: .abbreviated, time: .shortened))
+                    }
+                }
             }
             Divider()
             Text("统计当前启用来源的记录，包含此前扫描。总量随新文件发现而增加。")
@@ -122,11 +142,24 @@ struct SyncDetailsContent: View {
         .accessibilityIdentifier("sync-details-content")
     }
 
+    private var scanState: String {
+        switch snapshot.latestScan.state {
+        case .notStarted: return "尚未扫描"
+        case .running: return "进行中"
+        case .completed: return "已完成"
+        case .interrupted: return snapshot.latestScan.deferred ? "稍后继续" : "已中断"
+        }
+    }
+
     private func count(_ title: String, _ value: Int) -> some View {
+        row(title, "\(value)")
+    }
+
+    private func row(_ title: String, _ value: String) -> some View {
         HStack {
             Text(title)
             Spacer()
-            Text("\(value)").monospacedDigit()
+            Text(value).monospacedDigit()
         }
         .font(.caption)
         .accessibilityElement(children: .combine)

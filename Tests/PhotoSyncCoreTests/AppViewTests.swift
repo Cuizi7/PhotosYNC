@@ -1,10 +1,166 @@
 import AppKit
 import SwiftUI
 import XCTest
+import Vision
 @testable import PhotoSyncCore
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testFeedbackNativeActionsHaveEqualColumns() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .syncing, root: root)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: appearance) { host, _ in
+                let frames = self.nativeAccessibility(in: host).compactMap { node -> NSRect? in
+                    guard let view = node as? NSView else { return nil }
+                    let frame = host.convert(view.bounds, from: view)
+                    return frame.width > 40 && frame.width < 290 && frame.height > 15 && frame.height < 35
+                        && frame.minY > host.bounds.height - 90 ? frame : nil
+                }.sorted { $0.minY == $1.minY ? $0.minX < $1.minX : $0.minY < $1.minY }
+                XCTAssertEqual(frames.count, 4, "Expected four native action/focus frames: \(frames)")
+                guard frames.count == 4 else { return }
+                for pair in [Array(frames[0..<2]), Array(frames[2..<4])] {
+                    XCTAssertEqual(pair[0].width, pair[1].width, accuracy: 1)
+                    XCTAssertEqual(pair[0].height, pair[1].height, accuracy: 1)
+                    XCTAssertGreaterThan(pair[0].width, 130)
+                    XCTAssertLessThanOrEqual(pair[1].minX - pair[0].maxX, 10)
+                }
+                let texts = try self.recognizedText(in: host)
+                let settings = try XCTUnwrap(texts.first { $0.text == "设置" })
+                let quit = try XCTUnwrap(texts.first { $0.text.contains("退出 PhotosYNC") })
+                XCTAssertEqual(settings.frame.minX, 14, accuracy: 3)
+                XCTAssertEqual(quit.frame.maxX, 306, accuracy: 3)
+            }
+        }
+    }
+
+    func testFeedbackAnalysisCountPrecedesBarAndHasAdjacentInfo() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: appearance) { host, _ in
+                let texts = try self.recognizedText(in: host)
+                XCTAssertFalse(texts.contains { $0.text == "图库分析" })
+                let count = try XCTUnwrap(texts.first { $0.text.contains("已分析") })
+                let progress = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSProgressIndicator }
+                    .first { !$0.isIndeterminate })
+                let barFrame = host.convert(progress.bounds, from: progress)
+                XCTAssertLessThan(count.frame.maxY, barFrame.minY)
+                let info = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first)
+                let infoFrame = host.convert(info.bounds, from: info)
+                XCTAssertEqual(infoFrame.midY, count.frame.midY, accuracy: 4)
+                XCTAssertGreaterThan(infoFrame.minX, count.frame.maxX)
+                XCTAssertLessThan(infoFrame.minX - count.frame.maxX, 20)
+            }
+        }
+    }
+
+    func testFeedbackScanDetailsRenderIndependentAlignedRows() throws {
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(imported: 120, skipped: 30, pending: 49, importing: 1)
+        snapshot.latestScan = ScanProgress(state: .interrupted)
+        snapshot.latestScan.checkedCandidates = 86
+        snapshot.latestScan.newlyImported = 24
+        snapshot.latestScan.deferred = true
+        snapshot.latestScan.failed = 99
+        snapshot.latestScan.failedFiles = 3
+        snapshot.waitingSources[UUID()] = SourceIssue(summary: "合成来源问题", detail: "synthetic", kind: .sourceAvailability)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            _ = try UIReviewCapture.render(SyncDetailsContent(snapshot: snapshot), width: 300, appearance: appearance) { host, _ in
+                let texts = try self.recognizedText(in: host)
+                let checked = try XCTUnwrap(texts.first { $0.text == "检查候选" })
+                let imported = try XCTUnwrap(texts.first { $0.text == "新增导入" })
+                let checkedValue = try XCTUnwrap(texts.first { $0.text == "86" })
+                let importedValue = try XCTUnwrap(texts.first { $0.text == "24" })
+                XCTAssertEqual(checked.frame.minX, imported.frame.minX, accuracy: 2)
+                XCTAssertEqual(checkedValue.frame.maxX, importedValue.frame.maxX, accuracy: 2)
+                XCTAssertEqual(checked.frame.midY, checkedValue.frame.midY, accuracy: 2)
+                XCTAssertEqual(imported.frame.midY, importedValue.frame.midY, accuracy: 2)
+                XCTAssertTrue(texts.contains { $0.text == "稍后继续" })
+                XCTAssertTrue(texts.contains { $0.text == "本次读取失败" })
+                XCTAssertTrue(texts.contains { $0.text == "来源等待恢复" })
+                XCTAssertFalse(texts.contains { $0.text.contains("99") })
+            }
+        }
+    }
+
+    func testFeedbackScanStateDatesAndOptionalRowsComeFromSnapshot() throws {
+        let date = Date(timeIntervalSince1970: 1_791_878_400)
+        for (state, deferred, expected) in [(ScanProgressState.notStarted, false, "尚未扫描"),
+            (.running, false, "进行中"), (.completed, false, "已完成"), (.interrupted, false, "已中断"),
+            (.interrupted, true, "稍后继续")] {
+            var snapshot = EngineSnapshot()
+            snapshot.summary = SyncStatusSummary()
+            snapshot.latestScan = ScanProgress(state: state)
+            snapshot.latestScan.deferred = deferred
+            snapshot.latestScan.startedAt = date
+            snapshot.latestScan.endedAt = state == .completed ? date.addingTimeInterval(60) : nil
+            snapshot.latestScan.failed = 99
+            snapshot.waitingSources[UUID()] = SourceIssue(summary: "文件问题", detail: "synthetic", kind: .file)
+            _ = try UIReviewCapture.render(SyncDetailsContent(snapshot: snapshot), width: 300, appearance: .aqua) { host, _ in
+                let texts = try self.recognizedText(in: host).map(\.text)
+                XCTAssertTrue(texts.contains(expected), "Missing scan state \(expected): \(texts)")
+                XCTAssertEqual(texts.contains("检查候选"), state != .notStarted)
+                XCTAssertEqual(texts.contains("时间"), state != .notStarted)
+                XCTAssertEqual(texts.contains("开始"), state == .completed)
+                XCTAssertFalse(texts.contains("本次读取失败"))
+                XCTAssertFalse(texts.contains("来源等待恢复"))
+                XCTAssertFalse(texts.contains { $0.contains("99") })
+            }
+        }
+    }
+
+    func testFeedbackSyncInfoStaysAdjacentToStandingSummary() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .syncing, root: root)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: appearance) { host, _ in
+                let info = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first)
+                let frame = host.convert(info.bounds, from: info)
+                let countSize = NSHostingView(rootView: StatusMenuSingleLine(text: "已处理 150 / 已发现 200")).fittingSize
+                XCTAssertEqual(frame.minX, 14 + countSize.width + 7, accuracy: 2)
+                XCTAssertEqual(frame.midY, 47, accuracy: 2)
+            }
+        }
+    }
+
+    private func nativeAccessibility(in object: Any) -> [any NSAccessibilityProtocol] {
+        var seen: Set<ObjectIdentifier> = []
+        func walk(_ object: Any) -> [any NSAccessibilityProtocol] {
+            guard let node = object as? any NSAccessibilityProtocol,
+                  seen.insert(ObjectIdentifier(node)).inserted else { return [] }
+            return [node] + ((node.accessibilityChildren() ?? []) + ((object as? NSView)?.subviews ?? [])).flatMap(walk)
+        }
+        return walk(object)
+    }
+
+    private func recognizedText(in view: NSView) throws -> [(text: String, frame: NSRect)] {
+        let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        try VNImageRequestHandler(cgImage: try XCTUnwrap(bitmap.cgImage)).perform([request])
+        return (request.results ?? []).compactMap { result in
+            guard let candidate = result.topCandidates(1).first else { return nil }
+            let text = candidate.string
+            // Vision may group the adjacent info symbol into a text observation. Measure
+            // the recognized analysis string itself, preserving the native symbol frame.
+            let box: CGRect
+            if text.hasPrefix("已分析"), let end = text.firstIndex(of: "张"),
+               let bounds = try? candidate.boundingBox(for: text.startIndex..<text.index(after: end)) {
+                box = bounds.boundingBox
+            } else {
+                box = result.boundingBox
+            }
+            return (text, NSRect(x: box.minX * view.bounds.width, y: (1 - box.maxY) * view.bounds.height,
+                width: box.width * view.bounds.width, height: box.height * view.bounds.height))
+        }
+    }
+
     // An empty/default fixture must not silently erase counts, source rows or isolation.
     func testReviewScenariosStayIsolatedAndHaveExpectedCounts() throws {
         let root = try temporaryDirectory()
@@ -19,7 +175,16 @@ final class AppViewTests: XCTestCase {
                 XCTAssertEqual(summary.pending, scenario == .syncing ? 49 : 0)
                 XCTAssertEqual(summary.importing, scenario == .syncing ? 1 : 0)
                 XCTAssertEqual(summary.retryPending, 0)
-                XCTAssertEqual(try XCTUnwrap(SyncProgressMetrics(summary: summary)).known, 200)
+                let metrics = try XCTUnwrap(SyncProgressMetrics(summary: summary))
+                XCTAssertEqual(metrics.known, 200)
+                XCTAssertEqual(metrics.processed, scenario == .syncing ? 150 : 200)
+                XCTAssertEqual(model.state.snapshot.latestScan.checkedCandidates, 86)
+                XCTAssertEqual(model.state.snapshot.latestScan.newlyImported, 24)
+            }
+            if scenario == .analyzing {
+                XCTAssertEqual(model.state.snapshot.indexProgress?.readyAssets, 42680)
+                XCTAssertEqual(model.state.snapshot.indexProgress?.totalAssets, 100000)
+                XCTAssertEqual(model.state.snapshot.advancedWaitingReasons.count, 1)
             }
             if scenario == .unknown { XCTAssertEqual(model.state.snapshot.summary?.importing, 1) }
             if scenario == .many { XCTAssertEqual(model.state.sources.count, 30) }

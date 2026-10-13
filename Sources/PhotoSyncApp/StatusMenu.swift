@@ -41,7 +41,7 @@ struct StatusMenu: View {
                     .font(.headline).accessibilityLabel(model.statusDescription)
                     .accessibilityIdentifier("photosync-status")
                 Spacer()
-                if model.analysis != nil || !model.state.sources.contains(where: \.enabled) {
+                if model.analysis == nil && !model.state.sources.contains(where: \.enabled) {
                     SyncDetailsButton(snapshot: model.state.snapshot)
                 }
                 if model.state.snapshot.activeWork {
@@ -66,16 +66,13 @@ struct StatusMenu: View {
                 Text(hint).font(.caption).foregroundStyle(.secondary)
             }
             if let analysis = model.analysis {
-                LibraryAnalysisView(analysis: analysis).tint(.accentColor)
+                LibraryAnalysisView(analysis: analysis, snapshot: model.state.snapshot).tint(.accentColor)
                 if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
                     Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
                 }
             } else if model.state.sources.contains(where: \.enabled) {
                 SyncProgressView(summary: model.state.snapshot.summary,
-                    stale: model.state.snapshot.summaryError != nil)
-                    .overlay(alignment: .topTrailing) {
-                        SyncDetailsButton(snapshot: model.state.snapshot)
-                    }
+                    stale: model.state.snapshot.summaryError != nil, snapshot: model.state.snapshot)
             } else if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
                 Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
             }
@@ -99,28 +96,41 @@ struct StatusMenu: View {
     }
 
     private var actions: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Button("立即扫描", action: model.scan)
-                    .accessibilityIdentifier("scan-now")
-                    .disabled(!model.ready || model.state.snapshot.activeWork || model.state.snapshot.isPaused || !model.state.authorized || model.demo)
-                Spacer()
-                Button(model.state.snapshot.isPaused ? "继续同步" : "暂停同步", action: model.togglePause)
-                    .accessibilityIdentifier("toggle-pause")
-                    .disabled(!model.canTogglePause)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button(action: model.scan) {
+                    Text("立即扫描").frame(maxWidth: .infinity)
+                }
+                .accessibilityIdentifier("scan-now")
+                .disabled(!model.ready || model.state.snapshot.activeWork || model.state.snapshot.isPaused || !model.state.authorized || model.demo)
+                Button(action: model.togglePause) {
+                    Text(model.state.snapshot.isPaused ? "继续同步" : "暂停同步")
+                        .frame(maxWidth: .infinity)
+                }
+                .accessibilityIdentifier("toggle-pause")
+                .disabled(!model.canTogglePause)
             }
-            HStack {
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            Divider()
+            HStack(spacing: 4) {
                 if #available(macOS 14.0, *) {
-                    SettingsLink { Text("设置") }
+                    SettingsLink { Text("设置").frame(maxWidth: .infinity, alignment: .leading) }
                         .simultaneousGesture(TapGesture().onEnded { NSApp.activate(ignoringOtherApps: true) })
                         .accessibilityIdentifier("open-settings")
                 } else {
-                    Button("设置", action: model.openSettingsWindow)
+                    Button(action: model.openSettingsWindow) {
+                        Text("设置").frame(maxWidth: .infinity, alignment: .leading)
+                    }
                         .accessibilityIdentifier("open-settings")
                 }
-                Spacer()
-                Button("退出 PhotosYNC", action: model.quit).keyboardShortcut("q")
+                Divider().frame(height: 14)
+                Button(action: model.quit) {
+                    Text("退出 PhotosYNC").frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .keyboardShortcut("q")
             }
+            .buttonStyle(.plain)
         }
     }
 }
@@ -144,15 +154,18 @@ struct StatusMenuSingleLine: View {
 
 struct LibraryAnalysisView: View {
     let analysis: SyncStatusPresentation.Analysis
+    let snapshot: EngineSnapshot
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("图库分析").font(.subheadline.weight(.medium))
+            HStack(spacing: 6) {
+                StatusMenuSingleLine(text: analysis.progressText)
+                SyncDetailsButton(snapshot: snapshot)
+            }
             if let fraction = analysis.fraction {
                 ProgressView(value: fraction).accessibilityLabel(analysis.progressText)
             } else {
                 ProgressView().controlSize(.small).accessibilityLabel(analysis.progressText)
             }
-            Text(analysis.progressText).font(.caption)
             if let detail = analysis.detail {
                 if detail == "正在等待 iCloud 图像，连接恢复后自动继续" {
                     StatusMenuSingleLine(text: detail)
