@@ -82,7 +82,7 @@ xcrun xctest -XCTest 'PhotoSyncCoreTests.SyncStatusPresentationTests,PhotoSyncCo
 - Produces：`SyncProgressMetrics.init?(summary: SyncStatusSummary?)`；只读 `known: Int`、`processed: Int`、`incomplete: Int`、`importedFraction/skippedFraction/incompleteFraction: Double`；nil 输入返回 nil，known=0 的各 fraction 为 0。
 - Produces：`SyncProgressView(summary: SyncStatusSummary?, stale: Bool)`、`SyncDetailsButton(snapshot: EngineSnapshot)`、`SyncDetailsContent(snapshot: EngineSnapshot)`。内含局部私有色段视图和 hover 状态，不构建业务 adapter；后三者均为 SwiftUI View。
 
-- [ ] **Step 1: 写失败用例，锁定公式与未知状态。** 在 `AppViewTests` 新增以下测试（下列为核心断言，测试方法名固定）：
+- [x] **Step 1: 写失败用例，锁定公式与未知状态。** 在 `AppViewTests` 新增以下测试（下列为核心断言，测试方法名固定）：
 
 ```swift
 func testProgressCountsAllUnfinishedStatesButNotHistoryOrRoundEvents() throws {
@@ -111,16 +111,16 @@ func testProgressNilZeroAndDiscoveryGrowth() throws {
 
   同步扩展 `testProgressPreservesBlockingHeadlineAndStaleSummary`：构造 imported=200、其余=0，分别添加来源不可用与 unknown blocker，断言 model 标题仍为“等待恢复”/“需要处理错误”，渲染菜单；summaryError 存在时旧计数不消失，记录对应截图用例。新增 `testProgressLargeCountsAndAnalysisStatesRemainBounded`，输入 imported/skipped/pending 各999999、importing=3、retryPending=4、retainedImported=5；断言 known=3000004、processed=1999998，明暗菜单保持320pt和高度上限，进度摘要不截断。
 
-- [ ] **Step 2: 跑构建与聚焦测试，确认 RED 原因。** 使用前述命令，记录新断言/缺失新类型失败。不能删掉旧保护性测试来取得 RED/GREEN。
+- [x] **Step 2: 跑构建与聚焦测试，确认 RED 原因。** 使用前述命令，记录新断言/缺失新类型失败。不能删掉旧保护性测试来取得 RED/GREEN。
 
-- [ ] **Step 3: 实现新视图并接入菜单。** 指标只使用 spec §3 的五个互斥状态；6pt 轨道，accentColor / secondaryLabelColor / quaternaryLabelColor，同一外层裁切；零段不占宽。新 Button 的 hover 200ms / 离开联合区域200ms、点击保持、Escape/外部关闭行为按 spec §4，取消过期 UI Task，关闭恢复焦点。详情保留退役历史、统计错误、扫描失败/时间等全部既有信息。
+- [x] **Step 3: 实现新视图并接入菜单。** 指标只使用 spec §3 的五个互斥状态；6pt 轨道，accentColor / secondaryLabelColor / quaternaryLabelColor，同一外层裁切；零段不占宽。新 Button 的 hover 200ms / 离开联合区域200ms、点击保持、Escape/外部关闭行为按 spec §4，取消过期 UI Task，关闭恢复焦点。详情保留退役历史、统计错误、扫描失败/时间等全部既有信息。
 
   `StatusMenu` 继续用同一 model 的标题/符号/可见问题；分析非 nil 时保留 `LibraryAnalysisView` 并统一 accent tint，同步分段条仅在其余状态且有启用来源时显示。ⓘ 在两种阶段均可达。将扫描/暂停置于一行，设置/退出置于次行；两个设置兼容分支均改“设置”。逐字保留原动作、disabled 表达式和 quit 快捷键。保留 `photosync-status`、`sync-counters`、`scan-now`、`toggle-pause`、`open-settings` 等标识，新加 `sync-progress`、`sync-details`、`sync-details-content`；`sync-counters` 标识新的同口径摘要，不保留隐藏的旧重复行。
 
   调整旧 `testCompactAnalysisAndCountersFitNativeMenu` 的外观断言：旧三计数不再要求主界面常驻，但数字必须在详情完整可取，iCloud 固定提示仍单行，图库分析的可见性和状态测试保留。这不是修改 `SyncStatusPresentation`。
 
-- [ ] **Step 4: 重建、运行 AppViewTests 和既有 contracts 测试到 GREEN。** 增加进行中/暂停/未授权/未配置等动作使能对照表到验收记录草稿，review 时核对前后绑定；不要为 UI 测试开放 AppModel 私有 setter。
-- [ ] **Step 5: 提交本任务。** `git add Sources/PhotoSyncApp/SyncProgressView.swift Sources/PhotoSyncApp/StatusMenu.swift Tests/PhotoSyncCoreTests/AppViewTests.swift PhotoSync.xcodeproj/project.pbxproj`，`git commit -m "feat(ui): simplify sync progress and reveal scoped details"`。
+- [x] **Step 4: 重建、运行 AppViewTests 和既有 contracts 测试到 GREEN。** 增加进行中/暂停/未授权/未配置等动作使能对照表到验收记录草稿，review 时核对前后绑定；不要为 UI 测试开放 AppModel 私有 setter。
+- [x] **Step 5: 提交本任务。** `git add Sources/PhotoSyncApp/SyncProgressView.swift Sources/PhotoSyncApp/StatusMenu.swift Tests/PhotoSyncCoreTests/AppViewTests.swift PhotoSync.xcodeproj/project.pbxproj`，`git commit -m "feat(ui): simplify sync progress and reveal scoped details"`。
 
 ### Task 2: 两行来源显示与设置页局部滚动
 
@@ -132,7 +132,7 @@ func testProgressNilZeroAndDiscoveryGrowth() throws {
 - Produces：`SourcePathLabel(url: URL)`；`SourceRowLabel(url: URL, status: String, detail: String? = nil, fileIssueCount: Int = 0)`，仅包含文件夹图标及两行信息，不拥有来源按钮/action。
 - 保持 `SourceSettings(model:)`、静态600/420/680尺寸常量、`model.settingsContentHeightDidChange(_:)` 调用关系不变。
 
-- [ ] **Step 1: 添加失败的布局用例。** 在已有 `measure` 测试 helper 增加 `minimumHeight: CGFloat = 100` 参数，小组件测量时传0；仍要求多次布局收敛，不靠固定 sleep 判定。
+- [x] **Step 1: 添加失败的布局用例。** 在已有 `measure` 测试 helper 增加 `minimumHeight: CGFloat = 100` 参数，小组件测量时传0；仍要求多次布局收敛，不靠固定 sleep 判定。
 
 ```swift
 func testSourcePathStaysOneLineAtConstrainedWidths() throws {
@@ -151,12 +151,12 @@ func testSourcePathStaysOneLineAtConstrainedWidths() throws {
 
   新增 `testSourceRowKeepsFileFailureCountInTwoLines`：292pt 宽，长中文 status + fileIssueCount=7，明暗渲染高度≤42pt；静态测量之外，后续人工验证数量和完整 tooltip。新增 `testSettingsSourceViewportBoundsThirtyMixedSources`：0/1/30来源，30来源夹杂停用、登录待批准、长错误，600pt宽和≤680pt高；比较短列表自然收缩。为列表上下滚动位置的固定“同步选项/诊断”留下截图夹具，不能只断言总高度就称固定位置通过。
 
-- [ ] **Step 2: 执行聚焦 RED。** 按统一命令重建，核对新类型/断言失败；记录当前三行来源或整页长滚动的基线图作为前后比较。
-- [ ] **Step 3: 实现并接入共享行与设置结构。** 单个 rich `Text` 将 prefix `.caption/.secondary` 与 basename `.caption/.primary` 拼在同一基线，整行字号和字重一致，仅通过颜色突出末级（2026-10-13 用户实施中修订），`.lineLimit(1).truncationMode(.head)`；不把 path 拆成多个相互争宽的 HStack Text。单独对路径 `.help(url.path)` 和完整 accessibility label；第二行单行状态，fileIssueCount>0 时同一行尾部保留“读取失败 N 个”，状态先截断，完整摘要/raw detail 在 help 可取。菜单、设置、demo 三处共用，保留来源顺序和现有问题/阶段选择。
+- [x] **Step 2: 执行聚焦 RED。** 按统一命令重建，核对新类型/断言失败；记录当前三行来源或整页长滚动的基线图作为前后比较。
+- [x] **Step 3: 实现并接入共享行与设置结构。** 单个 rich `Text` 将 prefix `.caption/.secondary` 与 basename `.caption/.primary` 拼在同一基线，整行字号和字重一致，仅通过颜色突出末级（2026-10-13 用户实施中修订），`.lineLimit(1).truncationMode(.head)`；不把 path 拆成多个相互争宽的 HStack Text。单独对路径 `.help(url.path)` 和完整 accessibility label；第二行单行状态，fileIssueCount>0 时同一行尾部保留“读取失败 N 个”，状态先截断，完整摘要/raw detail 在 help 可取。菜单、设置、demo 三处共用，保留来源顺序和现有问题/阶段选择。
 
   设置改为顶部状态/权限 → 独立来源标题与受限列表 → 同步选项 → 诊断/版本。列表最高280pt，并用静态区实测高度缩小，正常30来源不推走底部；极长静态内容按 spec §6 退回外层有界滚动。同一权限说明只在顶部出现，其他错误及关闭动作不能丢。保留 onAppear 系统刷新、confirmationDialog、pendingRemoval 生命周期、各按钮 disabled 与 identifier；高度回调只在实际变化时触发，避免测量环。
-- [ ] **Step 4: 重建并跑聚焦 GREEN。** 既有 AppModel/SyncStatusPresentation 测试必须保持通过。仅因用户明确变更的视图结构更新测试，不能放宽680pt上限或移除未知提交/历史保护断言。
-- [ ] **Step 5: 提交。** 暂存本任务列出的5个文件，`git commit -m "refactor(ui): unify source rows and bound settings scrolling"`。
+- [x] **Step 4: 重建并跑聚焦 GREEN。** 既有 AppModel/SyncStatusPresentation 测试必须保持通过。仅因用户明确变更的视图结构更新测试，不能放宽680pt上限或移除未知提交/历史保护断言。
+- [x] **Step 5: 提交。** 暂存本任务列出的5个文件，`git commit -m "refactor(ui): unify source rows and bound settings scrolling"`。
 
 ### Task 3: 集成验证与真实 UI 证据产出
 
@@ -169,12 +169,12 @@ func testSourcePathStaysOneLineAtConstrainedWidths() throws {
 - Produces CLI：`run-ui-review.sh --derived-data PATH --output-dir PATH [--interactive --scenario NAME --appearance light|dark]`。默认捕获全部场景两种外观、菜单与设置；interactive 只启动选定场景用于真实浮层/焦点操作。
 - 输出：原始 PNG、`manifest.json`（scenario/appearance/surface/尺寸/输入计数/源码commit及diff摘要/OS/Xcode/捕获方式）、可浏览 `index.html`；源码图和测试 host 不进入产品资源。
 
-- [ ] **Step 1: 写有意义的夹具/截图失败检查。** 新增 `testReviewScenariosStayIsolatedAndHaveExpectedCounts` 与 `testRenderAllReviewScenarios` 到 AppViewTests。前者断言所有 model `allowsSystemIntegrations == false`，syncing 为120/30/49/1/0、known200，completed 为170/30/0/0/0、unknown保留importing1、many恰有30来源。后者在 `PHOTOSYNC_UI_OUTPUT` 指定时输出所有场景真实视图；缺失文件/零尺寸/空白图/不收敛均失败。无该变量仍跑场景尺寸验证，不静默跳过所有用例。RED 只接受新夹具/捕获检查未满足。
-- [ ] **Step 2: 实现测试专用 fixture 和原生 review host。** 固定示例日期2026-10-13，UUID临时 SQLite；仅造 source 描述，不遍历路径，不调用生产 `AppModel()`、bootstrap/tick、Photos gateway 或系统权限。保持 model 的系统集成断言；不得为造图改 AppModel 私有 setter。现有离屏 NSHostingView/未显示NSWindow/bitmap方法扩展到设置，用尺寸收敛而非固定延时确认捕获就绪，保留 `P8_NATIVE_OUTPUT` 兼容输出。
+- [x] **Step 1: 写有意义的夹具/截图失败检查。** 新增 `testReviewScenariosStayIsolatedAndHaveExpectedCounts` 与 `testRenderAllReviewScenarios` 到 AppViewTests。前者断言所有 model `allowsSystemIntegrations == false`，syncing 为120/30/49/1/0、known200，completed 为170/30/0/0/0、unknown保留importing1、many恰有30来源。后者在 `PHOTOSYNC_UI_OUTPUT` 指定时输出所有场景真实视图；缺失文件/零尺寸/空白图/不收敛均失败。无该变量仍跑场景尺寸验证，不静默跳过所有用例。RED 只接受新夹具/捕获检查未满足。
+- [x] **Step 2: 实现测试专用 fixture 和原生 review host。** 固定示例日期2026-10-13，UUID临时 SQLite；仅造 source 描述，不遍历路径，不调用生产 `AppModel()`、bootstrap/tick、Photos gateway 或系统权限。保持 model 的系统集成断言；不得为造图改 AppModel 私有 setter。现有离屏 NSHostingView/未显示NSWindow/bitmap方法扩展到设置，用尺寸收敛而非固定延时确认捕获就绪，保留 `P8_NATIVE_OUTPUT` 兼容输出。
 
   脚本使用当前 DerivedData 的 Core，编译当前 App Swift 文件（明确排除 `PhotoSyncApp.swift`）及测试 fixture/ReviewHost，构造独立 bundle ID `local.photosync.ui-review`。读取同次构建 Info.plist 版本信息但改变该 host 的 executable/identity；不复用生产单实例入口。默认不显示窗口；interactive 只打开隔离 host 的原生内容窗，不主动 activate、不发全局键，窗口ID写入 manifest。测试/审阅 host 的系统开关禁用是隔离约束，图册标明，不当作生产禁用规则变更。
 
-- [ ] **Step 3: 重建并跑聚焦 GREEN，生成整套真实主体截图。**
+- [x] **Step 3: 重建并跑聚焦 GREEN，生成整套真实主体截图。**
 
 ```bash
 mkdir -p work/ui-polish/screens
@@ -189,7 +189,7 @@ bash Tests/UIReview/run-ui-review.sh \
 
   17场景×2外观×2主体=68张主体图；many补设置顶部/底部。检查PNG实际内容、比例与清晰度，图册按场景配对菜单/设置，并提供原始图链接。
 - [ ] **Step 4: 实际触发并捕获瞬态 UI。** 运行上一脚本的 `--interactive --scenario syncing --appearance light`（并覆盖dark），通过 app 范围内的原生交互测试 hover→进入popover、click/Space/Return固定、Escape/外部关闭及焦点恢复。再以many场景触发完整路径tooltip，点击“移除”只打开确认框后取消。捕获真正打开的浮层、键盘焦点、列表顶/底；用该host窗口定向截图，不能P图或把详情组件拼成浮层，不能按确认或操作真实源。若工具不能触发/捕获，记录明确缺口，不拿离屏主体替代，不宣告该项通过。
-- [ ] **Step 5: 一次集成评审与最终完整验证。** 使用一个 reviewer 检查计算口径、UI绑定/使能等价、宏/目标成员/兼容范围和跨视图布局；tester 在集成结果运行最小相关检查并执行最后完整门槛，失败修复仅限授权前端范围。相同快照不重复等价 review；如采用逐任务 subagent review，最终只审新集成风险。
+- [x] **Step 5: 一次集成评审与最终完整验证。** 使用一个 reviewer 检查计算口径、UI绑定/使能等价、宏/目标成员/兼容范围和跨视图布局；tester 在集成结果运行最小相关检查并执行最后完整门槛，失败修复仅限授权前端范围。相同快照不重复等价 review；如采用逐任务 subagent review，最终只审新集成风险。
 
 ```bash
 python3 scripts/validate.py \
@@ -202,7 +202,7 @@ git diff f467ed49f5c34637437aa936dbe13f8c91ef2b33 -- \
 ```
 
   验证输出目录必须全新；失败保留记录，不复用成功标记。完整门槛要求 exit0、正常结束、非零用例、无失败以及工具/竞态/资源报告齐全。冻结路径 diff 必须为空；Info.plist、entitlements、版本、Core目标成员同样不变。任何修复改变行为/测试后，最终门槛覆盖最新快照并更新受影响截图。
-- [ ] **Step 6: 记录并提交自动验证及截图证据索引。** 验收文档列实际commit/dirty diff、构建、自动测试、GUI截图、系统/平台/发布各自结果；人工结论写“等待用户验收”。只提交测试host/fixture、测试改动、Xcode成员变更和报告，不提交 `work/`、生产数据或额外媒体。`git commit -m "test(ui): capture native review scenes for human acceptance"`。
+- [x] **Step 6: 记录并提交自动验证及截图证据索引。** 验收文档列实际commit/dirty diff、构建、自动测试、GUI截图、系统/平台/发布各自结果；人工结论写“等待用户验收”。只提交测试host/fixture、测试改动、Xcode成员变更和报告，不提交 `work/`、生产数据或额外媒体。`git commit -m "test(ui): capture native review scenes for human acceptance"`。
 
 ### Task 4: 用户前端人工验收（强制关卡）
 
@@ -227,3 +227,13 @@ git diff f467ed49f5c34637437aa936dbe13f8c91ef2b33 -- \
 2026-10-13 用户已批准开始实施，并明确选择 Subagent-driven；实施完成后仍需真实截图人工验收。
 
 执行方式：Task1–3依次交给新的implementer，每任务完成后做spec与quality评审；最终review只补新的集成风险。Task4的视觉一致性检查由主线程统筹，必要修正仍交implementer并复核；截图提交后等待用户明确验收。
+
+## 2026-10-13 实施结果与剩余关卡
+
+- 最终行为/测试提交 `e3e3a3f19c9b8e89f5795287bb5f9fcd2c1e2acc`；之后仅更新计划和验收记录。菜单分段进度、详情、两行目录与设置局部滚动均已实现；目录按用户最新指令全行caption/相同字重，仅颜色区别。
+- 独立task评审与完整集成评审通过；一轮修复后定向复核无遗留阻断问题。未改Core、AppModel、runtime、现有统计接口、入口/Info或Core目标成员。
+- `scripts/validate.py` 在全新 `work/validation-native-ui-final-retry1` / `-derived` 完整通过：599项XCTest（2项显式门控跳过，0失败）、96项Tools、四组优化规模和两组续体竞态、模型/资源检查；源码清单前后相同。首轮LFS前置失败保留，精确本地对象恢复后才重跑，没有绕过门槛。
+- 最终真实截图：`work/ui-polish/review-e3e3a3f-final` 70张主体，`probe-e3e3a3f-final-retry1` 四张实际原生组合窗口图，manifest均绑定干净e3e3a3f。`work/ui-polish/comparison`保存六组配对图与差异说明；主体视觉对照无已知规格偏差。
+- Task3Step4为**部分完成**：实际点击popover/确认框与取消已捕获；物理hover、完整路径tooltip、独立键盘固定、真实Escape/外部关闭/焦点恢复与active材质仍未验证，非key宿主本地popover Escape失败事实保留。
+- Task4维持待人工验收，不能由评审/自动回归代签；原生交互与外观缺口没有标为通过。当前结论为“完整自动验证通过，等待前端人工验收”。
+- 完整证据与差异：[验收记录](../../release/2026-10-13-native-ui-acceptance.md)。本轮没有合并、推送、安装、打包/发布或启动生产App。

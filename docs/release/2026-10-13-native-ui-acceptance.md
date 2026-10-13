@@ -1,73 +1,117 @@
-# PhotosYNC 原生 UI 候选证据（2026-10-13）
+# PhotosYNC 原生 UI 验收记录（2026-10-13）
 
-当前结论：**聚焦自动验证通过，真实截图已刷新，等待用户验收**。末级路径与前缀均为 caption/相同字重，仅 primary/secondary 颜色区别；本轮基于用户修正后的视图。截图仍是候选证据，没有用户结论前不能宣布前端人工验收通过。
+当前结论：**完整自动验证通过，主体视觉对照完成，等待用户前端验收**。菜单、设置与 demo 的末级路径和前缀使用相同 caption 字号、相同字重，仅 primary/secondary 颜色区别。截图仍是候选证据，原生交互缺口见下文；没有用户结论前不宣布前端验收完成。
 
-## 确切源码与最新证据
+## 确切快照与最新证据
 
-产品视图源码为 **`d1ea0449dc61943593429edc224366acad02d094`**（`fix(ui): keep source path typography uniform`）。每个 `source.json` / manifest 保存源码 HEAD、dirty stat/status、编译 Swift 文件 SHA256、同次 Debug Core/Info.plist 校验值、OS/Xcode/Swift。
+最终行为、测试和截图快照：**e3e3a3f19c9b8e89f5795287bb5f9fcd2c1e2acc**。此后只更新本文和实施计划的证据记录，不改变验证过的代码或测试。每个 source.json / manifest 保存 HEAD、dirty status/diff、编译 Swift 文件 SHA256、同次 Debug Core/Info.plist 校验值和 OS/Xcode/Swift。两份最终捕获清单均为该提交、sourceStatus 为空。
 
-| 最新产物 | 内容与源码身份 |
+| 产物 | 内容 |
 | --- | --- |
-| `work/ui-polish/review-d1ea044-final/index.html` / `manifest.json` | **70 张**真实主体 PNG；sourceCommit 为上述 d1ea044，生成时 sourceStatus 为空。17 场景 × 浅/深 × 菜单/设置 = 68，另 many 设置底部 2 张 |
-| `work/ui-polish/probe-d1ea044-native-appearance/index.html` / `probe-manifest.json` | 最新真实瞬态窗口图册；产品源仍 d1ea044；dirty 仅 Task 3 的 `ReviewHost.swift` / `run-ui-review.sh`，清单记录全部编译文件 hash。校准字号修正后的 212pt menu，给本测试 app/window 设置所选原生外观，不改变系统外观 |
-| 同目录 `compositor-syncing-light-47565.png` / `compositor-syncing-dark-47571.png` | 实际点击打开的统计 popover，WindowServer 原图包含其父测试宿主组合；两种原生外观均已核对。浅色原图仍有明显灰色/材质断层，不能据此验收 active 材质 |
-| 同目录 `compositor-many-light-47575.png` / `compositor-many-dark-47582.png` | 实际打开的移除确认框；只取消，未确认移除。两种原生外观均已核对 |
-| `work/ui-polish/task2-caption-build.log` / `task2-caption-tests.log` | 用户字号修正后的 build-for-testing 与 15 项 AppViewTests 结果；由 Task 2 所有者运行，本轮已读取正常结束/数量/失败数 |
+| work/ui-polish/index.html | 图册入口，对应 http://127.0.0.1:8766/ |
+| work/ui-polish/review-e3e3a3f-final/index.html / manifest.json | 70张真实主体PNG：17场景×浅/深×菜单/设置=68，另many设置底部2张 |
+| work/ui-polish/probe-e3e3a3f-final-retry1/index.html / probe-manifest.json | 四份实际原生窗口组合截图；仅本进程窗口，浅/深外观仅设置于隔离app/window |
+| 同目录 compositor-syncing-light-48175.png / compositor-syncing-dark-48183.png | 真正点击打开的统计popover及父测试宿主；不是独立详情组件拼图 |
+| 同目录 compositor-many-light-48186.png / compositor-many-dark-48192.png | 真正打开的移除确认框，只取消、未确认移除 |
+| work/ui-polish/comparison/index.html / comparison-{syncing,2,3,settings,5,6}.png | 六组原型与实现配对，保留各场景的差异说明；原始主体按320/600pt显示、不变形、不重新着色 |
+| work/validation-native-ui-final-retry1/validation.json / validation-report.md | 完整自动验收exit0，status=passed，源码清单前后相同 |
+| work/ui-polish/final-capture-report.md | 最终捕获命令、原图、源码身份与明确缺口 |
 
-较早 `review-task3-*`、`probe-task3-*` 和首次 `probe-d1ea044-final` 保留为历史候选/失败证据，**不要用它们替代上表最新版**。首次 d1ea044 probe 的 dark 原生外壳尚未跟随测试外观；该测试宿主问题已修正并重新捕获，未修改产品 UI。
+独立宿主标识 local.photosync.ui-review；同次构建版本0.2.0 beta / build7。XCTest的Bundle.main属于测试执行环境，不能作为产品版本证据。
 
-独立宿主 ID 是 `local.photosync.ui-review`；同次构建读取版本 **0.2.0 beta / build 7**。XCTest 的 `Bundle.main` 属于 XCTest 执行环境，可能展示测试 metadata/后备版本；不能据此解释产品或独立宿主版本。
+旧版review-task3-*、probe-task3-*、d1ea044捕获与首轮probe-e3e3a3f-final均保留为历史证据。首轮e3e3a3f深色确认框捕获失败，没有对应PNG并明确标unverified；同一稳定命令在全新retry1目录重试一次后齐全。不得用旧图代替上表最新版。
 
-## 本轮实际验证
+## 构建与自动验证
 
-| 项目 | 结果 |
+| 项目 | 本轮结果 |
 | --- | --- |
-| 最新 Debug build-for-testing | `TEST BUILD SUCCEEDED`，exit 0（Task 2 字号修正后的构建） |
-| 最新 AppViewTests | **15 项、0 失败、exit 0、正常结束**；35.067 秒（Task 2 同源码运行） |
-| 场景隔离/数据 | syncing=120/30/49/1/0、known=200；completed=170/30/0/0/0；unknown importing=1；many=30 来源；所有模型 `allowsSystemIntegrations=false` |
-| 最新主体 capture script | exit 0，明确 `Validated 70-image matrix`。布局收敛、宽高、像素变化、写入后 PNG 复读、缺失/空白/零尺寸/比例错误检查均执行 |
-| 最新布局 | menu320pt，settings600pt、高≤680pt。syncing menu212/settings426；many menu543/settings669，顶/底都有浅/深图 |
-| 最新 native probe | exit 0，4 个实际新 transient window 及 4 份 WindowServer 原图；own-window group 校验全部 `captured` |
-| 组合捕获尺寸 | light popover1274×620 / dark1270×616px；确认框均1200×1402px。清单包含目标 ID、本进程可见窗口 IDs/组合 bounds/真实像素与逻辑尺寸，允许16pt系统组合边缘差；不裁图、不改 PNG |
-| 原生外观 | 浅色 app/window=Aqua，深色 app/window=DarkAqua。设置的是隔离测试进程外观，不改变 macOS/用户设置 |
-| 不抢焦点 | 各探针 `applicationActiveBefore/AfterInput=false`，host key-window before/after=false；没有 activate、全局输入/按键 |
-| 确认框取消 | 浅/深均 actual opened，Escape 关闭；Cancel AX press 返回 false；没有调用 destructive action |
-| popover 关闭/键盘 | 实际点击打开；宿主与瞬态本地 Escape 未关闭，清理仅关闭探针创建的窗口。已有窗口在 Space/Return 后持续可见仅记 presence，不宣告独立固定/焦点成功 |
-| 最终完整验收 | **controller-owned，尚未执行**；需 integrated reviewer/tester 和 fresh-dir `scripts/validate.py`，结果不能由本轮聚焦验证推断 |
+| Debug build-for-testing | TEST BUILD SUCCEEDED，exit0；canonical使用全新DerivedData |
+| 最后聚焦回归 | 47项、0失败、exit0：15 AppViewTests、24 SyncStatusPresentationTests、8 AppModelTests |
+| 完整无过滤XCTest | 599项，2项显式跳过，0失败，exit0，正常结束；97.883秒 |
+| Tests/Tools | 96项、0失败、exit0；110.927秒 |
+| 模型与资源 | 固定资源SHA通过；两个执行配置共8项model self-test、33-case regression、injected runtime与资源报告通过 |
+| 优化规模回归 | 100000、150000、200000条记录，以及200000条+100000成功历史，四组均通过；各1项测试、0失败、budget_pass=true |
+| 受控续体竞态 | stamp和advanced-preparation两组均passed；门闩只进入隔离拷贝，不进入产品源码 |
+| 源码一致性 | 307项清单前后同SHA：598de9db0a820a51d1665a8268cc986b96e74911a4d8f6edfb1399104fda603c；unchanged_after_validation=true |
+| 独立评审 | task评审、完整集成评审和一轮定向修复复核完成；无Critical/Important遗留，两项Minor已在e3e3a3f修复 |
+| 人工结论 | 等待用户验收；未验证原生交互不由自动回归代签 |
 
-## 隔离、渲染方法及明确缺口
+两项XCTest跳过：testControlledScaleThroughActualGraph由上述canonical子进程另行运行；testExistingVectorReplayUsesSQLiteBackend需要显式本地向量输入，本次未执行该回放。没有将跳过项宣称为已执行。
 
-宿主编译当前 App Swift 文件并明确排除 `PhotoSyncApp.swift`；没有正常 app 单实例入口。模型使用 UUID 临时 SQLite，仅造合成来源描述，固定示例日期 2026-10-13；不创建 Photos gateway/engine，不运行 bootstrap/tick，不访问生产数据库、真实来源、Photos 或系统权限设置。图册中系统开关禁用源于 injected 模型隔离，不能当作产品使能规则改动。
-
-主体图使用 `NSView.cacheDisplay` 的真实原生绘制；菜单内容是 StatusMenu，而不是系统 MenuBarExtra 弹出截图。测试 `.controlActiveState=.active` 仅用于活跃控件颜色比较，未激活窗口；原生分析进度条在非 key 宿主仍为灰色，保留该限制。
-
-实际 popover 的 cacheDisplay PNG 包含透明/系统材质限制，图册在对应浅/深背景展示原 PNG。确认框 view bitmap 近乎空白，被明确拒绝；已有 Screen Recording 许可下的 `screencapture -x -o -l <verified-own-ID>` 捕获了真实确认框及其父测试宿主组合。没有请求或更改录屏/Accessibility 权限，没有个人桌面截图，也没有拼装静态详情冒充浮层。
-
-最新浅色 compositor popover `compositor-syncing-light-47565.png` 本身也有明显灰色/材质断层；限制不只存在于 cacheDisplay。compositor 的 `captured` 仅确认本进程窗口的捕获取得和组合几何有效，不证明 active 窗口的系统材质外观可接受。宿主未激活，保留原图和该限制，不据此修改产品样式。
-
-菜单/来源的 actionable identifier 与 help text 未被公开本进程 AX 遍历暴露；探针保留该事实，仅在视检 PNG 的固定尺寸中使用本宿主 hitTest/mouse 输入，尺寸变化则拒绝 fallback。实际 alert 的公开 AX 节点包含取消/移除来源。
-
-尚未验证：物理 hover→进入 popover、完整路径系统 tooltip、独立 Space/Return 固定、外部点击关闭、系统键盘焦点环及焦点恢复、实际 active 窗口下的系统材质。`--interactive` 仅提供用户控制的测试会话；不主动激活，不等于自动验收通过。
-
-## 重现入口
-
-使用当前源码的 Debug build-for-testing，所有输出目录必须全新：
+完整入口：
 
 ```bash
+python3 scripts/validate.py \
+  --output-dir "$PWD/work/validation-native-ui-final-retry1" \
+  --derived-data "$PWD/work/validation-native-ui-final-retry1-derived"
+```
+
+首轮因模型权重仍为133字节LFS指针在前置资源阶段停止，记录保留于work/validation-native-ui-final/。使用既有hydration脚本从本地LFS对象恢复精确提交权重后，资源校验通过：88,329,408字节，SHA256 be1b28a5be24ca216884b6a04db291f58bd484328ac5307f9577fd27295cb338。未联网、未改变模型字节契约或Core逻辑；Git LFS正常过滤后暂存diff和工作树状态为空，随后才运行全新retry1。
+
+环境：macOS27.0.1、Xcode27.0（27A266a）、Swift6.4。继承的CoreDevice/CoreSimulator、AppIntents、XCTest部署目标诊断和confstr临时目录fallback均保留在日志；不称输出pristine，不作为新前端源码故障。
+
+## 主体视觉对照
+
+| 场景 | 观察与结果 |
+| --- | --- |
+| 同步中120/30/49/1/0 | 150/200，蓝/深灰/浅灰60/15/25，连续6pt轨道；两行来源，底部两排动作固定 |
+| 完成170/30/0/0/0 | 200/200，85/15，无假零色段；状态继续由原model决定 |
+| 分析已知/未知、iCloud等待 | 仅显示图库前景进度，保留未知总数、等待原因和说明；不叠加同步进度 |
+| nil/过期/未确认提交/文件错误 | nil不造零；过期旧值有“统计暂未更新”；importing算未完成；问题与失败数量仍可见 |
+| 0/1/30来源设置 | 600pt、短内容收缩、高≤680；many669pt，来源列表滚动而标题、选项和诊断固定 |
+| 根/Unicode/长路径/超长末级 | 现有布局用例和最终长末级图覆盖；全行caption/相同字重，前缀secondary、末级primary，从前省略；第二行失败数量保留 |
+| 设置文字与动作 | “设置”无省略号，“添加来源目录…”保留；既有actions/Binding/disabled/order/identity不变 |
+
+六组配对图检查了顺序、字体颜色、间距、比例、路径省略和固定区域，没有已知未解决的主体布局规格偏差。原型较大的末级字号已由用户最新要求替代。原生控件字号、按钮固有宽度、单色状态符号、自然窗口高度与示意卡片不同；按已批准原生规格，不拉伸到ImageGen像素。同步单来源图高212pt，设置单来源426pt，many菜单543pt/设置669pt。示例数量和构建版本不照抄原型。
+
+### 操作使能对照（保留原规则）
+
+| 合成场景 | 立即扫描 | 暂停/继续 | 设置/退出 |
+| --- | --- | --- | --- |
+| 同步/分析进行中 | 禁用 | 暂停同步，可用 | 原入口 |
+| 已暂停/正在暂停 | 禁用 | 继续同步，可用 | 原入口 |
+| 已完成 | 可用 | 暂停同步，可用 | 原入口 |
+| 未授权且有启用来源 | 禁用 | 按原canTogglePause可用 | 原入口 |
+| 提交未确认、activeWork=false | 原ready/authorized规则，不新增前端阻断 | 原规则 | 原入口 |
+| 无来源、ready/authorized=true | 原规则可用，不新增hasSource条件 | 禁用 | 原入口 |
+| demo | 禁用 | 禁用 | 原入口 |
+
+此表仅比较原前端条件，不改变后端实际提交许可。设置来源启用/停用/移除、确认逻辑、授权入口、系统Binding、onAppear刷新与窗口高度回调均保持。系统集成开关在隔离模型中禁用，不代表生产规则变更。
+
+## 实际瞬态证据与明确缺口
+
+本轮真实点击打开了统计popover和移除确认框，两种原生外观均已捕获。确认框Escape取消成功；没有调用destructive action。所有probe记录appActive=false、host key-window=false；只用本进程窗口输入，没有activate、全局按键或新权限请求。
+
+组合图像素：浅popover1272×618、深popover1270×618，浅确认框1200×1402、深确认框600×700。显示器backing scale不同，manifest保存原始像素/逻辑尺寸和本进程窗口bounds；四份图均通过归属及尺寸校验，允许16pt系统组合边缘差，不裁图、不改PNG、不包含个人桌面。
+
+主体使用NSView.cacheDisplay的实际原生绘制；菜单是StatusMenu内容，不能冒称系统MenuBarExtra弹出交互。系统分析ProgressView在非key宿主仍灰色，即使测试环境controlActiveState=.active；产品tint和已导入均使用accentColor，真实激活颜色尚未验证。
+
+popover的cacheDisplay有透明/系统材质限制；**浅色compositor原图也有明显灰色/透明材质边界**。captured仅证明获取和几何检查成功，不证明激活系统材质可接受。确认框近乎空白的view bitmap被拒绝；实际WindowServer图用已有录屏权限和verified-own-window-ID定向取得。
+
+尚未验证：物理hover进入/离开popover、完整路径系统tooltip、独立Space/Return固定、外部点击关闭、真实键盘焦点环与恢复、active窗口材质和真实MenuBarExtra交互。非激活宿主的popover本地Escape未关闭；Space/Return仅观察到已有窗口继续存在，不能当作独立固定成功。公开AX未暴露菜单/来源actionable节点，alert节点可见但Cancel AX press返回false；这些失败事实保留。--interactive提供用户控制会话，不自动激活，不等于已验收。
+
+## 重现、范围与待办
+
+```bash
+# 每次使用全新output目录，Debug DerivedData需来自当前源码。
 bash Tests/UIReview/run-ui-review.sh \
   --derived-data "$PWD/work/ui-polish-task2-derived" \
   --output-dir "$PWD/work/ui-polish/review-<unique>"
 
-# 有界、只操作测试宿主窗口；已有权限才执行 compositor capture。
+# 有界本进程输入，已有权限才捕获实际窗口。
 bash Tests/UIReview/run-ui-review.sh \
   --derived-data "$PWD/work/ui-polish-task2-derived" \
   --output-dir "$PWD/work/ui-polish/probe-<unique>" --probe
 
-# 用户控制会话，窗口 ID / PID 记录在 interactive-manifest.json。
+# 用户控制的原生会话；不抢前台焦点，窗口ID/PID写manifest。
 bash Tests/UIReview/run-ui-review.sh \
   --derived-data "$PWD/work/ui-polish-task2-derived" \
   --output-dir "$PWD/work/ui-polish/interactive-<unique>" \
   --interactive --scenario syncing --appearance light
 ```
 
-本轮未做真实 Photos、来源/网络/原片验收、macOS 13/14 实机、通知/登录项/权限、生产配置变更、发布打包、安装/启动生产 App、合并或推送。冻结 Core、AppModel、SyncRuntime、SyncStatusPresentation、PhotoSyncApp、Info.plist 相对冻结基线 diff 为空；Task 3 的 Xcode 变更仅新增 test-target fixture 成员，整条分支另含 Task 1/2 新视图的 app/test target 成员，未加入 Core。
+宿主排除PhotoSyncApp.swift，不使用生产App入口。UUID临时SQLite、合成来源描述和injected模型不启动engine/gateway/bootstrap/tick、不遍历来源。正常App未启动；没有真实Photos、来源/网络/原片验收、权限/通知/登录项设置、macOS13/14实机、打包、Developer ID/公证、安装、合并或推送。
+
+冻结Core、AppModel、SyncRuntime、SyncStatusPresentation、PhotoSyncApp、Info.plist相对f467ed基线diff为空，Core目标成员不变。Task1/2视图只加入App和hostless tests，Task3 fixture只加入tests，review host不进入产品资源。只读metrics/局部popover状态、共享路径显示、设置列表布局和对应验证均映射到本次前端目标，没有附带后端修复或API变更。
+
+待办：用户检查本图册并明确给结论；在用户控制前台的隔离host中补上述原生交互/active外观证据。未收到结论时保持待验收，分支codex/native-ui-polish及恢复ledger保留。
