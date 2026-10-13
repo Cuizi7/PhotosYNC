@@ -112,6 +112,13 @@ python3 scripts/validate.py \
 
 ## 本轮未执行
 
-没有启动/安装生产 PhotosYNC、访问真实 Photos/来源/生产库、改变图库/系统权限/通知/登录项；没有 macOS13/14 实机验证、打包/发布、Developer ID/公证、合并或推送。构建、自动测试、GUI合成截图、真实 Photos、平台兼容和分发结论分别记录，不能互相替代。
+没有启动/安装生产 PhotosYNC、访问真实 Photos/来源/生产库、改变图库/系统权限/通知/登录项；没有 macOS13/14 实机验证、打包/发布、Developer ID/公证或合并。构建、自动测试、GUI合成截图、真实 Photos、平台兼容和分发结论分别记录，不能互相替代。
 
 历史 e3e3a3f 的599项测试及首次截图只用于回溯；当前自动验证与主体截图以 d3d1172 及上列最新目录为准。
+
+
+## PR收尾
+
+2026-10-13 已按用户要求创建 [PR #1](https://github.com/Cuizi7/PhotosYNC/pull/1)：`codex/native-ui-polish` → `codex/photosync-0.2.0-design`。来源基线f467ed4与远端PR base完全一致；PR创建前最终深度集成评审通过，无Critical/Important遗留。产品/测试仍等于完整验证的d3d1172；之后只记录验收与PR证据，未重新改变行为。
+
+已推送来源基线和前端分支、保留PR工作树、归档本计划的局部工作证据。未合并或发布应用。
