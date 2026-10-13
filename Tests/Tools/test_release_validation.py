@@ -393,6 +393,61 @@ class ReleaseValidationTests(unittest.TestCase):
                 finally:
                     temporary_directory.cleanup()
 
+    def test_packager_requires_both_native_architectures_in_app_and_core(self) -> None:
+        real_lipo = shutil.which("lipo")
+        real_clang = shutil.which("clang")
+        if sys.platform != "darwin" or real_lipo is None or real_clang is None:
+            self.skipTest("Native architecture gate requires macOS lipo and clang")
+
+        # Tiny self-made Mach-O objects exercise the actual lipo argument parser;
+        # the remaining build, resource and signing stages stay synthetic.
+        binaries = {}
+        for architecture in ("arm64", "x86_64"):
+            binary = Path(self.temporary_directory.name) / f"{architecture}.o"
+            subprocess.run(
+                [real_clang, "-target", f"{architecture}-apple-macos13", "-x", "c", "-c", "-", "-o", str(binary)],
+                input="int release_fixture(void) { return 0; }\n",
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            binaries[architecture] = binary
+        universal = Path(self.temporary_directory.name) / "universal.o"
+        subprocess.run(
+            [real_lipo, "-create", str(binaries["arm64"]), str(binaries["x86_64"]), "-output", str(universal)],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        cases = (
+            ("universal", universal, universal, True),
+            ("app-arm64-only", binaries["arm64"], universal, False),
+            ("app-x86_64-only", binaries["x86_64"], universal, False),
+            ("core-arm64-only", universal, binaries["arm64"], False),
+            ("core-x86_64-only", universal, binaries["x86_64"], False),
+        )
+        for label, app_binary, core_binary, should_publish in cases:
+            with self.subTest(label=label):
+                temporary_directory = tempfile.TemporaryDirectory()
+                fixture = ReleaseFixture(temporary_directory)
+                try:
+                    (fixture.bin_dir / "lipo").unlink()
+                    (fixture.bin_dir / "lipo").symlink_to(real_lipo)
+                    result = fixture.run_packager(
+                        FAKE_APP_BINARY=str(app_binary), FAKE_CORE_BINARY=str(core_binary),
+                    )
+                    if should_publish:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertTrue((fixture.release_path() / "SHA256SUMS").is_file())
+                    else:
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        self.assertFalse(fixture.release_path().exists())
+                        self.assertNotIn("hdiutil:create", fixture.event_lines())
+                    self.assert_no_transient_release_paths(fixture)
+                finally:
+                    temporary_directory.cleanup()
+
     def test_packager_refuses_dirty_untracked_existing_and_locked_release_paths(self) -> None:
         cases = ("dirty", "untracked", "file", "directory", "symlink", "lock")
         for case in cases:
@@ -495,6 +550,12 @@ PLIST
       printf 'asset' > "$app/Contents/Resources/Assets.car"
       printf 'icon' > "$app/Contents/Resources/PhotosYNC.icns"
       : > "$app/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore"
+      if [ -n "${FAKE_APP_BINARY:-}" ]; then
+        cp "$FAKE_APP_BINARY" "$app/Contents/MacOS/PhotosYNC"
+      fi
+      if [ -n "${FAKE_CORE_BINARY:-}" ]; then
+        cp "$FAKE_CORE_BINARY" "$app/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore"
+      fi
     fi
     ;;
 esac

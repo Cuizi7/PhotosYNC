@@ -140,8 +140,10 @@ codesign --verify --deep --strict --all-architectures "$app_path"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.2.0' ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '7' ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :PhotoSyncReleaseChannel' "$app_path/Contents/Info.plist")" == 'beta' ]]
-lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch arm64 x86_64
-lipo "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore" -verify_arch arm64 x86_64
+for architecture in arm64 x86_64; do
+  lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch "$architecture"
+  lipo "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore" -verify_arch "$architecture"
+done
 scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg"
 hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg"
 
