@@ -5,6 +5,7 @@ derived=""
 output=""
 interactive=0
 probe=0
+controlled=0
 scenario="syncing"
 appearance="light"
 while [[ $# -gt 0 ]]; do
@@ -13,6 +14,7 @@ while [[ $# -gt 0 ]]; do
     --output-dir) output="$2"; shift 2 ;;
     --interactive) interactive=1; shift ;;
     --probe) probe=1; shift ;;
+    --controlled-capture) controlled=1; shift ;;
     --scenario) scenario="$2"; shift 2 ;;
     --appearance) appearance="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -20,7 +22,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$derived" && -n "$output" ]] || { echo "--derived-data and --output-dir are required" >&2; exit 2; }
 [[ "$appearance" == light || "$appearance" == dark ]] || { echo "Invalid appearance" >&2; exit 2; }
-[[ "$interactive" != 1 || "$probe" != 1 ]] || { echo "Choose --interactive or --probe" >&2; exit 2; }
+[[ $((interactive + probe + controlled)) -le 1 ]] || { echo "Choose one capture/session mode" >&2; exit 2; }
 products="$derived/Build/Products/Debug"
 [[ -f "$products/PhotoSyncCore.framework/PhotoSyncCore" && -f "$products/PhotosYNC.app/Contents/Info.plist" ]] || {
   echo "Build-for-testing Debug Core and app Info.plist are required" >&2; exit 1;
@@ -73,6 +75,10 @@ metadata = dict(sourceCommit=command('git', 'rev-parse', 'HEAD'),
                 fixtureIsolation='UUID temporary SQLite; source descriptions only; no engine/gateway/bootstrap/tick')
 (output/'source.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
 PY
+if [[ "$controlled" == 1 ]]; then
+  "$bundle/Contents/MacOS/UIReviewHost" --output-dir "$output" --controlled-capture > "$output/capture.log" 2>&1
+  exit 0
+fi
 if [[ "$interactive" == 1 ]]; then
   exec "$bundle/Contents/MacOS/UIReviewHost" --output-dir "$output" --interactive --scenario "$scenario" --appearance "$appearance"
 fi

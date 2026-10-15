@@ -26,7 +26,7 @@ enum ReviewHost {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("PhotosYNC-UIReview-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let app = NSApplication.shared
-        app.setActivationPolicy(args.contains("--interactive") || args.contains("--probe") ? .accessory : .prohibited)
+        app.setActivationPolicy(args.contains("--interactive") || args.contains("--probe") || args.contains("--controlled-capture") ? .accessory : .prohibited)
         var manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: output.appendingPathComponent("source.json"))) as? [String: Any] ?? [:]
         manifest["hostBundle"] = ["identifier": Bundle.main.bundleIdentifier ?? "missing",
             "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "missing",
@@ -38,6 +38,10 @@ enum ReviewHost {
             "No screen/accessibility permission requests, no global events, no foreground activation."]
         manifest["humanAcceptance"] = "候选证据，等待协调代理审阅；未声称用户本人验收"
         manifest["controlActiveStateOverride"] = "SwiftUI environment controlActiveState=.active; affects control appearance only; does not activate app/window or certify focus/hover"
+        if args.contains("--controlled-capture") {
+            try controlledCapture(output: output, root: root, manifest: manifest)
+            return
+        }
         if args.contains("--probe") {
             var observations: [[String: Any]] = []
             let scenarios = argument("--scenario").flatMap(UIReviewScenario.init(rawValue:)).map { [$0] }
@@ -534,6 +538,197 @@ enum ReviewHost {
         return result
     }
 
+    /// Explicitly opt-in, one activation, one bounded synthetic QA session.
+    static func controlledCapture(output: URL, root: URL, manifest initial: [String: Any]) throws {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard let original = NSWorkspace.shared.frontmostApplication, original.processIdentifier != ownPID else {
+            throw UIReviewError.invalid("Need a distinct original frontmost app before the one allowed QA activation")
+        }
+        let originalPID = original.processIdentifier
+        let started = Date()
+        let deadline = started.addingTimeInterval(30)
+        var manifest = initial
+        var observations: [[String: Any]] = []
+        var captures: [[String: Any]] = []
+        var windows: [NSWindow] = []
+        var activated = false
+        var userSwitched = false
+        var failure: String?
+        var restore: [String: Any] = ["attempted": false]
+        manifest["limitations"] = ["Explicit authorization for one synthetic QA foreground activation, maximum 30 seconds.",
+            "Only own PID/windowID compositor captures; stop immediately after observing a user switch.",
+            "No global keys/mouse, permission requests, system settings changes, production runtime or Photos access.",
+            "Acquisition is not user acceptance; every original screenshot and frontmost guard is recorded."]
+        manifest["controlActiveStateOverride"] = "Synthetic SwiftUI appearance override; separate single QA activation is explicitly recorded below."
+        manifest["controlledSession"] = ["originalFrontmost": ["pid": originalPID, "bundleID": original.bundleIdentifier ?? "unknown"],
+            "qaPID": ownPID, "qaActivationCalls": 0, "maximumSeconds": 30,
+            "status": "prepared-before-activation", "startedAt": started.ISO8601Format()]
+        try save(manifest, output: output, name: "controlled-manifest.json")
+        func frontmost() -> [String: Any] {
+            let app = NSWorkspace.shared.frontmostApplication
+            return ["pid": app.map { $0.processIdentifier as Any } ?? NSNull(), "bundleID": app?.bundleIdentifier ?? "unknown"]
+        }
+        func mayContinue() -> Bool {
+            guard Date() < deadline else { return false }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID else {
+                userSwitched = true
+                return false
+            }
+            return true
+        }
+        func closeOwnWindows() {
+            for window in NSApp.windows where window.isVisible { window.orderOut(nil); window.close() }
+            windows.removeAll()
+        }
+        func capture(_ popup: NSWindow, scenario: UIReviewScenario, look: String, phase: String) throws {
+            guard mayContinue(), deadline.timeIntervalSinceNow > 6 else { throw UIReviewError.invalid("QA foreground/session deadline ended before capture") }
+            let popupID = CGWindowID(popup.windowNumber)
+            let paintDeadline = min(deadline, Date().addingTimeInterval(3))
+            var frames: [[String: Any]] = []
+            var stable = 0
+            repeat {
+                guard mayContinue() else { break }
+                let records = CGWindowListCopyWindowInfo([.optionIncludingWindow], popupID) as? [[String: Any]] ?? []
+                let own = records.first { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ownPID && ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == popupID }
+                let bounds = own?[kCGWindowBounds as String] as? [String: Any] ?? [:]
+                let w = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+                let h = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+                let matches = abs(w - popup.frame.width) <= 2 && abs(h - popup.frame.height) <= 2 && w > 100 && h > 100
+                stable = matches ? stable + 1 : 0
+                frames.append(["elapsedMilliseconds": Int(Date().timeIntervalSince(started) * 1000), "cgBounds": bounds,
+                    "nativeFrame": String(describing: popup.frame), "stableFrames": stable, "frontmost": frontmost()])
+                if stable >= 3 { break }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            } while Date() < paintDeadline
+            guard mayContinue(), stable >= 3, deadline.timeIntervalSinceNow > 6 else {
+                observations.append(["scenario": scenario.rawValue, "appearance": look, "phase": phase, "paintFrames": frames])
+                throw UIReviewError.invalid("Native/CG popup dimensions or session guard did not converge; no activation retry")
+            }
+            let entryFront = frontmost()
+            let acquisition = try compositorCapture(window: popup, output: output,
+                name: "controlled-\(scenario.rawValue)-\(look)-\(phase).png", captureAllowed: mayContinue)
+            captures.append(["scenario": scenario.rawValue, "appearance": look, "phase": phase,
+                "pid": ownPID, "windowID": popup.windowNumber, "nativeFrame": String(describing: popup.frame),
+                "frontmostBefore": entryFront, "frontmostAfter": frontmost(), "paintFrames": frames, "acquisition": acquisition])
+            guard mayContinue(), acquisition["status"] as? String == "captured" else {
+                throw UIReviewError.invalid("One controlled native acquisition did not succeed; no reactivation/retry")
+            }
+        }
+        do {
+            for scenario in [UIReviewScenario.mixedIssues, .longIssues, .analyzing] {
+                for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+                    if activated, !mayContinue() { throw UIReviewError.invalid("User switched away or bounded session expired") }
+                    guard deadline.timeIntervalSinceNow > 6 else { throw UIReviewError.invalid("Bounded session time budget reached") }
+                    let model = try makeUIReviewModel(scenario: scenario, root: root)
+                    NSApp.appearance = NSAppearance(named: appearance)
+                    let window = try interactiveWindow(AnyView(StatusMenu(model: model)), width: 320, appearance: appearance)
+                    windows.append(window)
+                    if !activated {
+                        // Persist the original foreground immediately before the sole QA activation.
+                        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == originalPID else {
+                            userSwitched = true
+                            throw UIReviewError.invalid("Original foreground changed before QA activation; session stopped")
+                        }
+                        manifest["frontmostBeforeActivation"] = frontmost()
+                        try save(manifest, output: output, name: "controlled-manifest.json")
+                        guard deadline.timeIntervalSinceNow > 6 else { throw UIReviewError.invalid("Session budget expired before the sole QA activation") }
+                        // The sole QA activation. There is no reactivation path.
+                        window.orderFront(nil)
+                        NSApp.activate(ignoringOtherApps: true)
+                        activated = true
+                        guard waitUntil({
+                            let currentPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                            if let currentPID, currentPID != originalPID, currentPID != ownPID {
+                                userSwitched = true
+                                return true
+                            }
+                            return currentPID == ownPID
+                        }), !userSwitched, NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID else {
+                            throw UIReviewError.invalid("The single QA activation did not become frontmost or a user switch was observed")
+                        }
+                    }
+                    guard mayContinue() else { throw UIReviewError.invalid("QA no longer frontmost before own-window presentation") }
+                    window.makeKeyAndOrderFront(nil)
+                    // Keep one QA host visible between scenes so closing the prior scene
+                    // does not itself surrender foreground and resemble a user switch.
+                    for previous in windows where previous !== window {
+                        previous.contentView = nil; previous.orderOut(nil); previous.close()
+                    }
+                    windows = [window]
+                    guard let host = window.contentView else { throw UIReviewError.invalid("Missing synthetic menu host") }
+                    func buttons(_ view: NSView) -> [NSButton] {
+                        ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap(buttons)
+                    }
+                    let candidates = buttons(host).filter { $0.isEnabled && $0.bounds.width > 0 && $0.bounds.height > 0 }
+                    let index = scenario == .analyzing ? 0 : 1
+                    guard candidates.indices.contains(index), mayContinue() else { throw UIReviewError.invalid("Native details trigger unavailable or QA lost foreground") }
+                    let trigger = candidates[index]
+                    let before = Set(NSApp.windows.map(\.windowNumber))
+                    trigger.performClick(nil)
+                    var popup: NSWindow?
+                    guard waitUntil({
+                        guard mayContinue() else { return true }
+                        popup = NSApp.windows.first { $0.isVisible && !before.contains($0.windowNumber) }
+                        return popup != nil
+                    }), mayContinue(), let popup else { throw UIReviewError.invalid("No native popup in the authorized foreground session") }
+                    observations.append(["scenario": scenario.rawValue, "appearance": look,
+                        "hostWindowID": window.windowNumber, "popupWindowID": popup.windowNumber, "input": inputs(model)])
+                    try capture(popup, scenario: scenario, look: look, phase: "opened")
+                    if scenario != .analyzing {
+                        guard let content = popup.contentView else { throw UIReviewError.invalid("Missing source popup content") }
+                        try UIReviewCapture.scrollToBottom(content)
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                        try capture(popup, scenario: scenario, look: look, phase: "bottom")
+                    } else {
+                        model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+                            totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+                            readyRepresentations: 6789, excludedAssets: 99, issue: "合成更新原因")
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                        try capture(popup, scenario: scenario, look: look, phase: "progress")
+                        model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
+                            totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
+                            readyRepresentations: 45000, excludedAssets: 99, issue: nil)
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                        try capture(popup, scenario: scenario, look: look, phase: "ready")
+                        observations.append(["scenario": scenario.rawValue, "appearance": look,
+                            "samePopupVisibleAfterReady": popup.isVisible, "sameTriggerAfterReady": buttons(host).first === trigger,
+                            "readyAccessibilityNameProjection": SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel])
+                    }
+                    popup.orderOut(nil); popup.close()
+                }
+            }
+        } catch { failure = String(describing: error) }
+        let frontBeforeRestore = frontmost()
+        // Restore before normal own-window cleanup, only while QA still owns foreground
+        // and no user switch has ever been observed. Never activateAllWindows or retry.
+        if activated, !userSwitched, NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID,
+           let liveOriginal = NSRunningApplication(processIdentifier: originalPID), !liveOriginal.isTerminated,
+           liveOriginal.bundleIdentifier == original.bundleIdentifier {
+            restore = ["attempted": true, "accepted": liveOriginal.activate(options: [])]
+            let restoreDeadline = min(deadline, Date().addingTimeInterval(0.75))
+            var observed = false
+            var thirdParty = false
+            repeat {
+                let currentPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                if currentPID == originalPID { observed = true; break }
+                if let currentPID, currentPID != ownPID { thirdParty = true; break }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            } while Date() < restoreDeadline
+            restore["observedOriginalFrontmost"] = observed
+            restore["stoppedOnThirdPartySwitch"] = thirdParty
+            restore["frontmostAtObservationEnd"] = frontmost()
+        }
+        closeOwnWindows()
+        manifest["controlledSession"] = ["originalFrontmost": ["pid": originalPID, "bundleID": original.bundleIdentifier ?? "unknown"],
+            "qaPID": ownPID, "qaActivationCalls": activated ? 1 : 0, "maximumSeconds": 30,
+            "elapsedSeconds": Date().timeIntervalSince(started), "userSwitchObserved": userSwitched,
+            "frontmostBeforeRestore": frontBeforeRestore, "restore": restore, "frontmostAfter": frontmost(),
+            "status": failure == nil ? "acquired-awaiting-coordinator-inspection" : "unverified",
+            "failure": failure.map { $0 as Any } ?? NSNull(), "observations": observations, "captures": captures,
+            "systemSettingsChanged": false, "globalInputInjected": false]
+        try save(manifest, output: output, name: "controlled-manifest.json")
+    }
+
     static func userOpenCaptureResult(_ acquisition: [String: Any]) -> [String: Any] {
         var result: [String: Any] = ["compositor": acquisition]
         if acquisition["status"] as? String == "captured" {
@@ -547,7 +742,8 @@ enum ReviewHost {
         return result
     }
 
-    static func compositorCapture(window: NSWindow, output: URL, name: String) throws -> [String: Any] {
+    static func compositorCapture(window: NSWindow, output: URL, name: String, captureAllowed: (() -> Bool)? = nil) throws -> [String: Any] {
+        if captureAllowed?() == false { return ["status": "unverified", "failure": "Controlled foreground/session guard ended before acquisition"] }
         guard CGPreflightScreenCaptureAccess() else {
             return ["status": "unverified", "failure": "Screen Recording preflight false; no permission requested"]
         }
@@ -569,12 +765,17 @@ enum ReviewHost {
         catch { return ["status": "unverified", "failure": String(describing: error)] }
         let deadline = Date().addingTimeInterval(5)
         while process.isRunning, Date() < deadline {
+            if captureAllowed?() == false {
+                process.terminate()
+                return ["status": "unverified", "failure": "Controlled foreground/session guard ended during acquisition"]
+            }
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         }
         if process.isRunning {
             process.terminate()
             return ["status": "unverified", "failure": "Own-window screencapture exceeded bounded five-second deadline"]
         }
+        if captureAllowed?() == false { return ["status": "unverified", "failure": "Controlled foreground/session guard ended after acquisition"] }
         let diagnostic = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             return ["status": "unverified", "exitCode": process.terminationStatus, "failure": diagnostic]
