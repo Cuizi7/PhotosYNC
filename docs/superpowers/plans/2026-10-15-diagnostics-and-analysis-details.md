@@ -86,6 +86,7 @@
 - [ ] **Step 4: 实现分析组及稳定入口。** SyncDetailsContent用既有analysis在顶部加入spec§6的状态/进度/原因/说明/脚注；三组分别标范围，300pt有界滚动。StatusMenu进度区将唯一SyncDetailsButton保持在analysis/sync条件分支之外的稳定结构中；调整LibraryAnalysisView/SyncProgressView的摘要与图形分工，避免复制交互或多个info，保留292pt内容宽、原生字号、原状态优先级和no-source可达入口。恢复ready时不重置presented。
 - [ ] **Step 5: GREEN。** 重建并运行AppViewTests、SyncStatusPresentationTests、现有AppModelTests；覆盖0/1/30来源、明暗、原操作/disabled/键盘映射。新原生文件必须在实际App与测试都编译。一次SDD完整任务review同时检查规格与质量，通过后提交 `fix(ui): align source and library analysis details`。
 - [ ] **Step 6: 产出可审阅真实UI证据。** 扩展现有ReviewHost识别新详情按钮，不沿用失效硬编码坐标。`Tests/UIReview/run-ui-review.sh --derived-data "$PWD/work/022-focused" --output-dir "$PWD/work/022-ui-static"`取得主体；`--probe`用另一fresh目录取得本进程实际浮层。合成场景包括混合问题、20项滚动首尾、analysis known/unknown/waiting/paused和opened→ready，明暗各一套。用已有权限的自己窗口捕获，记录commit/diff、PID/windowID、尺寸/场景、原生popover发现/实际内容/结果；不激活、无全局输入。静态详情拼接或透明异常材质不能充当成功。环境不足时交协调线程具体失败证据，不擅自改权限。
+- [ ] **Step 6a: 协调批准的一次前台取图。** 常规非激活捕获已产生CG窗口仅1×2的具体证据后，协调线程明确授权spec§8的单次合成ReviewHost受控激活（≤30秒）。保留原frontmost、自己的PID/window/尺寸和明暗/滚动/动态原图；用户切走即停、不抢回，条件恢复原App，无全局输入或权限改动。仅测试宿主入口支持此模式，默认验收路径不激活；控制器核对一次性/恢复边界后执行，不需重复询问授权。
 - [ ] **Step 7: 交协调线程截图审阅。** 给原始PNG/图册/已披露局限；按收到的范围内修订更新截图和相关验证。记录结论为“协调代理审阅”，不得改写旧版本人工结论或称用户本人验收。由协调线程判断其本次委托的验收条件。
 
 ### Task 3: 0.2.2发行配置与集成交付（scoped implementer + 主代理协调）
