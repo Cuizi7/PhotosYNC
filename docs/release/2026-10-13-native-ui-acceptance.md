@@ -122,3 +122,5 @@ python3 scripts/validate.py \
 2026-10-13 已按用户要求创建 [PR #1](https://github.com/Cuizi7/PhotosYNC/pull/1)：`codex/native-ui-polish` → `codex/photosync-0.2.0-design`。来源基线f467ed4与远端PR base完全一致；PR创建前最终深度集成评审通过，无Critical/Important遗留。产品/测试仍等于完整验证的d3d1172；之后只记录验收与PR证据，未重新改变行为。
 
 已推送来源基线和前端分支、保留PR工作树、归档本计划的局部工作证据。未合并或发布应用。
+
+2026-10-15追加[原生交互补验记录](2026-10-15-native-interaction-followup.md)：隔离探针未满足激活/key与事件队列校准前提，未新增产品交互通过或失败结论；产品代码和本记录的用户视觉验收结论未变。真实MenuBarExtra交互、物理hover/键盘与浮层偏灰原因的剩余缺口继续明示。
