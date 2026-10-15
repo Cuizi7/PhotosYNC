@@ -889,7 +889,8 @@ public actor SyncEngine {
                         guard canSubmit(sourceID: record.file.sourceID) else { continue }
                         recordRoundFailure(context.roundID)
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
-                            issue: SourceIssueText.submissionStampFailed(error: error), path: record.file.url.path, runID: context.runID, fileID: record.id, error: error)
+                            issue: SourceIssueText.submissionStampFailed(error: error), path: record.file.url.path,
+                            stage: "准备照片判重", runID: context.runID, fileID: record.id, error: error)
                         continue
                     }
                     guard canSubmit(sourceID: record.file.sourceID) else { continue }
@@ -1062,7 +1063,9 @@ public actor SyncEngine {
                                    issue: SourceIssue(summary: definite ? "有文件导入失败，稍后会自动重试。" : SourceIssueText.uncertainImport,
                                                       detail: error.localizedDescription, kind: .submission),
                                    path: record.file.url.path, stage: "提交导入", runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
-                    logEvent(phase: "submission", result: "failed", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
+                    logEvent(phase: "submission", result: "failed", sourceID: record.file.sourceID, runID: context.runID,
+                             fileID: record.id, attemptID: attempt, path: record.file.url.path, error: error,
+                             detail: "提交导入: \(SourceIssueText.systemDiagnostic(error))")
                     // A gateway reporting unknown may still own a physical request. Keep this
                     // instance and stop submissions until its own lifecycle permits recovery.
                     if !definite {
@@ -1185,6 +1188,13 @@ public actor SyncEngine {
             ?? TrackedSourceIssue(primary: issue, diagnostics: [:])
         tracked.diagnostics[diagnosticID] = diagnostic
         sourceIssues[sourceID, default: [:]][key] = refreshedPrimary(tracked)
+        // Individual submission evidence must outlive the snapshot even when this source's
+        // once-per-outage waiting notification has already been sent for another file.
+        if issue.kind == .submission {
+            logFailureOnce(phase: "submission-diagnostic", sourceID: sourceID, keyPath: diagnosticID,
+                           runID: runID, fileID: fileID, attemptID: attemptID, path: path, stage: stage,
+                           result: "unresolved", error: error, detail: diagnostic.detail)
+        }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
     }
 
@@ -1234,6 +1244,7 @@ public actor SyncEngine {
         // failure must not re-enable identical log rows for any other file in this source.
         if key.hasPrefix("file:"), let fileID {
             lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|submission-stamp|\(fileID.uuidString)")
+            lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|submission-diagnostic|\(fileID.uuidString)")
         }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID,
                               error: nil, announceRecovery: announceRecovery)
@@ -1325,14 +1336,15 @@ public actor SyncEngine {
     /// logged physical location.
     private func logFailureOnce(phase: String, sourceID: UUID, keyPath: String? = nil, runID: UUID? = nil,
                                 fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, stage: String? = nil,
-                                result: String = "failed", error: Error? = nil) {
+                                result: String = "failed", error: Error? = nil, detail: String? = nil) {
         let identity = fileID?.uuidString ?? keyPath ?? path ?? ""
         let key = "\(sourceID.uuidString)|\(phase)|\(identity)"
-        let signature = "\(result)|\(stage ?? "")|\(error.map { SourceIssueText.systemDiagnostic($0) } ?? "")"
+        let diagnostic = detail ?? error.map { SourceIssueText.systemDiagnostic($0) } ?? ""
+        let signature = "\(result)|\(stage ?? "")|\(diagnostic)"
         guard lastFailureLogSignatures[key] != signature else { return }
         lastFailureLogSignatures[key] = signature
-        let detail = stage.map { "\($0): " + (error.map { SourceIssueText.systemDiagnostic($0) } ?? "") }
-        logEvent(phase: phase, result: result, sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, path: path, error: error, detail: detail)
+        let logDetail = detail ?? stage.map { "\($0): \(diagnostic)" }
+        logEvent(phase: phase, result: result, sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, path: path, error: error, detail: logDetail)
     }
 
     private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, error: Error? = nil, detail: String? = nil) {

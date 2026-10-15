@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import ImageIO
 import SQLite3
 @testable import PhotoSyncCore
 
@@ -530,6 +531,115 @@ final class EngineTests: XCTestCase {
         XCTAssertFalse(recoveryResults.contains("recovered"))
     }
 
+    func testReconciliationDiagnosticsJournalEachIdentityAndChangedCauseWithoutRenotifying() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let sourceID = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+        let first = try await engineSourceFile(sourceID: sourceID, directory: root)
+        let secondURL = root.appendingPathComponent("second.jpg")
+        try FileManager.default.copyItem(at: first.url, to: secondURL)
+        let second = SourceFile(sourceID: sourceID, relativePath: "second.jpg", url: secondURL,
+            stamp: try await DirectoryReader().stamp(of: secondURL),
+            metadata: try await MetadataReader().read(url: secondURL, filename: "second.jpg"))
+        let firstID = try await f.store.save(first, decision: .importNew)
+        let secondID = try await f.store.save(second, decision: .importNew)
+        let firstAttempt = UUID(), secondAttempt = UUID()
+        try await f.store.beginAttempt(fileID: firstID, attemptID: firstAttempt)
+        try f.store.checkpointPlaceholder(fileID: firstID, attemptID: firstAttempt, identifier: "first")
+        try await f.store.beginAttempt(fileID: secondID, attemptID: secondAttempt)
+        try f.store.checkpointPlaceholder(fileID: secondID, attemptID: secondAttempt, identifier: "second")
+        let photos = DiagnosticSubmissionPhotos()
+        await photos.setReconciliation("first", evidence: .unknown)
+        await photos.setReconciliation("second", error: diagnosticReconciliationError("cause one"))
+        let logs = try temporaryDirectory(), notices = SourceIssueNotificationRecorder()
+        let logger = try RunLogger(directory: logs)
+        let engine = SyncEngine(store: f.store, photos: photos, logger: logger,
+            notifySourceIssue: { _, recovered, issue in notices.record(recovered: recovered, issue: issue) })
+        let logURL = logs.appendingPathComponent("photo-sync.jsonl")
+        await engine.recoverImports(); logger.flushForTesting()
+        let initial = try submissionDiagnosticRows(at: logURL)
+        XCTAssertEqual(initial.count, 2)
+        for (fileID, fileURL, attempt) in [(firstID, first.url, firstAttempt), (secondID, second.url, secondAttempt)] {
+            let row = try XCTUnwrap(initial.first { $0["file"] == fileID.uuidString })
+            XCTAssertEqual(row["path"], fileURL.path)
+            XCTAssertEqual(row["attempt"], attempt.uuidString)
+            XCTAssertTrue(row["detail"]?.contains("核对导入结果") == true)
+        }
+        let unknown = try XCTUnwrap(initial.first { $0["file"] == firstID.uuidString })
+        XCTAssertTrue(unknown["detail"]?.contains("An earlier Photos import is awaiting confirmation.") == true)
+        let errorRow = try XCTUnwrap(initial.first { $0["file"] == secondID.uuidString })
+        XCTAssertTrue(errorRow["detail"]?.contains("Fixture.Reconciliation 7: outer unchanged") == true)
+        XCTAssertTrue(errorRow["detail"]?.contains("NSPOSIXErrorDomain 13: cause one") == true)
+        XCTAssertEqual(notices.events.count, 1)
+        XCTAssertEqual(notices.events.first?.recovered, false)
+        await engine.recoverImports(); logger.flushForTesting()
+        XCTAssertEqual(try submissionDiagnosticRows(at: logURL).count, 2, "Unchanged reconciliation must not duplicate rows")
+        await photos.setReconciliation("second", error: diagnosticReconciliationError("cause two"))
+        await engine.recoverImports(); logger.flushForTesting()
+        let changed = try submissionDiagnosticRows(at: logURL)
+        XCTAssertEqual(changed.count, 3)
+        XCTAssertEqual(changed.filter { $0["file"] == firstID.uuidString }.count, 1)
+        XCTAssertTrue(changed.last?["detail"]?.contains("NSPOSIXErrorDomain 13: cause two") == true)
+        XCTAssertEqual(notices.events.count, 1)
+        await photos.setReconciliation("first", evidence: .definitelyNotCommitted)
+        await engine.recoverImports()
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 0, "The other identity is still unresolved")
+        let nextAttempt = UUID()
+        try await f.store.beginAttempt(fileID: firstID, attemptID: nextAttempt)
+        try f.store.checkpointPlaceholder(fileID: firstID, attemptID: nextAttempt, identifier: "first")
+        await photos.setReconciliation("first", evidence: .unknown)
+        await engine.recoverImports(); logger.flushForTesting()
+        let relapsed = try submissionDiagnosticRows(at: logURL)
+        XCTAssertEqual(relapsed.count, 4)
+        XCTAssertEqual(relapsed.filter { $0["file"] == firstID.uuidString }.count, 2, "Resolution resets only the matching identity")
+        XCTAssertEqual(relapsed.filter { $0["file"] == secondID.uuidString }.count, 2, "Its sibling remains deduplicated")
+        XCTAssertEqual(notices.events.count, 1)
+        await photos.setReconciliation("first", evidence: .found(identifier: "imported-first"))
+        await photos.setReconciliation("second", evidence: .found(identifier: "imported-second"))
+        await engine.recoverImports()
+        let recovered = await engine.snapshot()
+        XCTAssertNil(recovered.sourceIssueDetails[sourceID]); XCTAssertNil(recovered.waitingSources[sourceID])
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 1)
+        let creates = await photos.createCount
+        XCTAssertEqual(creates, 0, "Reconciliation logging must not cause another submission")
+    }
+
+    func testPreparationFailureJournalsEachFilePathStageAndCause() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let root = try SourceRegistry.normalizedURL(f.directories[0]), id = f.sourceIDs[0]
+        try FileManager.default.copyItem(at: root.appendingPathComponent("same.jpg"), to: root.appendingPathComponent("second.jpg"))
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let configuration = try JSONDecoder().decode(DedupConfiguration.self,
+            from: Data(contentsOf: repository.appendingPathComponent("docs/research/advanced-dedup/integration-profile.json")))
+        let photos = DiagnosticSubmissionPhotos(), model = DiagnosticPreparationModel()
+        let coordinator = PhotosIndexCoordinator(store: f.store, photos: photos, fingerprinter: model, configuration: configuration)
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: Date())
+        let executor = ReadExecutor(), budget = ImageWorkBudget(limits: configuration.resources)
+        let service = AdvancedDedupService(store: f.store, photos: photos, coordinator: coordinator, fingerprinter: model,
+            configuration: configuration, executor: executor, budget: budget)
+        let logs = try temporaryDirectory(), notices = SourceIssueNotificationRecorder()
+        let logger = try RunLogger(directory: logs)
+        let engine = SyncEngine(store: f.store, photos: photos, logger: logger,
+            advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, dedupConfiguration: configuration,
+            notifySourceIssue: { _, recovered, issue in notices.record(recovered: recovered, issue: issue) })
+        await engine.scan(sourceIDs: f.sourceIDs); logger.flushForTesting()
+        let snapshot = await engine.snapshot()
+        let details = try XCTUnwrap(snapshot.sourceIssueDetails[id])
+        XCTAssertEqual(details.count, 2)
+        let rows = try submissionDiagnosticRows(at: logs.appendingPathComponent("photo-sync.jsonl"))
+        XCTAssertEqual(rows.count, 2)
+        for detail in details {
+            XCTAssertEqual(detail.stage, "准备照片判重")
+            let row = try XCTUnwrap(rows.first { $0["path"] == detail.path })
+            XCTAssertTrue(row["detail"]?.contains("准备照片判重") == true)
+            XCTAssertTrue(row["detail"]?.contains("Fixture.Preparation 8: preparation failed") == true)
+            XCTAssertTrue(row["detail"]?.contains("NSPOSIXErrorDomain 13: preparation cause") == true)
+        }
+        XCTAssertEqual(notices.events.count, 1)
+        XCTAssertEqual(notices.events.first?.recovered, false)
+        let creates = await photos.createCount; XCTAssertEqual(creates, 0)
+        XCTAssertEqual(snapshot.summary?.retryPending, 2)
+    }
+
     func testMetadataFailureLogsSourcePathAndRun() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         let logDirectory = try temporaryDirectory()
@@ -567,6 +677,10 @@ final class EngineTests: XCTestCase {
         XCTAssertNotNil(submission["file"])
         XCTAssertNotNil(submission["attempt"])
         XCTAssertNotNil(submission["error"])
+        let stored = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        let record = try XCTUnwrap(stored)
+        XCTAssertEqual(submission["path"], record.file.url.path)
+        XCTAssertTrue(submission["detail"]?.contains("提交导入") == true)
     }
 
     func testPreAdmissionDefiniteFailureStaysPendingAndRetriesOneActualSubmission() async throws {
@@ -2209,5 +2323,48 @@ private actor DiagnosticDirectory: DirectoryReading {
         if file.resolvingSymlinksInPath().path == deferredFilePath { throw ReadExecutorError.sourceBusy }
         if let failure = fileFailures[file.resolvingSymlinksInPath().path] { throw failure }
         return try await reader.stamp(of: file)
+    }
+}
+
+private func submissionDiagnosticRows(at url: URL) throws -> [[String: String]] {
+    try String(contentsOf: url).split(separator: "\n").compactMap { line in
+        let row = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String]
+        return row?["phase"] == "submission-diagnostic" ? row : nil
+    }
+}
+
+private func diagnosticReconciliationError(_ cause: String) -> NSError {
+    NSError(domain: "Fixture.Reconciliation", code: 7, userInfo: [NSLocalizedDescriptionKey: "outer unchanged",
+        NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: cause])])
+}
+
+private actor DiagnosticSubmissionPhotos: PhotosIndexGateway {
+    nonisolated let context = LibraryContext(id: UUID(), epoch: 1)
+    private var evidence: [String: ImportEvidence] = [:]
+    private var errors: [String: NSError] = [:]
+    private(set) var createCount = 0
+    func setReconciliation(_ placeholder: String, evidence: ImportEvidence) { self.evidence[placeholder] = evidence; errors[placeholder] = nil }
+    func setReconciliation(_ placeholder: String, error: NSError) { errors[placeholder] = error }
+    func reconcile(placeholder: String?) async throws -> ImportEvidence {
+        let key = placeholder ?? ""
+        if let error = errors[key] { throw error }
+        return evidence[key] ?? .unknown
+    }
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot { .init(generation: 1, candidates: []) }
+    nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { $0.finish() } }
+    func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
+        .init(context: context, generation: 1, descriptors: [], nextOffset: nil)
+    }
+    func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation { throw PhotoKitGatewayError.libraryUnavailable }
+    func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+        createCount += 1
+        throw FixtureError.unavailable("No create is expected while logging these diagnostics")
+    }
+}
+
+private struct DiagnosticPreparationModel: ImageFingerprinting {
+    func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        throw NSError(domain: "Fixture.Preparation", code: 8, userInfo: [NSLocalizedDescriptionKey: "preparation failed",
+            NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: "preparation cause"])])
     }
 }
