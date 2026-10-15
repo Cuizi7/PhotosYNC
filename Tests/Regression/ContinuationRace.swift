@@ -1,5 +1,7 @@
 import Foundation
 import SQLite3
+import CoreGraphics
+import ImageIO
 
 // This executable is compiled only from a disposable copy of PhotoSyncCore by
 // scripts/test-continuation-race.py.  The production module never sees its gate.
@@ -70,13 +72,25 @@ actor ProbeGate {
 // write.  It deliberately does not exist in the checked-in production engine.
 let integrationRetryGate = ProbeGate()
 
+// latestScan belongs to the newer scan while the older drain resumes. Observe all round
+// failures synchronously in the disposable module so the older round cannot hide a failure.
+final class ProbeRoundFailures: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func record() { lock.lock(); count += 1; lock.unlock() }
+    func value() -> Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+let integrationRoundFailures = ProbeRoundFailures()
+
 private actor ProbeDirectory: DirectoryReading {
     private let markerGate: ProbeGate
     private let root: URL
+    private let advancedStamp: FileStamp?
     private var rounds = 0
     private var sameStampCalls = 0
 
-    init(root: URL, markerGate: ProbeGate) {
+    init(root: URL, markerGate: ProbeGate, advancedStamp: FileStamp? = nil) {
+        self.advancedStamp = advancedStamp
         self.root = root
         self.markerGate = markerGate
     }
@@ -98,6 +112,7 @@ private actor ProbeDirectory: DirectoryReading {
         switch file.lastPathComponent {
         case "same.jpg":
             sameStampCalls += 1
+            if let advancedStamp, sameStampCalls <= 2 { return advancedStamp }
             switch sameStampCalls {
             case 1:
                 return FileStamp(size: 1, modifiedNanoseconds: 1)
@@ -143,7 +158,15 @@ private struct ProbeMetadata: MetadataReading {
     }
 }
 
-private actor ProbePhotos: PhotosGateway {
+private actor ProbePhotos: PhotosIndexGateway {
+    nonisolated let context = LibraryContext(id: UUID(), epoch: 1)
+    nonisolated func changes() -> AsyncStream<PhotosIndexChange> { AsyncStream { _ in } }
+    func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
+        .init(context: context, generation: 0, descriptors: [], nextOffset: nil)
+    }
+    func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
+        throw PhotoKitGatewayError.libraryUnavailable
+    }
     private(set) var createCount = 0
 
     func loadCandidates() async throws -> [MatchCandidate] { [] }
@@ -162,6 +185,29 @@ private actor ProbePhotos: PhotosGateway {
         throw NSError(domain: "ContinuationRace", code: 14, userInfo: [
             NSLocalizedDescriptionKey: "the continuation probe must never submit to Photos"
         ])
+    }
+}
+
+private actor ThrowingProbeModel: ImageFingerprinting {
+    private(set) var calls = 0
+    func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        calls += 1
+        throw NSError(domain: "ContinuationRace", code: 16, userInfo: [
+            NSLocalizedDescriptionKey: "probe advanced preparation failed"
+        ])
+    }
+}
+
+private func writeProbeImage(_ url: URL) throws {
+    guard let context = CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+          let image = context.makeImage(),
+          let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil) else {
+        throw ProbeFailure.invalidArguments("Unable to create synthetic probe image.")
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        throw ProbeFailure.invalidArguments("Unable to write synthetic probe image.")
     }
 }
 
@@ -254,8 +300,9 @@ private func require(_ condition: Bool, name: String, observation: [String: Stri
 
 private func readEvidenceDirectory() throws -> URL {
     let arguments = Array(CommandLine.arguments.dropFirst())
-    guard arguments.count == 2, arguments[0] == "--evidence-dir" else {
-        throw ProbeFailure.invalidArguments("Usage: ContinuationRace --evidence-dir ABSOLUTE_PATH")
+    guard arguments.count == 4, arguments[0] == "--evidence-dir", arguments[2] == "--scenario",
+          ["stamp", "advanced-preparation"].contains(arguments[3]) else {
+        throw ProbeFailure.invalidArguments("Usage: ContinuationRace --evidence-dir ABSOLUTE_PATH --scenario stamp|advanced-preparation")
     }
     let rawPath = arguments[1]
     guard rawPath.hasPrefix("/") else {
@@ -280,14 +327,36 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
     let store = try SyncStore(url: databaseURL)
     let sourceID = try await store.registerSource(url: temporaryRoot)
     let markerGate = ProbeGate()
-    let directory = ProbeDirectory(root: temporaryRoot, markerGate: markerGate)
+    let isAdvanced = CommandLine.arguments.last == "advanced-preparation"
+    let executor = ReadExecutor(maxConcurrentOperations: 2)
+    var advancedStamp: FileStamp?
+    if isAdvanced {
+        let imageURL = temporaryRoot.appendingPathComponent("same.jpg")
+        try writeProbeImage(imageURL)
+        advancedStamp = try await DirectoryReader(sourceID: sourceID, executor: executor).stamp(of: imageURL)
+    }
+    let directory = ProbeDirectory(root: temporaryRoot, markerGate: markerGate, advancedStamp: advancedStamp)
     let photos = ProbePhotos()
+    let model = ThrowingProbeModel()
+    var coordinator: PhotosIndexCoordinator?
+    var service: AdvancedDedupService?
+    if isAdvanced {
+        let profileURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("integration-profile.json")
+        let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: profileURL))
+        let current = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model, configuration: configuration)
+        try await current.reconcile()
+        await current.processDueWork(now: Date())
+        coordinator = current
+        service = AdvancedDedupService(store: store, photos: photos, coordinator: current, fingerprinter: model,
+            configuration: configuration, executor: executor, budget: ImageWorkBudget(limits: configuration.resources))
+    }
     let notifications = NotificationRecorder()
     let engine = SyncEngine(
         store: store,
         photos: photos,
         directory: { _ in directory },
         metadata: { _ in ProbeMetadata() },
+        advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: isAdvanced,
         notify: { source, recovered in notifications.recordSource(source, recovered: recovered) },
         notifyIssue: { notifications.recordBlocking($0) },
         notifySourceIssue: { source, recovered, issue in
@@ -300,6 +369,10 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
     do {
         try await waitFor("the persisted retry gate") { await integrationRetryGate.entered }
 
+        if isAdvanced {
+            let calls = await model.calls
+            try require(calls == 1, name: "advanced_model_failure_reached", observation: ["model_calls": String(calls)])
+        }
         second = Task { await engine.scan(sourceIDs: [sourceID]) }
         try await waitFor("the sourceChanged scan marker") { await markerGate.entered }
 
@@ -319,10 +392,10 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
         try require(changed?.state == .skipped, name: "source_changed_state_before_marker", observation: beforeObservation)
         try require(changed?.file.stamp == FileStamp(size: 2, modifiedNanoseconds: 2), name: "source_changed_stamp_before_marker", observation: beforeObservation)
         try require(changed?.retryCount == 1 && changed?.nextRetryAt != nil, name: "source_changed_retry_before_marker", observation: beforeObservation)
-        try require(changedFields.lastError == "probe submission stamp failed", name: "source_changed_last_error_before_marker", observation: beforeObservation)
+        try require(changedFields.lastError == (isAdvanced ? "probe advanced preparation failed" : "probe submission stamp failed"), name: "source_changed_last_error_before_marker", observation: beforeObservation)
         try require(changedFields.definitelyNotCommitted == 1 && changedFields.skipReason == SkipReason.sourceChanged.rawValue,
                     name: "source_changed_retry_fields_before_marker", observation: beforeObservation)
-        try require(before.waitingSources.isEmpty && before.blockingError == nil && before.latestScan.failed == 0 &&
+        try require(integrationRoundFailures.value() == 0 && before.waitingSources.isEmpty && before.blockingError == nil && before.latestScan.failed == 0 &&
                     before.sourceFileIssueCounts.isEmpty && before.deferredSources.isEmpty && beforeNotifications.source == 0 &&
                     beforeNotifications.sourceIssue == 0 && beforeNotifications.blocking == 0 && beforeCreates == 0 &&
                     (try scanFailureCount(databaseURL: databaseURL)) == 0,
@@ -347,9 +420,11 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
 
         // In the intentionally mutated copy this is the exact old regression: the already
         // sourceChanged/skipped row becomes waiting when the first drain resumes.
-        try require(afterRecord?.state == .skipped, name: "post_resume_row_remains_skipped", observation: afterObservation)
+        try require(afterRecord?.state == .skipped && afterRecord?.file.stamp == changed?.file.stamp &&
+                    afterRecord?.retryCount == changed?.retryCount && afterRecord?.successID == nil &&
+                    afterFields.skipReason == SkipReason.sourceChanged.rawValue, name: "post_resume_row_remains_skipped", observation: afterObservation)
         try require(after.waitingSources.isEmpty, name: "post_resume_waiting_sources", observation: afterObservation)
-        try require(after.blockingError == nil && after.latestScan.failed == 0 && after.sourceFileIssueCounts.isEmpty &&
+        try require(integrationRoundFailures.value() == 0 && after.blockingError == nil && after.latestScan.failed == 0 && after.sourceFileIssueCounts.isEmpty &&
                     after.deferredSources.isEmpty && afterNotifications.source == 0 && afterNotifications.sourceIssue == 0 &&
                     afterNotifications.blocking == 0 && afterCreates == 0 &&
                     (try scanFailureCount(databaseURL: databaseURL)) == 0,
@@ -359,6 +434,8 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
         if let second { await second.value }
         var finalObservation = afterObservation
         finalObservation["marker_released"] = "true"
+        finalObservation["scenario"] = isAdvanced ? "advanced-preparation" : "stamp"
+        finalObservation["model_calls"] = String(await model.calls)
         return finalObservation
     } catch {
         await integrationRetryGate.release()
@@ -395,6 +472,7 @@ private func observation(
         "waiting_sources": String(snapshot.waitingSources.count),
         "blocking_error": snapshot.blockingError ?? "nil",
         "round_failed": String(snapshot.latestScan.failed),
+        "all_round_failures": String(integrationRoundFailures.value()),
         "file_issues": String(snapshot.sourceFileIssueCounts.count),
         "deferred_sources": String(snapshot.deferredSources.count),
         "source_notifications": String(notifications.source),

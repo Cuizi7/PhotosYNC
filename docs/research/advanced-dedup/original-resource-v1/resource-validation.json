@@ -1,0 +1,20 @@
+{
+  "execution_policy_id": "fp16-ane-gpu-v1",
+  "files": {
+    "LICENSE-SSCD.txt": "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93",
+    "ModelSelfTest/manifest.json": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+    "closeout.json": "a9a382e406c3ca3014ea8531e0fc4eff8e04e33051ebcd19cfd8c3c546394ea9",
+    "decision.json": "686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab",
+    "execution-policy.json": "8f852fd534ec48aad4a2dbdfc32fea6c47b5aa9d2326eb83f82a5c344cf96183",
+    "model-provenance.json": "5417926c82f42963f8ad959d53cf6cd4078ef83b0cceb68797f7ce77bb0d3b52",
+    "profile.json": "8f3c2b481eaf7b192206e85725d3132506bca12b9ce7fc79ff78891384f06004",
+    "regression.json": "50d34a60bea55db493c817c890d7d9563f82cece66bc4363811472a7ee73e6a2"
+  },
+  "fingerprint_version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
+  "input_contract": "encoded-resource-imageio-v1",
+  "model_sha256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+  "self_test_manifest_sha256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+  "status": "passed",
+  "weight_bytes": 88329408,
+  "weight_sha256": "be1b28a5be24ca216884b6a04db291f58bd484328ac5307f9577fd27295cb338"
+}

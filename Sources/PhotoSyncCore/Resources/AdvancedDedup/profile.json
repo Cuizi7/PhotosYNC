@@ -1,0 +1,44 @@
+{
+  "acceptanceID": "user-decision:686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab",
+  "backend": "sqlite-exact-f32-v1",
+  "evidenceCandidateLimit": 200000,
+  "fingerprint": {
+    "colorSpace": "sRGB",
+    "inputContract": "encoded-resource-imageio-v1",
+    "inputSide": 320,
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+    "resizeMode": "stretchFullFrame",
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "version": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c"
+  },
+  "policyVersion": "33036418cef48b6952faefc73f8d1e6a7a2c3a5115af2735a6464d1601e96e2e",
+  "resources": {
+    "batchSize": 1,
+    "catalogBatchSize": 128,
+    "decodeConcurrency": 1,
+    "freeSpaceReserveBytes": 134217728,
+    "inferenceConcurrency": 1,
+    "maxDecodedBytes": 536870912,
+    "maxEncodedBytes": 536870912,
+    "maxInFlightTasks": 2,
+    "photoRequestConcurrency": 1,
+    "progressPublishIntervalSeconds": 1,
+    "requestTimeoutSeconds": 30,
+    "retryDelaysSeconds": [
+      5,
+      15,
+      30,
+      60
+    ]
+  },
+  "threshold": 0.98
+}

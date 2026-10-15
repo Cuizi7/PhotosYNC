@@ -1,0 +1,68 @@
+{
+  "cases": [
+    {
+      "input": {
+        "bytes": 1228800,
+        "path": "input-0.f32",
+        "sha256": "966dd9e3871330af5cbe036eaf63189a6b7959efc0fb235a2638ae548e53f0c2"
+      },
+      "reference": {
+        "bytes": 4096,
+        "path": "reference-0.f32",
+        "sha256": "28fd2681ecacf9b52f6d5b28d60a84357567d881d14282bf0231d1a396007e5b"
+      }
+    },
+    {
+      "input": {
+        "bytes": 1228800,
+        "path": "input-1.f32",
+        "sha256": "8031aaff33fe6a264cf39984dd9916c8e97ac2ed71be67e6a0b606b1033a4928"
+      },
+      "reference": {
+        "bytes": 4096,
+        "path": "reference-1.f32",
+        "sha256": "a0c712975704e6fbe67e1b3a2f695e39e73aed74920c9dd3c7225ce22618bd0e"
+      }
+    },
+    {
+      "input": {
+        "bytes": 1228800,
+        "path": "input-2.f32",
+        "sha256": "4df05be6a4dbd5b92c96cef8043278fb1bb4b698d091a2aacea182e2860c0060"
+      },
+      "reference": {
+        "bytes": 4096,
+        "path": "reference-2.f32",
+        "sha256": "246a0c56323c73ebde6e0e8b286921cc2ac8fbd1b0c62d982f9425420217faa6"
+      }
+    },
+    {
+      "input": {
+        "bytes": 1228800,
+        "path": "input-3.f32",
+        "sha256": "b03483c4a2eccc0439e3ab07523ff90bb1d14e002f7d36e642d88acba65ab9ed"
+      },
+      "reference": {
+        "bytes": 4096,
+        "path": "reference-3.f32",
+        "sha256": "251986e7c90c6da655f1be5e59c0a61b751340d892765dd1a6f78bd88c7f6988"
+      }
+    }
+  ],
+  "comparison": "l2_normalized_float32",
+  "inputShape": [
+    1,
+    3,
+    320,
+    320
+  ],
+  "inputType": "float32",
+  "maxAbsError": 0.02,
+  "minCosine": 0.999,
+  "outputShape": [
+    1,
+    1024
+  ],
+  "outputType": "float32",
+  "schemaVersion": 1
+}

@@ -1,0 +1,45 @@
+{
+  "acceptanceID": "user-decision:686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab",
+  "activeSuiteSHA256": "e0b3d8a6c4a74131d2b60b13eef655cee66f607027b83257e6bddcf15faadd23",
+  "approvedForProductIntegration": true,
+  "backend": "sqlite-exact-f32-v1",
+  "computeUnits": "fp16-ane-gpu-v1",
+  "date": "2026-10-11",
+  "decisionSHA256": "686b2b04c04cdcd8a132e563cf38bb4b78315941422800dc33afda266bd30dab",
+  "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
+  "inputAcquisition": "Source original URL and PhotoKit selected encoded original/current resource; shared EncodedImageDecoder/ImageIO, never 320px Photos raster fallback.",
+  "inputContract": "encoded-resource-imageio-v1",
+  "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+  "performanceAcceptance": "Final canonical validation belongs to Task 3; no new full-scale performance claim.",
+  "platformLimitations": [
+    "macOS13 Apple Silicon physical validation unavailable",
+    "Intel physical execution excluded"
+  ],
+  "policyVersion": "33036418cef48b6952faefc73f8d1e6a7a2c3a5115af2735a6464d1601e96e2e",
+  "profileSHA256": "8f3c2b481eaf7b192206e85725d3132506bca12b9ce7fc79ff78891384f06004",
+  "realPhotosValidation": "Pending targeted real resource-path validation; Task 2 used frozen local media and synthetic SQLite only.",
+  "regression": {
+    "actionFailures": [],
+    "caseCount": 33,
+    "contentFailures": [],
+    "independent": false,
+    "newImageInference": true,
+    "passCount": 33,
+    "sameImagePairsAndVectors": false,
+    "sha256": "50d34a60bea55db493c817c890d7d9563f82cece66bc4363811472a7ee73e6a2"
+  },
+  "resourcePathEvidence": {
+    "nativeExecution": "Fresh CPU+ANE and CPU+GPU; four goldens and 33 content/action cases each.",
+    "realPhotoKitAcquisition": "not validated by this local native corpus run",
+    "sharedImageIODecoder": "Task 1 controlled encoded-resource tests; this fresh 33-case run exercises the unchanged Source/shared decoder numerical body."
+  },
+  "schemaVersion": 1,
+  "statisticalAcceptance": {
+    "falseSkipUpperBoundClaimed": false,
+    "recallConfidenceClaimed": false,
+    "status": "not_performed"
+  },
+  "status": "closed_with_user_selected_configuration",
+  "threshold": 0.98,
+  "thresholdBasis": "explicit_user_choice"
+}

@@ -225,7 +225,9 @@ final class AppModel: ObservableObject {
             return "无法请求通知权限：\(message)。请稍后重试或在系统设置中检查 PhotosYNC 通知。"
         }
     }
-    var counters: String { SyncStatusPresentation(snapshot: state.snapshot).summary }
+    var analysis: SyncStatusPresentation.Analysis? { SyncStatusPresentation(snapshot: state.snapshot).analysis }
+    var counterNotes: [String] { SyncStatusPresentation(snapshot: state.snapshot).summaryNotes }
+    var counters: String { SyncStatusPresentation(snapshot: state.snapshot).baseSummary }
     var scanDescription: String { SyncStatusPresentation(snapshot: state.snapshot).scan }
     var recoveryAdvice: String? { SyncStatusPresentation(snapshot: state.snapshot).recoveryAdvice }
     var hasEnabledSources: Bool { state.sources.contains(where: \.enabled) }
@@ -281,7 +283,7 @@ final class AppModel: ObservableObject {
     }
 
     func authorize() { guard !demo else { return }; Task { await runtime?.requestAuthorization() } }
-    func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true) } }
+    func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true, retryModel: true) } }
     func togglePause() {
         guard canTogglePause else { return }
         Task {

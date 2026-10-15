@@ -79,7 +79,7 @@ class ReleaseFixture:
         return self.events.read_text().splitlines()
 
     def release_path(self) -> Path:
-        return self.root / "outputs" / "releases" / "0.1.0"
+        return self.root / "outputs" / "releases" / "0.2.0"
 
     def _write_repository(self) -> None:
         for relative in ("scripts", "Tests/Tools", "docs/release", "PhotoSync.xcodeproj"):
@@ -91,7 +91,7 @@ class ReleaseFixture:
         (self.root / "PhotoSync.xcodeproj" / "project.pbxproj").write_text("fixture project\n")
         (self.root / "Sources").mkdir()
         (self.root / "Sources" / "fixture.swift").write_text("let fixture = true\n")
-        (self.root / "docs/release/0.1.0.md").write_text("fixture release notes\n")
+        (self.root / "docs/release/0.2.0.md").write_text("fixture release notes\n")
         (self.root / "CHANGELOG.md").write_text("fixture changelog\n")
         (self.root / "Tests/Tools/test_fixture.py").write_text(
             "import unittest\n\n"
@@ -100,6 +100,19 @@ class ReleaseFixture:
             "        self.assertEqual('fixture', 'fixture')\n\n"
             "if __name__ == '__main__':\n"
             "    unittest.main()\n"
+        )
+        for directory in ("scripts/advanced-dedup", "scripts/dedup-fixtures"):
+            (self.root / directory).mkdir()
+        # Physical resource/model work is replaced only in this synthetic CLI
+        # orchestration fixture; exact-byte gates have their own independent tests.
+        (self.root / "scripts/advanced-dedup/release.py").write_text(
+            "import argparse,json,os,sys\nfrom pathlib import Path\n"
+            "p=argparse.ArgumentParser();p.add_argument('--output');a,_=p.parse_known_args()\n"
+            "if os.environ.get('FAKE_RESOURCE_MODE') == 'fail': sys.exit(25)\n"
+            "if a.output: Path(a.output).write_text(json.dumps({'status':'passed'}))\n"
+        )
+        (self.root / "scripts/dedup-fixtures/validate.py").write_text(
+            "import os,sys\nif os.environ.get('FAKE_FIXTURE_MODE') == 'fail': sys.exit(26)\n"
         )
         (self.root / "scripts/test-continuation-race.py").write_text(
             textwrap.dedent(
@@ -112,16 +125,20 @@ class ReleaseFixture:
 
                 parser = argparse.ArgumentParser()
                 parser.add_argument("--output-dir", required=True)
+                parser.add_argument("--scenario", required=True)
                 args = parser.parse_args()
                 with Path(os.environ["FAKE_EVENTS"]).open("a") as events:
                     events.write("continuation:%s\\n" % os.environ.get("RQDATAC2_CONF", "absent"))
-                if os.environ.get("FAKE_PROBE_MODE") == "fail":
+                if (os.environ.get("FAKE_PROBE_MODE") == "fail" or
+                    (os.environ.get("FAKE_PROBE_MODE") == "advanced-fail" and args.scenario == "advanced-preparation")):
                     sys.exit(23)
                 output = Path(args.output_dir)
                 output.mkdir(parents=True)
                 (output / "probe evidence with spaces.txt").write_text("synthetic evidence")
                 json.dump(
-                    {"status": "passed", "regression": "continuation-race"},
+                    {"status": "passed", "regression": "continuation-race", "scenario": args.scenario,
+                     "runs": {"green": {"exit_code": 0, "timed_out": False, "fixture_result": {"status": "passed"}},
+                              "red": {"exit_code": 1, "timed_out": False, "fixture_result": {"status": "failed", "failure_stage": "assertion", "assertion": "post_resume_waiting_sources"}}}},
                     (output / "result.json").open("w"),
                 )
                 """
@@ -166,8 +183,84 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertNotIn("must-not-reach-child-tools", "\n".join(self.fixture.event_lines()))
         self.assertEqual(
             [line.split(":", 1)[0] for line in self.fixture.event_lines()],
-            ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "continuation"],
+            ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcrun", "xcrun", "xcrun", "continuation", "continuation"],
         )
+
+    def test_validator_rejects_false_or_missing_index_change_readiness(self) -> None:
+        for mode in ("false", "missing"):
+            with self.subTest(mode=mode):
+                output_dir = Path(self.temporary_directory.name) / f"validation-readiness-{mode}"
+                result = self.fixture.run_validator(
+                    output_dir,
+                    Path(self.temporary_directory.name) / f"derived-readiness-{mode}",
+                    FAKE_SCALE_READINESS=mode,
+                )
+                scale = json.loads((output_dir / "scale-100000.json").read_text())
+                self.assertIs(scale["budget_pass"], True)
+                self.assertLessEqual(scale["hot_preparation_ms"]["p95"], 2000)
+                self.assertLessEqual(scale["source_incremental_ms"]["p95"], 2000)
+                self.assertLessEqual(scale["rss_peak_bytes"], 4 * 1024**3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((output_dir / "validation.json").exists())
+                self.assertFalse((output_dir / "validation-report.md").exists())
+
+    def test_validator_accepts_background_preparation_through_inclusive_budget(self) -> None:
+        for scope in ("scale", "runtime"):
+            for p95 in (750, 2000):
+                with self.subTest(scope=scope, p95=p95):
+                    output_dir = Path(self.temporary_directory.name) / f"budget-{scope}-{p95}"
+                    result = self.fixture.run_validator(
+                        output_dir, output_dir.with_name(output_dir.name + "-derived"),
+                        FAKE_PREPARATION_SCOPE=scope,
+                        FAKE_PREPARATION_OVERRIDES=json.dumps({
+                            "hot_preparation_ms": {"p95": p95},
+                            "source_incremental_ms": {"p95": p95},
+                        }),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads((output_dir / "validation.json").read_text())["status"], "passed")
+
+    def test_validator_rejects_invalid_preparation_evidence_despite_true_budget_flag(self) -> None:
+        cases = [
+            {"performance_contract": None},
+            {"performance_contract": "historical-v1"},
+            {"preparation_p95_budget_ms": None},
+            {"preparation_p95_budget_ms": 250},
+            {"preparation_p95_budget_ms": 3000},
+            {"preparation_p95_budget_ms": "2000"},
+        ]
+        for field in ("hot_preparation_ms", "source_incremental_ms"):
+            cases.extend({field: value} for value in (
+                None, {}, "bad", {"p95": None}, {"p95": "100"}, {"p95": True},
+                {"p95": -1}, {"p95": float("nan")}, {"p95": float("inf")}, {"p95": 2000.01},
+            ))
+        for scope in ("scale", "runtime"):
+            for index, overrides in enumerate(cases):
+                with self.subTest(scope=scope, overrides=overrides):
+                    output_dir = Path(self.temporary_directory.name) / f"invalid-{scope}-{index}"
+                    result = self.fixture.run_validator(
+                        output_dir, output_dir.with_name(output_dir.name + "-derived"),
+                        FAKE_PREPARATION_SCOPE=scope,
+                        FAKE_PREPARATION_OVERRIDES=json.dumps(overrides),
+                    )
+                    report = "scale-100000.json" if scope == "scale" else "runtime-load.json"
+                    self.assertIs(json.loads((output_dir / report).read_text())["budget_pass"], True)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("preparation", result.stderr.lower())
+                    self.assertFalse((output_dir / "validation.json").exists())
+                    self.assertFalse((output_dir / "validation-report.md").exists())
+
+    def test_validator_rejects_missing_or_false_delta_path_evidence(self) -> None:
+        for mode in ("false", "missing"):
+            with self.subTest(mode=mode):
+                output_dir = Path(self.temporary_directory.name) / f"delta-{mode}"
+                result = self.fixture.run_validator(
+                    output_dir,
+                    Path(self.temporary_directory.name) / f"delta-derived-{mode}",
+                    FAKE_SCALE_DELTA=mode,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((output_dir / "validation.json").exists())
 
     def test_validator_build_failure_stops_before_xctest_and_never_marks_success(self) -> None:
         output_dir = Path(self.temporary_directory.name) / "validation"
@@ -197,8 +290,11 @@ class ReleaseValidationTests(unittest.TestCase):
 
     def test_validator_rejects_tool_or_continuation_failures_without_success_marker(self) -> None:
         for label, environment in (
+            ("resources", {"FAKE_RESOURCE_MODE": "fail"}),
+            ("fixtures", {"FAKE_FIXTURE_MODE": "fail"}),
             ("tool-tests", {}),
             ("continuation", {"FAKE_PROBE_MODE": "fail"}),
+            ("advanced-continuation", {"FAKE_PROBE_MODE": "advanced-fail"}),
         ):
             with self.subTest(label=label):
                 temporary_directory = tempfile.TemporaryDirectory()
@@ -238,6 +334,19 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertIn("timed out", str(raised.exception))
         self.assertTrue(log_path.exists())
 
+    def test_packager_disables_lfs_smudge_before_exact_pointer_hydration(self) -> None:
+        # A real configured LFS filter may hydrate during git archive itself.
+        # The packager must override an inherited opt-in before that boundary.
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        self.fixture._write_tool(
+            "git",
+            '#!/bin/sh\nif [ "$1" = archive ] && [ "${GIT_LFS_SKIP_SMUDGE:-}" != 1 ]; then exit 86; fi\n'
+            f'exec "{real_git}" "$@"\n',
+        )
+        result = self.fixture.run_packager(GIT_LFS_SKIP_SMUDGE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_packager_validates_archived_snapshot_before_release_build_and_publishes_evidence(self) -> None:
         result = self.fixture.run_packager()
 
@@ -246,6 +355,12 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertTrue((release / "validation" / "validation.json").is_file())
         self.assertTrue((release / "validation" / "validation-report.md").is_file())
         self.assertEqual((release / "CHANGELOG.md").read_text(), "fixture changelog\n")
+        self.assertEqual((release / "RELEASE-NOTES.md").read_text(), "fixture release notes\n")
+        self.assertTrue((release / "PhotosYNC-0.2.0.dmg").is_file())
+        provenance = (release / "PhotosYNC.provenance").read_text().splitlines()
+        self.assertIn("release=0.2.0", provenance)
+        self.assertIn("build_number=8", provenance)
+        self.assertIn("signing=ad-hoc; notarized=no", provenance)
         self.assertTrue((release / "SHA256SUMS").is_file())
         self.assertIn(
             "./validation/continuation-race/probe evidence with spaces.txt",
@@ -278,6 +393,61 @@ class ReleaseValidationTests(unittest.TestCase):
                 finally:
                     temporary_directory.cleanup()
 
+    def test_packager_requires_both_native_architectures_in_app_and_core(self) -> None:
+        real_lipo = shutil.which("lipo")
+        real_clang = shutil.which("clang")
+        if sys.platform != "darwin" or real_lipo is None or real_clang is None:
+            self.skipTest("Native architecture gate requires macOS lipo and clang")
+
+        # Tiny self-made Mach-O objects exercise the actual lipo argument parser;
+        # the remaining build, resource and signing stages stay synthetic.
+        binaries = {}
+        for architecture in ("arm64", "x86_64"):
+            binary = Path(self.temporary_directory.name) / f"{architecture}.o"
+            subprocess.run(
+                [real_clang, "-target", f"{architecture}-apple-macos13", "-x", "c", "-c", "-", "-o", str(binary)],
+                input="int release_fixture(void) { return 0; }\n",
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            binaries[architecture] = binary
+        universal = Path(self.temporary_directory.name) / "universal.o"
+        subprocess.run(
+            [real_lipo, "-create", str(binaries["arm64"]), str(binaries["x86_64"]), "-output", str(universal)],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        cases = (
+            ("universal", universal, universal, True),
+            ("app-arm64-only", binaries["arm64"], universal, False),
+            ("app-x86_64-only", binaries["x86_64"], universal, False),
+            ("core-arm64-only", universal, binaries["arm64"], False),
+            ("core-x86_64-only", universal, binaries["x86_64"], False),
+        )
+        for label, app_binary, core_binary, should_publish in cases:
+            with self.subTest(label=label):
+                temporary_directory = tempfile.TemporaryDirectory()
+                fixture = ReleaseFixture(temporary_directory)
+                try:
+                    (fixture.bin_dir / "lipo").unlink()
+                    (fixture.bin_dir / "lipo").symlink_to(real_lipo)
+                    result = fixture.run_packager(
+                        FAKE_APP_BINARY=str(app_binary), FAKE_CORE_BINARY=str(core_binary),
+                    )
+                    if should_publish:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertTrue((fixture.release_path() / "SHA256SUMS").is_file())
+                    else:
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        self.assertFalse(fixture.release_path().exists())
+                        self.assertNotIn("hdiutil:create", fixture.event_lines())
+                    self.assert_no_transient_release_paths(fixture)
+                finally:
+                    temporary_directory.cleanup()
+
     def test_packager_refuses_dirty_untracked_existing_and_locked_release_paths(self) -> None:
         cases = ("dirty", "untracked", "file", "directory", "symlink", "lock")
         for case in cases:
@@ -287,7 +457,7 @@ class ReleaseValidationTests(unittest.TestCase):
                 try:
                     release = fixture.release_path()
                     if case == "dirty":
-                        (fixture.root / "docs/release/0.1.0.md").write_text("changed\n")
+                        (fixture.root / "docs/release/0.2.0.md").write_text("changed\n")
                     elif case == "untracked":
                         (fixture.root / "untracked.txt").write_text("untracked\n")
                     elif case == "file":
@@ -300,7 +470,7 @@ class ReleaseValidationTests(unittest.TestCase):
                         release.parent.mkdir(parents=True, exist_ok=True)
                         release.symlink_to(fixture.root / "missing-release-target")
                     else:
-                        lock = release.parent / ".0.1.0.lock"
+                        lock = release.parent / ".0.2.0.lock"
                         lock.mkdir(parents=True)
                     result = fixture.run_packager()
                     self.assertNotEqual(result.returncode, 0)
@@ -325,8 +495,8 @@ class ReleaseValidationTests(unittest.TestCase):
 
     def assert_no_transient_release_paths(self, fixture: ReleaseFixture) -> None:
         release_root = fixture.release_path().parent
-        self.assertFalse((release_root / ".0.1.0.lock").exists())
-        self.assertEqual(list(release_root.glob(".0.1.0.staging.*")), [])
+        self.assertFalse((release_root / ".0.2.0.lock").exists())
+        self.assertEqual(list(release_root.glob(".0.2.0.staging.*")), [])
 
 
 _FAKE_XCODEBUILD = """#!/bin/sh
@@ -346,6 +516,11 @@ for argument in "$@"; do
 done
 case " $* " in
   *' build-for-testing '*)
+    if [ "$configuration" = 'Release' ]; then
+      printf 'xcodebuild:scale\\n' >> "$FAKE_EVENTS"
+      mkdir -p "$derived/Build/Products/Release/PhotoSyncCoreTests.xctest"
+      exit 0
+    fi
     printf 'xcodebuild:debug\\n' >> "$FAKE_EVENTS"
     if [ "${FAKE_XCODEBUILD_MODE:-}" = 'fail-debug-build' ]; then exit 17; fi
     mkdir -p "$derived/Build/Products/Debug/PhotoSyncCoreTests.xctest"
@@ -365,8 +540,8 @@ case " $* " in
 <plist version="1.0"><dict>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleExecutable</key><string>PhotosYNC</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>6</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>8</string>
 <key>PhotoSyncReleaseChannel</key><string>stable</string>
 </dict></plist>
 PLIST
@@ -375,6 +550,12 @@ PLIST
       printf 'asset' > "$app/Contents/Resources/Assets.car"
       printf 'icon' > "$app/Contents/Resources/PhotosYNC.icns"
       : > "$app/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore"
+      if [ -n "${FAKE_APP_BINARY:-}" ]; then
+        cp "$FAKE_APP_BINARY" "$app/Contents/MacOS/PhotosYNC"
+      fi
+      if [ -n "${FAKE_CORE_BINARY:-}" ]; then
+        cp "$FAKE_CORE_BINARY" "$app/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore"
+      fi
     fi
     ;;
 esac
@@ -382,14 +563,66 @@ esac
 
 _FAKE_XCRUN = """#!/bin/sh
 set -eu
+patch_preparation_report() {
+  if [ "${FAKE_PREPARATION_SCOPE:-}" = "$1" ]; then
+    python3 - "$2" <<'PY'
+import json, os, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+report = json.loads(path.read_text())
+for key, value in json.loads(os.environ["FAKE_PREPARATION_OVERRIDES"]).items():
+    if value is None:
+        report.pop(key, None)
+    else:
+        report[key] = value
+path.write_text(json.dumps(report))
+PY
+  fi
+}
 printf 'xcrun:%s:%s\\n' "${1:-}" "${RQDATAC2_CONF:-absent}" >> "$FAKE_EVENTS"
 if [ "${1:-}" = 'swift' ]; then
   printf 'Swift fake 1.0\\n'
   exit 0
 fi
 if [ "${1:-}" != 'xctest' ]; then exit 19; fi
+if [ -n "${PHOTOSYNC_SCALE_REPRESENTATIONS:-}" ]; then
+  sample="$PHOTOSYNC_SCALE_REPRESENTATIONS"
+  if [ "${PHOTOSYNC_SCALE_HISTORY:-0}" != 0 ]; then sample="$sample-history-$PHOTOSYNC_SCALE_HISTORY"; fi
+  readiness=',"index_change_ready_within_2s":true'
+  case "${FAKE_SCALE_READINESS:-true}" in
+    false) readiness=',"index_change_ready_within_2s":false' ;;
+    missing) readiness='' ;;
+  esac
+  delta=',"delta_path_verified":true'
+  case "${FAKE_SCALE_DELTA:-true}" in
+    false) delta=',"delta_path_verified":false' ;;
+    missing) delta='' ;;
+  esac
+  printf '{"representations":%s,"success_history_vectors":%s,"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}],"index_change_sample_count_per_operation":5,"query_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":0},"unchanged_full_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":3},"idle_60s":{"elapsed_seconds":60,"after":{"footprint_bytes":1,"rss_bytes":1},"resume_query_ms":1}%s%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" "$delta" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  patch_preparation_report scale "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  printf "Test Suite 'Selected tests' passed at fixture.\\n"
+  printf 'Executed 1 test, with 0 failures\\n'
+  exit 0
+fi
 case "${FAKE_XCTEST_MODE:-success}" in
   success)
+    printf '{"case_count":33,"duplicate_count":14,"skip_count":11}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-regression.json"
+    python3 - "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-execution.json" <<'P12'
+import json,platform,sys
+from pathlib import Path
+names = ['cpuAndNeuralEngine','cpuAndGPU'] if platform.machine() == 'arm64' else ['cpuAndGPU']
+report = {'schemaVersion':1,'policyID':'fp16-ane-gpu-v1',
+'modelSHA256':'026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0',
+'fingerprintVersion':'fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c',
+'selfTestManifestSHA256':'8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9',
+'configurations':[{'requested':name,'selfTests':[{'case':str(i),'result':'passed','maxAbs':'0.02','cosine':'0.999'} for i in range(4)]} for name in names]}
+Path(sys.argv[1]).write_text(json.dumps(report))
+P12
+
+    printf '{"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"legacy_imports":1,"one_changed_inferences":1,"unchanged_inferences":0}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
+    patch_preparation_report runtime "$PHOTOSYNC_ACCEPTANCE_OUTPUT/runtime-load.json"
+    mkdir -p "$PHOTOSYNC_MODEL_CACHE_DIR"
+    printf 'synthetic compiled bytes' > "$PHOTOSYNC_MODEL_CACHE_DIR/fixture.bin"
     printf "Test Suite 'All tests' passed at fixture.\\n"
     printf '\\t Executed 7 tests, with 0 failures (0 unexpected) in 0.001 seconds\\n'
     ;;
@@ -435,3 +668,24 @@ esac
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelExecutionGateTests(unittest.TestCase):
+    def test_gate_rejects_missing_or_failed_instance_golden_evidence(self):
+        module_spec = importlib.util.spec_from_file_location("p12_validator", VALIDATOR)
+        module = importlib.util.module_from_spec(module_spec)
+        sys.modules[module_spec.name] = module
+        module_spec.loader.exec_module(module)
+        for report in [{}, {"policyID": "cpuOnly"}, {"policyID": "fp16-ane-gpu-v1", "configurations": []}]:
+            with self.assertRaises(module.ValidationError): module.validate_model_execution(report)
+
+        report = {"schemaVersion": 1, "policyID": "fp16-ane-gpu-v1",
+            "modelSHA256": "026e7a43660e29c307941a88dbe35b9c14468693333ff926e9b984eef3b4b8d0",
+            "fingerprintVersion": "fb20bd364a329b23363c0178af9b6af33657feedecdd7c7485531bedd43e242c",
+            "selfTestManifestSHA256": "8dfb4ccac57943db5ed867d180916dc6477fa8377017ef9e1b1cdf19e0c993f9",
+            "configurations": [{"requested": name, "selfTests": [{"case": str(i), "result": "passed", "maxAbs": "0.02", "cosine": "0.999"} for i in range(4)]}
+                for name in (["cpuAndNeuralEngine", "cpuAndGPU"] if module.platform.machine() == "arm64" else ["cpuAndGPU"])]}
+        module.validate_model_execution(report)
+        for field, bad in [("maxAbs", "0.020001"), ("cosine", "0.998999"), ("cosine", "nan"), ("result", "failed")]:
+            changed = json.loads(json.dumps(report)); changed["configurations"][0]["selfTests"][0][field] = bad
+            with self.assertRaises(module.ValidationError): module.validate_model_execution(changed)

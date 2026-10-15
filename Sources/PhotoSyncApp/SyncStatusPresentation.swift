@@ -21,6 +21,9 @@ struct SyncStatusPresentation {
 
         let issues = enabledIssues(for: enabledSourceIDs)
         if issues.contains(where: \.isSourceAvailability) { return .waiting }
+        if let progress = snapshot.indexProgress, progress.state != .ready {
+            return progress.state == .waiting ? .waiting : .running
+        }
         if snapshot.activeWork { return .running }
         if hasDeferredWork(for: enabledSourceIDs) { return .waiting }
 
@@ -34,6 +37,8 @@ struct SyncStatusPresentation {
     func statusDescription(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String {
         let issues = enabledIssues(for: enabledSourceIDs)
         let summary = snapshot.summary
+        if !snapshot.isPaused, !issues.contains(where: \.isSourceAvailability),
+           let analysis, [.running, .waiting].contains(status) { return analysis.title }
         switch status {
         case .error:
             return hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs)
@@ -72,6 +77,46 @@ struct SyncStatusPresentation {
             snapshot.sourceFileIssueCounts.contains {
                 enabledSourceIDs.contains($0.key) && $0.value > 0
             }
+    }
+
+    struct Analysis {
+        let title: String
+        let progressText: String
+        let fraction: Double?
+        let detail: String?
+        let explanation: String
+    }
+
+    var analysis: Analysis? {
+        guard let p = snapshot.indexProgress, p.state != .ready else { return nil }
+        let title: String
+        switch p.state {
+        case .preparing: title = "正在准备图库分析"
+        case .updating: title = "正在分析图库"
+        case .waiting: title = "图库分析正在等待"
+        case .paused: title = "图库分析已暂停"
+        case .ready: return nil
+        }
+        return Analysis(title: title,
+            progressText: p.totalsKnown ? "已分析 \(p.readyAssets) / \(p.totalAssets) 张" : "正在读取图库…",
+            fraction: p.totalsKnown && p.totalAssets > 0 ? Double(p.readyAssets) / Double(p.totalAssets) : nil,
+            detail: p.issue,
+            explanation: "完成图库分析后开始导入。部分照片可能需要从 iCloud 下载。")
+    }
+
+    var baseSummary: String {
+        guard let s = snapshot.summary else { return summary }
+        return "已导入 \(s.imported) · 已跳过 \(s.skipped) · 待处理 \(s.pending)"
+    }
+
+    var summaryNotes: [String] {
+        guard let s = snapshot.summary else { return [] }
+        var notes: [String] = []
+        if s.retryPending > 0 { notes.append("待重试 \(s.retryPending)") }
+        if s.importing > 0 { notes.append("提交中/待确认 \(s.importing)") }
+        if s.retainedImported > 0 { notes.append("另有 \(s.retainedImported) 条历史属已停用或移除的来源") }
+        if snapshot.summaryError != nil { notes.append("统计暂未更新") }
+        return notes
     }
 
     var summary: String {

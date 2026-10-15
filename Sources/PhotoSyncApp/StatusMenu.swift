@@ -45,6 +45,9 @@ struct StatusMenu: View {
             if model.state.snapshot.activeWork {
                 ProgressView().controlSize(.small)
             }
+            if let analysis = model.analysis {
+                LibraryAnalysisView(analysis: analysis)
+            }
             ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
                 // The line is plain language; the raw system text stays in the tooltip so the
                 // menu never greets a person with "The file “home” couldn’t be opened…".
@@ -62,7 +65,7 @@ struct StatusMenu: View {
                         }
                     }
                     .help("\(source.url.path)\n\(issue.detail)\n\(issue.summary)")
-                } else if let phase = model.state.snapshot.sourcePhases[source.id] {
+                } else if let phase = model.state.snapshot.advancedWaitingReasons[source.id] ?? model.state.snapshot.sourcePhases[source.id] {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(source.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
                         Text(phase).font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -70,7 +73,11 @@ struct StatusMenu: View {
                     .help(source.url.path)
                 }
             }
-            Text(model.counters).font(.caption).foregroundStyle(.secondary)
+            StatusMenuSingleLine(text: model.counters)
+                .accessibilityIdentifier("sync-counters")
+            ForEach(model.counterNotes, id: \.self) { note in
+                Text(note).font(.caption).foregroundStyle(.secondary)
+            }
             Text(model.scanDescription).font(.caption).foregroundStyle(.secondary)
             if let warning = model.notificationWarning {
                 Label(warning, systemImage: "bell.slash")
@@ -124,5 +131,39 @@ private struct StatusMenuContentHeightKey: PreferenceKey {
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+/// The critical passive rows keep system caption metrics and never truncate counts.
+struct StatusMenuSingleLine: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: true, vertical: true)
+    }
+}
+
+struct LibraryAnalysisView: View {
+    let analysis: SyncStatusPresentation.Analysis
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("图库分析").font(.subheadline.weight(.medium))
+            if let fraction = analysis.fraction {
+                ProgressView(value: fraction).accessibilityLabel(analysis.progressText)
+            } else {
+                ProgressView().controlSize(.small).accessibilityLabel(analysis.progressText)
+            }
+            Text(analysis.progressText).font(.caption)
+            if let detail = analysis.detail {
+                if detail == "正在等待 iCloud 图像，连接恢复后自动继续" {
+                    StatusMenuSingleLine(text: detail)
+                } else {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text(analysis.explanation).font(.caption).foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("library-analysis")
     }
 }

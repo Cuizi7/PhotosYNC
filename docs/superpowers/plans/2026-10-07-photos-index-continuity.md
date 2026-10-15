@@ -1,0 +1,77 @@
+# Photos 索引连续性修复 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. 用户已明确要求实施，使用当前隔离工作树，不重复询问执行方式。
+
+**Goal:** 图库清单核对和普通变化不再销毁全库指纹；同时保持对未知内容、未覆盖事件及过期决定的阻断。
+
+**Architecture:** 分离稳定枚举会话、通知覆盖终点、表示有效性和最终 publication。继续用现有 SQLite、串行任务队列和 PhotoKit 适配；同一所有者串行修改这些紧密耦合的接口，保持完整的回归周期。
+
+**Tech Stack:** Swift、公开 PhotoKit、SQLite、XCTest；最低 macOS 13。
+
+**Spec:** [高级判重设计](../specs/2026-09-28-photosync-0.2.0-advanced-dedup-design.md) §4.1–4.4、§9–11；设计冻结 `9235ce9`。
+
+## Global Constraints
+
+- SSCD Large FP16、ANE 优先/GPU 降级、0.98、SQLite 精确 Float32 评分不变。
+- 源目录严格只读；本实施和自动验收不访问真实 Photos、生产数据库或 MobileBackup，不启动生产 App。真实只读恢复另按已批准的分阶段计划执行，不进行 Photos 写入。
+- 保留四种来源状态、成功历史、unknown 提交保护、物理资源租约、原生 UI 布局和既有视频判重。
+- `revision` 不是像素版本。相同摘要不覆盖已知内容变化，也不能弥补历史断档。
+- 完整校验前不得 ready。未知向量可保留字节，但不可作为有效候选。
+- 有证据的无变化对账：零取图、零推理、零无变化表示/任务行写；允许少量全局检查点写。
+- 不新增常驻全量向量缓存、第二数据库、无界事件队列或无关存储重构。
+- 使用当前 worktree；只做本地提交。没有合并、推送、发布授权。Intel 实机不测，macOS 13 实机缺口保留。
+
+## Review Focus
+
+- 事件详情晚到、重复投递、频道溢出：关闭 publication，保留义务及字节；不能用同名原因合并未知事件。
+- 每页之间都有中性通知：枚举身份保持稳定，覆盖终点可前进；真实变化没有覆盖时拒绝旧令牌。
+- 同 revision 的编辑和删除后重插：不得复活旧任务或旧向量。
+- 重启/崩溃时只有部分清单或部分变化批次：不把缺失当删除，不误报完整连续性。
+- metadata-only 更新仍影响文件名/视频视图；原生分析进度不得重置，保留字节数不冒充 ready 数。
+
+### Task 1: 完整实现事件证据、非破坏性核对及在途任务有效性
+
+**Files / ownership:** `Sources/PhotoSyncCore/Photos/PhotoKitGateway.swift`、`PhotosIndexGateway.swift`、`PhotosRepresentationReader.swift`（仅输入事实/修订的必要变化）；`Sources/PhotoSyncCore/Sync/PhotosIndexCoordinator.swift`；`Sources/PhotoSyncCore/Storage/SyncStore.swift`、`Schema.sql`（仅必要迁移）；`Matching/AdvancedDedupTypes.swift`；`Sources/PhotoSyncApp/SyncRuntime.swift`（仅接线）。测试限 `PhotoKitContractTests.swift`、`PhotosRepresentationTests.swift`、`PhotosIndexCoordinatorTests.swift`、`AdvancedDedupStoreTests.swift`、`AdvancedDedupServiceTests.swift`、`AdvancedRuntimeTests.swift` 及其共享 fake/现有原生 progress 测试。若需抽出小型 Photos 连续性值类型文件，加入项目 target，不做无关文件拆分。
+
+**Interfaces:** 保留 `PhotosIndexCoordinator.reconcile/processDueWork/libraryChanged/readyToken/progress` 调用边界、`SyncStore.completeRepresentation` 的任务发行校验和 `PhotosCandidateSnapshot` 最终提交 fence。演进 `PhotosIndexGateway` 清单接口以显式携带枚举身份和覆盖终点，不能继续把 raw generation 当固定全轮枚举身份。`PhotosIndexDelta` 的完整覆盖声明与批次必须区分：批次不是新的完整 interval。`PhotoKitLifecycle` 注入层必须覆盖真实 producer 分类逻辑，测试不能只向 coordinator 喂一个可信标签。
+
+**Persistence decision:** 优先沿用表示 `state` 与非空 `vector` 分离：待验证设为不可查询状态但保留字节；task 的发行身份在真正替换时变更，无关对账不变。若有界变化集合需要新增持久表/字段，只能加到现有 SQLite，以事务迁移保留全部既有向量/成功历史，旧库撤销 publication 并重新建立覆盖证明；未知高版本继续拒绝。新增项须在编码前补入本计划的具体接口/迁移记录，说明为何已有表无法表示，不引入第二快照。未知区间不能靠默认“连续”字段升级成已证明连续。
+
+**实施接口/迁移决定（2026-10-07）：** 当前 v5 的任务表不能可靠承载“通知尚未消费、描述尚未获取”的资产变化义务，故升至 v6，在同一个 SQLite 增加 `photos_content_change` 小表，按 `(context_id, context_epoch, run_id, asset_id)` 唯一记录内容待核验范围和覆盖代次。producer 将完整已知 ID 集合分批同步提交后才交付唤醒；大集合只升级清单核对，不升级全库内容失效。增加 `PhotosIndexGateway.attachIndexStore(_ store: SyncStore)`（兼容 fake 的默认 no-op）接线；最终稳定枚举接口为 `beginCatalogSession(expectedGeneration:) async throws -> PhotosCatalogSession`、`representationCatalog(session:offset:limit:) async throws -> RepresentationPage`、`catalogCoverage(session:) async throws -> Int`，将基线身份与覆盖终点分开；`catalogChanges(baselineGeneration:throughGeneration:afterAssetID:limit:)` 返回有界变化批次。`acknowledgeInventory(expectedGeneration:)` 仅确认已落库清单，`acknowledgeReconciliation` 仍拥有最终 ready 屏障。旧适配方法仅作为显式保守兼容，不能绕过证据要求。
+
+迁移须事务化同步两份 schema，保留全部已有数据并撤销旧 publication；旧库没有 journal 不能证明连续。journal 还记录 changed/deleted/content 标志以归并成员变化，并以进程 UUID 区分 raw generation；旧进程记录在成功回放与完整核对前保守保留，绝不与新进程同值序号比较。恢复先保留旧义务，成功合并/覆盖后才删除对应范围。清单未完成、崩溃或日志写失败保持 fail-closed，不能提前确认 checkpoint。同步 journal 提交不得持 PhotoKit 状态锁或数据库锁等待另一个系统；旧 vector 不作为新 descriptor 的有效证据，必须通过待验证状态隔离。
+
+metadata 中性更新仍可能改变含修改日期的 descriptor revision，不修改原摘要算法来制造全库版本变化。页级 `inputUnchangedAssetIDs` 必须来自 producer 的内容连续性和输入事实核验；仅此证据可在同一任务发行身份下更新描述 revision 并保留向量/期限。v6 为 `fingerprint_task` 增加 `issuance_revision`，旧记录以原 revision 为发行修订；`RepresentationTask.issuanceRevision` 带回不可变发行信息，完成时仍检查上下文、发行代次/修订、尺寸、等价关系和指纹版本。真正输入变化、删除重插或旧未知义务须更换发行身份，不能用后来的中性变化覆盖。
+
+会话采用明确 `PhotosCatalogSession` UUID 与 baselineGeneration，绑定当前图库上下文；即使 raw generation 相同，重开后旧 UUID 也失效。分批增量用 `PhotosIndexDeltaBatch` 表达完整 interval 和 offset/count，复用 `dedup_index_state.reconcile_cursor` 保存区间摘要及下一批游标，拒绝跳批/重复批/跨区间拼接，最后批之前不推进历史检查点。迁移引起的 `StoreTests.swift`、`LegacySkipReevaluationTests.swift` 固定版本/未来版本断言纳入 Task 1，限当前 schema 契约，不改无关行为。
+
+历史检查点与已覆盖 observer endpoint 是两个事实：整轮完整核对保存读取前捕获的保守 token，不能在归并结束后替换为 `currentChangeToken`。增量只覆盖局部资产，保留已有 durable token，不用本批读取前的新 token 越过无关资产的未送达通知；下一次完整核对再推进。完整核对中，基线前已转为待验证任务的未知义务不妨碍读取其后的完整已分类归并页，但不能提前解除验证，也不能放宽普通增量或基线后的未知事件检查。
+
+若完整核对复用已有向量，单纯在 metadata 枚举前取新 token 仍不足：它可能已包含通知未送达的同摘要内容编辑。推进前必须完整回放旧 durable token 之后覆盖新区间的持久变化，并将 affected 义务落库；无覆盖证明时保留旧 token 或保持待验证。回归分别覆盖变化发生在本轮开始前、最后页面后，以及局部增量期间，并跨重启核对不能跳过编辑。
+
+对应最小接口 `PhotosIndexGateway.coverPersistentHistory(from:through:) -> Bool` 使用两个明确检查点，兼容实现默认 false。proposed checkpoint 先捕获，真实 gateway 再从 prior durable token 完整回放并有界落库；不因这次检查切换图库上下文。每次完整核对（包含启动 resume 后）都覆盖这一间隙；失败不得从 metadata 相同推出内容未变。处理期间实际 Photos admission 保持关闭，旧 token/义务保留；同一接口由只读验收 wrapper 完整转发。
+
+- [x] **Step 1 — RED。** 加入并实际运行代表性失败测试：full-reconcile 保留 vector 字节；129 个已知变化不污染其余条目；真实 gateway 分类链路的中性通知在每页之间到来仍完成同一枚举；相关/无关在途结果分离。记录行为失败而非环境/编译失败。
+- [x] **Step 2 — Gateway 证据。** 保留 SDK 保证的 `fetchResultBeforeChanges === before` 校验。用公开 object 内容变化详情结合输入/资格事实判别；不能根据时间相关或 iCloud 名称判断中性。记录 raw notification、具体 producer fallback、已知/未知内容范围。固定枚举基线与按序覆盖 endpoint；页面失败可重开轻量会话，但不抹向量。原始事件先关闭 admission，详情完成后才能推进覆盖。对完整大集合做有界批次，不以 128 作为内容可信度上限。
+- [x] **Step 3 — SQLite / coordinator。** 移除 generic full-reconcile 到全库 `vector=NULL` 的含义。保留已完成和待办事实、有效重试期限；未知表示留字节且不参与 publication。只有可靠删除/完整清单缺失才墓碑化。完整批次持久化后才确认 interval；每次 await 后复查相关有效性，最后用当前 context/index/covered endpoint 短 fence 发布。无关变化不使在途结果失效；已知相关/未知输入不 ready，物理结束后才释放。
+- [x] **Step 4 — GREEN 与补充回归。** 十万条单项变化；非增量但有充分内容连续性证据零重算；历史断档+相同 metadata 不复用；129-ID 两种表示容量/重复事件/删除重插；中性通知持续的初建收敛；未覆盖新增/内容/未知事件拒绝发布；分页/任务/迁移崩溃恢复；metadata/video 更新；进度保留。断言真实 SQLite 行写/向量字节、模型/读次数和租约，不只断言日志。
+- [x] **Step 5 — 聚焦验证和提交。** 用独立 `work/index-continuity-*` DerivedData build-for-testing，再对相关 XCTest bundle/套件运行测试；保留准确退出码和数量。不在此重复 canonical/性能负载。提交 `fix: preserve Photos fingerprints across catalog reconciliation`，报告 RED/GREEN、接口/迁移决定、限制、自查。
+
+### Task 2: 独立集成审阅、最终验收及交付证据
+
+**Files / ownership:** 控制线程更新本计划、spec 当前状态、`docs/research/advanced-dedup/photokit-contract.md`、`docs/release/0.2.0-advanced-dedup-validation.md` 与真实验收计划的恢复条件。Reviewer 只读；tester 不改实现；Task 1 所有者负责范围内修复。
+
+**Interfaces:** 消费 Task 1 冻结提交及报告；通过当前 `scripts/validate.py` canonical 入口，不能拿历史 `bc27a425` 或 fake 测试声称真实 Photos 通过。
+
+- [x] **Step 1 — 一次深度审阅。** 对整个 Task 1 跨层差异做 spec+quality 审阅，特别检查上述五项风险、可信证据来源及存储候选 SQL；此审阅同时是该单一实施任务的最终集成审阅。只对后续修复差异复审，不重复同等门槛。
+- [x] **Step 2 — 最终 canonical。** tester 在最后行为/测试快照运行 `python3 scripts/validate.py --output-dir "$PWD/work/validation-index-continuity-<unique>" --derived-data "$PWD/work/validation-index-continuity-<unique>-derived"`，保留完整 XCTest/Tools/实际模型/四档规模/竞态验证及前后源码身份。正常 Universal build 只在 canonical 未覆盖时补一次；不运行 Intel/Rosetta。若测试失败，定位修复后重新完成受影响门槛，不能跳过失败。
+- [x] **Step 3 — 文档收口。** 记录实现提交、测试命令/结果、核对/复用/待验证/重算口径、证据与缺口；旧性能和真实失败原样保留。同步旧集成计划末尾到本计划，避免重跑已完成 P1–P14。
+- [x] **Step 4 — 准备恢复真实只读验收。** 新实现需重建只读宿主、绑定新哈希、重新审阅读写边界后才能沿用既有授权继续；旧 READY/hash 不批准新二进制。新宿主使用独立私有 run 目录，保留旧证据。Readonly wrapper 须显式转发 `attachIndexStore`、会话/覆盖/有界变化/清单确认接口，禁止因兼容默认 no-op 而静默绕过真实接线；生产 gateway 的 diagnostics 也接入私有轮转日志。构建核对 Core 的准确源码/二进制 SHA，不能直接拷贝旧 DerivedData 宣称新版本。先验证通知分类和索引收敛，完整 ready 后才 MobileBackup 扫描/盲审。真实验收单列结果，不以自动测试代替；不扩为写入验收。
+
+## 执行结果
+
+**后续实测修复入口：** 本计划的已完成实现与验收保留为历史事实。首批恢复实测发现通知 dirty 确认时机和候选基线接续问题；用户已批准按 [通知恢复修复计划](2026-10-07-photos-index-notification-recovery.md) 处理，不重跑本计划已经完成的 Task 1/2。当前实际测试状态以新计划与真实验收记录为准。
+
+Task 1、Task 2 完成；冻结 `3871947`，独立评审通过，完整 545 XCTest（2 跳过、0 失败）、94 Tools、33 例实际模型、四档规模和两项竞态验证通过，正常 Universal Release 编译通过。评审暴露并修复检查点越过延迟通知、未知恢复归并和公共批次构造问题；完整验收另修正合成规模网关的新协议适配，未放宽产品默认拒绝或性能断言。
+
+Task 2 Step 4 的完成指**新宿主已构建、源码审查/哈希/签名及离线 fake 自测通过**，不表示已恢复真实测试。READY 保持不存在；修复后的实际 Photos/iCloud 收敛及 MobileBackup 扫描仍属于下一系统阶段。具体源码、命令、性能和私有宿主绑定见[验收记录](../../release/2026-10-07-photos-index-continuity-validation.md)。本轮不合并、推送或发行；后续文档提交不改变冻结行为，也不重新运行同快照全量验证。

@@ -1,0 +1,4 @@
+module TestSQLiteMetrics {
+    header "SQLiteMetrics.h"
+    export *
+}

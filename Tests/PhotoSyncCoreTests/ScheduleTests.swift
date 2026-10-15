@@ -2,6 +2,21 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class ScheduleTests: XCTestCase {
+    func testThirtyMinuteReconcileDoesNotOverlapOrCatchUp() {
+        var s = ScanSchedule()
+        let t = Date(timeIntervalSince1970: 0)
+        XCTAssertEqual(ScanSchedule.interval, 1800)
+        XCTAssertTrue(s.requestPhotosReconciliation(now: t))
+        XCTAssertFalse(s.requestPhotosReconciliation(now: t.addingTimeInterval(1800)))
+        s.finishedPhotosReconciliation()
+        XCTAssertFalse(s.requestPhotosReconciliation(now: t.addingTimeInterval(1801)))
+        XCTAssertTrue(s.requestPhotosReconciliation(now: t.addingTimeInterval(9000)))
+        s.finishedPhotosReconciliation()
+        XCTAssertFalse(s.requestPhotosReconciliation(now: t.addingTimeInterval(9001)))
+        s.pause()
+        XCTAssertFalse(s.requestPhotosReconciliation(now: t.addingTimeInterval(10800), force: true))
+    }
+
     func testNoOverlapOrCatchupBurst() {
         var schedule = ScanSchedule()
         let start = Date(timeIntervalSince1970: 0)

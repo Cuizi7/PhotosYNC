@@ -2,7 +2,8 @@
 """Run the isolated continuation-race regression against disposable Core sources.
 
 The checked-in SyncEngine is never modified.  This runner copies its current source tree, injects
-one gate after the uniquely identified no-attempt retry write, and proves both sides of the test:
+one gate after the selected uniquely identified no-attempt retry write, observes round failures,
+and proves both sides of the test:
 the guarded implementation passes and a narrowly mutated historical implementation fails the
 specific post-resume waiting assertion.
 """
@@ -34,8 +35,13 @@ RETRY_ANCHOR = (
     "try await store.recordRetry(fileID: record.id, attemptID: nil, "
     "nextRetry: nextRetry(for: record), error: message, definitelyNotCommitted: true)"
 )
+ADVANCED_RETRY_ANCHOR = (
+    "try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record),\n"
+    "                                                        error: error.localizedDescription, definitelyNotCommitted: true)"
+)
 GATE_LINE = "await integrationRetryGate.wait()"
 EXPECTED_RED_ASSERTION = "post_resume_waiting_sources"
+VECTOR_BRIDGE_FLAGS = ["-O3", "-fno-fast-math", "-ffp-contract=off"]
 
 
 class RunnerError(RuntimeError):
@@ -52,6 +58,8 @@ class ProcessResult:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=("stamp", "advanced-preparation"), default="stamp",
+                        help="Retry continuation to exercise (default: stamp).")
     parser.add_argument("--output-dir", required=True, type=Path, help="A new absolute evidence directory.")
     parser.add_argument(
         "--timeout-seconds",
@@ -134,40 +142,34 @@ def replace_unique(text: str, expected: str, replacement: str, name: str) -> str
     return text.replace(expected, replacement, 1)
 
 
-def instrument_green_engine(original: str) -> str:
+def instrument_green_engine(original: str, scenario: str = "stamp") -> str:
     if GATE_LINE in original:
         raise RunnerError("SyncEngine already contains the continuation probe gate.")
-    count = original.count(RETRY_ANCHOR)
+    anchor = RETRY_ANCHOR if scenario == "stamp" else ADVANCED_RETRY_ANCHOR
+    count = original.count(anchor)
     if count != 1:
         raise RunnerError(f"The no-attempt recordRetry anchor must occur exactly once; found {count}.")
-    indentation = original[original.rfind("\n", 0, original.index(RETRY_ANCHOR)) + 1 : original.index(RETRY_ANCHOR)]
-    result = original.replace(RETRY_ANCHOR, f"{RETRY_ANCHOR}\n{indentation}{GATE_LINE}", 1)
+    indentation = original[original.rfind("\n", 0, original.index(anchor)) + 1 : original.index(anchor)]
+    result = original.replace(anchor, f"{anchor}\n{indentation}{GATE_LINE}", 1)
     if result.count(GATE_LINE) != 1:
         raise RunnerError("The continuation probe gate was not inserted exactly once.")
-    return result
+    round_anchor = "    private func recordRoundFailure(_ roundID: UUID, fileLevel: Bool = false) {"
+    return replace_unique(result, round_anchor, round_anchor + "\n        integrationRoundFailures.record()",
+                          "round-failure observation anchor")
 
 
 def mutate_historical_behavior(green: str) -> str:
-    """Remove only the reservation/cancellation guard introduced by the fixed implementation."""
+    """Remove only the selected branch's post-write guard; keep shared cancellation intact."""
 
-    fragments = (
-        ("    private var pendingStampFailureID: UUID?\n", "pending retry identity declaration"),
-        ("                        pendingStampFailureID = record.id\n", "pending retry identity reservation"),
-        ("                        defer { pendingStampFailureID = nil }\n", "pending retry identity defer"),
-        ("                        guard pendingStampFailureID == record.id else { continue }\n", "pending retry identity guard"),
-        (
-            "        if let fileID, key == issueKey(for: fileID), pendingStampFailureID == fileID {\n"
-            "            pendingStampFailureID = nil\n"
-            "        }\n",
-            "pending retry identity resolution",
-        ),
-    )
-    result = green
-    for fragment, name in fragments:
-        result = replace_unique(result, fragment, "", name)
-    if "pendingStampFailureID" in result:
-        raise RunnerError("Historical mutation left an active pending retry identity reference.")
-    return result
+    before_gate, separator, after_gate = green.partition(GATE_LINE)
+    if not separator or GATE_LINE in after_gate:
+        raise RunnerError("Historical mutation requires exactly one continuation probe gate.")
+    before_failure, separator, after_failure = after_gate.partition("recordRoundFailure(context.roundID)")
+    if not separator:
+        raise RunnerError("Selected retry branch has no round-failure publication.")
+    guard = "                        guard pendingStampFailureID == record.id else { continue }\n"
+    before_failure = replace_unique(before_failure, guard, "", "selected pending retry identity guard")
+    return before_gate + GATE_LINE + before_failure + separator + after_failure
 
 
 def unified_diff(before: str, after: str, fromfile: str, tofile: str) -> str:
@@ -236,14 +238,27 @@ def compile_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
     source_files = sorted(source_directory.rglob("*.swift"))
     if not source_files:
         raise RunnerError(f"No Core Swift files were copied for {scenario.name}.")
+    bridge = source_directory / "Storage/SQLiteVectorQuery"
+    object_file = scenario / "SQLiteVectorQuery.o"
+    c_command = ["xcrun", "clang", *VECTOR_BRIDGE_FLAGS, "-c", str(bridge / "SQLiteVectorQuery.c"), "-o", str(object_file)]
+    write_json(scenario / "bridge-compile-command.json", c_command)
+    c_result = run_process(c_command, cwd=scenario, timeout_seconds=timeout_seconds,
+                           stdout_path=scenario / "bridge-compile.stdout.log", stderr_path=scenario / "bridge-compile.stderr.log")
+    if c_result.timed_out:
+        raise RunnerError(f"{scenario.name} SQLite vector bridge compilation timed out.")
+    if c_result.exit_code != 0:
+        raise RunnerError(f"{scenario.name} SQLite vector bridge compilation failed; inspect bridge-compile.stderr.log.")
     command = [
         "xcrun",
         "swiftc",
         "-parse-as-library",
         "-module-name",
         "PhotoSyncCore",
+        "-I", str(bridge),
+        "-module-cache-path", str(scenario / "module-cache"),
         *map(str, source_files),
         str(fixture),
+        str(object_file),
         "-o",
         str(executable),
         "-framework",
@@ -255,6 +270,7 @@ def compile_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
         "-framework",
         "UniformTypeIdentifiers",
         "-lsqlite3",
+        "-framework", "Accelerate",
     ]
     write_json(scenario / "compile-command.json", command)
     result = run_process(
@@ -271,9 +287,10 @@ def compile_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
     return result
 
 
-def run_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
+def run_probe(scenario: Path, timeout_seconds: float, probe_scenario: str = "stamp") -> ProcessResult:
     evidence_directory = scenario / "fixture-evidence"
-    command = [str(scenario / "continuation-race"), "--evidence-dir", str(evidence_directory)]
+    command = [str(scenario / "continuation-race"), "--evidence-dir", str(evidence_directory),
+               "--scenario", probe_scenario]
     write_json(scenario / "run-command.json", command)
     return run_process(
         command,
@@ -360,7 +377,7 @@ def relative_result(output: Path, result: ProcessResult, scenario: Path, fixture
 def run(args: argparse.Namespace, output: Path) -> dict[str, Any]:
     core, engine, probe = checked_source_paths()
     original = engine.read_text(encoding="utf-8")
-    green_engine = instrument_green_engine(original)
+    green_engine = instrument_green_engine(original, args.scenario)
     red_engine = mutate_historical_behavior(green_engine)
     write_text(output / "instrumentation-green.diff", unified_diff(original, green_engine, "SyncEngine.swift", "green/SyncEngine.swift"))
     write_text(output / "instrumentation-red.diff", unified_diff(green_engine, red_engine, "green/SyncEngine.swift", "red/SyncEngine.swift"))
@@ -370,12 +387,17 @@ def run(args: argparse.Namespace, output: Path) -> dict[str, Any]:
         "fixture_sha256": sha256_file(probe),
         "green_sync_engine_sha256": hashlib.sha256(green_engine.encode("utf-8")).hexdigest(),
         "red_sync_engine_sha256": hashlib.sha256(red_engine.encode("utf-8")).hexdigest(),
+        "vector_bridge_compile_flags": VECTOR_BRIDGE_FLAGS,
     }
+    if args.scenario == "advanced-preparation":
+        source_hashes["profile_sha256"] = sha256_file(REPO_ROOT / "docs/research/advanced-dedup/integration-profile.json")
     write_json(output / "source-hashes.json", source_hashes)
 
     green = prepare_scenario(output, "green", core, probe, green_engine)
+    if args.scenario == "advanced-preparation":
+        shutil.copy2(REPO_ROOT / "docs/research/advanced-dedup/integration-profile.json", green / "integration-profile.json")
     green_compile = compile_probe(green, args.timeout_seconds)
-    green_run = run_probe(green, args.timeout_seconds)
+    green_run = run_probe(green, args.timeout_seconds, args.scenario)
     if green_run.timed_out:
         raise RunnerError("Green continuation probe timed out.")
     if green_run.exit_code != 0:
@@ -384,8 +406,10 @@ def run(args: argparse.Namespace, output: Path) -> dict[str, Any]:
     validate_green(green_run, green_fixture)
 
     red = prepare_scenario(output, "red", core, probe, red_engine)
+    if args.scenario == "advanced-preparation":
+        shutil.copy2(REPO_ROOT / "docs/research/advanced-dedup/integration-profile.json", red / "integration-profile.json")
     red_compile = compile_probe(red, args.timeout_seconds)
-    red_run = run_probe(red, args.timeout_seconds)
+    red_run = run_probe(red, args.timeout_seconds, args.scenario)
     if red_run.timed_out:
         raise RunnerError("Red continuation mutation timed out instead of proving its expected assertion.")
     if red_run.exit_code == 0:
@@ -396,6 +420,7 @@ def run(args: argparse.Namespace, output: Path) -> dict[str, Any]:
     return {
         "status": "passed",
         "regression": "continuation-race",
+        "scenario": args.scenario,
         "source": source_hashes,
         "instrumentation": {
             "green_diff": "instrumentation-green.diff",

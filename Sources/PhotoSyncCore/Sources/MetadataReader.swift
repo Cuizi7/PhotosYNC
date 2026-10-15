@@ -12,6 +12,12 @@ public enum MetadataError: Error {
     case unsupported
 }
 
+struct SourceImage: @unchecked Sendable {
+    let image: CGImage
+    let orientation: CGImagePropertyOrientation
+    let eligibility: RepresentationEligibility
+}
+
 public struct MetadataReader: MetadataReading {
     private let sourceID: UUID
     private let executor: ReadExecutor
@@ -32,6 +38,21 @@ public struct MetadataReader: MetadataReading {
         }
         return try await executor.execute(sourceID: sourceID) {
             try readImage(url: url, filename: filename)
+        }
+    }
+
+    /// Restore the bound R2 full-frame bounded ImageIO decode before its common
+    /// stretch/orientation/color pipeline. Reserve the full allowance first;
+    /// original-backing preflight still decides conservative oversize admission.
+    func readForFingerprint(url: URL, configuration: DedupConfiguration, budget: ImageWorkBudget) async throws -> ImageWorkResult<SourceImage> {
+        let allowance = configuration.resources.maxDecodedBytes
+        return try await executor.executeImage(sourceID: sourceID, budget: budget,
+            bytes: allowance, limits: configuration.resources) {
+            _ = try SourceRegistry.normalizedURL(url.deletingLastPathComponent())
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else { throw MetadataError.unreadable }
+            guard Self.classification(url) == "image" else { throw MetadataError.unreadable }
+            return try EncodedImageDecoder.decode(url: url, configuration: configuration, decodedAllowance: allowance)
         }
     }
 

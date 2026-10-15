@@ -20,6 +20,7 @@ public actor ReadExecutor {
     private let beforeAsyncOperationStart: (@Sendable () -> Void)?
     private var inFlightSources = Set<UUID>()
     private var physicalOccupancy = 0
+    private var imageDecodeSources = Set<UUID>()
 
     public init(maxConcurrentOperations: Int = 2, defaultTimeout: Duration = .seconds(60)) {
         self.init(
@@ -52,9 +53,34 @@ public actor ReadExecutor {
         timeout: Duration? = nil,
         operation: @escaping @Sendable () throws -> Value
     ) async throws -> Value {
+        try await executeReserved(sourceID: sourceID, timeout: timeout, imageDecodeLimit: nil, operation: operation)
+    }
+
+    /// Shares the normal source fairness and physical occupancy. The image lease
+    /// travels with the result through inference; a timeout never releases a
+    /// still-running decode's reservation.
+    public func executeImage<Value: Sendable>(
+        sourceID: UUID, budget: ImageWorkBudget, bytes: Int64, limits: ResourceLimits,
+        operation: @escaping @Sendable () throws -> Value
+    ) async throws -> ImageWorkResult<Value> {
+        let lease = try await budget.acquire(bytes: bytes)
+        return try await executeReserved(sourceID: sourceID, timeout: .seconds(limits.requestTimeoutSeconds),
+                                         imageDecodeLimit: limits.decodeConcurrency) {
+            ImageWorkResult(value: try operation(), lease: lease)
+        }
+    }
+
+    private func executeReserved<Value: Sendable>(
+        sourceID: UUID, timeout: Duration?, imageDecodeLimit: Int?,
+        operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
         try Task.checkCancellation()
         guard !inFlightSources.contains(sourceID) else { throw ReadExecutorError.sourceBusy }
         guard physicalOccupancy < maxConcurrentOperations else { throw ReadExecutorError.resourceExhausted }
+        if let imageDecodeLimit {
+            guard imageDecodeSources.count < imageDecodeLimit else { throw ReadExecutorError.resourceExhausted }
+            imageDecodeSources.insert(sourceID)
+        }
         inFlightSources.insert(sourceID)
         physicalOccupancy += 1
 
@@ -110,6 +136,7 @@ public actor ReadExecutor {
 
     private func completed(source: UUID) {
         inFlightSources.remove(source)
+        imageDecodeSources.remove(source)
         physicalOccupancy -= 1
     }
 }

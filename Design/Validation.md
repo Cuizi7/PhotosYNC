@@ -1,5 +1,9 @@
 # PhotoKit Manual Validation
 
+## Current 0.2 validation authority (2026-10-06; planned, not executed)
+
+The user has no separate test environment and explicitly permits this Mac's actively used production Photos library, with read-only work first, writing last, defensive limits and restoration afterwards. Follow the [current production-library plan](../docs/release/2026-10-06-real-photos-icloud-validation-plan.md): use isolated QA application state, real pending-source directories for read-only evaluation, and exact creation evidence for bounded additions and cleanup. Never roll the production library/database back wholesale or edit/delete pre-existing assets. Restoration includes an explicit Recently Deleted check; a remaining cleanup obligation is not a successful full rollback. The older separate-account and iCloud-off instructions and results below are historical and do not override this later authorization. This document change performs no library access or test execution.
+
 ## Current Validation Status (2026-09-13)
 
 | Specification acceptance case | Status | Evidence type and result |
@@ -181,3 +185,17 @@ The continuation harness preserves the legal ordering proven during beta3: retry
 Ordinary beta changes do not require repeating all historical real-Photos tests. Their unchanged system boundaries can reuse the dated evidence above, with current automated regression and package verification. Changed PhotoKit, authorization, media-extraction or platform boundaries require targeted acceptance and explicit reporting of any unverified behavior. This policy does not authorize accessing a personal library or changing system settings.
 
 Current execution results must be taken from the final package's provenance and validation evidence. This section defines the gate; it does not predeclare a future build successful. The original beta3 archive at 1f0047d remains historical and is not retroactively relabeled as having run the new gate.
+
+## 0.2 advanced dedup integration gate (2026-10-05)
+
+The current scope, resource/LFS identities, approved 512 MiB conservative-overlimit policy and evidence are in [0.2 validation](../docs/release/0.2.0-advanced-dedup-validation.md). The canonical entry point now requires the local approved fixture validator, actual-model 33-case content/action regression, a nonempty injected actual runtime graph, complete XCTest/Tools, and both continuation scenarios with GREEN and intended RED. It preserves source-manifest identity and records current compilation cache identity separately from the portable source model package. Missing resources, license, model bytes, reports or passing cases block acceptance.
+
+Real Photos/iCloud, 100k real-library load, older macOS/Intel model execution, keyboard/VoiceOver and release/signing remain distinct unperformed gates. The synthetic runtime test must not be called those system tests. Six user images are local-only and excluded from App resources and public CI. No new personal-library, production-database or system-setting authorization is implied.
+
+## Original encoded resource/shared decoder — 2026-10-11
+
+Behavior snapshot `cd32bd61a31ac0613e8e90ceb45095cc355b9de0` passed complete canonical acceptance: 589 XCTest (2 explicit skips, 0 failures), 96 Tools, active33, eight requested-backend golden checks, four scale cases and both continuation scenarios. New input contract/schema v8, Source history migration and resource ownership evidence are in the [implementation validation record](../docs/release/2026-10-11-original-resource-integration-validation.md).
+
+Within the user's authorized production-library and MobileBackup READONLY scope, a reviewed private LaunchServices host called the actual public gateway with real observers and the same Source/ImageIO/preprocessing/Core ML path. Frozen50 included 19 high-confidence duplicates and 31 distinct pairs (one medium-confidence label retained); all50 scored and matched, with 19 skip/31 importFile policy actions and no actual imports. Source stamp/identity and Photos revision stayed bound; all50 owned temporary directories were observed while held and absent after exit, budgets/executor reached0, and native/launcher/system termination evidence was recorded independently. The first run's owner-observation gap was preserved, then corrected and rerun; repeated samples do not increase the independent denominator.
+
+This validates fixed original-resource pairs, not complete real index publication, production database migration, full-library nearest-candidate recall or statistical false-skip bounds. Edited-current/revert, explicitly network-required resources/offline recovery, physical processor traces and iCloud byte origin remain unverified for this new acquisition path. No Photos/source writes, production app launch/configuration, merge/push, GUI/platform/system-setting change or release packaging occurred. Intel hardware testing remains skipped and the accepted macOS13 hardware gap remains.

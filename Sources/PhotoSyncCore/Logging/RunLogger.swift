@@ -5,6 +5,7 @@ public final class RunLogger: @unchecked Sendable {
     private let directory: URL
     private let queue = DispatchQueue(label: "PhotoSync.RunLogger")
     private var reportedFailure = false
+    private var decisionSignatures: [UUID: String] = [:]
     private let maximumFiles = 10
     private let maximumBytes = 10 * 1024 * 1024
 
@@ -16,6 +17,23 @@ public final class RunLogger: @unchecked Sendable {
 
     public func log(_ fields: [String: String], at date: Date = Date()) {
         queue.async { [weak self] in self?.append(fields, at: date) }
+    }
+
+    public func logDecision(_ evidence: AdvancedEvidence, configuration: DedupConfiguration,
+                            sourceSize: PixelSize? = nil, conservativeReason: RepresentationConservativeReason? = nil,
+                            additionalTimingsMS: [String: Double] = [:]) {
+        var fields = DedupDecisionLog.fields(evidence: evidence, configuration: configuration)
+        fields["source.width"] = sourceSize.map { String($0.width) }
+        fields["source.height"] = sourceSize.map { String($0.height) }
+        fields["conservativeReason"] = conservativeReason?.rawValue
+        for (name, duration) in additionalTimingsMS { fields["timingMS.\(name)"] = String(duration) }
+        let entry = fields
+        let signature = DedupDecisionLog.signature(evidence: evidence, configuration: configuration)
+        queue.async { [weak self] in
+            guard let self, self.decisionSignatures[evidence.fileID] != signature else { return }
+            self.decisionSignatures[evidence.fileID] = signature
+            self.append(entry, at: Date())
+        }
     }
 
     /// Lets XCTest wait for already-enqueued journal writes without guessing a delay.

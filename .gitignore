@@ -1,5 +1,8 @@
 .DS_Store
 /work/
+
+# Local visual design sessions include private access keys and preview state.
+/.superpowers/brainstorm/
 /outputs/PhotoSync.app/
 /outputs/PhotoSync.dmg
 /outputs/PhotoSync.provenance

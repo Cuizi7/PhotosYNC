@@ -1,0 +1,675 @@
+{
+  "review_schema_version": 2,
+  "review_scope": "content_only",
+  "source_license_review": {
+    "responsibility": "agent_reviewer",
+    "report": "LICENSE_REVIEW.md"
+  },
+  "dataset_id": "photosync-advanced-dedup-v1",
+  "version": "2026-10-02-review-7",
+  "content_sha256": "6c4854844ce958fa5514cb4ccb7e2ccbafd8750b05e5279ca2720bc74691d8a1",
+  "exported_at": "2026-10-02T02:16:58.201Z",
+  "reminder": "pending/rejected cases are not approved ground truth",
+  "cases": [
+    {
+      "id": "P001",
+      "group": "positive",
+      "query": "cc-01-1-renamed",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:10:51.567Z",
+      "updated_at": "2026-09-29T06:10:51.567Z",
+      "notes": ""
+    },
+    {
+      "id": "P002",
+      "group": "positive",
+      "query": "cc-01-1-metadata",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:11:07.650Z",
+      "updated_at": "2026-09-29T06:11:07.650Z",
+      "notes": ""
+    },
+    {
+      "id": "P003",
+      "group": "positive",
+      "query": "cc-01-1-jpeg-q45",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:11:27.987Z",
+      "updated_at": "2026-09-29T06:11:27.987Z",
+      "notes": ""
+    },
+    {
+      "id": "P004",
+      "group": "positive",
+      "query": "cc-01-1-half",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:11:41.962Z",
+      "updated_at": "2026-09-29T06:11:41.962Z",
+      "notes": ""
+    },
+    {
+      "id": "P005",
+      "group": "positive",
+      "query": "cc-01-1-png",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:11:45.046Z",
+      "updated_at": "2026-09-29T06:11:45.046Z",
+      "notes": ""
+    },
+    {
+      "id": "N001",
+      "group": "negative",
+      "query": "cc-01-2-base",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:12:14.703Z",
+      "updated_at": "2026-09-29T06:12:14.704Z",
+      "notes": ""
+    },
+    {
+      "id": "B001",
+      "group": "boundary",
+      "query": "cc-01-1-crop",
+      "candidates": [
+        "cc-01-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:12:37.388Z",
+      "updated_at": "2026-09-29T06:12:37.388Z",
+      "notes": ""
+    },
+    {
+      "id": "B002",
+      "group": "boundary",
+      "query": "cc-01-1-base",
+      "candidates": [
+        "cc-01-1-half"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:12:43.533Z",
+      "updated_at": "2026-09-29T06:12:43.533Z",
+      "notes": ""
+    },
+    {
+      "id": "N004",
+      "group": "negative",
+      "query": "cc-02-2-base",
+      "candidates": [
+        "cc-02-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:13:11.370Z",
+      "updated_at": "2026-09-29T06:13:11.370Z",
+      "notes": ""
+    },
+    {
+      "id": "B003",
+      "group": "boundary",
+      "query": "cc-02-1-crop",
+      "candidates": [
+        "cc-02-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-29T06:13:23.588Z",
+      "updated_at": "2026-09-29T06:13:23.588Z",
+      "notes": ""
+    },
+    {
+      "id": "P013",
+      "group": "positive",
+      "query": "cc-03-1-jpeg-q45",
+      "candidates": [
+        "cc-03-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:56:51.705Z",
+      "updated_at": "2026-09-30T00:56:51.705Z",
+      "notes": ""
+    },
+    {
+      "id": "P014",
+      "group": "positive",
+      "query": "cc-03-1-half",
+      "candidates": [
+        "cc-03-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:56:57.926Z",
+      "updated_at": "2026-09-30T00:56:57.926Z",
+      "notes": ""
+    },
+    {
+      "id": "P015",
+      "group": "positive",
+      "query": "cc-03-1-png",
+      "candidates": [
+        "cc-03-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:57:21.229Z",
+      "updated_at": "2026-09-30T00:57:21.229Z",
+      "notes": ""
+    },
+    {
+      "id": "N007",
+      "group": "negative",
+      "query": "cc-03-2-base",
+      "candidates": [
+        "cc-03-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:57:26.908Z",
+      "updated_at": "2026-09-30T00:57:26.908Z",
+      "notes": ""
+    },
+    {
+      "id": "B005",
+      "group": "boundary",
+      "query": "cc-03-1-crop",
+      "candidates": [
+        "cc-03-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:57:42.357Z",
+      "updated_at": "2026-09-30T00:57:42.357Z",
+      "notes": ""
+    },
+    {
+      "id": "B006",
+      "group": "boundary",
+      "query": "cc-03-1-base",
+      "candidates": [
+        "cc-03-1-half"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:57:46.509Z",
+      "updated_at": "2026-09-30T00:57:46.509Z",
+      "notes": ""
+    },
+    {
+      "id": "N010",
+      "group": "negative",
+      "query": "cc-04-2-base",
+      "candidates": [
+        "cc-04-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:58:00.896Z",
+      "updated_at": "2026-09-30T00:58:00.896Z",
+      "notes": ""
+    },
+    {
+      "id": "B007",
+      "group": "boundary",
+      "query": "cc-04-1-crop",
+      "candidates": [
+        "cc-04-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T00:58:17.116Z",
+      "updated_at": "2026-09-30T00:58:17.116Z",
+      "notes": ""
+    },
+    {
+      "id": "N013",
+      "group": "negative",
+      "query": "cc-05-2-base",
+      "candidates": [
+        "cc-05-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-09-30T01:23:58.137Z",
+      "updated_at": "2026-09-30T01:23:58.137Z",
+      "notes": ""
+    },
+    {
+      "id": "B009",
+      "group": "boundary",
+      "query": "cc-05-1-tone",
+      "candidates": [
+        "cc-05-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:43:49.315Z",
+      "updated_at": "2026-10-02T01:43:49.315Z",
+      "notes": ""
+    },
+    {
+      "id": "N016",
+      "group": "negative",
+      "query": "cc-06-2-base",
+      "candidates": [
+        "cc-06-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:43:57.060Z",
+      "updated_at": "2026-10-02T01:43:57.060Z",
+      "notes": ""
+    },
+    {
+      "id": "B011",
+      "group": "boundary",
+      "query": "cc-06-1-tone",
+      "candidates": [
+        "cc-06-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:43:59.405Z",
+      "updated_at": "2026-10-02T01:43:59.405Z",
+      "notes": ""
+    },
+    {
+      "id": "N019",
+      "group": "negative",
+      "query": "cc-08-2-base",
+      "candidates": [
+        "cc-07-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:44:05.922Z",
+      "updated_at": "2026-10-02T01:44:05.922Z",
+      "notes": ""
+    },
+    {
+      "id": "B013",
+      "group": "boundary",
+      "query": "cc-07-1-tone",
+      "candidates": [
+        "cc-07-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:44:11.398Z",
+      "updated_at": "2026-10-02T01:44:11.398Z",
+      "notes": ""
+    },
+    {
+      "id": "N022",
+      "group": "negative",
+      "query": "cc-08-1-base",
+      "candidates": [
+        "cc-07-2-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:44:13.713Z",
+      "updated_at": "2026-10-02T01:44:13.713Z",
+      "notes": ""
+    },
+    {
+      "id": "P048",
+      "group": "positive",
+      "query": "cc-10-1-jpeg-q45",
+      "candidates": [
+        "cc-10-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:45:12.105Z",
+      "updated_at": "2026-10-02T01:45:12.105Z",
+      "notes": ""
+    },
+    {
+      "id": "P049",
+      "group": "positive",
+      "query": "cc-10-1-half",
+      "candidates": [
+        "cc-10-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:45:16.447Z",
+      "updated_at": "2026-10-02T01:45:16.447Z",
+      "notes": ""
+    },
+    {
+      "id": "P050",
+      "group": "positive",
+      "query": "cc-10-1-png",
+      "candidates": [
+        "cc-10-1-base"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "skip",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:45:26.397Z",
+      "updated_at": "2026-10-02T01:45:26.397Z",
+      "notes": ""
+    },
+    {
+      "id": "N028",
+      "group": "negative",
+      "query": "cc-10-2-base",
+      "candidates": [
+        "cc-10-1-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:45:32.413Z",
+      "updated_at": "2026-10-02T01:45:32.413Z",
+      "notes": ""
+    },
+    {
+      "id": "B020",
+      "group": "boundary",
+      "query": "cc-10-1-base",
+      "candidates": [
+        "cc-10-1-half"
+      ],
+      "content_result": "duplicate",
+      "relation": "same_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:45:40.771Z",
+      "updated_at": "2026-10-02T01:45:40.771Z",
+      "notes": ""
+    },
+    {
+      "id": "N031",
+      "group": "negative",
+      "query": "synthetic-01-value",
+      "candidates": [
+        "synthetic-01-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:46:04.689Z",
+      "updated_at": "2026-10-02T01:46:04.689Z",
+      "notes": ""
+    },
+    {
+      "id": "N032",
+      "group": "negative",
+      "query": "synthetic-01-status",
+      "candidates": [
+        "synthetic-01-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:46:09.679Z",
+      "updated_at": "2026-10-02T01:46:09.679Z",
+      "notes": ""
+    },
+    {
+      "id": "N033",
+      "group": "negative",
+      "query": "synthetic-02-value",
+      "candidates": [
+        "synthetic-02-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T01:46:20.805Z",
+      "updated_at": "2026-10-02T01:46:20.805Z",
+      "notes": ""
+    },
+    {
+      "id": "N035",
+      "group": "negative",
+      "query": "synthetic-03-value",
+      "candidates": [
+        "synthetic-03-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:00:51.252Z",
+      "updated_at": "2026-10-02T02:00:51.252Z",
+      "notes": ""
+    },
+    {
+      "id": "N037",
+      "group": "negative",
+      "query": "synthetic-04-value",
+      "candidates": [
+        "synthetic-04-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:00:53.619Z",
+      "updated_at": "2026-10-02T02:00:53.619Z",
+      "notes": ""
+    },
+    {
+      "id": "N039",
+      "group": "negative",
+      "query": "synthetic-05-value",
+      "candidates": [
+        "synthetic-05-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:00:55.818Z",
+      "updated_at": "2026-10-02T02:00:55.818Z",
+      "notes": ""
+    },
+    {
+      "id": "N041",
+      "group": "negative",
+      "query": "synthetic-06-value",
+      "candidates": [
+        "synthetic-06-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:00:58.288Z",
+      "updated_at": "2026-10-02T02:00:58.288Z",
+      "notes": ""
+    },
+    {
+      "id": "N043",
+      "group": "negative",
+      "query": "synthetic-07-value",
+      "candidates": [
+        "synthetic-07-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:00:59.994Z",
+      "updated_at": "2026-10-02T02:00:59.994Z",
+      "notes": ""
+    },
+    {
+      "id": "N045",
+      "group": "negative",
+      "query": "synthetic-08-value",
+      "candidates": [
+        "synthetic-08-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:01:01.877Z",
+      "updated_at": "2026-10-02T02:01:01.877Z",
+      "notes": ""
+    },
+    {
+      "id": "N047",
+      "group": "negative",
+      "query": "synthetic-09-value",
+      "candidates": [
+        "synthetic-09-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:01:03.131Z",
+      "updated_at": "2026-10-02T02:01:03.131Z",
+      "notes": ""
+    },
+    {
+      "id": "N049",
+      "group": "negative",
+      "query": "synthetic-10-value",
+      "candidates": [
+        "synthetic-10-base"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02T02:01:08.039Z",
+      "updated_at": "2026-10-02T02:01:08.039Z",
+      "notes": ""
+    },
+    {
+      "id": "N051",
+      "group": "negative",
+      "query": "user-01-2",
+      "candidates": [
+        "user-01-1"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02",
+      "updated_at": null,
+      "notes": ""
+    },
+    {
+      "id": "N052",
+      "group": "negative",
+      "query": "user-02-2",
+      "candidates": [
+        "user-02-1"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "derived_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02",
+      "updated_at": null,
+      "notes": ""
+    },
+    {
+      "id": "N053",
+      "group": "negative",
+      "query": "user-03-2",
+      "candidates": [
+        "user-03-1"
+      ],
+      "content_result": "not_duplicate",
+      "relation": "different_photo",
+      "action": "import",
+      "review_status": "approved",
+      "reviewed_at": "2026-10-02",
+      "updated_at": null,
+      "notes": ""
+    }
+  ]
+}

@@ -217,6 +217,9 @@ public struct EngineSnapshot: Sendable {
     /// Sources whose last round left work for a later attempt because a read was deferred. They
     /// are waiting, not failing: nothing is reported for them and they are retried within seconds.
     public var deferredSources: Set<UUID> = []
+    /// Current advanced preparation wait, separate from source read failures.
+    public var advancedWaitingReasons: [UUID: String] = [:]
+    public var indexProgress: IndexProgress?
     /// Raw engine-level failure, kept for the journal and the menu tooltip.
     public var blockingError: String?
     /// Plain-language headline for `blockingError`, and the text a notification carries.
@@ -232,6 +235,12 @@ public actor SyncEngine {
     private let photos: any PhotosGateway
     private let directory: DirectoryFactory
     private let metadata: MetadataFactory
+    private let legacySkipReevaluation: LegacySkipReevaluation?
+    private let advancedDedup: AdvancedDedupService?
+    private let indexCoordinator: PhotosIndexCoordinator?
+    private let requiresAdvancedDedup: Bool
+    private let dedupConfiguration: DedupConfiguration?
+    private let submissionState = EngineSubmissionState()
     private let policy: DuplicatePolicy
     private let logger: RunLogger?
     private let notify: @Sendable (UUID, Bool) -> Void
@@ -241,7 +250,7 @@ public actor SyncEngine {
     /// Announces a blocking problem that needs a person. Unlike `notify`, it carries the message.
     private let notifyIssue: @Sendable (String) -> Void
     private let now: @Sendable () -> Date
-    private var status = EngineSnapshot()
+    private var status = EngineSnapshot() { didSet { refreshSubmissionState() } }
     private var scanning = false
     private var recovering = false
     private var storageFailed = false
@@ -251,7 +260,7 @@ public actor SyncEngine {
     private var uncertainSubmissionHints: [UUID: EngineRecoveryHint] = [:]
     private var uncertainSubmissionErrors: [UUID: String] = [:]
     private var hasUncertainSubmissionBlock = false
-    private var disabledSources: Set<UUID> = []
+    private var disabledSources: Set<UUID> = [] { didSet { refreshSubmissionState() } }
     private var removedSources: Set<UUID> = []
     private var rounds: [UUID: ScanRound] = [:]
     private var latestRoundID: UUID?
@@ -280,10 +289,16 @@ public actor SyncEngine {
                 directory: @escaping DirectoryFactory = { DirectoryReader(sourceID: $0) },
                 metadata: @escaping MetadataFactory = { MetadataReader(sourceID: $0) },
                 policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
+                advancedDedup: AdvancedDedupService? = nil, indexCoordinator: PhotosIndexCoordinator? = nil,
+                requiresAdvancedDedup: Bool = false, dedupConfiguration: DedupConfiguration? = nil, legacySkipReevaluation: LegacySkipReevaluation? = nil,
                 notify: @escaping @Sendable (UUID, Bool) -> Void = { _, _ in },
                 notifyIssue: @escaping @Sendable (String) -> Void = { _ in },
                 notifySourceIssue: @escaping @Sendable (UUID, Bool, SourceIssue?) -> Void = { _, _, _ in },
                 now: @escaping @Sendable () -> Date = { Date() }) {
+        self.advancedDedup = advancedDedup; self.indexCoordinator = indexCoordinator
+        self.requiresAdvancedDedup = requiresAdvancedDedup
+        self.dedupConfiguration = dedupConfiguration
+        self.legacySkipReevaluation = legacySkipReevaluation
         self.store = store; self.photos = photos; self.directory = directory
         self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
         self.notifyIssue = notifyIssue; self.notifySourceIssue = notifySourceIssue
@@ -316,16 +331,31 @@ public actor SyncEngine {
             throw error
         }
     }
+    /// P8 supplies the validated profile's batch limit and schedules this on its existing tick.
+    /// Reopened rows enter the ordinary P6 drain; this operation never calls Photos create.
+    /// Zero counts actual reopens, not completion: later bounded ticks must continue retries.
+    @discardableResult
+    public func processLegacySkips(limit: Int) async throws -> Int {
+        guard !status.isPaused, !storageFailed, let legacySkipReevaluation else { return 0 }
+        let reopened = try await legacySkipReevaluation.processBatch(limit: limit)
+        await refreshSummary()
+        return reopened
+    }
+
     public func startupScan() async { await scanEnabledSources() }
     public func manualScan() async { await scanEnabledSources() }
     public func wakeScan() async { await scanEnabledSources() }
-    public func setPaused(_ paused: Bool) { status.isPaused = paused }
+    public func setPaused(_ paused: Bool) async {
+        status.isPaused = paused
+        await legacySkipReevaluation?.setPaused(paused)
+        await advancedDedup?.setPaused(status.isPaused)
+    }
     public func pause() async {
-        status.isPaused = true
+        await setPaused(true)
         logEvent(phase: "scan", result: "paused")
     }
     public func resume() async {
-        status.isPaused = false
+        await setPaused(false)
         logEvent(phase: "scan", result: "resumed")
         await scanEnabledSources()
     }
@@ -440,6 +470,7 @@ public actor SyncEngine {
     private func scanSource(_ sourceID: UUID, roundID: UUID, photosSnapshot: PhotosCandidateSnapshot) async {
         status.sourcePhases[sourceID] = "扫描目录与元数据"
         status.deferredSources.remove(sourceID)
+        status.advancedWaitingReasons.removeValue(forKey: sourceID)
         defer { status.sourcePhases.removeValue(forKey: sourceID) }
         var checked = 0, failed = 0
         var run: UUID?
@@ -592,6 +623,7 @@ public actor SyncEngine {
                 if complete && !deferred {
                     resolveScanIssues(sourceID, runID: run)
                     status.deferredSources.remove(sourceID)
+                    status.advancedWaitingReasons.removeValue(forKey: sourceID)
                 }
                 let result: String
                 if status.isPaused {
@@ -621,6 +653,10 @@ public actor SyncEngine {
     private static let snapshotCommitAttempts = 3
 
     private func saveScannedFile(_ file: SourceFile, initialSnapshot: PhotosCandidateSnapshot) async throws {
+        if file.metadata.kind == .image && usesAdvancedDedup {
+            _ = try await store.save(file, decision: .importNew)
+            return
+        }
         var photoSnapshot = initialSnapshot
         var localCandidates = try await store.candidates(filename: file.metadata.filename, excludingID: nil)
         var candidates = photoSnapshot.candidates(named: file.metadata.filename) + localCandidates
@@ -744,59 +780,110 @@ public actor SyncEngine {
                 }
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
                 var photoSnapshot: PhotosCandidateSnapshot
-                do { photoSnapshot = try await photos.candidateSnapshot() }
-                catch {
-                    recordRoundFailure(context.roundID)
-                    setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
-                    break
-                }
-                var local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
-                guard canSubmit(sourceID: record.file.sourceID) else { break }
-                var candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
-                var decision = policy.evaluate(record.file.metadata, candidates: candidates)
-                var evidence = matchingCandidates(decision, candidates: candidates)
-                var staleAttempts = 0
-                while true {
-                    if case .skip = decision {
-                        let skipResult: SnapshotCommitResult
+                var advanced: AdvancedPreparation?
+                if record.file.metadata.kind == .image && usesAdvancedDedup {
+                    guard let advancedDedup, indexCoordinator != nil else {
+                        recordAdvancedWait("照片判重组件尚未就绪。", record: record, context: context)
+                        continue
+                    }
+                    let preparation: AdvancedPreparation
+                    do { preparation = try await advancedDedup.prepare(fileID: record.id, file: record.file) }
+                    catch let error as SyncStoreError { throw error }
+                    catch {
+                        // Preparation is still known not to have sent a Photos request.
+                        // Share the single drain reservation so source-change resolution
+                        // during retry persistence cancels this failure publication too.
+                        pendingStampFailureID = record.id
+                        defer { pendingStampFailureID = nil }
                         do {
-                            skipResult = try await store.markSkippedWithSnapshotValidity(
-                                fileID: record.id,
-                                reason: .suspectedDuplicate,
-                                candidates: evidence,
-                                validity: photoSnapshot.candidateValidity
-                            )
-                        } catch let error as SyncStoreError {
-                            guard case .invalidTransition = error,
-                                  try await pendingRecordWasSuperseded(record) else { throw error }
-                            continue drainLoop
-                        }
-                        switch skipResult {
-                        case .committed:
-                            resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
-                            continue drainLoop
-                        case .staleSnapshot:
-                            staleAttempts += 1
-                            guard staleAttempts < Self.snapshotCommitAttempts else {
-                                recordRoundFailure(context.roundID)
-                                setBlockingError(PhotoKitGatewayError.libraryChanged.localizedDescription,
-                                                 summary: SourceIssueText.blockingSummary(for: PhotoKitGatewayError.libraryChanged))
-                                break drainLoop
-                            }
-                            do { photoSnapshot = try await photos.candidateSnapshot() }
-                            catch {
-                                recordRoundFailure(context.roundID)
-                                setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
-                                break drainLoop
-                            }
-                            local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
-                            candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
-                            decision = policy.evaluate(record.file.metadata, candidates: candidates)
-                            evidence = matchingCandidates(decision, candidates: candidates)
+                            try await store.recordRetry(fileID: record.id, attemptID: nil, nextRetry: nextRetry(for: record),
+                                                        error: error.localizedDescription, definitelyNotCommitted: true)
+                        } catch let storeError as SyncStoreError {
+                            guard case .invalidTransition = storeError,
+                                  try await pendingRecordWasSuperseded(record) else { throw storeError }
                             continue
                         }
+                        guard pendingStampFailureID == record.id else { continue }
+                        guard canSubmit(sourceID: record.file.sourceID) else { continue }
+                        recordRoundFailure(context.roundID)
+                        setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
+                            issue: SourceIssueText.submissionStampFailed(error: error), runID: context.runID, fileID: record.id, error: error)
+                        continue
                     }
-                    break
+                    guard canSubmit(sourceID: record.file.sourceID) else { continue }
+                    switch preparation {
+                    case .waiting(let reason):
+                        recordAdvancedWait(reason, record: record, context: context)
+                        continue
+                    case .ready(let admission):
+                        if admission.evidence.evaluation.action == .skip {
+                            let admissionStarted = ProcessInfo.processInfo.systemUptime
+                            if try await store.commitAdvancedSkip(admission) {
+                                logAdvancedDecision(.ready(admission), timings: ["databaseAdmission": (ProcessInfo.processInfo.systemUptime - admissionStarted) * 1000])
+                                resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                            } else { recordAdvancedWait("照片判重依据已变化，稍后继续。", record: record, context: context) }
+                            continue
+                        }
+                        photoSnapshot = PhotosCandidateSnapshot(generation: admission.evidence.token.photosGeneration, candidates: [])
+                    case .conservative(let admission):
+                        photoSnapshot = PhotosCandidateSnapshot(generation: admission.evidence.token.photosGeneration, candidates: [])
+                    }
+                    advanced = preparation
+                } else {
+                    do { photoSnapshot = try await photos.candidateSnapshot() }
+                    catch {
+                        recordRoundFailure(context.roundID)
+                        setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
+                        break
+                    }
+                    var local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
+                    guard canSubmit(sourceID: record.file.sourceID) else { break }
+                    var candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
+                    var decision = policy.evaluate(record.file.metadata, candidates: candidates)
+                    var evidence = matchingCandidates(decision, candidates: candidates)
+                    var staleAttempts = 0
+                    while true {
+                        if case .skip = decision {
+                            let skipResult: SnapshotCommitResult
+                            do {
+                                skipResult = try await store.markSkippedWithSnapshotValidity(
+                                    fileID: record.id,
+                                    reason: .suspectedDuplicate,
+                                    candidates: evidence,
+                                    validity: photoSnapshot.candidateValidity
+                                )
+                            } catch let error as SyncStoreError {
+                                guard case .invalidTransition = error,
+                                      try await pendingRecordWasSuperseded(record) else { throw error }
+                                continue drainLoop
+                            }
+                            switch skipResult {
+                            case .committed:
+                                resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id)
+                                continue drainLoop
+                            case .staleSnapshot:
+                                staleAttempts += 1
+                                guard staleAttempts < Self.snapshotCommitAttempts else {
+                                    recordRoundFailure(context.roundID)
+                                    setBlockingError(PhotoKitGatewayError.libraryChanged.localizedDescription,
+                                                     summary: SourceIssueText.blockingSummary(for: PhotoKitGatewayError.libraryChanged))
+                                    break drainLoop
+                                }
+                                do { photoSnapshot = try await photos.candidateSnapshot() }
+                                catch {
+                                    recordRoundFailure(context.roundID)
+                                    setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
+                                    break drainLoop
+                                }
+                                local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
+                                candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
+                                decision = policy.evaluate(record.file.metadata, candidates: candidates)
+                                evidence = matchingCandidates(decision, candidates: candidates)
+                                continue
+                            }
+                        }
+                        break
+                    }
                 }
                 guard canSubmit(sourceID: record.file.sourceID) else { break }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
@@ -804,7 +891,21 @@ public actor SyncEngine {
                 let attempt = UUID()
                 activeAttempt = attempt
                 do {
-                    try await store.beginAttempt(fileID: record.id, attemptID: attempt)
+                    let admissionStarted = ProcessInfo.processInfo.systemUptime
+                    let admitted: Bool
+                    switch advanced {
+                    case .ready(let admission): admitted = try await store.beginAdvancedAttempt(admission, attemptID: attempt)
+                    case .conservative(let admission): admitted = try await store.beginAdvancedAttempt(admission, attemptID: attempt)
+                    default:
+                        try await store.beginAttempt(fileID: record.id, attemptID: attempt)
+                        admitted = true
+                    }
+                    if admitted, let advanced { logAdvancedDecision(advanced, timings: ["databaseAdmission": (ProcessInfo.processInfo.systemUptime - admissionStarted) * 1000]) }
+                    guard admitted else {
+                        activeAttempt = nil
+                        recordAdvancedWait("照片判重依据已变化，稍后继续。", record: record, context: context)
+                        continue
+                    }
                 } catch let error as SyncStoreError {
                     guard case .invalidTransition = error else { throw error }
                     guard try await pendingRecordWasSuperseded(record) else { throw error }
@@ -814,22 +915,62 @@ public actor SyncEngine {
                 let enabled = try await store.source(id: record.file.sourceID).enabled
                 guard enabled, canSubmit(sourceID: record.file.sourceID) else {
                     // A durable attempt exists, but no Photos request has been dispatched.
-                    try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: now(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
+                    if advanced != nil {
+                        try await deferAdvancedAttempt(record, attempt: attempt, context: context)
+                    } else {
+                        try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: now(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
+                    }
                     activeAttempt = nil
                     break
                 }
                 do {
+                    let submissionStarted = ProcessInfo.processInfo.systemUptime
+                    defer {
+                        if advanced != nil {
+                            logger?.log(["phase": "advanced-submission-timing", "file": record.id.uuidString,
+                                "attempt": attempt.uuidString, "timingMS.nativeSubmissionWait": String((ProcessInfo.processInfo.systemUptime - submissionStarted) * 1000)])
+                        }
+                    }
                     let store = self.store
                     status.sourcePhases[record.file.sourceID] = "新增到照片"
                     defer { status.sourcePhases.removeValue(forKey: record.file.sourceID) }
-                    let id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind, expectedGeneration: photoSnapshot.generation) { identifier in
+                    let id: String
+                    let checkpoint: @Sendable (String) throws -> Void = { identifier in
                         try store.checkpointPlaceholder(fileID: record.id, attemptID: attempt, identifier: identifier)
+                    }
+                    if let advanced {
+                        let validity: any PhotosCandidateValidity
+                        switch advanced {
+                        case .ready(let admission): validity = admission.validity
+                        case .conservative(let admission): validity = admission.validity
+                        case .waiting: preconditionFailure("Waiting preparation cannot begin an attempt")
+                        }
+                        let state = submissionState
+                        id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind,
+                            expectedGeneration: photoSnapshot.generation, beforeMutation: {
+                                guard state.allows(record.file.sourceID) else { return false }
+                                // One inline probe belongs to the native submission's physical
+                                // lifetime. No detached read, DB/Photos/state lock, or logical
+                                // timeout can release this submission while the OS call lives.
+                                guard try Self.physicalStampMatches(record.file),
+                                      try store.advancedAttemptIsCurrentSynchronously(fileID: record.id, attemptID: attempt),
+                                      state.allows(record.file.sourceID) else { return false }
+                                // Queue has been released before taking Photos validity.
+                                return try validity.commitIfCurrent({})
+                            }, onPlaceholder: checkpoint)
+                    } else {
+                        id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind,
+                            expectedGeneration: photoSnapshot.generation, onPlaceholder: checkpoint)
                     }
                     // Even pause or loss of library health cannot erase a committed callback.
                     try await store.markImported(fileID: record.id, attemptID: attempt, identifier: id)
                     recordRoundImport(context.roundID)
                     resolveSourceIssue(record.file.sourceID, key: issueKey(for: record.id), runID: context.runID, fileID: record.id, attemptID: attempt)
                     logEvent(phase: "submission", result: "imported", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, attemptID: attempt)
+                } catch is PhotosAdmissionDeferred {
+                    // Only the gateway's explicit no-mutation outcome reaches this
+                    // path. Never infer it from a stale token on an in-flight call.
+                    try await deferAdvancedAttempt(record, attempt: attempt, context: context)
                 } catch let error as SyncStoreError { activeAttempt = nil; throw error }
                 catch {
                     let definite = (error as? PhotoKitGatewayError)?.recoveryEvidence == .definitelyNotCommitted
@@ -879,6 +1020,58 @@ public actor SyncEngine {
             current?.state == .skipped || current?.state == .imported
     }
 
+    private func deferAdvancedAttempt(_ record: StoredFile, attempt: UUID, context: SubmissionContext) async throws {
+        try await store.deferAdvancedAttempt(fileID: record.id, attemptID: attempt,
+            nextRetry: now().addingTimeInterval(sourceDeferralDelay(count: 1)))
+        recordAdvancedWait("照片判重依据已变化或同步已暂停，稍后继续。", record: record, context: context)
+    }
+
+    private var usesAdvancedDedup: Bool {
+        requiresAdvancedDedup || advancedDedup != nil || indexCoordinator != nil
+    }
+
+    private func refreshSubmissionState() {
+        submissionState.update(paused: status.isPaused,
+            blocked: storageFailed || status.blockingError != nil || !uncertainSubmissions.isEmpty,
+            disabled: disabledSources)
+    }
+
+    private func recordAdvancedWait(_ reason: String, record: StoredFile, context: SubmissionContext) {
+        guard canScan(sourceID: record.file.sourceID) else { return }
+        recordDeferral(context.roundID, sourceID: record.file.sourceID)
+        status.advancedWaitingReasons[record.file.sourceID] = reason
+        let key = "\(record.file.sourceID.uuidString)|advanced-wait|\(record.id.uuidString)"
+        if lastFailureLogSignatures[key] != reason {
+            lastFailureLogSignatures[key] = reason
+            logEvent(phase: "advanced-dedup", result: "waiting", sourceID: record.file.sourceID,
+                     runID: context.runID, fileID: record.id, detail: reason)
+        }
+    }
+
+    private func logAdvancedDecision(_ preparation: AdvancedPreparation, timings: [String: Double]) {
+        guard let dedupConfiguration else { return }
+        switch preparation {
+        case .ready(let admission):
+            logger?.logDecision(admission.evidence, configuration: dedupConfiguration, sourceSize: admission.source.size, additionalTimingsMS: timings)
+        case .conservative(let admission):
+            let m = admission.file.metadata
+            let size = m.width.flatMap { width in m.height.flatMap { try? PixelSize(width: width, height: $0) } }
+            logger?.logDecision(admission.evidence, configuration: dedupConfiguration,
+                sourceSize: size, conservativeReason: admission.reason, additionalTimingsMS: timings)
+        case .waiting: break
+        }
+    }
+
+    private nonisolated static func physicalStampMatches(_ file: SourceFile) throws -> Bool {
+        let url = URL(fileURLWithPath: file.url.path)
+        _ = try SourceRegistry.normalizedURL(url.deletingLastPathComponent())
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { throw DirectoryReaderError.missingFileAttributes }
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        guard let size = values.fileSize, let modified = values.contentModificationDate else { throw DirectoryReaderError.missingFileAttributes }
+        return FileStamp(size: Int64(size), modifiedNanoseconds: Int64((modified.timeIntervalSince1970 * 1_000_000_000).rounded(.down))) == file.stamp
+    }
+
     private func canSubmit(sourceID: UUID) -> Bool {
         !status.isPaused && !storageFailed && status.blockingError == nil && uncertainSubmissions.isEmpty && !disabledSources.contains(sourceID)
     }
@@ -907,6 +1100,7 @@ public actor SyncEngine {
 
     private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil,
                                     attemptID: UUID? = nil, announceRecovery: Bool = true) {
+        if let fileID, key == issueKey(for: fileID) { lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|advanced-wait|\(fileID.uuidString)") }
         if let fileID, key == issueKey(for: fileID), pendingStampFailureID == fileID {
             pendingStampFailureID = nil
         }
@@ -995,14 +1189,17 @@ public actor SyncEngine {
         status.waitingSources.removeValue(forKey: sourceID)
         status.sourceFileIssueCounts.removeValue(forKey: sourceID)
         status.deferredSources.remove(sourceID)
+        status.advancedWaitingReasons.removeValue(forKey: sourceID)
         sourceIssues.removeValue(forKey: sourceID)
         reportedWaitingSources.remove(sourceID)
-        clearFailureLogSignatures(sourceID)
+        clearFailureLogSignatures(sourceID, includeAdvanced: true)
     }
 
-    private func clearFailureLogSignatures(_ sourceID: UUID) {
+    private func clearFailureLogSignatures(_ sourceID: UUID, includeAdvanced: Bool = false) {
         let prefix = "\(sourceID.uuidString)|"
-        lastFailureLogSignatures = lastFailureLogSignatures.filter { !$0.key.hasPrefix(prefix) }
+        lastFailureLogSignatures = lastFailureLogSignatures.filter {
+            !$0.key.hasPrefix(prefix) || (!includeAdvanced && $0.key.hasPrefix(prefix + "advanced-wait|"))
+        }
     }
 
     /// Journals a failure only while its signature changes. Every attempt still persists its own
@@ -1187,5 +1384,20 @@ public actor SyncEngine {
         hasUncertainSubmissionBlock = false
         logger?.log(["error": error.localizedDescription, "scope": "storage"])
         if firstStop { publishIssueNotification(SourceIssueText.storageStopped) }
+    }
+}
+
+/// Synchronous mirror for the existing native beforeMutation callback. Its lock
+/// is never held across source I/O, SQLite, or Photos validity checks.
+private final class EngineSubmissionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var paused = false, blocked = false
+    private var disabled: Set<UUID> = []
+    func update(paused: Bool, blocked: Bool, disabled: Set<UUID>) {
+        lock.lock(); self.paused = paused; self.blocked = blocked; self.disabled = disabled; lock.unlock()
+    }
+    func allows(_ source: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !paused && !blocked && !disabled.contains(source)
     }
 }
