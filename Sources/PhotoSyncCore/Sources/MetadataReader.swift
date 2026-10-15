@@ -12,6 +12,13 @@ public enum MetadataError: Error {
     case unsupported
 }
 
+enum VideoMetadataStage: String, CaseIterable {
+    case duration = "读取时长"
+    case creationDate = "读取创建日期"
+    case commonMetadata = "读取公共元数据"
+    case creationDateStringValue = "读取拍摄时间文本"
+}
+
 struct SourceImage: @unchecked Sendable {
     let image: CGImage
     let orientation: CGImagePropertyOrientation
@@ -83,45 +90,48 @@ public struct MetadataReader: MetadataReading {
     }
 
     private func readVideo(url: URL, filename: String) async throws -> MediaMetadata {
-        do {
-            let asset = AVURLAsset(url: url)
-            let duration = try await asset.load(.duration)
-            let creationDate = try await asset.load(.creationDate)
-            let metadata = try await asset.load(.commonMetadata)
-            let creationItem = creationDate ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })
-            let rawCaptureTime = try await creationItem?.load(.stringValue)
-            let dimensions = try? await asset.load(.tracks).first(where: { $0.mediaType == .video })?.load(.naturalSize)
-            return MediaMetadata(
-                filename: filename,
-                kind: .video,
-                captureSecond: MetadataReader.videoCaptureSecond(rawCaptureTime: rawCaptureTime),
-                rawCaptureTime: rawCaptureTime,
-                rawCaptureOffset: videoOffset(rawCaptureTime),
-                make: nil,
-                model: nil,
-                width: dimensions.map { Int(abs($0.width)) },
-                height: dimensions.map { Int(abs($0.height)) },
-                duration: duration.seconds.isFinite ? duration.seconds : nil
-            )
-        } catch {
-            throw Self.videoMetadataError(error)
-        }
+        let asset = AVURLAsset(url: url)
+        let duration = try await Self.loadVideoMetadata(.duration) { try await asset.load(.duration) }
+        let creationDate = try await Self.loadVideoMetadata(.creationDate) { try await asset.load(.creationDate) }
+        let metadata = try await Self.loadVideoMetadata(.commonMetadata) { try await asset.load(.commonMetadata) }
+        let creationItem = creationDate ?? metadata.first(where: { $0.commonKey == .commonKeyCreationDate })
+        let rawCaptureTime = try await Self.loadVideoMetadata(.creationDateStringValue) { try await creationItem?.load(.stringValue) }
+        let dimensions = try? await asset.load(.tracks).first(where: { $0.mediaType == .video })?.load(.naturalSize)
+        return MediaMetadata(
+            filename: filename,
+            kind: .video,
+            captureSecond: MetadataReader.videoCaptureSecond(rawCaptureTime: rawCaptureTime),
+            rawCaptureTime: rawCaptureTime,
+            rawCaptureOffset: videoOffset(rawCaptureTime),
+            make: nil,
+            model: nil,
+            width: dimensions.map { Int(abs($0.width)) },
+            height: dimensions.map { Int(abs($0.height)) },
+            duration: duration.seconds.isFinite ? duration.seconds : nil
+        )
+    }
+
+    /// All required loads use the same wrapper; optional dimensions keep their existing try?.
+    static func loadVideoMetadata<Value>(_ stage: VideoMetadataStage, operation: () async throws -> Value) async throws -> Value {
+        do { return try await operation() }
+        catch { throw videoMetadataError(error, stage: stage) }
+    }
+
+    static func videoMetadataStage(_ error: Error) -> String? {
+        SourceIssueText.underlyingNSErrorChain(error).first { $0.domain == "PhotoSync.VideoMetadata" }?
+            .userInfo["PhotoSync.VideoMetadataStage"] as? String
     }
 
     /// Keep the underlying AVFoundation and OSStatus codes in diagnostics. The localized system
     /// sentence can be generic even when the nested error identifies a repeatable file failure.
-    static func videoMetadataError(_ error: Error) -> NSError {
-        var codes: [String] = []
-        var current: NSError? = error as NSError
-        for _ in 0..<3 {
-            guard let failure = current else { break }
-            codes.append("\(failure.domain) \(failure.code)")
-            current = failure.userInfo[NSUnderlyingErrorKey] as? NSError
-        }
-        return NSError(domain: "PhotoSync.VideoMetadata", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "Video metadata could not be read (\(codes.joined(separator: " <- "))).",
+    static func videoMetadataError(_ error: Error, stage: VideoMetadataStage? = nil) -> NSError {
+        let diagnostic = SourceIssueText.systemDiagnostic(error)
+        var info: [String: Any] = [
+            NSLocalizedDescriptionKey: "Video metadata could not be read" + (stage.map { " [\($0.rawValue)]" } ?? "") + ": " + diagnostic,
             NSUnderlyingErrorKey: error
-        ])
+        ]
+        if let stage { info["PhotoSync.VideoMetadataStage"] = stage.rawValue }
+        return NSError(domain: "PhotoSync.VideoMetadata", code: 1, userInfo: info)
     }
 }
 

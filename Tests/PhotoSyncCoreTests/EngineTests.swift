@@ -4,6 +4,277 @@ import SQLite3
 @testable import PhotoSyncCore
 
 final class EngineTests: XCTestCase {
+    func testSourceIssueDetailsPreserveMixedDirectoriesFilesAndSubmission() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let root = try SourceRegistry.normalizedURL(f.directories[0]), id = f.sourceIDs[0]
+        let file = try await engineSourceFile(sourceID: id, directory: root)
+        let recordID = try await f.store.save(file, decision: .importNew)
+        try await f.store.beginAttempt(fileID: recordID, attemptID: UUID())
+        for name in ["A", "B"] { try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true) }
+        try Data("bad image".utf8).write(to: root.appendingPathComponent("bad.jpg"))
+        let reader = DiagnosticDirectory(sourceID: id)
+        await reader.setFailure(root.appendingPathComponent("A"), code: Int(EACCES))
+        await reader.setFailure(root.appendingPathComponent("B"), code: Int(ENETDOWN))
+        await reader.setFileFailure(file.url, code: Int(ENOENT))
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let snapshot = await engine.snapshot()
+        let details = try XCTUnwrap(snapshot.sourceIssueDetails[id])
+        XCTAssertEqual(details.count, 5)
+        XCTAssertEqual(Set(details.map(\.id)), ["scan:directory:" + root.appendingPathComponent("A").path,
+            "scan:directory:" + root.appendingPathComponent("B").path, "scan:file:bad.jpg", "scan:file:same.jpg", "file:" + recordID.uuidString])
+        XCTAssertEqual(details.filter { $0.path == file.url.path }.count, 2)
+        XCTAssertEqual(details.filter { $0.kind == .sourceAvailability }.count, 2)
+        XCTAssertEqual(details.filter { $0.kind == .file }.count, 2)
+        XCTAssertEqual(details.filter { $0.kind == .submission }.count, 1)
+        XCTAssertEqual(snapshot.sourceFileIssueCounts[id], 2)
+        XCTAssertTrue(details.first { $0.path.hasSuffix("/A") }?.detail.contains("fixture failure 13") == true)
+        XCTAssertTrue(details.first { $0.id == "scan:file:same.jpg" }?.summary.contains("路径不可用") == true)
+        XCTAssertEqual(details.map(\.path), details.map(\.path).sorted())
+    }
+
+    func testDirectoryPrimaryFollowsRemainingDiagnostic() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+        let a = root.appendingPathComponent("A"), b = root.appendingPathComponent("B"), c = root.appendingPathComponent("C")
+        for folder in [a, b, c] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        let reader = DiagnosticDirectory(sourceID: id)
+        let notices = SourceIssueNotificationRecorder()
+        let logDirectory = try temporaryDirectory()
+        let journalLogger = try RunLogger(directory: logDirectory)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader }, logger: journalLogger,
+            notifySourceIssue: { _, recovered, issue in notices.record(recovered: recovered, issue: issue) })
+        await reader.setFailure(a, code: Int(EACCES)); await reader.setFailure(b, code: Int(ENETDOWN))
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let first = await engine.snapshot()
+        XCTAssertTrue(first.waitingSources[id]?.detail.contains(a.path) == true)
+        await reader.setFailure(a, code: nil)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let remaining = await engine.snapshot()
+        XCTAssertEqual(remaining.sourceIssueDetails[id]?.count, 1)
+        XCTAssertEqual(remaining.waitingSources[id]?.summary, "部分子目录所在的网络共享连接已中断；恢复后会自动继续。")
+        XCTAssertTrue(remaining.waitingSources[id]?.detail.contains(b.path) == true)
+        XCTAssertFalse(remaining.waitingSources[id]?.detail.contains(a.path) == true)
+        journalLogger.flushForTesting()
+        let partialRows = try String(contentsOf: logDirectory.appendingPathComponent("photo-sync.jsonl")).split(separator: "\n").compactMap {
+            try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String]
+        }
+        let directoryRows = partialRows.filter { $0["phase"] == "directory" && $0["result"] == "failed" }
+        XCTAssertEqual(directoryRows.filter { $0["path"] == a.path }.count, 1)
+        XCTAssertEqual(directoryRows.filter { $0["path"] == b.path }.count, 1, "A's recovery must not reset B's log signature")
+        XCTAssertTrue(directoryRows.allSatisfy { $0["detail"]?.contains("枚举目录") == true })
+        await reader.setFailure(b, code: nil)
+        await reader.deferDirectory(c)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let neutral = await engine.snapshot()
+        XCTAssertNil(neutral.sourceIssueDetails[id])
+        XCTAssertEqual(neutral.waitingSources[id]?.kind, .sourceAvailability)
+        XCTAssertEqual(neutral.waitingSources[id]?.summary, "等待确认来源恢复")
+        XCTAssertFalse(neutral.waitingSources[id]?.detail.contains(a.path) == true)
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 0)
+        await reader.deferDirectory(nil)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let complete = await engine.snapshot()
+        XCTAssertNil(complete.waitingSources[id])
+        XCTAssertNil(complete.sourceIssueDetails[id])
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 1)
+    }
+
+    func testDirectoryDiagnosticRecoveryKeepsSourceRecoveryUntilCompleteTraversal() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+        let a = root.appendingPathComponent("A"), b = root.appendingPathComponent("B"), c = root.appendingPathComponent("C")
+        for folder in [a, b, c] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        let reader = DiagnosticDirectory(sourceID: id), gate = EngineTestGate()
+        let notices = SourceIssueNotificationRecorder()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader },
+            notifySourceIssue: { _, recovered, issue in notices.record(recovered: recovered, issue: issue) })
+        var schedule = ScanSchedule()
+        let start = Date(timeIntervalSince1970: 100)
+        await reader.setFailure(a, code: Int(EACCES)); await reader.setFailure(b, code: Int(ENETDOWN))
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let initial = await engine.snapshot()
+        XCTAssertEqual(initial.sourceIssueDetails[id]?.count, 2)
+        XCTAssertEqual(schedule.recordSourceFailure(id, now: start), start.addingTimeInterval(5))
+        await reader.setFailure(a, code: nil)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let partial = await engine.snapshot()
+        XCTAssertEqual(partial.sourceIssueDetails[id]?.map(\.path), [b.path])
+        XCTAssertEqual(schedule.recordSourceFailure(id, now: start), start.addingTimeInterval(15))
+        await reader.setFailure(b, code: nil)
+        await reader.hold(c, gate: gate); await reader.deferDirectory(c)
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let held = await engineEventually { await gate.entered }
+        XCTAssertTrue(held)
+        let beforePause = await engine.snapshot()
+        XCTAssertNil(beforePause.sourceIssueDetails[id])
+        XCTAssertEqual(beforePause.waitingSources[id]?.summary, "等待确认来源恢复")
+        await engine.setPaused(true); await gate.release(); await scan.value
+        let paused = await engine.snapshot()
+        XCTAssertEqual(paused.waitingSources[id]?.kind, .sourceAvailability)
+        XCTAssertNil(paused.sourceIssueDetails[id])
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 0)
+        await engine.setPaused(false)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let deferred = await engine.snapshot()
+        XCTAssertTrue(deferred.deferredSources.contains(id))
+        XCTAssertEqual(deferred.waitingSources[id]?.kind, .sourceAvailability)
+        XCTAssertNil(deferred.sourceIssueDetails[id])
+        // Exercise the same availability/deferral separation consumed by finishedRound.
+        if deferred.waitingSources[id]?.isSourceAvailability == true {
+            XCTAssertEqual(schedule.recordSourceFailure(id, now: start), start.addingTimeInterval(30))
+        } else { XCTFail("Source failure curve must survive leaf-only recovery") }
+        XCTAssertEqual(schedule.recordSourceDeferral(id, now: start), start.addingTimeInterval(5))
+        schedule.recordSourceDeferralRecovered(id)
+        XCTAssertEqual(schedule.nextRecoveryAt, start.addingTimeInterval(30))
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 0)
+        await reader.deferDirectory(nil)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let complete = await engine.snapshot()
+        XCTAssertNil(complete.sourceIssueDetails[id]); XCTAssertNil(complete.waitingSources[id])
+        XCTAssertFalse(complete.deferredSources.contains(id))
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 1)
+        schedule.recordSourceFailureRecovered(id)
+        XCTAssertEqual(schedule.recordSourceFailure(id, now: start), start.addingTimeInterval(5))
+    }
+
+    func testRepeatedIssuesUpdateWithoutAccumulating() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], a = (try SourceRegistry.normalizedURL(f.directories[0])).appendingPathComponent("A")
+        try FileManager.default.createDirectory(at: a, withIntermediateDirectories: true)
+        let reader = DiagnosticDirectory(sourceID: id)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await reader.setFailure(a, code: Int(EACCES))
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let first = await engine.snapshot().sourceIssueDetails[id]
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let repeated = await engine.snapshot().sourceIssueDetails[id]
+        XCTAssertEqual(first, repeated)
+        await reader.setFailure(a, code: Int(ENETDOWN))
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let changed = await engine.snapshot().sourceIssueDetails[id]
+        XCTAssertEqual(first?.map(\.id), changed?.map(\.id))
+        XCTAssertNotEqual(first?.first?.detail, changed?.first?.detail)
+        XCTAssertEqual(changed?.count, 1)
+        await reader.setFailure(a, code: nil)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let recovered = await engine.snapshot()
+        XCTAssertNil(recovered.sourceIssueDetails[id])
+        XCTAssertNil(recovered.waitingSources[id])
+    }
+
+    func testLateIssueCannotReviveDisabledOrRemovedSource() async throws {
+        for remove in [false, true] {
+            let f = try await makeEngineFixture(sourceCount: 1)
+            let id = f.sourceIDs[0], gate = EngineTestGate()
+            let reader = DiagnosticDirectory(sourceID: id)
+            await reader.setFailure(f.directories[0], code: Int(EACCES))
+            await reader.hold(f.directories[0], gate: gate)
+            let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+            let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+            let held = await engineEventually { await gate.entered }
+            XCTAssertTrue(held)
+            if remove { try await engine.removeSource(id: id) } else { try await engine.disableSource(id: id) }
+            await gate.release(); await scan.value
+            let snapshot = await engine.snapshot()
+            XCTAssertNil(snapshot.sourceIssueDetails[id])
+            XCTAssertNil(snapshot.waitingSources[id])
+            XCTAssertNil(snapshot.sourceFileIssueCounts[id])
+        }
+    }
+
+    func testRecoveredDirectoryEntryAttributesClearOnlyTheirOwnDiagnostic() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+        let folder = root.appendingPathComponent("unknown-child")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("bad JPEG".utf8).write(to: root.appendingPathComponent("bad.jpg"))
+        let reader = DiagnosticDirectory(sourceID: id)
+        let logs = try temporaryDirectory()
+        let logger = try RunLogger(directory: logs)
+        await reader.failAttribute(folder, code: Int(EACCES))
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader }, logger: logger)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let first = await engine.snapshot()
+        let attribute = try XCTUnwrap(first.sourceIssueDetails[id]?.first { $0.path == folder.path })
+        XCTAssertEqual(attribute.kind, .file)
+        XCTAssertEqual(attribute.stage, "读取目录项属性")
+        XCTAssertTrue(attribute.summary.contains("目录项")); XCTAssertTrue(attribute.summary.contains("权限"))
+        XCTAssertTrue(attribute.detail.contains("NSCocoaErrorDomain")); XCTAssertTrue(attribute.detail.contains("NSPOSIXErrorDomain 13"))
+        XCTAssertTrue(attribute.detail.contains("attribute leaf"))
+        XCTAssertEqual(first.sourceIssueDetails[id]?.count, 2)
+        logger.flushForTesting()
+        let rows = try String(contentsOf: logs.appendingPathComponent("photo-sync.jsonl")).split(separator: "\n").compactMap {
+            try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String]
+        }
+        let logged = try XCTUnwrap(rows.first { $0["phase"] == "metadata" && $0["path"] == folder.path })
+        XCTAssertTrue(logged["detail"]?.contains("读取目录项属性") == true)
+        XCTAssertTrue(logged["detail"]?.contains("NSPOSIXErrorDomain 13: attribute leaf") == true)
+        await reader.failAttribute(folder, code: nil)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let remaining = await engine.snapshot()
+        XCTAssertEqual(remaining.sourceIssueDetails[id]?.map(\.id), ["scan:file:bad.jpg"])
+        XCTAssertEqual(remaining.sourceFileIssueCounts[id], 1)
+    }
+
+    func testCompleteTraversalClearsDeletedUnstoredScanDiagnosticWhileSiblingStillFails() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+        let a = root.appendingPathComponent("a.jpg"), b = root.appendingPathComponent("b.jpg")
+        for file in [a, b] { try Data("bad JPEG".utf8).write(to: file) }
+        let notices = SourceIssueNotificationRecorder()
+        let engine = SyncEngine(store: f.store, photos: f.photos,
+            notifySourceIssue: { _, recovered, issue in notices.record(recovered: recovered, issue: issue) })
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let first = await engine.snapshot()
+        XCTAssertEqual(first.sourceIssueDetails[id]?.map(\.id), ["scan:file:a.jpg", "scan:file:b.jpg"])
+        let aRecord = try await f.store.file(sourceID: id, relativePath: "a.jpg")
+        let bRecord = try await f.store.file(sourceID: id, relativePath: "b.jpg")
+        XCTAssertNil(aRecord); XCTAssertNil(bRecord)
+        try FileManager.default.removeItem(at: a)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let remaining = await engine.snapshot()
+        XCTAssertEqual(remaining.sourceIssueDetails[id]?.map(\.id), ["scan:file:b.jpg"])
+        XCTAssertEqual(remaining.sourceFileIssueCounts[id], 1)
+        XCTAssertEqual(remaining.waitingSources[id]?.kind, .file)
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 0)
+        XCTAssertEqual(remaining.summary?.imported, 1)
+        XCTAssertEqual(remaining.latestScan.failedFiles, 1)
+        try FileManager.default.removeItem(at: b)
+        await engine.scan(sourceIDs: f.sourceIDs)
+        let clean = await engine.snapshot()
+        XCTAssertNil(clean.sourceIssueDetails[id]); XCTAssertNil(clean.waitingSources[id])
+        XCTAssertEqual(notices.events.filter(\.recovered).count, 0, "Normal deletion is not failure recovery")
+    }
+
+    func testIncompleteTraversalRetainsDeletedUnstoredScanDiagnostic() async throws {
+        for incomplete in ["directory-deferred", "attribute-failed", "metadata-deferred", "paused"] {
+            let f = try await makeEngineFixture(sourceCount: 1)
+            let id = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+            let a = root.appendingPathComponent("a.jpg"), b = root.appendingPathComponent("b.jpg")
+            for file in [a, b] { try Data("bad JPEG".utf8).write(to: file) }
+            let folder = root.appendingPathComponent("C")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let reader = DiagnosticDirectory(sourceID: id)
+            let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+            await engine.scan(sourceIDs: f.sourceIDs)
+            try FileManager.default.removeItem(at: a)
+            if incomplete == "directory-deferred" { await reader.deferDirectory(folder) }
+            if incomplete == "attribute-failed" { await reader.failAttribute(folder, code: Int(EACCES)) }
+            if incomplete == "metadata-deferred" { await reader.setFileDeferred(b) }
+            if incomplete == "paused" {
+                let gate = EngineTestGate()
+                await reader.hold(folder, gate: gate)
+                let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+                let held = await engineEventually { await gate.entered }; XCTAssertTrue(held)
+                await engine.setPaused(true); await gate.release(); await scan.value
+            } else { await engine.scan(sourceIDs: f.sourceIDs) }
+            let snapshot = await engine.snapshot()
+            XCTAssertTrue(snapshot.sourceIssueDetails[id]?.contains { $0.id == "scan:file:a.jpg" } == true, incomplete)
+            XCTAssertTrue(snapshot.sourceIssueDetails[id]?.contains { $0.id == "scan:file:b.jpg" } == true, incomplete)
+        }
+    }
+
     func testCompleteTraversalTreatsDeletedPendingFileAsNormalSourceChange() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         let directory = f.directories[0]
@@ -554,6 +825,7 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(createCount, 1)
         XCTAssertNil(snapshot.blockingError)
         XCTAssertTrue(snapshot.waitingSources.isEmpty)
+        XCTAssertTrue(snapshot.sourceIssueDetails.isEmpty)
         XCTAssertEqual(snapshot.latestScan.failed, 0)
         XCTAssertTrue(notifications.events.isEmpty)
         XCTAssertEqual(try engineSQLInteger("SELECT COALESCE(SUM(failed), 0) FROM scan_run", at: f.databaseURL), 0)
@@ -813,7 +1085,7 @@ final class EngineTests: XCTestCase {
         let both = await f.engine.snapshot()
         XCTAssertEqual(both.latestScan.failedFiles, 2)
         XCTAssertEqual(both.sourceFileIssueCounts[f.sourceIDs[0]], 2)
-        XCTAssertEqual(both.waitingSources[f.sourceIDs[0]]?.summary, "文件无法读取，可能已损坏或没有权限。")
+        XCTAssertEqual(both.waitingSources[f.sourceIDs[0]]?.summary, "文件暂时无法读取，具体原因尚无法确定。")
         XCTAssertTrue(both.waitingSources[f.sourceIDs[0]]?.detail.contains("bad-1.jpg") ?? false)
 
         // Repairing one file clears only that file's issue; the source keeps waiting for the other.
@@ -1895,4 +2167,47 @@ private struct AuthorizationRequiredPhotosGateway: PhotosGateway {
     }
 
     func reconcile(placeholder: String?) async throws -> ImportEvidence { .unknown }
+}
+
+/// Uses real synthetic-directory enumeration; faults occur at the I/O boundary only.
+private actor DiagnosticDirectory: DirectoryReading {
+    private let reader: DirectoryReader
+    private var failures: [String: NSError] = [:]
+    private var fileFailures: [String: NSError] = [:]
+    private var attributeFailures: [String: NSError] = [:]
+    private var deferredFilePath: String?
+    private var deferredPath: String?
+    private var heldPath: String?
+    private var gate: EngineTestGate?
+    init(sourceID: UUID) { reader = DirectoryReader(sourceID: sourceID) }
+    func setFailure(_ url: URL, code: Int?) {
+        failures[url.resolvingSymlinksInPath().path] = code.map { NSError(domain: NSPOSIXErrorDomain, code: $0,
+            userInfo: [NSLocalizedDescriptionKey: "fixture failure \($0)"]) }
+    }
+    func setFileFailure(_ url: URL, code: Int) {
+        fileFailures[url.resolvingSymlinksInPath().path] = NSError(domain: NSPOSIXErrorDomain, code: code)
+    }
+    func failAttribute(_ url: URL, code: Int?) {
+        attributeFailures[url.resolvingSymlinksInPath().path] = code.map {
+            NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError, userInfo: [NSLocalizedDescriptionKey: "attribute wrapper",
+                NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: $0, userInfo: [NSLocalizedDescriptionKey: "attribute leaf"])])
+        }
+    }
+    func setFileDeferred(_ url: URL) { deferredFilePath = url.resolvingSymlinksInPath().path }
+    func deferDirectory(_ url: URL?) { deferredPath = url?.resolvingSymlinksInPath().path }
+    func hold(_ url: URL, gate: EngineTestGate) { heldPath = url.resolvingSymlinksInPath().path; self.gate = gate }
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        if directory.resolvingSymlinksInPath().path == heldPath, let gate { await gate.wait() }
+        if directory.resolvingSymlinksInPath().path == deferredPath { throw ReadExecutorError.sourceBusy }
+        if let failure = failures[directory.resolvingSymlinksInPath().path] { throw failure }
+        return try await reader.entries(in: directory).map { entry in
+            guard let error = attributeFailures[entry.url.resolvingSymlinksInPath().path] else { return entry }
+            return DirectoryEntry(url: entry.url, isDirectory: false, stamp: nil, failure: error.localizedDescription, failureCause: error)
+        }
+    }
+    func stamp(of file: URL) async throws -> FileStamp {
+        if file.resolvingSymlinksInPath().path == deferredFilePath { throw ReadExecutorError.sourceBusy }
+        if let failure = fileFailures[file.resolvingSymlinksInPath().path] { throw failure }
+        return try await reader.stamp(of: file)
+    }
 }

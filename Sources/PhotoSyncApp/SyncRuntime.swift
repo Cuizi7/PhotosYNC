@@ -336,6 +336,7 @@ actor SyncRuntime {
         registeredFailures.remove(id)
         state.snapshot.sourcePhases.removeValue(forKey: id)
         state.snapshot.waitingSources.removeValue(forKey: id)
+        state.snapshot.sourceIssueDetails.removeValue(forKey: id)
         try await refreshSources()
         await applyAnalysisEligibility()
     }

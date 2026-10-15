@@ -3,6 +3,82 @@ import AVFoundation
 @testable import PhotoSyncCore
 
 final class SourceReaderTests: XCTestCase {
+    func testEntryAttributeFailurePreservesSystemCause() async throws {
+        let folder = try sourceFixtureDirectory()
+        let cause = NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError, userInfo: [
+            NSLocalizedDescriptionKey: "attribute wrapper",
+            NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES),
+                                          userInfo: [NSLocalizedDescriptionKey: "fixture permission denied"])
+        ])
+        let entries = try await DirectoryReader(attributes: { url, keys in
+            if url.lastPathComponent == "normal.jpg" { throw cause }
+            return try url.resourceValues(forKeys: keys)
+        }).entries(in: folder)
+        let failed = try XCTUnwrap(entries.first { $0.url.lastPathComponent == "normal.jpg" })
+        XCTAssertEqual(failed.failureCause?.domain, NSCocoaErrorDomain)
+        XCTAssertEqual((failed.failureCause?.userInfo[NSUnderlyingErrorKey] as? NSError)?.code, Int(EACCES))
+        XCTAssertEqual(failed.failure, "attribute wrapper")
+        XCTAssertNotNil(entries.first { $0.url.lastPathComponent == "no-exif.png" }?.stamp)
+    }
+
+    func testVideoMetadataFailureReportsExactRequiredStage() async throws {
+        let leaf = NSError(domain: "Fixture.Deep", code: 42, userInfo: [NSLocalizedDescriptionKey: "deep cause"])
+        let os = NSError(domain: NSOSStatusErrorDomain, code: -12979,
+                         userInfo: [NSLocalizedDescriptionKey: "status cause", NSUnderlyingErrorKey: leaf])
+        let av = NSError(domain: AVFoundationErrorDomain, code: -11800,
+                         userInfo: [NSLocalizedDescriptionKey: "asset cause", NSUnderlyingErrorKey: os])
+        let cases: [(VideoMetadataStage, String)] = [
+            (.duration, "读取时长"), (.creationDate, "读取创建日期"),
+            (.commonMetadata, "读取公共元数据"), (.creationDateStringValue, "读取拍摄时间文本")
+        ]
+        for (stage, expected) in cases {
+            do {
+                let _: Int = try await MetadataReader.loadVideoMetadata(stage) { throw av }
+                XCTFail("Required metadata load must fail")
+            } catch {
+                let issue = SourceIssueText.fileUnreadable(relativePath: "sample.mpg", url: URL(fileURLWithPath: "/fixture/sample.mpg"), error: error)
+                XCTAssertEqual(MetadataReader.videoMetadataStage(error), expected)
+                XCTAssertTrue(issue.detail.contains(expected))
+                for text in ["AVFoundationErrorDomain -11800", "asset cause", "NSOSStatusErrorDomain -12979", "status cause", "Fixture.Deep 42", "deep cause"] {
+                    XCTAssertTrue(issue.detail.contains(text), text)
+                }
+                XCTAssertEqual(issue.summary, "视频元数据读取失败，具体原因尚无法确定。")
+            }
+        }
+        XCTAssertNil(MetadataReader.videoMetadataStage(MetadataReader.videoMetadataError(av)))
+    }
+
+    func testFileDiagnosticClassifiesKnownCauseWithoutGuessingUnknownVideo() {
+        let url = URL(fileURLWithPath: "/fixture/clip.mpg")
+        let cases: [(Int, String)] = [(Int(EACCES), "权限"), (Int(ENOENT), "路径不可用"), (Int(ENETDOWN), "网络共享连接已中断")]
+        for (code, expected) in cases {
+            let cause = NSError(domain: NSPOSIXErrorDomain, code: code, userInfo: [NSLocalizedDescriptionKey: "fixture leaf"])
+            let outer = NSError(domain: "Fixture.Wrapper", code: 7, userInfo: [NSUnderlyingErrorKey: cause])
+            let issue = SourceIssueText.fileUnreadable(relativePath: "clip.mpg", url: url, error: MetadataReader.videoMetadataError(outer))
+            XCTAssertEqual(issue.kind, .file)
+            XCTAssertTrue(issue.summary.contains(expected), issue.summary)
+            XCTAssertTrue(issue.detail.contains("fixture leaf"))
+        }
+        let plain = SourceIssueText.fileUnreadable(relativePath: "clip.mpg", url: url, error: MetadataError.unreadable)
+        XCTAssertEqual(plain.summary, "文件暂时无法读取，具体原因尚无法确定。")
+        let unknown = SourceIssueText.fileUnreadable(relativePath: "clip.mpg", url: url,
+            error: MetadataReader.videoMetadataError(NSError(domain: AVFoundationErrorDomain, code: -11800)))
+        XCTAssertEqual(unknown.summary, "视频元数据读取失败，具体原因尚无法确定。")
+    }
+
+    func testSystemDiagnosticKeepsEveryAvailableCause() {
+        var failure = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: "deepest permission"])
+        for depth in 1...8 {
+            failure = NSError(domain: "Fixture.Layer", code: depth,
+                userInfo: [NSLocalizedDescriptionKey: "layer \(depth)", NSUnderlyingErrorKey: failure])
+        }
+        let diagnostic = SourceIssueText.systemDiagnostic(failure)
+        XCTAssertTrue(diagnostic.contains("NSPOSIXErrorDomain 13: deepest permission"))
+        for depth in 1...8 { XCTAssertTrue(diagnostic.contains("Fixture.Layer \(depth): layer \(depth)")) }
+        let issue = SourceIssueText.fileUnreadable(relativePath: "photo.jpg", url: URL(fileURLWithPath: "/fixture/photo.jpg"), error: failure)
+        XCTAssertTrue(issue.summary.contains("权限"))
+    }
+
     func testDirectoryReaderExcludesHiddenLinksAndPackages() async throws {
         let directory = try sourceFixtureDirectory()
 
@@ -448,6 +524,13 @@ extension SourceReaderTests {
         let fixture = try await makeEngineFixture(sourceCount: 1)
         let unreadableDirectory = fixture.directories[0].appendingPathComponent("unreadable-child")
         try FileManager.default.createDirectory(at: unreadableDirectory, withIntermediateDirectories: true)
+        let pendingURL = unreadableDirectory.appendingPathComponent("gone.jpg")
+        let pending = SourceFile(sourceID: fixture.sourceIDs[0], relativePath: "unreadable-child/gone.jpg", url: pendingURL,
+                                 stamp: FileStamp(size: 1, modifiedNanoseconds: 1), metadata: try await MetadataReader().read(url: fixture.directories[0].appendingPathComponent("same.jpg"), filename: "gone.jpg"))
+        let pendingID = try await fixture.store.save(pending, decision: .importNew)
+        // Keep this absent descendant pending without scheduling an unrelated submission read.
+        try await fixture.store.recordRetry(fileID: pendingID, attemptID: nil, nextRetry: .distantFuture,
+                                             error: "held pending fixture", definitelyNotCommitted: true)
         let engine = SyncEngine(store: fixture.store, photos: fixture.photos, directory: { id in
             DirectoryReader(sourceID: id, attributes: { url, keys in
                 if url.lastPathComponent == "unreadable-child" {
@@ -461,12 +544,20 @@ extension SourceReaderTests {
 
         let snapshot = await engine.snapshot()
         XCTAssertEqual(snapshot.summary?.imported, 1)
+        let details = try XCTUnwrap(snapshot.sourceIssueDetails[fixture.sourceIDs[0]])
+        let normalizedChild = try SourceRegistry.normalizedURL(unreadableDirectory)
+        let item = try XCTUnwrap(details.first { $0.path == normalizedChild.path })
+        XCTAssertEqual(item.stage, "读取目录项属性")
+        XCTAssertTrue(item.summary.contains("目录项"))
+        XCTAssertFalse(item.summary.contains("损坏"))
+        let retained = try await fixture.store.file(sourceID: fixture.sourceIDs[0], relativePath: "unreadable-child/gone.jpg")
+        XCTAssertNotNil(retained)
         XCTAssertEqual(snapshot.latestScan.checkedCandidates, 1)
         XCTAssertEqual(snapshot.latestScan.failed, 1)
         XCTAssertEqual(snapshot.latestScan.state, .interrupted)
         XCTAssertNotNil(snapshot.waitingSources[fixture.sourceIDs[0]])
         XCTAssertEqual(try engineSQLInteger("SELECT checked FROM scan_run", at: fixture.databaseURL), 1)
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record", at: fixture.databaseURL), 2)
     }
 
     func testAuxiliaryFilesDoNotBecomeCandidatesOrSkippedRecords() async throws {

@@ -5,12 +5,14 @@ public struct DirectoryEntry: Sendable {
     public let isDirectory: Bool
     public let stamp: FileStamp?
     public let failure: String?
+    public let failureCause: NSError?
 
-    public init(url: URL, isDirectory: Bool, stamp: FileStamp?, failure: String? = nil) {
+    public init(url: URL, isDirectory: Bool, stamp: FileStamp?, failure: String? = nil, failureCause: NSError? = nil) {
         self.url = url
         self.isDirectory = isDirectory
         self.stamp = stamp
         self.failure = failure
+        self.failureCause = failureCause
     }
 }
 
@@ -65,7 +67,7 @@ public struct DirectoryReader: DirectoryReading {
                     stamp: isDirectory ? nil : try fileStamp(values: values)
                 )
                 } catch {
-                    return DirectoryEntry(url: url, isDirectory: false, stamp: nil, failure: error.localizedDescription)
+                    return DirectoryEntry(url: url, isDirectory: false, stamp: nil, failure: error.localizedDescription, failureCause: error as NSError)
                 }
             }
             .sorted { $0.url.path < $1.url.path }
