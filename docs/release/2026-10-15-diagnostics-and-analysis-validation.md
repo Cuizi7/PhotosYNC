@@ -1,12 +1,12 @@
 # 0.2.2 来源诊断与图库分析详情验证记录
 
-记录更新：2026-10-16（Asia/Shanghai）；文件名保留设计日期。**状态：发行准备，合并与发布阻断。** 本页汇总已存在的分阶段证据及本步骤的聚焦检查，不是最终 canonical 或真实浮层验收成功记录。
+记录更新：2026-10-16（Asia/Shanghai）；文件名保留设计日期。**状态：发行准备，合并与发布阻断。** 冻结 `125ada6` 的完整 canonical 已通过，静态代码/规格/架构评审已批准；评审者补核最终验证仍待完成，真实浮层/材质验收未通过。本页分别记录历史、最终自动结果和仍未完成的门槛。此次仅更新文档事实，未对较晚的文档提交重跑 suite。
 
 基线 main/v0.2.1：`1291b53ee0d263709379eb016d78b6fb8070c762`。工作分支 `codex/source-diagnostics-022`，本步骤开始 HEAD `926fbdb`。2026-10-16 通过 GitHub REST 只读复核：main 仍为上述提交，latest 为 v0.2.1（draft=false、prerelease=false）；v0.2.2 tag 和 release 查询均 HTTP404。查询时点无冲突不保证稍后仍空闲；发布前须再核对。
 
 ## 范围与约束
 
-依据[批准设计](../superpowers/specs/2026-10-15-diagnostics-and-analysis-details-design.md) §§1、7、8：完整当前诊断与准确阶段、原生来源详情、与主菜单一致的图库分析详情。schema v8、媒体规则、模型/阈值、提交/恢复/调度决策和权限不变，无迁移、视频扩展、转码或新依赖。测试只用合成来源、UUID 临时库、fake/injected Photos；本步骤仅版本、脚本常量、合成发行 fixture 和文档。
+依据[批准设计](../superpowers/specs/2026-10-15-diagnostics-and-analysis-details-design.md) §§1、7、8：完整当前诊断与准确阶段、原生来源详情、与主菜单一致的图库分析详情。schema v8、媒体规则、模型/阈值、提交/恢复/调度决策和权限不变，无迁移、视频扩展、转码或新依赖。分阶段诊断/UI 测试使用合成来源、UUID 临时库、fake/injected Photos；最终 canonical 另运行既有获批固定 33 例模型语料。均不读取生产来源/数据库或真实 Photos。本步骤最初仅版本、脚本常量、合成发行 fixture 和文档，此次后续仅更新文档事实。
 
 ## 诊断与恢复实现边界
 
@@ -29,7 +29,40 @@
 | Task 2 修正 QA fixture 之前的完整 hostless | 626 项、3 跳过、0 失败，exit0，完整结束；不是 canonical 全门槛 | `work/022-task2-full-hostless.log` |
 | Task 2 最后 QA fixture/test 修正 `a0f5a6c` | 新一致性测试有效 RED：1 项、10 个预期断言失败；GREEN build exit0，5 项、0 失败、exit0 | `work/022-task2-fixture-red-tests.log`、`022-task2-fixture-green-build.log`、`022-task2-fixture-green-tests.log` |
 
-完整 hostless 的三项跳过为 `testControlledScaleThroughActualGraph`、`testExistingVectorReplayUsesSQLiteBackend`、`testFrozenCorpusContentAndActions`，需要 canonical 子进程/显式本地输入。它们不能免除最终语料、模型、runtime、四组规模及两项 continuation 门槛。旧 626 项完整通过早于最后一次 QA fixture/test 修改，最终完整验证仍待执行。
+上述历史完整 hostless 的三项跳过为 `testControlledScaleThroughActualGraph`、`testExistingVectorReplayUsesSQLiteBackend`、`testFrozenCorpusContentAndActions`，需要 canonical 子进程/显式本地输入。它们不能免除最终语料、模型、runtime、四组规模及两项 continuation 门槛。旧 626 项完整通过早于最后一次 QA fixture/test 修改；该历史记录本身不能替代后述 `125ada6` 的完整 canonical。
+
+## 最终自动验收：冻结 125ada6
+
+专属 tester 在干净冻结提交 `125ada636248249fe74bc87299f598a0eac77950` 执行以下 canonical 入口，最终进程 **exit0**、`validation.json.status=passed`。协调代理已独立核对完整结果及所引用哈希并认可；未重复 suite。此后的提交只有文档结果更新，不声称新提交重新执行过验证。
+
+```sh
+python3 scripts/validate.py --output-dir "$PWD/work/022-integrated-validation" --derived-data "$PWD/work/022-integrated-derived" > "$PWD/work/022-integrated-validation.log" 2>&1
+```
+
+| 门槛 | 实际结果 |
+| --- | --- |
+| 构建与完整 XCTest | Debug/Release build-for-testing 完成；627 项，2 跳过，0 失败 |
+| Python Tools | 97 项通过 |
+| 权重/模型/runtime/固定语料 | 资源、实际模型执行及 runtime 门槛通过；固定 33 例实际运行，14 个内容 duplicate、11 个策略 skip，不混同两个口径 |
+| 四组独立规模子进程 | 100000、150000、200000、200000 + 100000 history 均通过，包含 60 秒 idle 观察 |
+| 两项受控 continuation | stamp 与 advanced-preparation 均 GREEN exit0/fixture passed、预期 RED exit1/fixture failed，无 timeout |
+| 源码一致性 | 324 entries，前后 digest 相同，unchanged_after_validation=true；所有引用结果哈希匹配 |
+
+两个 XCTest 跳过分别为 `testControlledScaleThroughActualGraph`（已由上述四组独立子进程实际覆盖）和 `testExistingVectorReplayUsesSQLiteBackend`（额外本地 saved-vector 输入未提供，未运行，不声称通过）。此前默认跳过的固定语料本次已实际执行，不能沿用历史三跳过说法。
+
+证据目录 `work/022-integrated-validation/` 包含 validation/report、源码 manifest、模型/runtime/scale 结果、两项 continuation 结果及日志；外层日志 `work/022-integrated-validation.log`。关键绑定：
+
+| 证据 | SHA256 / digest |
+| --- | --- |
+| `validation.json` 文件 | `e3e09e9db85a37032dbd006d841d0cf218aada8b320bd6a2efd4a45d213955d7` |
+| `source-manifest.json` 文件 | `2439c6208ce9fff92f7697d3c41cb26bf9373099d27159f40249f804f8714d52` |
+| 前后源码 manifest digest | `806b41958d833617cf5419a8f0a4451a71aa7e1c5059b47d9075f2ac8dc9fe35` |
+
+## 最终集成静态评审与已接受残余
+
+独立 deep reviewer 对 `1291b53..125ada6` 全部集成差异完成代码、规格和架构评审，结论 **APPROVED，无 P0/P1/P2**。报告为 ignored `.superpowers/sdd/2026-10-15-diagnostics-and-analysis-details/integrated-review.md`。同一评审者对刚完成 canonical 证据的补核仍待完成，不将静态批准写成已经补核验证。
+
+协调代理明确接受 **P3 F1**：仅自定义 `PhotosGateway` 在 `saveScannedFile` 候选查询抛出非 typed 错误时，诊断可能继承前面的“读取媒体元数据”阶段。内置 `SystemPhotoKitLifecycle` 当前路径没有已证实触发点，不宣称已运行复现。后续最小修正可在 metadata 读取完成后结束该阶段、使用准确后续阶段或 nil，并加该 gateway 边界注入测试；本轮不扩展异常分类、重试或准入策略，不改冻结代码。
 
 ## GUI 证据和未通过项目
 
@@ -57,9 +90,9 @@ git diff --check
 ## 必须后续完成的门槛
 
 1. 完成改变部分的真实原生浮层/材质截图，由协调代理明确审阅具体证据；分别标注普通原生宿主、真正 MenuBarExtra 和物理交互覆盖。不得将失败/无截图写为通过。
-2. 专属 tester 对最终快照执行 fresh `scripts/validate.py`，记录完整 XCTest/跳过/失败与 Tools、完整权重/model/runtime、固定语料、100000/150000/200000/200000-history-100000 四组规模、stamp 与 advanced-preparation continuation 的 GREEN/预期 RED、前后源码 manifest 一致。
-3. 对 main 基线到最终集成 diff 完成 deep review；最后行为/测试修改后完整验证，等价只读 review 不强制重复相同快照验证。
-4. 按批准计划 Step 4 独立推进 push/PR，创建后立即 attach，并如实披露当前验证及视觉缺口；核对远端 diff/checks/mergeability。真实 popup 视觉关卡不扩大为创建 PR 的前置条件。squash merge 与 release 仍须满足上述完整验证、集成深度评审和协调代理对真实浮层/材质的必要审阅结论。
+2. 最终自动验收已在 `125ada6` 完成，结果见上；保留 exact snapshot 和哈希绑定，不因只读评审或此次纯文档结果更新重复 suite。若后续行为/测试改变，必须按影响重新验证，不能复用旧快照冒称新快照已测。
+3. 集成静态 deep review 已 APPROVED，无 P0–P2；等待同一评审者补核最终 canonical 证据。P3 F1 按协调决定保留为已接受残余；等价只读 review 不强制重复相同快照验证。
+4. 协调线程已明确允许核对 final results 后独立推进 push、披露视觉缺口的 draft PR，创建后立即 attach；尚未创建时不预填编号。核对远端 diff/checks/mergeability。真实 popup 视觉关卡不扩大为创建 PR 的前置条件。squash merge 与 release 仍须满足上述完整验证、集成深度评审和协调代理对真实浮层/材质的必要审阅结论。
 5. 合并后核对 main tree 和实际提交，再从该干净提交运行 package-release，归档内重新完整验收并核验 Universal App/Core、0.2.2/stable/10、资源、图标、签名、DMG、provenance 和校验。保留 App、DMG、RELEASE-NOTES、CHANGELOG、完整 validation、构建日志及本地全目录 SHA256SUMS；已有目录、文件、符号链接或锁均不能覆盖/绕过；失败、缺报告、零测试、资源损坏及源码 manifest 变化不得跳过。
 6. 真正发布前，逐项检查 README、CHANGELOG、0.2.2 发行说明、此验证记录及最终 RELEASE-NOTES 与实际证据一致。依据真实完成状态更新“尚未发布”“待完成”“未创建”等准备阶段语句；历史采集失败和分阶段数量仍保留为有日期/快照绑定的历史，不改写成成功。不预填未知 main/tag/哈希，精确源码、manifest、验证哈希和产物绑定由实际 provenance 与校验记录给出。避免将准备阶段文本原样作为已完成发行说明上传。
 7. 发布前重新核对 v0.2.2，tag 绑定实际 main；GitHub stable/latest 四项资产为 `PhotosYNC-0.2.2.dmg`、`PhotosYNC.provenance`、`RELEASE-NOTES.md` 和只覆盖前三项的下载 `SHA256SUMS`，与本地全目录清单分离，上传后回读并下载校验。旧包/标签/证据保留。
@@ -68,8 +101,9 @@ git diff --check
 
 | 类别 | 当前状态 |
 | --- | --- |
-| 构建 | 分阶段 build-for-testing 已通过；最终 canonical 和正式 Universal Release 未执行 |
-| 自动测试 | 上述分阶段结果；最后 fixture 修正后未完整 canonical 验证 |
+| 构建 | `125ada6` canonical 的 Debug/Release build-for-testing 通过；正式 Universal Release 打包未执行 |
+| 自动测试 | `125ada6` 完整 canonical passed：627 XCTest/2 skip/0 fail、97 Tools、模型语料/四规模/两项 continuation 通过；较晚纯文档提交未重跑 |
+| 集成评审 | 静态 code/spec/architecture APPROVED，无 P0–P2，P3 F1 已接受；同一评审者补核最终验证仍待完成 |
 | GUI | 118 静态内容图已由协调代理审阅；真实屏幕 popup/material 仍未通过，物理键盘/hover/系统菜单/VoiceOver 有缺口 |
 | 真实 Photos/生产来源或数据库 | 本轮未执行；历史实测不标成本轮新测 |
 | 平台实机 | macOS13/14 与 Intel 本轮未运行；macOS13/Intel 按授权排除实机收尾门槛，最低版本与 Universal 构建要求保留 |
