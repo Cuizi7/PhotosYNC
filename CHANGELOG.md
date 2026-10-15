@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-10-15（build 8）
+
+正式渠道为 stable，仅包含 PR #2 的高级照片判重工作：SSCD Large FP16、跨文件名照片判重、原始版/当前编辑版索引连续性、单项读取错误隔离及 schema v8 升级。产品规则和模型阈值沿用下方 beta 记录；不包含 PR #1 的分段导入进度与来源设置优化。
+
+升级前须正常退出应用并备份完整 Application Support/PhotoSync 目录，升级至 v8 后不承诺直接降级。既有真实 QA 范围、统计和 iCloud 限制、macOS 13/Intel 实机未验证及 ad-hoc 签名边界见[正式发行说明](docs/release/0.2.0.md)。正式包从 main 的确切提交归档并执行完整验收，实际完成状态、确切源码、测试和产物结果以本次包内 provenance 与 validation 记录为准，不能由 beta 成功替代；保留 beta build 7 说明和旧包。
+
 ## 0.2.0 beta — 发行准备（build 7）
 
 版本与本地打包目标为 0.2.0 beta。本机批准范围的真实 Photos QA 已完成，发行说明见 [0.2.0 beta](docs/release/0.2.0-beta.md)；实际发行包的源码和完整自动验收由包内 provenance 绑定。

@@ -2,9 +2,9 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.0 beta preparation
+## 0.2.0 stable
 
-The 0.2.0 beta configuration adds SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
+The 0.2.0 stable configuration adds SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
 Photos catalog reconciliation retains existing fingerprint bytes and pending work. Known changes affect their own assets; unverified entries remain excluded from decisions until content continuity is established. Stable catalog sessions and a bounded same-database change journal separate inventory progress from publication. Schema v8 preserves prior vectors and import history while withdrawing old publication for the new encoded-resource input contract. Individual Photos read failures remain isolated from healthy siblings; see the [continuity implementation and validation](docs/release/2026-10-07-photos-index-continuity-validation.md) and [read-error isolation validation](docs/release/2026-10-08-photos-read-error-isolation-validation.md). Candidate scores use system SQLite + Accelerate exact Float32 queries.
 
@@ -26,10 +26,14 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Prepared release configuration: **0.2.0 beta (build 7)**, targeting
-`outputs/releases/0.2.0-beta/`; see [beta release notes](docs/release/0.2.0-beta.md)
-and the [changelog](CHANGELOG.md). This configuration does not prove that a package
-has been generated. The package entry point requires Apple Silicon and Intel code,
+Prepared release configuration: **0.2.0 stable (build 8)**, targeting
+`outputs/releases/0.2.0/`; see [release notes](docs/release/0.2.0.md)
+and the [changelog](CHANGELOG.md). The stable package archives the exact main
+commit and runs full acceptance; its provenance and validation records identify
+the actual source, completion status and results. Beta success cannot replace them.
+This release includes PR #2 only; PR #1 segmented import progress and source-settings
+optimizations are excluded. The completed [0.2.0 beta build 7](docs/release/0.2.0-beta.md)
+package and its validation remain historical evidence. The package entry point requires Apple Silicon and Intel code,
 the compiled layered icon and an ICNS fallback for older macOS. The previous
 0.1.0 stable build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
 
@@ -37,7 +41,7 @@ Before first launch after upgrading, quit PhotosYNC normally and back up the com
 `~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
 files. The app transactionally migrates supported schemas v3–v7 to v8; older apps reject the upgraded database on reopening.
 Direct downgrade is not supported. Restoring an old database after new imports can
-lose success evidence and cause duplicate additions; see the beta notes for the
+lose success evidence and cause duplicate additions; see the release notes for the
 backup and downgrade boundary. Packaging does not back up or migrate production data.
 
 Open the DMG, drag `PhotosYNC.app` to `Applications`, then launch it. The menu-bar app asks for read-write access to the **System Photo Library** only after you choose **Authorize Photos**. Once macOS grants that access and at least one source is enabled, PhotosYNC can scan and submit additions to that library. It does not select, migrate, or mount another library, and it does not change iCloud Photos settings.
@@ -62,7 +66,7 @@ If an import result is uncertain after an interruption, PhotosYNC keeps it in an
 
 ## Boundaries
 
-The user has authorized 0.2 validation on this Mac's actively used production System Photo Library. The [real Photos/iCloud plan](docs/release/2026-10-06-real-photos-icloud-validation-plan.md) requires isolated QA state, read-only source dry runs first, then one self-made canary with exact-ID rollback. Existing assets and production application data are not edited or restored from an old snapshot. The [current closeout record](docs/release/2026-10-13-final-real-qa-closeout.md) covers 256 scoped assets, 262 effective representations and 3,017 Source photos: 51 content-duplicate decisions, 2,965 below-threshold decisions and one typed waiting error. Blind review of 87 groups concluded 36 duplicates, 50 distinct and one uncertain; established labels agree with the algorithm within the supplied candidate scope. Six natural original/current pairs passed; a required-network/iCloud-only scene was not established. One self-made canary passed import, same-path and renamed-copy checks, exact-ID deletion and retained-success rescan. The user confirmed targeted permanent deletion in Recently Deleted; the QA host exited, released the production lock and preserved the prior stopped App state. This does not establish other-device cloud propagation or restore system caches. A read gap can miss duplicates proven only by that representation. macOS 13 and Intel runtime behavior remain unverified, with both device tests excluded from this beta's closeout requirements; the macOS 13 minimum and Universal build checks remain in scope. The older isolated-account/iCloud-off procedure in `Design/Validation.md` is historical evidence.
+The user has authorized 0.2 validation on this Mac's actively used production System Photo Library. The [real Photos/iCloud plan](docs/release/2026-10-06-real-photos-icloud-validation-plan.md) requires isolated QA state, read-only source dry runs first, then one self-made canary with exact-ID rollback. Existing assets and production application data are not edited or restored from an old snapshot. The [current closeout record](docs/release/2026-10-13-final-real-qa-closeout.md) covers 256 scoped assets, 262 effective representations and 3,017 Source photos: 51 content-duplicate decisions, 2,965 below-threshold decisions and one typed waiting error. Blind review of 87 groups concluded 36 duplicates, 50 distinct and one uncertain; established labels agree with the algorithm within the supplied candidate scope. Six natural original/current pairs passed; a required-network/iCloud-only scene was not established. One self-made canary passed import, same-path and renamed-copy checks, exact-ID deletion and retained-success rescan. The user confirmed targeted permanent deletion in Recently Deleted; the QA host exited, released the production lock and preserved the prior stopped App state. This does not establish other-device cloud propagation or restore system caches. A read gap can miss duplicates proven only by that representation. macOS 13 and Intel runtime behavior remain unverified, with both device tests excluded from this release's closeout requirements; the macOS 13 minimum and Universal build checks remain in scope. The older isolated-account/iCloud-off procedure in `Design/Validation.md` is historical evidence.
 
 PhotosYNC does not synchronize deletions, re-import assets removed from Photos, manage Photos libraries, auto-mount network storage, or provide a media browser. A slow or disconnected network mount is treated as a source error or waiting condition, not as a reason to alter the mount or the source contents.
 
