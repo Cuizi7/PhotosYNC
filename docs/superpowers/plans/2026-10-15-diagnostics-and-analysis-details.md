@@ -32,9 +32,9 @@
 ## 执行前准备（主代理/验证代理）
 
 - [x] 协调线程已明确批准实际design/plan，消息来自 `01a0ce7b-c1db-70d3-a47d-34f56363ffe0`，并认可primary跟随剩余诊断、目录项属性阶段、0诊断待恢复三点；本次按其委托执行。
-- [ ] 核对worktree干净、分支及main基线；执行 `git lfs checkout` 仅恢复本checkout受控权重，缺本地对象时用已授权仓库LFS下载并校验，不复制QA数据。当前新worktree的 `git lfs ls-files` 显示权重尚为pointer。
-- [ ] 运行 `python3 scripts/advanced-dedup/release.py --resources "$PWD/Sources/PhotoSyncCore/Resources/AdvancedDedup" --output "$PWD/work/022-baseline-resources.json"`；必须验证真实权重而非pointer。先创建work目录。
-- [ ] 优先复用主目录 `outputs/releases/0.2.1/PhotosYNC.provenance` 及 `work/Archive/2026-10-15-worktree-cleanup-20261015T124806Z/worktrees/a60d/work/release-0.2.1.Q7OJM6/validation/` 的exact-main=1291b53完整基线。核实源码manifest（本轮仅新增设计文档）、日志/报告哈希、工具链、模型绑定等价；相同快照不再无条件全跑baseline。新worktree仍hydrate并校验资源，任务RED/GREEN仍运行。
+- [x] 核对worktree干净、分支及main基线；执行 `git lfs checkout` 仅恢复本checkout受控权重，缺本地对象时用已授权仓库LFS下载并校验，不复制QA数据。初始pointer已hydrate并完成资源校验；证据见台账baseline与work/022-baseline-resources.json。
+- [x] 运行 `python3 scripts/advanced-dedup/release.py --resources "$PWD/Sources/PhotoSyncCore/Resources/AdvancedDedup" --output "$PWD/work/022-baseline-resources.json"`；必须验证真实权重而非pointer。先创建work目录。
+- [x] 优先复用主目录 `outputs/releases/0.2.1/PhotosYNC.provenance` 及 `work/Archive/2026-10-15-worktree-cleanup-20261015T124806Z/worktrees/a60d/work/release-0.2.1.Q7OJM6/validation/` 的exact-main=1291b53完整基线。核实源码manifest（本轮仅新增设计文档）、日志/报告哈希、工具链、模型绑定等价；相同快照不再无条件全跑baseline。新worktree仍hydrate并校验资源，任务RED/GREEN仍运行。
 - [ ] 仅发现真实环境/工具链差异使旧基线失效时，记录证据再用fresh路径执行完整baseline validate。最终集成完整validate与确切main归档打包的完整验证无条件保留。
 
 ### Task 1: 完整、准确且不改变恢复决策的来源诊断
@@ -90,7 +90,7 @@
 - [ ] **Step 7: 交协调线程截图审阅。** 给原始PNG/图册/已披露局限；按收到的范围内修订更新截图和相关验证。记录结论为“协调代理审阅”，不得改写旧版本人工结论或称用户本人验收。由协调线程判断其本次委托的验收条件。
 
 
-执行注：Step6a已于3df233d执行唯一受控会话，QA未成为前台（原前台loginwindow），零截图、不重试；Step6的真实屏幕材质与Step7协调视觉验收仍未通过，禁止merge/release。静态图及逻辑popup更新已有证据，不能替代。Task2代码独立review正在进行，Step5中的review完成状态以台账为准。
+执行注：Step6a已于3df233d执行唯一受控会话，QA未成为前台（原前台loginwindow），零截图、不重试；Step6的真实屏幕材质与Step7协调视觉验收仍未通过，禁止merge/release。静态图及逻辑popup更新已有证据，不能替代。Task2独立代码review的SPEC/QUALITY已通过，无P0–P2发现；审阅不替代实际屏幕浮层验收。
 
 ### Task 3: 0.2.2发行配置与集成交付（scoped implementer + 主代理协调）
 
@@ -117,4 +117,4 @@
 
 需求映射：Task1覆盖spec§3–4，Task2覆盖§5–6与截图，Task3覆盖§8发行。Review Focus五项各有具名测试。新增文件仅共享hover责任，Core新增类型留在既有文件；不拆分/重构其他模块。
 
-设计方向已由协调线程审阅通过；本计划将其指定的目录primary跟随剩余成员、未知目录项属性阶段两点落实为Task1测试与实现要求。Task2稳定入口也列为验收点；若实现发现必须改调度/存储或更大架构，暂停相关修改并报告具体差异，不改设计自授权。基线按协调要求优先核验复用；本计划更新时产品尚未实施，**尚未新增编译或测试运行**。
+设计方向已由协调线程审阅通过；本计划将其指定的目录primary跟随剩余成员、未知目录项属性阶段两点落实为Task1测试与实现要求。Task2稳定入口也列为验收点；若实现发现必须改调度/存储或更大架构，暂停相关修改并报告具体差异，不改设计自授权。基线按协调要求优先核验复用；截至2026-10-16，Task1/2代码及各自独立审阅已完成；具体RED/GREEN和运行次数见台账。Task3发行准备进行中，最终canonical验收和真实浮层视觉关卡仍待完成，不能以已通过的聚焦检查替代。
