@@ -1,6 +1,6 @@
 # PhotosYNC 来源诊断与图库分析详情设计
 
-日期：2026-10-15（Asia/Shanghai）。状态：**协调线程已批准设计方向；已补入两项指定细节，实施计划待审；未开始产品实现**。
+日期：2026-10-15（Asia/Shanghai）。状态：**协调线程已批准实际设计与计划，进入SDD；批准时未开始产品实现**。
 基线：本地/远端 main 与 v0.2.1 均为 `1291b53ee0d263709379eb016d78b6fb8070c762`。
 工作树：`/Users/cuiziqi/.codex/worktrees/photosync-diagnostics-022/PhotosYNC`；分支：`codex/source-diagnostics-022`。
 

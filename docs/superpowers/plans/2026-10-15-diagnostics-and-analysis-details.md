@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-15-diagnostics-and-analysis-details-design.md`（先读全文）。
 
-**Status:** 待协调线程审阅；本计划不是产品实施已获通过的声明。执行方法已指定为SDD。
+**Status:** 2026-10-15协调线程已完整审阅并批准实际spec/plan，进入SDD；以下采用同消息明确的基线复用、Task3独立implementer和单次任务review收敛。
 
 ## Global Constraints
 
@@ -18,8 +18,8 @@
 - 源严格只读，Photos 仅既有新增语义；不转码、不扩展视频兼容性，不吞解析错误继续导入，不变更判重/提交/恢复/调度决策或 schema v8。
 - 使用合成来源、UUID 临时库与 fake/injected 状态；不读取生产视频、数据库、真实 Photos，不安装或启动生产 App，不改权限/登录项/通知设置。
 - 当前工作树 `/Users/cuiziqi/.codex/worktrees/photosync-diagnostics-022/PhotosYNC`，分支 `codex/source-diagnostics-022`；禁止在主仓库main实施。
-- 第一轮只完成文档；协调线程审阅设计与计划后才执行以下任务。不得自动变更历史UI验收事实。
-- 两个开发任务顺序执行，每个fresh implementer独占其范围。任务1提供任务2的数据接口；不要并行修改SyncEngine或共享UI文件。
+- 设计与实际计划已获协调线程明确批准；按SDD继续，不重复等待相同设计答复。不得自动变更历史UI验收事实。
+- 三个开发任务顺序执行，每个fresh scoped implementer独占其范围，包括Task3的版本/打包脚本/测试fixture。控制器只负责文档台账、调度、审阅与PR/合并/打包/GitHub工具操作。任务1提供任务2的数据接口；不要并行修改共享文件。每任务一次合适深度完整review同时检查spec+quality，最后独立deep集成review。
 
 ## Review Focus
 
@@ -31,10 +31,11 @@
 
 ## 执行前准备（主代理/验证代理）
 
-- [ ] 取得协调线程对design和plan的明确审阅结论，记录其消息及修订；不把未回复当批准。当前设计方向已获协调线程批准，并已纳入primary更新与未知目录项属性两项补充；实际plan仍等待其审阅。
+- [x] 协调线程已明确批准实际design/plan，消息来自 `01a0ce7b-c1db-70d3-a47d-34f56363ffe0`，并认可primary跟随剩余诊断、目录项属性阶段、0诊断待恢复三点；本次按其委托执行。
 - [ ] 核对worktree干净、分支及main基线；执行 `git lfs checkout` 仅恢复本checkout受控权重，缺本地对象时用已授权仓库LFS下载并校验，不复制QA数据。当前新worktree的 `git lfs ls-files` 显示权重尚为pointer。
 - [ ] 运行 `python3 scripts/advanced-dedup/release.py --resources "$PWD/Sources/PhotoSyncCore/Resources/AdvancedDedup" --output "$PWD/work/022-baseline-resources.json"`；必须验证真实权重而非pointer。先创建work目录。
-- [ ] 建立当前基线：`python3 scripts/validate.py --output-dir "$PWD/work/022-baseline" --derived-data "$PWD/work/022-baseline-derived" > "$PWD/work/022-baseline.log" 2>&1`。确认完整成功/实际数量/显式跳过，失败保留并分析，不过滤或冒称通过。当前实际工具链为Xcode27.0(27A266a)、Swift6.4；不能照搬历史版本。
+- [ ] 优先复用主目录 `outputs/releases/0.2.1/PhotosYNC.provenance` 及 `work/Archive/2026-10-15-worktree-cleanup-20261015T124806Z/worktrees/a60d/work/release-0.2.1.Q7OJM6/validation/` 的exact-main=1291b53完整基线。核实源码manifest（本轮仅新增设计文档）、日志/报告哈希、工具链、模型绑定等价；相同快照不再无条件全跑baseline。新worktree仍hydrate并校验资源，任务RED/GREEN仍运行。
+- [ ] 仅发现真实环境/工具链差异使旧基线失效时，记录证据再用fresh路径执行完整baseline validate。最终集成完整validate与确切main归档打包的完整验证无条件保留。
 
 ### Task 1: 完整、准确且不改变恢复决策的来源诊断
 
@@ -59,7 +60,7 @@
 - [ ] **Step 3: 运行RED并保留输出。** `xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -destination 'platform=macOS' -derivedDataPath work/022-focused CODE_SIGNING_ALLOWED=NO build-for-testing > work/022-task1-red-build.log 2>&1`，缺新接口的编译错误或新增断言失败为预期。已有bundle运行可用 `xcrun xctest -XCTest PhotoSyncCoreTests.EngineTests work/022-focused/Build/Products/Debug/PhotoSyncCoreTests.xctest`；验证命令与当前bundle真实test标识相符，零测试不是RED证据。
 - [ ] **Step 4: 最小实现诊断保留。** 改私有sourceIssues值，所有问题产生点填入已有路径/步骤；目录失败合并诊断成员，不覆盖其他目录；成功entries只清对应成员/日志签名并刷新明细，完整遍历才走既有清槽位路径。每次目录成员增删后按路径/身份从仍未解决成员确定primary，summary/detail保持同一成员；禁止继续引用已恢复项。成员全空但标记仍在时primary使用“等待确认来源恢复”，detail说明等待完整遍历，不生成诊断项。停用/移除/clean-scan/单文件恢复同步清理；不改finishedRound、ScanSchedule、store或提交路径决策。读取后遵守canScan及现有防晚回检查。
 - [ ] **Step 5: 实现原因与步骤保真。** DirectoryReader填failureCause，engine优先使用原cause；属性失败stage固定“读取目录项属性”，无法确定file/directory时使用“目录项”主体，保持遍历不完整安全门槛；准确分类仍保留原kind。每个必需视频load使用标注阶段包装，可选尺寸load保持try?；完整NSError链含每层描述/代码并防环，UI与日志共享可读诊断。阶段未知就nil，不从扩展名或错误代码猜根因。文案严格按spec§4。
-- [ ] **Step 6: GREEN和规格/质量review。** 重建同derived数据后运行完整EngineTests、SourceReaderTests及受影响Runtime测试；须验证 `testUnreadableVideoKeepsFileFailureWhileHealthySiblingImports`、`testUnreadableMetadataLeavesNoRecordAndRecoversNextScan` 和目录/文件恢复/日志去重现有测试。对新增接口+恢复边界使用符合SDD的规格审阅、质量深度审阅；只修范围内发现，记录不可接受风险。提交 `fix: preserve complete source issue diagnostics`。
+- [ ] **Step 6: GREEN和规格/质量review。** 重建同derived数据后运行完整EngineTests、SourceReaderTests及受影响Runtime测试；须验证 `testUnreadableVideoKeepsFileFailureWhileHealthySiblingImports`、`testUnreadableMetadataLeavesNoRecordAndRecoversNextScan` 和目录/文件恢复/日志去重现有测试。对新增接口+恢复边界使用一次deep任务review同时检查规格与质量；只修范围内发现，记录不可接受风险。提交 `fix: preserve complete source issue diagnostics`。
 
 ### Task 2: 来源问题hover和随状态更新的图库分析详情
 
@@ -83,17 +84,19 @@
 - [ ] **Step 2: 写RED分析与更新测试。** `testAnalysisDetailsUseSameAssetProgressAsMenu` 用readyAssets=2192,totalAssets=15702，但表示数/summary/scan均不同，assert两处文本一致且没有混用；`testAnalysisDetailsCoverUnknownZeroWaitingPausedAndReady` 覆盖每种状态/原issue/三个脚注；`testOpenDetailsUpdateAndRemainOpenWhenAnalysisBecomesReady`在单个原生宿主打开实际popover，向同一model发布新snapshot，验证进度更新、ready移除“图库分析”但下两组和popover保留、辅助名称回到“查看同步详情”。不以重新实例化静态详情证明动态更新。
 - [ ] **Step 3: 最小原生交互复用。** 将SyncDetailsButton现有状态/任务原样迁入HoverDetailsButton，两个入口用同一交互；来源第二行用button承载，路径help仍是独立目标。SourceIssuesContent按spec§5渲染并有界ScrollView，路径/诊断可选择、不截断。所有调用方和ReviewFixtures改用真实明细，不能用计数补造虚构错误。
 - [ ] **Step 4: 实现分析组及稳定入口。** SyncDetailsContent用既有analysis在顶部加入spec§6的状态/进度/原因/说明/脚注；三组分别标范围，300pt有界滚动。StatusMenu进度区将唯一SyncDetailsButton保持在analysis/sync条件分支之外的稳定结构中；调整LibraryAnalysisView/SyncProgressView的摘要与图形分工，避免复制交互或多个info，保留292pt内容宽、原生字号、原状态优先级和no-source可达入口。恢复ready时不重置presented。
-- [ ] **Step 5: GREEN。** 重建并运行AppViewTests、SyncStatusPresentationTests、现有AppModelTests；覆盖0/1/30来源、明暗、原操作/disabled/键盘映射。新原生文件必须在实际App与测试都编译。SDD规格/质量review通过后提交 `fix(ui): align source and library analysis details`。
+- [ ] **Step 5: GREEN。** 重建并运行AppViewTests、SyncStatusPresentationTests、现有AppModelTests；覆盖0/1/30来源、明暗、原操作/disabled/键盘映射。新原生文件必须在实际App与测试都编译。一次SDD完整任务review同时检查规格与质量，通过后提交 `fix(ui): align source and library analysis details`。
 - [ ] **Step 6: 产出可审阅真实UI证据。** 扩展现有ReviewHost识别新详情按钮，不沿用失效硬编码坐标。`Tests/UIReview/run-ui-review.sh --derived-data "$PWD/work/022-focused" --output-dir "$PWD/work/022-ui-static"`取得主体；`--probe`用另一fresh目录取得本进程实际浮层。合成场景包括混合问题、20项滚动首尾、analysis known/unknown/waiting/paused和opened→ready，明暗各一套。用已有权限的自己窗口捕获，记录commit/diff、PID/windowID、尺寸/场景、原生popover发现/实际内容/结果；不激活、无全局输入。静态详情拼接或透明异常材质不能充当成功。环境不足时交协调线程具体失败证据，不擅自改权限。
 - [ ] **Step 7: 交协调线程截图审阅。** 给原始PNG/图册/已披露局限；按收到的范围内修订更新截图和相关验证。记录结论为“协调代理审阅”，不得改写旧版本人工结论或称用户本人验收。由协调线程判断其本次委托的验收条件。
 
-### Task 3: 集成验收、PR与0.2.2 stable发行（主代理协调）
+### Task 3: 0.2.2发行配置与集成交付（scoped implementer + 主代理协调）
 
 **Files:**
 - Modify: `PhotoSync.xcodeproj/project.pbxproj`（所有现有配置0.2.2/build10）
 - Modify: `scripts/package-release.sh`（release_name、版本/build断言、notes/provenance，仅必要替换）
 - Modify: `Tests/Tools/test_release_validation.py`（对应打包fixture版本/锁/路径，不改失败门槛）
 - Modify/Create: `README.md`, `CHANGELOG.md`, `docs/release/0.2.2.md`, `docs/release/2026-10-15-diagnostics-and-analysis-validation.md`
+
+**Ownership:** scoped implementer仅承担Step1版本、打包脚本、测试fixture与发行文档；主代理在其一次完整spec+quality review通过后负责Step2–8验证调度和外部工具操作，不自行编辑产品/测试。
 
 **Interfaces:** 使用既有 `scripts/validate.py` 与 `scripts/package-release.sh`，不得增加skip/cache-success通道；输出新目录`outputs/releases/0.2.2/`。
 
@@ -110,4 +113,4 @@
 
 需求映射：Task1覆盖spec§3–4，Task2覆盖§5–6与截图，Task3覆盖§8发行。Review Focus五项各有具名测试。新增文件仅共享hover责任，Core新增类型留在既有文件；不拆分/重构其他模块。
 
-设计方向已由协调线程审阅通过；本计划将其指定的目录primary跟随剩余成员、未知目录项属性阶段两点落实为Task1测试与实现要求。Task2稳定入口也列为验收点；若实现发现必须改调度/存储或更大架构，暂停相关修改并报告具体差异，不改设计自授权。完整验证在设计批准后的执行前建立新基线；目前只核对git、release及工具链，**尚未编译或运行测试**。
+设计方向已由协调线程审阅通过；本计划将其指定的目录primary跟随剩余成员、未知目录项属性阶段两点落实为Task1测试与实现要求。Task2稳定入口也列为验收点；若实现发现必须改调度/存储或更大架构，暂停相关修改并报告具体差异，不改设计自授权。基线按协调要求优先核验复用；本计划更新时产品尚未实施，**尚未新增编译或测试运行**。
