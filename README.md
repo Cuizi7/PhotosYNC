@@ -2,9 +2,11 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.1 stable
+## 0.2.2 stable — release preparation
 
-0.2.1 adds PR #1 native UI improvements: segmented import progress, a details popover, clearer source paths, and a height-limited scrolling source list in Settings. The [2026-10-13 visual acceptance](docs/release/2026-10-13-native-ui-acceptance.md) is historical user acceptance; the [2026-10-15 follow-up](docs/release/2026-10-15-native-interaction-followup.md) added zero product interaction assertions (zero passed, zero failed). Physical hover, keyboard and system menu interactions retain the disclosed gaps. Core, schema v8, the model, the 0.98 threshold, permissions and Photos resource reads retain 0.2.0 behavior; this version adds no database migration.
+0.2.2 fixes two details gaps: source rows summarize all current unresolved issues and open complete diagnostics, and the sync details popover shows the same gallery-analysis state and asset progress as the main menu. Directory recovery retains its existing complete-traversal boundary; video failures retain their actual metadata-read stage and system cause. This adds no video support, database migration, model or threshold change, permission change, or new dependency. Schema remains v8.
+
+Release preparation is dated **2026-10-16**. Final canonical validation, integrated review and actual onscreen popup/material acceptance are pending; merge and release remain blocked. The 118-image gallery is static native content reviewed by the coordinator agent. The single authorized foreground attempt produced zero captures and did not pass popup acceptance. See [0.2.2 release notes](docs/release/0.2.2.md) and the [current validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md). [0.2.1 notes](docs/release/0.2.1.md) and its historical acceptance remain available.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -28,16 +30,18 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Prepared release configuration: **0.2.1 stable (build 9)**, targeting
-`outputs/releases/0.2.1/`; see [release notes](docs/release/0.2.1.md)
-and the [changelog](CHANGELOG.md). The stable package archives the exact main
-commit and runs full acceptance; its provenance and validation records identify
-the actual source, completion status and results. Prior success cannot replace them.
-This release integrates PR #1 UI improvements on the 0.2.0 baseline. Previous
-[0.2.0 stable build 8](docs/release/0.2.0.md) and completed
-[0.2.0 beta build 7](docs/release/0.2.0-beta.md) notes and evidence are retained. The package entry point requires Apple Silicon and Intel code,
-the compiled layered icon and an ICNS fallback for older macOS. The previous
-0.1.0 stable build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
+Prepared release configuration: **0.2.2 stable (build 10)**, targeting
+`outputs/releases/0.2.2/`; see [release notes](docs/release/0.2.2.md)
+and the [changelog](CHANGELOG.md). After the pending acceptance gates pass,
+the stable package must archive the exact main commit and run full acceptance;
+its provenance and validation records identify the actual source, completion
+status and results. Prior success cannot replace them. Previous
+[0.2.1 stable build 9](docs/release/0.2.1.md),
+[0.2.0 stable build 8](docs/release/0.2.0.md) and
+[0.2.0 beta build 7](docs/release/0.2.0-beta.md) notes and artifacts are retained.
+The package entry point requires Apple Silicon and Intel code, the compiled
+layered icon and an ICNS fallback for older macOS. The previous 0.1.0 stable
+build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
 
 Before first launch after upgrading, quit PhotosYNC normally and back up the complete
 `~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
