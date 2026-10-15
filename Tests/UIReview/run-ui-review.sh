@@ -77,14 +77,14 @@ if [[ "$interactive" == 1 ]]; then
   exec "$bundle/Contents/MacOS/UIReviewHost" --output-dir "$output" --interactive --scenario "$scenario" --appearance "$appearance"
 fi
 if [[ "$probe" == 1 ]]; then
-  "$bundle/Contents/MacOS/UIReviewHost" --output-dir "$output" --probe > "$output/capture.log" 2>&1
+  "$bundle/Contents/MacOS/UIReviewHost" --output-dir "$output" --probe --scenario "$scenario" --appearance "$appearance" > "$output/capture.log" 2>&1
   python3 - "$output" <<'PY'
 import html, json, pathlib, sys
 out = pathlib.Path(sys.argv[1])
 m = json.loads((out/'probe-manifest.json').read_text())
 parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>原生交互候选证据</title>',
  '<style>body{font:15px system-ui;margin:24px}.light{background:#f5f5f5;color:#222}.dark{background:#202020;color:white}section{padding:20px;margin:20px 0}pre{white-space:pre-wrap}img{max-width:100%;height:auto}figure{margin:10px 0}</style>',
- '<h1>PhotosYNC · 原生交互候选证据 · 等待用户验收</h1>',
+ '<h1>PhotosYNC · 原生交互候选证据 · 等待协调代理审阅</h1>',
  '<p>仅本测试 host 的窗口。cacheDisplay 透明底在相应明/暗背景展示，不改 PNG；WindowServer 图片来自已有录屏许可下的 own-window 定向 screencapture，可能包含其父宿主组合。</p>',
  '<p><a href="probe-manifest.json">原始观测清单</a> · <a href="source.json">源码与环境</a></p>']
 for probe in m['interactions']:
@@ -109,23 +109,27 @@ out = pathlib.Path(sys.argv[1])
 m = json.loads((out/'manifest.json').read_text())
 captures = m['captures']
 scenarios = ['syncing','analyzing','preparing','icloud','paused','pausing','completed','offline',
-             'fileIssue','unauthorized','unknown','summaryLoading','summaryStale','empty','single','many','longLeaf']
+             'fileIssue','unauthorized','unknown','summaryLoading','summaryStale','empty','single','many','longLeaf',
+             'mixedIssues','longIssues','recoveryPending','analysisPaused','analysisZero']
 expected = {(s,a,v) for s in scenarios for a in ('light','dark') for v in ('menu','settings')}
 expected |= {('many', a, 'settings-bottom') for a in ('light','dark')}
+for s in ('mixedIssues','longIssues','analyzing','preparing','icloud','analysisPaused','analysisZero'):
+    kind = 'source-details' if s in ('mixedIssues','longIssues') else 'sync-details'
+    expected |= {(s,a,kind+'-'+position) for a in ('light','dark') for position in ('top','bottom')}
 actual = {(c['scenario'],c['appearance'],c['surface']) for c in captures}
-if len(captures) != 70 or actual != expected:
+if len(captures) != 118 or actual != expected:
     raise SystemExit('Missing/duplicate matrix entries')
 for c in captures:
     p = out/c['file']
     if not p.is_file() or p.stat().st_size < 512: raise SystemExit('Missing/empty PNG: '+str(p))
-    width = 320 if c['surface']=='menu' else 600
+    width = 320 if c['surface']=='menu' else (360 if c['surface'].startswith('source-details') else (300 if c['surface'].startswith('sync-details') else 600))
     if abs(c['logicalWidth']-width)>1 or not 100<c['logicalHeight']<=681:
         raise SystemExit('Unexpected dimensions: '+str(c))
 esc = html.escape
 parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>PhotosYNC 原生 UI 待验收</title>',
  '<style>body{font:15px system-ui;margin:24px;background:#eceef0;color:#222}section{margin:30px 0;padding:20px;background:white;border-radius:12px}.pair{display:flex;gap:24px;align-items:start;flex-wrap:wrap}figure{margin:12px 0}img{display:block;max-width:100%;box-shadow:0 1px 8px #8888}pre{white-space:pre-wrap;font-size:12px}a{color:#175ba4}</style>',
- '<h1>PhotosYNC · 真实编译视图 · 候选证据 · 等待用户验收</h1>',
- '<p>17 场景 × 浅/深外观 × 菜单/设置 + 2 张设置底部，共 70 张原始 PNG。系统开关在隔离 injected 模型中禁用。</p>',
+ '<h1>PhotosYNC · 真实编译视图 · 候选证据 · 等待协调代理审阅</h1>',
+ '<p>22 场景 × 浅/深外观 × 菜单/设置 + 2 张设置底部 + 28 张独立详情内容首尾，共 118 张原始 PNG。系统开关在隔离 injected 模型中禁用。</p>',
  '<p>菜单为真实 StatusMenu 的离屏原生绘制；不是系统 MenuBarExtra 弹出截图。图片按逻辑尺寸展示，原图链接保留像素。</p>',
  '<p><a href="manifest.json">完整清单与原生交互结果</a> · <a href="source.json">源码/环境/编译文件 SHA256</a></p>',
  '<pre>'+esc(json.dumps({k:m[k] for k in ('sourceCommit','sourceDiff','sourceStatus','os','xcode','hostBundle')},ensure_ascii=False,indent=2))+'</pre>',
@@ -143,5 +147,5 @@ for s in scenarios:
     parts.append('</section>')
 parts.append('</html>')
 (out/'index.html').write_text('\n'.join(parts))
-print('Validated 70-image matrix; gallery: '+str(out/'index.html'))
+print('Validated 118-image matrix; gallery: '+str(out/'index.html'))
 PY

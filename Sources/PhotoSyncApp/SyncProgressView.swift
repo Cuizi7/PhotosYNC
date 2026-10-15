@@ -25,14 +25,10 @@ struct SyncProgressMetrics {
 struct SyncProgressView: View {
     let summary: SyncStatusSummary?
     let stale: Bool
-    let snapshot: EngineSnapshot
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let summary, let metrics = SyncProgressMetrics(summary: summary) {
-                counters(metrics.known == 0
-                    ? "已发现 0 个文件"
-                    : "已处理 \(metrics.processed) / 已发现 \(metrics.known)")
                 GeometryReader { proxy in
                     HStack(spacing: 0) {
                         segment(.accentColor, fraction: metrics.importedFraction, width: proxy.size.width)
@@ -53,19 +49,10 @@ struct SyncProgressView: View {
                 if stale {
                     Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
                 }
-            } else {
-                counters(stale ? "同步统计暂不可用" : "正在读取同步统计…")
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sync-progress")
-    }
-
-    private func counters(_ text: String) -> some View {
-        HStack(spacing: 6) {
-            StatusMenuSingleLine(text: text).accessibilityIdentifier("sync-counters")
-            SyncDetailsButton(snapshot: snapshot)
-        }
     }
 
     @ViewBuilder private func segment(_ color: Color, fraction: Double, width: CGFloat) -> some View {
@@ -86,69 +73,61 @@ struct SyncDetailsContent: View {
     let snapshot: EngineSnapshot
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("已发现的文件").font(.headline)
-            if let summary = snapshot.summary {
-                VStack(spacing: 5) {
-                    count("已导入", summary.imported)
-                    count("已跳过", summary.skipped)
-                    count("待处理", summary.pending)
-                    count("提交中/待确认", summary.importing)
-                    count("待重试", summary.retryPending)
-                }
-                if summary.retainedImported > 0 {
-                    Text("另有 \(summary.retainedImported) 条历史属已停用或移除的来源")
+        DetailsScrollView(width: 300) {
+            VStack(alignment: .leading, spacing: 10) {
+                if let analysis = SyncStatusPresentation(snapshot: snapshot).analysis {
+                    Text("图库分析").font(.headline)
+                    row("状态", analysis.title)
+                    row("进度", analysis.progressText)
+                    if let detail = analysis.detail, !detail.isEmpty {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(analysis.explanation).font(.caption).foregroundStyle(.secondary)
+                    Text("统计 Photos 图库中的项目，与来源目录的文件数分别计算。")
                         .font(.caption).foregroundStyle(.secondary)
+                    Divider()
                 }
-            } else {
-                Text(snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用")
+                Text("已发现的文件").font(.headline)
+                if let summary = snapshot.summary {
+                    VStack(spacing: 5) {
+                        count("已导入", summary.imported)
+                        count("已跳过", summary.skipped)
+                        count("待处理", summary.pending)
+                        count("提交中/待确认", summary.importing)
+                        count("待重试", summary.retryPending)
+                    }
+                    if summary.retainedImported > 0 {
+                        Text("另有 \(summary.retainedImported) 条历史属已停用或移除的来源")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .help(snapshot.summaryError ?? "正在读取同步统计…")
+                }
+                if let error = snapshot.summaryError, snapshot.summary != nil {
+                    Text("统计暂未更新")
+                        .font(.caption).foregroundStyle(.secondary).help(error)
+                }
+                Text("统计当前启用来源的记录，包含此前扫描。总量随新文件发现而增加。")
                     .font(.caption).foregroundStyle(.secondary)
-                    .help(snapshot.summaryError ?? "正在读取同步统计…")
-            }
-            if let error = snapshot.summaryError, snapshot.summary != nil {
-                Text("统计暂未更新")
-                    .font(.caption).foregroundStyle(.secondary).help(error)
-            }
-            Divider()
-            Text("本次扫描").font(.headline)
-            if snapshot.latestScan.state == .notStarted {
-                Text("尚未扫描").font(.caption).foregroundStyle(.secondary)
-            } else {
-                VStack(spacing: 5) {
-                    count("检查候选", snapshot.latestScan.checkedCandidates)
-                    count("新增导入", snapshot.latestScan.newlyImported)
-                    row("状态", scanState)
-                    if snapshot.latestScan.failedFiles > 0 {
-                        row("本次读取失败", "\(snapshot.latestScan.failedFiles) 个文件")
-                    }
-                    let unavailableSources = snapshot.waitingSources.values.filter(\.isSourceAvailability).count
-                    if unavailableSources > 0 {
-                        row("来源等待恢复", "\(unavailableSources) 个来源")
-                    }
-                    if let date = snapshot.latestScan.endedAt ?? snapshot.latestScan.startedAt {
-                        row("时间", date.formatted(date: .abbreviated, time: .shortened))
-                    }
-                    if let started = snapshot.latestScan.startedAt, snapshot.latestScan.endedAt != nil {
-                        row("开始", started.formatted(date: .abbreviated, time: .shortened))
+                Divider()
+                Text("本次扫描").font(.headline)
+                if snapshot.latestScan.state == .notStarted {
+                    Text("尚未扫描").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 5) {
+                        ForEach(SyncStatusPresentation(snapshot: snapshot).scanDetailRows, id: \.title) { item in
+                            row(item.title, item.value)
+                        }
                     }
                 }
+                Text("仅统计本轮扫描事件；文件读取失败与来源等待分别计数，不与上方记录数相加。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Divider()
-            Text("统计当前启用来源的记录，包含此前扫描。总量随新文件发现而增加。")
-                .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(14).frame(width: 300, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sync-details-content")
-    }
-
-    private var scanState: String {
-        switch snapshot.latestScan.state {
-        case .notStarted: return "尚未扫描"
-        case .running: return "进行中"
-        case .completed: return "已完成"
-        case .interrupted: return snapshot.latestScan.deferred ? "稍后继续" : "已中断"
-        }
     }
 
     private func count(_ title: String, _ value: Int) -> some View {
@@ -159,78 +138,25 @@ struct SyncDetailsContent: View {
         HStack {
             Text(title)
             Spacer()
-            Text(value).monospacedDigit()
+            Text(value).monospacedDigit().multilineTextAlignment(.trailing)
         }
         .font(.caption)
         .accessibilityElement(children: .combine)
     }
 }
 
-/// Hover is a temporary preview; activating the native button pins the same popover.
 struct SyncDetailsButton: View {
     let snapshot: EngineSnapshot
-    @State private var presented = false
-    @State private var pinned = false
-    @State private var buttonHovered = false
-    @State private var contentHovered = false
-    @State private var hoverTask: Task<Void, Never>?
-    @FocusState private var triggerFocused: Bool
 
-    var body: some View {
-        Button {
-            hoverTask?.cancel()
-            pinned = true
-            presented = true
-        } label: {
-            Image(systemName: "info.circle")
-        }
-        .buttonStyle(.borderless)
-        .foregroundStyle(.secondary)
-        .focused($triggerFocused)
-        .accessibilityLabel("查看同步详情")
-        .accessibilityIdentifier("sync-details")
-        .onHover { inside in
-            buttonHovered = inside
-            updateHover()
-        }
-        .popover(isPresented: $presented, arrowEdge: .trailing) {
-            SyncDetailsContent(snapshot: snapshot)
-                .onHover { inside in
-                    contentHovered = inside
-                    updateHover()
-                }
-                .onExitCommand { presented = false }
-        }
-        .onExitCommand { presented = false }
-        .onChange(of: presented) { visible in
-            if !visible {
-                hoverTask?.cancel()
-                pinned = false
-                contentHovered = false
-                triggerFocused = true
-            }
-        }
-        .onDisappear {
-            hoverTask?.cancel()
-            hoverTask = nil
-            presented = false
-            pinned = false
-            buttonHovered = false
-            contentHovered = false
-        }
+    var accessibilityLabel: String {
+        SyncStatusPresentation(snapshot: snapshot).analysis == nil ? "查看同步详情" : "查看图库分析与同步详情"
     }
 
-    private func updateHover() {
-        hoverTask?.cancel()
-        guard !pinned else { return }
-        let inside = buttonHovered || contentHovered
-        guard inside != presented else { return }
-        hoverTask = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: 200_000_000) }
-            catch { return }
-            guard !Task.isCancelled, !pinned,
-                  (buttonHovered || contentHovered) == inside else { return }
-            presented = inside
+    var body: some View {
+        HoverDetailsButton(accessibilityLabel: accessibilityLabel, accessibilityIdentifier: "sync-details") {
+            Image(systemName: "info.circle")
+        } content: {
+            SyncDetailsContent(snapshot: snapshot)
         }
     }
 }

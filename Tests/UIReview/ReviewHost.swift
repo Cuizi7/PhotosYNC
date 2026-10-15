@@ -36,13 +36,19 @@ enum ReviewHost {
             "System integrations disabled by injected-model isolation; this is not a product enablement change.",
             "XCTest renders use XCTest Bundle.main metadata; this host uses the same build's app version metadata.",
             "No screen/accessibility permission requests, no global events, no foreground activation."]
-        manifest["humanAcceptance"] = "候选证据，等待用户验收"
+        manifest["humanAcceptance"] = "候选证据，等待协调代理审阅；未声称用户本人验收"
         manifest["controlActiveStateOverride"] = "SwiftUI environment controlActiveState=.active; affects control appearance only; does not activate app/window or certify focus/hover"
         if args.contains("--probe") {
             var observations: [[String: Any]] = []
-            for scenario in [UIReviewScenario.syncing, .analyzing, .many] {
-                let model = try makeUIReviewModel(scenario: scenario, root: root)
-                for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            let scenarios = argument("--scenario").flatMap(UIReviewScenario.init(rawValue:)).map { [$0] }
+                ?? [UIReviewScenario.syncing, .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero, .mixedIssues, .longIssues]
+            for scenario in scenarios {
+                let appearances: [(String, NSAppearance.Name)] = argument("--appearance").map {
+                    [($0, $0 == "dark" ? .darkAqua : .aqua)]
+                } ?? [("light", .aqua), ("dark", .darkAqua)]
+                for (look, appearance) in appearances {
+                    // Dynamic probes mutate their snapshot; each appearance starts fresh.
+                    let model = try makeUIReviewModel(scenario: scenario, root: root)
                     // This process is a test-only host. Native alert/popover chrome must use
                     // the selected fixture appearance too, without changing the user's OS.
                     app.appearance = NSAppearance(named: appearance)
@@ -54,7 +60,7 @@ enum ReviewHost {
                     _ = waitUntil { window.isVisible }
                     let staticName = "probe-\(scenario.rawValue)-\(look).png"
                     _ = try UIReviewCapture.write(host, to: output.appendingPathComponent(staticName))
-                    observations.append(try probe(host: host, window: window, model: model, scenario: scenario,
+                    observations.append(try probeDetails(host: host, window: window, model: model, scenario: scenario,
                         appearance: look, output: output))
                     manifest["interactions"] = observations
                     try save(manifest, output: output, name: "probe-manifest.json")
@@ -175,9 +181,30 @@ enum ReviewHost {
                         }
                     }
                 }
+                if [.mixedIssues, .longIssues, .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero].contains(scenario) {
+                    let sourceDetails = scenario == .mixedIssues || scenario == .longIssues
+                    let details = sourceDetails
+                        ? AnyView(SourceIssuesContent(sourceURL: model.state.sources[0].url,
+                            issues: model.state.snapshot.sourceIssueDetails[model.state.sources[0].id] ?? [], recoveryPending: false))
+                        : AnyView(SyncDetailsContent(snapshot: model.state.snapshot))
+                    let width: CGFloat = sourceDetails ? 360 : 300
+                    let kind = sourceDetails ? "source-details" : "sync-details"
+                    _ = try UIReviewCapture.render(details, width: width, appearance: appearance) { host, window in
+                        for position in ["top", "bottom"] {
+                            if position == "bottom" { try UIReviewCapture.scrollToBottom(host) }
+                            let filename = "\(scenario.rawValue)-\(look)-\(kind)-\(position).png"
+                            var item = try UIReviewCapture.write(host, to: output.appendingPathComponent(filename))
+                            item.merge(["scenario": scenario.rawValue, "appearance": look, "surface": "\(kind)-\(position)",
+                                "file": filename, "windowID": window.windowNumber, "input": inputs(model),
+                                "limitation": "Standalone native content on test window background; not an opened popover/material capture"], uniquingKeysWith: { _, b in b })
+                            captures.append(item)
+                        }
+                    }
+                }
             }
         }
-        guard captures.count == 70 else { throw UIReviewError.invalid("Incomplete matrix: \(captures.count)/70") }
+        let expected = UIReviewScenario.allCases.count * 4 + 2 + 7 * 4
+        guard captures.count == expected else { throw UIReviewError.invalid("Incomplete matrix: \(captures.count)/\(expected)") }
         manifest["captures"] = captures
         manifest["interactions"] = probes
         try save(manifest, output: output, name: "manifest.json")
@@ -194,6 +221,7 @@ enum ReviewHost {
             "retryPending": s.map { $0.retryPending as Any } ?? NSNull(),
             "checkedCandidates": model.state.snapshot.latestScan.checkedCandidates,
             "newlyImported": model.state.snapshot.latestScan.newlyImported,
+            "analysisState": model.state.snapshot.indexProgress.map { String(describing: $0.state) as Any } ?? NSNull(),
             "analysisReadyAssets": model.state.snapshot.indexProgress.map { $0.readyAssets as Any } ?? NSNull(),
             "analysisTotalAssets": model.state.snapshot.indexProgress.map { $0.totalAssets as Any } ?? NSNull(),
             "status": model.statusDescription, "fixtureDate": "2026-10-13"]
@@ -259,27 +287,9 @@ enum ReviewHost {
             point = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
             hitView = target as? NSView
         } else {
-            // Coordinates were visually checked against this scenario's real compiled PNG.
-            // Fail closed if its geometry changes; never infer a target in an unrelated window.
-            let expectedHeight: CGFloat = scenario == .many ? 669 : (scenario == .syncing ? 213 : 225)
-            guard abs(host.bounds.height - expectedHeight) <= 1 else {
-                result["status"] = "unverified"
-                result["failure"] = "AX target unavailable and capture-verified fallback geometry changed"
-                return result
-            }
-            let topPoint = scenario == .many ? NSPoint(x: 535, y: 165)
-                : NSPoint(x: scenario == .syncing ? 138 : 151, y: 47)
-            let local = NSPoint(x: topPoint.x, y: host.isFlipped ? topPoint.y : host.bounds.height - topPoint.y)
-            point = host.convert(local, to: nil)
-            hitView = host.hitTest(point)
-            result["inputMethod"] = "NSWindow-scoped mouse at visually verified own-view PNG coordinate; AX target unavailable"
-            result["targetPointInWindow"] = [point.x, point.y]
-            result["hitView"] = String(describing: hitView)
-            guard hitView != nil else {
-                result["status"] = "unverified"
-                result["failure"] = "No own-window hit target at capture-verified coordinate"
-                return result
-            }
+            result["status"] = "unverified"
+            result["failure"] = "Native AX target not exposed; stale hardcoded coordinate fallback removed"
+            return result
         }
         window.acceptsMouseMovedEvents = true
         func mouse(_ type: NSEvent.EventType, at location: NSPoint? = nil) {
@@ -377,6 +387,150 @@ enum ReviewHost {
             ? "Local AX/mouse/keyboard dispatch produced no observable native presentation in non-key host"
             : "Actual presentation captured; non-key host cannot certify physical hover, outside click or visible focus ring"
         result["missing"] = ["physical hover/tooltip", "independent Space/Return pin verification", "outside click dismissal", "system keyboard focus/ring", "focus restoration acceptance", "compositor/frame/material appearance"]
+        return result
+    }
+
+    /// Opens the real production popover by a native button in this test host's view tree.
+    /// No activation, global pointer, key event, permissions or production runtime are used.
+    static func probeDetails(host: NSView, window: NSWindow, model: AppModel, scenario: UIReviewScenario,
+        appearance: String, output: URL) throws -> [String: Any] {
+        func buttons(_ view: NSView) -> [NSButton] {
+            ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap(buttons)
+        }
+        let candidates = buttons(host).filter { $0.isEnabled && $0.bounds.width > 0 && $0.bounds.height > 0 }
+        let isSource = scenario == .mixedIssues || scenario == .longIssues
+        // Menu content has one native info button followed by the single synthetic source's
+        // summary button. Locate real controls, then use their actual native frames.
+        let candidateIndex = isSource ? 1 : 0
+        var result: [String: Any] = ["scenario": scenario.rawValue, "appearance": appearance,
+            "pid": ProcessInfo.processInfo.processIdentifier, "hostWindowID": window.windowNumber,
+            "applicationActive": NSApp.isActive, "hostKeyWindow": window.isKeyWindow,
+            "activationRequested": false, "globalInputInjected": false,
+            "buttonDiscovery": "NSView tree native NSButton order in single-source synthetic menu; no hardcoded coordinate",
+            "nativeButtons": candidates.map { ["title": $0.title, "frame": String(describing: host.convert($0.bounds, from: $0))] },
+            "input": inputs(model)]
+        guard candidates.indices.contains(candidateIndex) else {
+            result["status"] = "unverified"; result["failure"] = "Expected native details button absent"; return result
+        }
+        let trigger = candidates[candidateIndex]
+        let before = Set(NSApp.windows.map(\.windowNumber))
+        trigger.performClick(nil)
+        func presentations() -> [NSWindow] { NSApp.windows.filter { $0.isVisible && !before.contains($0.windowNumber) } }
+        result["nativeClickOpened"] = waitUntil { !presentations().isEmpty }
+        guard let popup = presentations().first, let content = popup.contentView else {
+            result["status"] = "unverified"; result["failure"] = "Native performClick produced no popup in non-key host"; return result
+        }
+        defer { for popup in presentations() { popup.orderOut(nil); popup.close() } }
+        var captures: [[String: Any]] = []
+        var compositorAvailable = true
+        let popupID = CGWindowID(popup.windowNumber)
+        let paintStart = Date()
+        let paintDeadline = paintStart.addingTimeInterval(3)
+        var paintFrames: [[String: Any]] = []
+        var stablePaintFrames = 0
+        var lastBounds = ""
+        repeat {
+            let records = CGWindowListCopyWindowInfo([.optionIncludingWindow], popupID) as? [[String: Any]] ?? []
+            let own = records.first {
+                ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == popupID &&
+                    ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ProcessInfo.processInfo.processIdentifier
+            }
+            let bounds = own?[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+            let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+            let onScreen = (own?[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true
+            let matches = onScreen && abs(width - popup.frame.width) <= 2 && abs(height - popup.frame.height) <= 2
+            stablePaintFrames = matches ? stablePaintFrames + 1 : 0
+            let signature = "\(width)x\(height)/\(popup.frame.size)/\(onScreen)"
+            if signature != lastBounds || stablePaintFrames == 3 {
+                paintFrames.append(["elapsedMilliseconds": Int(Date().timeIntervalSince(paintStart) * 1000),
+                    "cgBounds": bounds, "nativeFrame": String(describing: popup.frame),
+                    "onScreen": onScreen, "matchesNativeSize": matches, "stableFrames": stablePaintFrames])
+                lastBounds = signature
+            }
+            if stablePaintFrames >= 3 { break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        } while Date() < paintDeadline
+        let paintObserved = stablePaintFrames >= 3
+        result["paintObservation"] = paintFrames
+        result["paintTimeoutSeconds"] = 3
+        compositorAvailable = paintObserved
+        result["popupOnScreenObserved"] = paintObserved
+        result["popupWindowID"] = popup.windowNumber
+        result["popupFrame"] = String(describing: popup.frame)
+        result["screenVisibleFrames"] = NSScreen.screens.map { String(describing: $0.visibleFrame) }
+        let ownRecords = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        result["ownWindowServerRecords"] = ownRecords.filter {
+            ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ProcessInfo.processInfo.processIdentifier
+        }.map { record in
+            ["windowID": record[kCGWindowNumber as String] ?? NSNull(),
+             "bounds": record[kCGWindowBounds as String] ?? NSNull(),
+             "onScreen": record[kCGWindowIsOnscreen as String] ?? NSNull(),
+             "layer": record[kCGWindowLayer as String] ?? NSNull()]
+        }
+        func capture(_ phase: String) throws {
+            content.layoutSubtreeIfNeeded(); content.displayIfNeeded()
+            let filename = "popover-\(scenario.rawValue)-\(appearance)-\(phase).png"
+            var entry: [String: Any] = ["phase": phase, "file": filename, "windowID": popup.windowNumber,
+                "visible": popup.isVisible, "keyWindow": popup.isKeyWindow, "input": inputs(model)]
+            do {
+                entry.merge(try UIReviewCapture.write(content, to: output.appendingPathComponent(filename)), uniquingKeysWith: { _, b in b })
+                entry["captureAccepted"] = true
+            } catch { entry["captureAccepted"] = false; entry["captureError"] = String(describing: error) }
+            if entry["captureAccepted"] as? Bool != true,
+               let raw = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: raw)
+                let rawName = "raw-\(filename)"
+                try raw.representation(using: .png, properties: [:])?.write(to: output.appendingPathComponent(rawName))
+                entry["rawUnvalidatedFile"] = rawName
+            }
+            if compositorAvailable {
+                let acquisition = try compositorCapture(window: popup, output: output,
+                    name: "compositor-\(scenario.rawValue)-\(appearance)-\(phase).png")
+                entry["compositor"] = acquisition
+                compositorAvailable = acquisition["status"] as? String == "captured"
+            } else {
+                entry["compositor"] = ["status": "unverified", "failure": paintObserved
+                    ? "Not retried after the same own-window acquisition failure"
+                    : "Own popup CG bounds did not converge to its native frame; acquisition not attempted"]
+            }
+            captures.append(entry)
+        }
+        _ = waitUntil { content.bounds.width >= (isSource ? 360 : 300) && content.bounds.height > 100 }
+        try capture("opened")
+        if scenario == .longIssues {
+            try UIReviewCapture.scrollToBottom(content)
+            try capture("bottom")
+        }
+        if scenario == .analyzing {
+            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+                totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+                readyRepresentations: 6789, excludedAssets: 99, issue: "合成更新原因")
+            // Drain the same host's update; this does not reconstruct any views or popovers.
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try capture("progress")
+            model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
+                totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
+                readyRepresentations: 45000, excludedAssets: 99, issue: nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try capture("ready")
+            result["samePopupVisibleAfterReady"] = popup.isVisible
+            result["sameTriggerAfterReady"] = buttons(host).first === trigger
+            result["readyAccessibilityNameProjection"] = SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel
+        }
+        result["presentations"] = captures
+        if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: popup.windowNumber,
+            context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) {
+            popup.sendEvent(event)
+        }
+        result["escapeDismissed"] = waitUntil { presentations().isEmpty }
+        result["status"] = compositorAvailable ? "native-capture-awaiting-coordinator-inspection" : "unverified-native-material"
+        if !compositorAvailable { result["failure"] = "Real popup observed; native material acquisition failed. Bitmap/text evidence does not certify popover appearance." }
+        result["limitations"] = ["Programmatic native click is not physical hover/Space/Return/outside click acceptance",
+            "Non-key test host cannot certify visible focus ring or physical focus restoration",
+            "See each compositor acquisition; cacheDisplay alone does not certify native material appearance",
+            "No real MenuBarExtra popup, Photos, sources or production database"]
         return result
     }
 
