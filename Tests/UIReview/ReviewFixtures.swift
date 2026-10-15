@@ -87,8 +87,13 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         state.snapshot.recoveryHint = .uncertainSubmission(message: "合成 unknown 提交诊断")
     case .mixedIssues, .longIssues:
         if let first {
-            state.snapshot.sourceIssueDetails[first] = reviewIssues(long: scenario == .longIssues)
-            state.snapshot.waitingSources[first] = SourceIssue(summary: "文件暂时无法读取。", detail: "合成诊断", kind: .file)
+            let issues = reviewIssues(long: scenario == .longIssues)
+            state.snapshot.sourceIssueDetails[first] = issues
+            let primary = issues.filter { $0.kind == .sourceAvailability }.sorted {
+                $0.path == $1.path ? $0.id < $1.id : $0.path < $1.path
+            }.first ?? issues[0]
+            state.snapshot.waitingSources[first] = SourceIssue(summary: primary.summary, detail: primary.detail, kind: primary.kind)
+            state.snapshot.sourceFileIssueCounts[first] = issues.filter { $0.kind == .file }.count
         }
     case .recoveryPending:
         if let first {
@@ -234,7 +239,7 @@ func reviewIssues(long: Bool = false) -> [SourceIssueDetail] {
     return [
         SourceIssueDetail(id: "directory-b", kind: .sourceAvailability, path: "/示例来源/B", summary: "目录暂时不可用。", stage: "枚举目录", detail: "NSPOSIXErrorDomain Code=2"),
         SourceIssueDetail(id: "directory-a", kind: .sourceAvailability, path: "/示例来源/A", summary: "访问权限不足。", stage: nil, detail: "NSCocoaErrorDomain Code=257"),
-        SourceIssueDetail(id: "scan-same", kind: .file, path: "/示例来源/same.jpg", summary: "文件暂时无法读取。", stage: nil, detail: "NSPOSIXErrorDomain Code=13"),
+        SourceIssueDetail(id: "scan-same", kind: .file, path: "/示例来源/same.jpg", summary: "文件无法访问，请检查访问权限。", stage: nil, detail: "NSPOSIXErrorDomain Code=13"),
         SourceIssueDetail(id: "video", kind: .file, path: "/示例来源/video.mov", summary: "视频元数据读取失败。", stage: "读取时长", detail: "AVFoundationErrorDomain Code=-11800"),
         SourceIssueDetail(id: "submit-same", kind: .submission, path: "/示例来源/same.jpg", summary: "导入结果尚未确认。", stage: "提交原始文件", detail: "NSCocoaErrorDomain Code=512")
     ]

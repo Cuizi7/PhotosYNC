@@ -234,6 +234,33 @@ final class AppViewTests: XCTestCase {
         }
     }
 
+    func testReviewIssueSnapshotsKeepLegacyAndDetailedProjectionsConsistent() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (scenario, expectedKind, expectedCount, expectedPrimaryID) in [
+            (UIReviewScenario.mixedIssues, SourceIssueKind.sourceAvailability, 2, "directory-a"),
+            (.longIssues, .file, 20, "read-00")
+        ] {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            let sourceID = try XCTUnwrap(model.state.sources.first?.id)
+            let details = try XCTUnwrap(model.state.snapshot.sourceIssueDetails[sourceID])
+            let primary = try XCTUnwrap(model.state.snapshot.waitingSources[sourceID])
+            let expected = try XCTUnwrap(details.first { $0.id == expectedPrimaryID })
+            XCTAssertEqual(primary.kind, expectedKind, scenario.rawValue)
+            XCTAssertEqual(primary.summary, expected.summary, scenario.rawValue)
+            XCTAssertEqual(primary.detail, expected.detail, scenario.rawValue)
+            XCTAssertEqual(model.state.snapshot.sourceFileIssueCounts[sourceID], expectedCount, scenario.rawValue)
+            XCTAssertEqual(details.filter { $0.kind == .file }.count, expectedCount, scenario.rawValue)
+            XCTAssertFalse(model.recoveryPending(for: sourceID), scenario.rawValue)
+            if scenario == .mixedIssues { XCTAssertEqual(model.statusDescription, "等待恢复") }
+            else { XCTAssertTrue(details.allSatisfy { $0.kind == .file }) }
+        }
+        let permission = try XCTUnwrap(reviewIssues().first { $0.id == "scan-same" })
+        XCTAssertEqual(permission.summary, "文件无法访问，请检查访问权限。")
+        XCTAssertEqual(permission.summary, SourceIssueText.fileUnreadable(relativePath: "same.jpg",
+            url: URL(fileURLWithPath: permission.path), error: NSError(domain: NSPOSIXErrorDomain, code: 13)).summary)
+    }
+
     // A missing/nonconvergent renderer must fail even when output is not requested.
     func testRenderAllReviewScenarios() throws {
         let root = try temporaryDirectory()
