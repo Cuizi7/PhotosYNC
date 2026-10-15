@@ -92,7 +92,7 @@
 | analysis.progressText | “进度”行，已知总数为“已分析 X / Y 张”；未知为“正在读取图库…” |
 | analysis.detail | 非空时显示等待/异常原因；包括现有 iCloud 原文 |
 | analysis.explanation | 保留已有说明 |
-| 组脚注 | “本组按 Photos 图库资产计数；一项资产可能有原始与编辑图像表示，不等于来源文件数。” |
+| 组脚注 | “统计 Photos 图库中的项目，与来源目录的文件数分别计算。” |
 
 本轮不新增表示计数表：totalRepresentations/readyRepresentations/readErrorRepresentations/excludedAssets 不混入 X/Y、不推算 remainingAssets。零/未知总数不制造完成率。snapshot.isPaused 的全局标题优先级不改；分析组按现有 IndexProgress.state 显示，并以测试覆盖暂停前后同一快照的既有结果。
 
