@@ -24,23 +24,23 @@
 ### Task 1: Bounded causal diagnostics, behavior unchanged
 **Files:** Create Sources/PhotoSyncCore/Logging/IndexDiagnostics.swift if needed; modify PhotoKitGateway.swift, PhotosRepresentationReader.swift, PhotosIndexCoordinator.swift, SyncStore.swift, ImageWorkBudget.swift only for diagnostics; wire shared context in SyncRuntime.swift; Xcode membership; matching focused tests.
 **Interfaces:** Optional shared `IndexDiagnostics` context with existing diagnostics closures preserved; anonymous stable run-local handles and at most 8 sticky sample assets; aggregate/nonthrowing bounded logging. Exact initializer spelling may follow local patterns and must be recorded for Task 2.
-- [ ] Add failing tests for history/live/invalidation/task lifecycle linkage across two reconciliations, raw field absence and bounded volume.
-- [ ] Run those tests and retain RED evidence; add the small shared context and call-site facts without changing decisions.
-- [ ] Run focused GREEN and existing history/same-revision regressions, self-review, commit and report interfaces/commands/results.
-- [ ] One task reviewer checks spec and quality; resolve findings without expanding scope.
+- [x] Add failing tests for history/live/invalidation/task lifecycle linkage across two reconciliations, raw field absence and bounded volume.
+- [x] Run those tests and retain RED evidence; add the small shared context and call-site facts without changing decisions.
+- [x] Run focused GREEN and existing history/same-revision regressions, self-review, commit and report interfaces/commands/results.
+- [x] One task reviewer checks spec and quality; resolve findings without expanding scope.
 
 ### Task 2: Timing, fair finite slices and reader backpressure
 **Files:** PhotosIndexCoordinator.swift, PhotosRepresentationReader.swift, PhotosIndexGateway.swift, PhotoKitGateway.swift, ImageWorkBudget.swift, SyncStore.swift task selection, SyncRuntime.swift only if tick integration needs it; focused core/UI-host tests.
 **Interfaces:** Inject wall/monotonic closures; processDueWork(now:) cutoff compatibility; async reader admission snapshot (available/busy/draining/stalled) with default fake implementation; task selection optional rotating cursor, no schema change. Constants: 16 attempts, 1-second slice admission budget, 60-second drain-stall threshold.
-- [ ] RED tests use fake clocks/callback gates: failureTime+backoff, sibling busy no-write, timeout then late drain resume, no terminal bounded wait, budget-held after active empty, duplicate terminal, terminal-before-query, pause/context change, slice size/time and fair cursor wrap.
-- [ ] Implement smallest coherent scheduler/admission changes preserving owned work and all existing content/unknown/soft-read behavior.
-- [ ] Run focused GREEN plus affected regression groups, self-review and commit.
-- [ ] One task reviewer checks spec and quality; resolve findings; tester validates integrated affected groups without rerunning identical evidence.
+- [x] RED tests use fake clocks/callback gates: failureTime+backoff, sibling busy no-write, timeout then late drain resume, no terminal bounded wait, budget-held after active empty, duplicate terminal, terminal-before-query, pause/context change, slice size/time and fair cursor wrap.
+- [x] Implement smallest coherent scheduler/admission changes preserving owned work and all existing content/unknown/soft-read behavior.
+- [x] Run focused GREEN plus affected regression groups, self-review and commit.
+- [x] One task reviewer checks spec and quality; resolve findings; tester validates integrated affected groups without rerunning identical evidence.
 
 ### Task 3: 0.2.3 release preparation and frozen handoff
 **Files:** project version config, scripts/package-release.sh exact version checks, docs/release/0.2.3.md, README.md, focused version-tool expectations as needed.
-- [ ] Set stable 0.2.3/build11 consistently; document diagnostics, timing and scheduling fixes and unresolved repeated invalidation/no-terminal limits.
-- [ ] Run version/package static checks and diff hygiene, commit; freeze clean candidate and report exact SHA/path/evidence.
+- [x] Set stable 0.2.3/build11 consistently; document diagnostics, timing and scheduling fixes and unresolved repeated invalidation/no-terminal limits.
+- [x] Run version/package static checks and diff hygiene, commit; freeze clean candidate and report exact SHA/path/evidence.
 - [ ] Independent acceptance chat reviews full integrated branch and coordinates canonical validate once; wait for explicit clearance.
 - [ ] Create/attach PR, squash to main after clearance, compare source trees; exact-main package-release performs mandatory archive validation and Universal/signature/DMG/provenance checks.
 - [ ] Publish v0.2.3 latest stable with four customary assets, three-payload public sums, private full manifest; read back tag/main/release and re-download all assets to verify. No installation or production launch.

@@ -65,6 +65,11 @@ public actor PhotosRepresentationReader {
         self.resourceLimits = resourceLimits; self.storage = storage; self.decode = decode
     }
 
+    /// Prompt advisory snapshot; does not reserve, cancel or release work. Busy
+    /// includes cleanup and consumer-held budget leases after the active set empties.
+    /// Logical timeout/cancellation retains physical ownership as draining, then
+    /// stalled after 60 monotonic seconds, without forced release or a recovery
+    /// guarantee. Callers must still handle a racing capacity error from `read`.
     public func admission() async -> PhotosReaderAdmission {
         let capacity = await budget.canAcquire(bytes: configuration.resources.maxDecodedBytes)
         // Recheck physical ownership after the budget actor suspension. Active can
