@@ -6,7 +6,7 @@ PhotosYNC scans selected filesystem folders and adds eligible images and videos 
 
 0.2.3 (build 11) corrects gallery-index retry deadlines to use the actual failure time, processes work in fair finite slices, and waits for physical reader and shared-budget capacity before admitting more work. A timed-out read retains its owner until real completion; after 60 monotonic seconds it shows an aggregate stalled wait. Later runtime ticks resume after actual cleanup and lease release. A system request that never completes has no guaranteed automatic recovery.
 
-Bounded anonymous causal diagnostics link history/live events, invalidation, task attempts and physical request/lease lifetimes within a run. Up to eight sticky sample assets receive capped detail; neutral events and unchanged polling states are coalesced. This does not establish the root cause or fix repeated conservative history invalidation, and it does not guarantee whole-log retention under arbitrary error traffic. Schema remains v8 with no new migration or cleanup; import success history remains protected. See [0.2.3 release notes](docs/release/0.2.3.md) and the [approved scope](docs/superpowers/specs/2026-10-16-index-recovery-023.md).
+Bounded anonymous causal diagnostics link history/live events, invalidation, task attempts and physical request/lease lifetimes within a run. Up to eight sticky sample assets receive capped detail; neutral events and unchanged polling states are coalesced. This does not establish the root cause or fix repeated conservative history invalidation, and it does not guarantee whole-log retention under arbitrary error traffic. The 0.2.3 release uses schema v8; the unreleased input-diagnostic update adds nullable baselines in schema v9 without reindexing or cleanup. Import success history remains protected. See [0.2.3 release notes](docs/release/0.2.3.md) and the [approved scope](docs/superpowers/specs/2026-10-16-index-recovery-023.md).
 
 A release requires independent integrated review and full candidate validation to pass. Focused checks alone do not establish final acceptance; exact-main archive validation and the resulting package's provenance bind the final source and complete results. [0.2.2 notes](docs/release/0.2.2.md), its [validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md), and earlier evidence are retained. This iteration adds no real Photos/production or macOS 13/Intel hardware evidence.
 
@@ -48,7 +48,7 @@ build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
 
 Before first launch after upgrading, quit PhotosYNC normally and back up the complete
 `~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
-files. The app transactionally migrates supported schemas v3–v7 to v8; older apps reject the upgraded database on reopening.
+files. The app transactionally migrates supported schemas v3–v8 to v9; older apps reject the upgraded database on reopening.
 Direct downgrade is not supported. Restoring an old database after new imports can
 lose success evidence and cause duplicate additions; see the release notes for the
 backup and downgrade boundary. Packaging does not back up or migrate production data.
@@ -62,6 +62,12 @@ Choose one or more source folders in Settings. PhotosYNC scans at launch and the
 Only supported bitmap images and videos are considered. RAW files, Live Photo pairing, transcoding, album mapping, media hashing, and source-file caching are out of scope. Photos use visual fingerprints across filenames with the selected 0.98 threshold and resolution rules; videos retain exact-filename and conservative metadata matching. Eligible old suspected-duplicate photo skips are reconsidered under the new policy; successful imports and unknown submissions remain protected. A possible duplicate is skipped and logged rather than imported. An earlier successful import remains recorded even if the Photos asset is later removed, so it is not automatically re-imported. Removing a source in Settings hides and disables that configuration while retaining its import history; it does not delete any source files or Photos assets. Re-adding the same path restores that history.
 
 PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source file. It sends additions to Photos only. It also never deletes or overwrites a Photos asset. Import completion means PhotoKit accepted the addition; it does not mean the asset has finished syncing to iCloud.
+
+## Model input diagnostics (unreleased)
+
+For gallery recomputation, SHA-256 describes the exact prepared 320 × 320 Float32 model input. The independent successful baseline is stored per context, epoch, asset and original/current representation. Accepted tasks report `same_input`, `different_input`, `missing_baseline` or `incomparable`; older or diagnostic-free test implementations additionally report `missing_input`. Schema v9 adds two nullable columns without creating new tasks, discarding vectors or altering the index policy. Older schema-v8 apps reject an upgraded database; direct downgrade remains unsupported.
+
+Same input proves equality only at this model-input boundary. Different input may reflect resource selection, decoding, orientation, color or image changes; neither outcome alone proves a PhotoKit pixel edit. History updated identities remain unknown content evidence. Logs use bounded anonymous causal samples plus complete comparison counts and monotonic elapsed-wall timing aggregates; they contain no input hashes. Nested timings are inclusive and cannot be added to form a CPU profile or labelled as iCloud download time. See the [approved diagnostics scope](docs/superpowers/specs/2026-10-16-input-digest-diagnostics.md) and [measurement/validation notes](docs/release/2026-10-16-input-diagnostics-validation.md).
 
 ## Storage, logs, and recovery
 

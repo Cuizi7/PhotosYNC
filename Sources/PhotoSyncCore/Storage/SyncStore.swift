@@ -1719,14 +1719,30 @@ public final class SyncStore: @unchecked Sendable {
 
     /// A stale store-issued task returns false and cannot revive old facts.
     public func completeRepresentation(_ task: RepresentationTask, fingerprint: Fingerprint) async throws -> Bool {
+        try await completeRepresentation(task, result: FingerprintResult(fingerprint: fingerprint)) != nil
+    }
+
+    /// Diagnostic baselines advance only with an accepted vector in this same transaction.
+    /// Missing input evidence preserves any previous successful digest and its own contract.
+    public func completeRepresentation(_ task: RepresentationTask, result: FingerprintResult) async throws -> InputDigestComparison? {
+        let fingerprint = result.fingerprint
         guard fingerprint.version == task.fingerprintVersion else { throw AdvancedDedupError.modelMismatch }
         return try await perform {
             try self.transaction {
-                guard try self.representationTaskIsCurrent(task) else { return false }
+                guard try self.representationTaskIsCurrent(task) else { return nil }
                 if try self.taskHasReadFailure(task) { try self.revokeReadExclusionPublication() }
-                try self.execute("UPDATE photos_representation SET state = 'ready', vector = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.blob(fingerprint.littleEndianFloat32)] + self.representationBindings(task.descriptor))
-                try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", self.representationBindings(task.descriptor))
-                return true
+                let key = self.representationBindings(task.descriptor)
+                let comparison: InputDigestComparison
+                if let digest = result.inputDigest {
+                    let baseline = try self.one("SELECT input_digest, input_digest_contract FROM photos_representation WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                    if let baseline, case .blob(let bytes) = baseline[0], let contract = self.optionalText(baseline[1]) {
+                        comparison = contract == digest.contract ? (bytes == digest.bytes ? .sameInput : .differentInput) : .incomparable
+                    } else { comparison = .missingBaseline }
+                    try self.execute("UPDATE photos_representation SET input_digest = ?, input_digest_contract = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.blob(digest.bytes), .text(digest.contract)] + key)
+                } else { comparison = .missingInput }
+                try self.execute("UPDATE photos_representation SET state = 'ready', vector = ? WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", [.blob(fingerprint.littleEndianFloat32)] + key)
+                try self.execute("DELETE FROM fingerprint_task WHERE context_id = ? AND context_epoch = ? AND asset_id = ? AND kind = ?", key)
+                return comparison
             }
         }
     }
@@ -1860,14 +1876,23 @@ public final class SyncStore: @unchecked Sendable {
 
     private func migrate() throws {
         let version = try pragmaUserVersion()
-        guard version <= 8 else { throw SyncStoreError.unsupportedSchema(version) }
-        guard version < 8 else { return }
+        guard version <= 9 else { throw SyncStoreError.unsupportedSchema(version) }
+        guard version < 9 else { return }
+        if version == 8 {
+            // Nullable diagnostics do not revoke publication or schedule new work.
+            try transaction {
+                try addInputDigestColumns()
+                try execute("PRAGMA user_version = 9")
+            }
+            return
+        }
         if version == 7 {
             // Fence durable readiness before new-contract startup. An already-open
             // legacy process is not revoked; normal instance ownership remains required.
             try transaction {
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
-                try execute("PRAGMA user_version = 8")
+                try addInputDigestColumns()
+                try execute("PRAGMA user_version = 9")
             }
             return
         }
@@ -1875,7 +1900,8 @@ public final class SyncStore: @unchecked Sendable {
             try transaction {
                 try addReadFailureKindColumn()
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
-                try execute("PRAGMA user_version = 8")
+                try addInputDigestColumns()
+                try execute("PRAGMA user_version = 9")
             }
             return
         }
@@ -1887,7 +1913,8 @@ public final class SyncStore: @unchecked Sendable {
                 }
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
                 try addReadFailureKindColumn()
-                try execute("PRAGMA user_version = 8")
+                try addInputDigestColumns()
+                try execute("PRAGMA user_version = 9")
             }
             return
         }
@@ -1916,7 +1943,8 @@ public final class SyncStore: @unchecked Sendable {
                     try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
                 }
                 try addReadFailureKindColumn()
-                try execute("PRAGMA user_version = 8")
+                try addInputDigestColumns()
+                try execute("PRAGMA user_version = 9")
                 try ensureLegacyRecheckSchema()
             }
             return
@@ -1939,7 +1967,18 @@ public final class SyncStore: @unchecked Sendable {
                 try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
             }
             try addReadFailureKindColumn()
-            try execute("PRAGMA user_version = 8")
+            try addInputDigestColumns()
+            try execute("PRAGMA user_version = 9")
+        }
+    }
+
+    private func addInputDigestColumns() throws {
+        let columns = try rows("PRAGMA table_info(photos_representation)", []).map { try text($0[1]) }
+        if !columns.contains("input_digest") {
+            try execute("ALTER TABLE photos_representation ADD COLUMN input_digest BLOB CHECK(input_digest IS NULL OR (typeof(input_digest) = 'blob' AND length(input_digest) = 32))")
+        }
+        if !columns.contains("input_digest_contract") {
+            try execute("ALTER TABLE photos_representation ADD COLUMN input_digest_contract TEXT CHECK(input_digest_contract IS NULL OR length(input_digest_contract) > 0)")
         }
     }
 

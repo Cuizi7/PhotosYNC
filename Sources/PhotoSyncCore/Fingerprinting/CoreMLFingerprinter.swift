@@ -7,6 +7,55 @@ import ImageIO
 
 public protocol ImageFingerprinting: Sendable {
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint
+    func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult
+}
+
+public extension ImageFingerprinting {
+    func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult {
+        FingerprintResult(fingerprint: try await fingerprint(image: image, orientation: orientation))
+    }
+}
+
+/// Hash logical NCHW Float32 elements, excluding backing strides and padding. The tensor is
+/// borrowed immutably before the same instance is transferred to physical prediction.
+enum PreparedTensorDigest {
+    static let runtimeIdentity: String = {
+        func version(_ framework: String) -> String {
+            let bundle = Bundle(path: "/System/Library/Frameworks/\(framework).framework")
+            return bundle?.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        }
+        // The full OS build additionally binds ImageIO decoders, CoreGraphics and ColorSync
+        // implementation updates even where an individual framework reports no bundle version.
+        return "\(ProcessInfo.processInfo.operatingSystemVersionString)|ImageIO=\(version("ImageIO"))|CoreGraphics=\(version("CoreGraphics"))|ColorSync=\(version("ColorSync"))"
+    }()
+
+    static func compute(_ tensor: MLMultiArray, configuration: FingerprintConfiguration,
+                        runtimeIdentity: String = Self.runtimeIdentity) throws -> ModelInputDigest {
+        let side = configuration.inputSide
+        guard tensor.dataType == .float32, tensor.shape.map(\.intValue) == [1, 3, side, side],
+              tensor.strides.count == 4, tensor.strides.allSatisfy({ $0.intValue > 0 }) else {
+            throw AdvancedDedupError.invalidConfiguration
+        }
+        let strides = tensor.strides.map(\.intValue)
+        let pointer = tensor.dataPointer.assumingMemoryBound(to: Float.self)
+        var hash = SHA256()
+        var row = [UInt32](repeating: 0, count: side)
+        for channel in 0..<3 {
+            for y in 0..<side {
+                for x in 0..<side {
+                    let value = pointer[channel * strides[1] + y * strides[2] + x * strides[3]]
+                    guard value.isFinite else { throw AdvancedDedupError.invalidImage }
+                    row[x] = value.bitPattern.littleEndian
+                }
+                row.withUnsafeBytes { hash.update(bufferPointer: $0) }
+            }
+        }
+        // This is deliberately independent of the mutable representation descriptor. v1 binds
+        // resource selection/ImageIO orientation, sRGB RGBA8 premultiplication, high interpolation,
+        // EXIF transforms, Float32 normalization, model config, serialization and system runtime.
+        let contract = "model-input-sha256-v1|nchw-f32-le|imageio-selection-v1|cg-srgb-rgba8-premultiplied-high-exif-v1|\(configuration.version)|\(runtimeIdentity)"
+        return try ModelInputDigest(bytes: Data(hash.finalize()), contract: contract)
+    }
 }
 
 private final class CancellationFlag: @unchecked Sendable {
@@ -129,11 +178,29 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
         return try await fingerprintPrepared(tensor)
     }
 
+    public func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult {
+        try Task.checkCancellation()
+        guard eligibility.isEligible else { throw CancellationError() }
+        let prepareStart = ProcessInfo.processInfo.systemUptime
+        let tensor = try ImagePreprocessor.prepare(image: image, orientation: orientation, configuration: configuration)
+        let prepareEnd = ProcessInfo.processInfo.systemUptime
+        let digest = try PreparedTensorDigest.compute(tensor, configuration: configuration)
+        let digestEnd = ProcessInfo.processInfo.systemUptime
+        let prediction = try await predictPrepared(tensor)
+        return FingerprintResult(fingerprint: prediction.fingerprint, inputDigest: digest,
+            timings: .init(preprocessingSeconds: prepareEnd - prepareStart, digestSeconds: digestEnd - prepareEnd,
+                           modelQueueSeconds: prediction.queueSeconds, predictionSeconds: prediction.predictionSeconds))
+    }
+
     /// Probe seam: the same serialized prediction path, after independently timed preprocessing.
     /// The caller lends tensor storage exclusively and must not mutate or reuse it until physical
     /// prediction completes. Logical task cancellation does not release that physical work;
     /// after cancellation, discard the tensor rather than assuming the prediction has finished.
     public func fingerprintPrepared(_ tensor: MLMultiArray) async throws -> Fingerprint {
+        try await predictPrepared(tensor).fingerprint
+    }
+
+    private func predictPrepared(_ tensor: MLMultiArray) async throws -> (fingerprint: Fingerprint, queueSeconds: Double, predictionSeconds: Double) {
         try Task.checkCancellation()
         guard tensor.shape.map(\.intValue) == [1, 3, configuration.inputSide, configuration.inputSide],
               tensor.dataType == .float32 else { throw AdvancedDedupError.invalidConfiguration }
@@ -142,7 +209,8 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
         let queue = physicalQueue
         let submitted = onSubmitted
         let input = InferenceInput(tensor: tensor)
-        let values: [Float] = try await withTaskCancellationHandler {
+        let enqueued = ProcessInfo.processInfo.systemUptime
+        let output: (values: [Float], queueSeconds: Double, predictionSeconds: Double) = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
                     if flag.isCancelled || !eligibility.isEligible {
@@ -150,17 +218,18 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
                         return
                     }
                     do {
+                        let started = ProcessInfo.processInfo.systemUptime
                         let values: [Float]
                         if let execution { values = try execution.predict(input.tensor, cancelled: { flag.isCancelled }, eligible: { eligibility.isEligible }) }
                         else { values = try prediction!(input.tensor) }
                         if flag.isCancelled { continuation.resume(throwing: CancellationError()) }
-                        else { continuation.resume(returning: values) }
+                        else { continuation.resume(returning: (values, started - enqueued, ProcessInfo.processInfo.systemUptime - started)) }
                     } catch { continuation.resume(throwing: flag.isCancelled ? CancellationError() : error) }
                 }
                 submitted?()
             }
         } onCancel: { flag.cancel() }
-        return try Fingerprint(version: configuration.version, values: values)
+        return (try Fingerprint(version: configuration.version, values: output.values), output.queueSeconds, output.predictionSeconds)
     }
 
     nonisolated static func compiledModel(modelURL: URL, configuration: FingerprintConfiguration) throws -> URL {

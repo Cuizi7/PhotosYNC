@@ -1,6 +1,20 @@
 import CryptoKit
 import Foundation
 
+private struct DiagnosticElapsed {
+    var count = 0
+    var sum: TimeInterval = 0
+    var max: TimeInterval = 0
+    mutating func add(_ seconds: TimeInterval) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        count += 1; sum += seconds; max = Swift.max(max, seconds)
+    }
+    func fields(_ stage: String) -> [String: String] {
+        ["timing.\(stage).count": String(count), "timing.\(stage).sumMS": String(sum * 1000),
+         "timing.\(stage).maxMS": String(max * 1000)]
+    }
+}
+
 /// Best-effort causal facts only. No decisions, durable identity or history coverage
 /// are derived from these run-local handles. Sinks run after diagnostic locks unlock.
 public final class IndexDiagnostics: @unchecked Sendable {
@@ -10,7 +24,14 @@ public final class IndexDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private var samples = Set<String>()
     private var sequence: UInt64 = 0
-    private var issuances: [String: (descriptor: String, issuance: String)] = [:]
+    private var issuances: [String: (descriptor: String, issuance: String, causes: [String: String])] = [:]
+    // At most one latest cause per sampled asset, and one attempt snapshot per kind.
+    // Context is stored in the value so a library switch cannot grow the maps.
+    private var causes: [String: (context: LibraryContext, fields: [String: String])] = [:]
+    private var causeCounts: [String: Int] = [:]
+    private var causeDetails = 0
+    private var windowTimings: [String: DiagnosticElapsed] = [:]
+    private var windowStarted: TimeInterval
     private var readerCounts: [String: Int] = [:]
     private var states: [String: (value: String, suppressed: Int, start: TimeInterval)] = [:]
     private var neutral: [String: (start: TimeInterval, emitted: Int, suppressed: Int, assets: Int, batches: Int)] = [:]
@@ -18,7 +39,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
 
     public init(sink: @escaping @Sendable ([String: String]) -> Void,
                 monotonic: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
-        self.sink = sink; self.monotonic = monotonic
+        self.sink = sink; self.monotonic = monotonic; self.windowStarted = monotonic()
     }
     public func handle(_ category: String, _ value: String) -> String {
         let bytes = Data((category + ":" + value).utf8)
@@ -37,7 +58,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let selected = samples.contains(asset); lock.unlock()
         return selected ? ["assetHandle": asset] : nil
     }
-    fileprivate func sample(_ descriptor: RepresentationDescriptor) -> [String: String]? {
+    fileprivate func sample(_ descriptor: RepresentationDescriptor, includeIssuance: Bool = true) -> [String: String]? {
         guard var fields = assetSample(descriptor.key.assetID) else { return nil }
         // Encode the full descriptor, including unknown revision reliability. Never
         // retain a per-library descriptor map just to produce diagnostic handles.
@@ -45,15 +66,62 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let encoded = (try? encoder.encode(descriptor)) ?? Data()
         fields["descriptorHandle"] = handle("descriptor", encoded.base64EncodedString())
         fields["representation"] = descriptor.key.kind.rawValue
-        let key = fields["assetHandle"]! + ":" + descriptor.key.kind.rawValue
-        lock.lock(); let issuance = issuances[key]; lock.unlock()
-        if issuance?.descriptor == fields["descriptorHandle"] { fields["issuanceHandle"] = issuance?.issuance }
+        fields.merge(scope(descriptor.context)) { _, new in new }
+        let asset = fields["assetHandle"]!
+        let key = asset + ":" + descriptor.key.kind.rawValue
+        lock.lock(); let issuance = issuances[key], cause = causes[asset]; lock.unlock()
+        if cause?.context == descriptor.context { fields.merge(cause!.fields) { _, new in new } }
+        if includeIssuance, issuance?.descriptor == fields["descriptorHandle"], let issuance {
+            fields = fields.filter { !$0.key.hasPrefix("cause") }
+            fields.merge(issuance.causes) { _, new in new }
+            fields["issuanceHandle"] = issuance.issuance
+        }
         return fields
     }
     fileprivate func linkIssuance(_ fields: [String: String]) {
         guard let asset = fields["assetHandle"], let kind = fields["representation"],
               let descriptor = fields["descriptorHandle"], let issuance = fields["issuanceHandle"] else { return }
-        lock.lock(); issuances[asset + ":" + kind] = (descriptor, issuance); lock.unlock()
+        lock.lock(); issuances[asset + ":" + kind] = (descriptor, issuance, fields.filter { $0.key.hasPrefix("cause") }); lock.unlock()
+    }
+    public func scope(_ context: LibraryContext) -> [String: String] {
+        ["contextHandle": handle("context", context.id.uuidString), "contextEpoch": String(context.epoch)]
+    }
+    /// Facts name public fields, never their values. History identifiers remain unknown
+    /// content evidence. Correlation is bounded, run-local and best effort across restarts.
+    public func recordCause(context: LibraryContext, assetID: String, source: String, generation: Int?,
+                            facts: [String: String], operation: String? = nil) {
+        let source = ["history", "live", "catalog"].contains(source) ? source : "unknown"
+        lock.lock(); causeCounts[source, default: 0] += 1; lock.unlock()
+        guard let sample = assetSample(assetID), let asset = sample["assetHandle"] else { return }
+        let allowed = Set(["category", "content", "assetContentChanged", "visibleInputFields", "metadataFields"])
+        let facts = facts.filter { allowed.contains($0.key) }
+        var chain = facts.reduce(into: [String: String]()) { $0["cause." + $1.key] = $1.value }
+        lock.lock()
+        sequence &+= 1
+        chain["causeHandle"] = "cause-\(sequence)"
+        chain["causeSource"] = source; chain["causeGeneration"] = generation.map(String.init) ?? "unknown"
+        if let operation { chain["causeOperation"] = operation }
+        causes[asset] = (context, chain)
+        let admitted = causeDetails < 64
+        if admitted { causeDetails += 1 }
+        lock.unlock()
+        if admitted {
+            var row = facts
+            row.merge(chain) { _, new in new }; row.merge(scope(context)) { _, new in new }
+            row["phase"] = "index-cause"; row["source"] = source; row["assetHandle"] = asset
+            emit(row)
+        }
+    }
+    /// Fixed runtime stage names; the overflow bucket keeps accidental new names bounded.
+    public func recordTiming(stage: String, seconds: TimeInterval) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        let now = monotonic()
+        lock.lock()
+        let key = windowTimings[stage] != nil || windowTimings.count < 32 ? stage : "other"
+        windowTimings[key, default: DiagnosticElapsed()].add(seconds)
+        let flush = now - windowStarted >= 30
+        lock.unlock()
+        if flush { flushObservations() }
     }
     public func emit(_ fields: [String: String]) {
         var fields = fields; fields["run"] = run; sink(fields)
@@ -112,11 +180,21 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let now = monotonic()
         lock.lock()
         let readers = readerCounts; readerCounts.removeAll()
+        let flushWindow = force || now - windowStarted >= 30
+        let timings = flushWindow ? windowTimings : [:]
+        let causal = flushWindow ? causeCounts : [:]
+        if flushWindow { windowTimings.removeAll(); causeCounts.removeAll(); causeDetails = 0; windowStarted = now }
         let readyStates = states.filter { force || now - $0.value.start >= 30 }
         let readyNeutral = neutral.filter { force || now - $0.value.start >= 30 }
         for (key, value) in readyStates { states[key] = (value.value, 0, now) }
         for (key, value) in readyNeutral { neutral[key] = (value.start, value.emitted, 0, 0, 0) }
         lock.unlock()
+        if !timings.isEmpty || !causal.isEmpty {
+            var fields = ["phase": "index-window-summary", "measurement": "monotonic-elapsed-wall", "scope": "run-window"]
+            for (stage, timing) in timings { fields.merge(timing.fields(stage)) { _, new in new } }
+            for (source, count) in causal { fields["cause." + source] = String(count) }
+            emit(fields)
+        }
         if !readers.isEmpty {
             var fields = readers.mapValues(String.init); fields["phase"] = "index-reader-summary"; emit(fields)
         }
@@ -136,6 +214,9 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
     private let context: IndexDiagnostics
     private let lock = NSLock()
     private var emitted = 0, suppressed = 0
+    private var scopeFields: [String: String] = [:]
+    private var comparisons: [InputDigestComparison: Int] = [:]
+    private var timings: [String: DiagnosticElapsed] = [:]
     private let identityBound: Bool
     private let identity: [String: String]?
     /// A physical request owns the identity captured before admission. Its late
@@ -150,7 +231,7 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
             guard let identity else { lock.lock(); suppressed += 1; lock.unlock(); return }
             fields.merge(identity) { _, new in new }
         } else if let descriptor = task?.descriptor ?? descriptor {
-            guard let sample = context.sample(descriptor) else {
+            guard let sample = context.sample(descriptor, includeIssuance: task != nil && fields["event"] != "attempt") else {
                 lock.lock(); suppressed += 1; lock.unlock(); return
             }
             fields.merge(sample) { _, new in new }
@@ -178,9 +259,39 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
             "reason": assets == 0 ? "empty" : "input-unchanged", "assets": String(assets), "batches": "1",
             "readyToPending": "0", "generation": String(generation), "fromGeneration": String(fromGeneration), "throughGeneration": String(throughGeneration)])
     }
-    public func finish() {
-        lock.lock(); let emitted = emitted, suppressed = suppressed; lock.unlock()
-        guard emitted > 0 || suppressed > 0 else { return }
-        context.emit(["phase": "index-diagnostic-summary", "operation": id, "detailed": String(emitted), "suppressed": String(suppressed)])
+    /// Bind the operation's inventory boundary, independently of detail sampling.
+    public func bindScope(context library: LibraryContext, photosGeneration: Int, indexGeneration: Int64? = nil) {
+        var fields = context.scope(library)
+        fields["photosGeneration"] = String(photosGeneration)
+        if let indexGeneration { fields["indexGeneration"] = String(indexGeneration) }
+        lock.lock(); scopeFields = fields; lock.unlock()
+    }
+    /// Accepted results count before sampling. A disabled sink does not alter totals.
+    public func recordComparison(_ comparison: InputDigestComparison, task: RepresentationTask) {
+        lock.lock(); comparisons[comparison, default: 0] += 1; lock.unlock()
+        record(["phase": "index-task", "event": "accepted", "comparison": comparison.rawValue], task: task)
+    }
+    public func measure(stage: String, seconds: TimeInterval) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        lock.lock()
+        let key = timings[stage] != nil || timings.count < 32 ? stage : "other"
+        timings[key, default: DiagnosticElapsed()].add(seconds)
+        lock.unlock()
+    }
+    @discardableResult public func finish() -> [String: String] {
+        lock.lock(); let emitted = emitted, suppressed = suppressed, comparisons = comparisons, timings = timings, scope = scopeFields; lock.unlock()
+        var fields = ["phase": "index-diagnostic-summary", "operation": id, "detailed": String(emitted), "suppressed": String(suppressed)]
+        fields.merge(scope) { _, new in new }
+        if !comparisons.isEmpty {
+            for outcome in [InputDigestComparison.sameInput, .differentInput, .missingBaseline, .incomparable, .missingInput] {
+                fields["comparison." + outcome.rawValue] = String(comparisons[outcome, default: 0])
+            }
+        }
+        if !timings.isEmpty {
+            fields["measurement"] = "monotonic-elapsed-wall"
+            for (stage, timing) in timings { fields.merge(timing.fields(stage)) { _, new in new } }
+        }
+        if emitted > 0 || suppressed > 0 || !comparisons.isEmpty || !timings.isEmpty { context.emit(fields) }
+        return fields
     }
 }

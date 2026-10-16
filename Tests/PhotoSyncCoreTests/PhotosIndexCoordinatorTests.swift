@@ -6,6 +6,129 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testActualPreparedInputsReachAcceptedComparisonsWithoutExtraReads() async throws {
+        let rows = CoordinatorDiagnostics(), diagnostic = IndexDiagnostics(sink: { rows.record($0) })
+        let f = try fixture(), count = CoordinatorPhysicalCount()
+        let model = CoreMLFingerprinter(configuration: f.configuration.fingerprint, predict: { _ in
+            count.increment(); return [1] + Array(repeating: 0, count: 1023)
+        })
+        let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: model,
+            configuration: f.configuration, indexDiagnostics: diagnostic)
+        await f.photos.set([descriptor(f.photos.context, revision: "first")])
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        XCTAssertEqual(rows.rows.last { $0["event"] == "accepted" }?["comparison"], "missing_baseline")
+        diagnostic.recordCause(context: f.photos.context, assetID: "asset", source: "history", generation: 2,
+            facts: ["category": "updated", "content": "unknown"])
+        await f.photos.set([descriptor(f.photos.context, revision: "metadata-only")])
+        await coordinator.libraryChanged(.fullReconcileRequired)
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        let same = try XCTUnwrap(rows.rows.last { $0["event"] == "accepted" })
+        XCTAssertEqual(same["comparison"], "same_input")
+        XCTAssertEqual(same["causeSource"], "history"); XCTAssertEqual(same["cause.content"], "unknown")
+        let catalog = rows.rows.last { $0["phase"] == "index-catalog-sample" && $0["causeHandle"] == same["causeHandle"] }
+        XCTAssertNotNil(catalog)
+        await f.photos.setImageRed(1)
+        await f.photos.set([descriptor(f.photos.context, revision: "edited-input")])
+        await coordinator.libraryChanged(.fullReconcileRequired)
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        XCTAssertEqual(rows.rows.last { $0["event"] == "accepted" }?["comparison"], "different_input")
+        // A changed preprocessing contract is incomparable even with an actual new tensor.
+        let old = f.configuration.fingerprint
+        let changed = try FingerprintConfiguration(modelSHA256: old.modelSHA256, inputSide: old.inputSide,
+            resizeMode: old.resizeMode, colorSpace: old.colorSpace, mean: [0.4, 0.4, 0.4], std: old.std)
+        let configuration = try DedupConfiguration(fingerprint: changed, policyVersion: DedupConfiguration.computePolicyVersion(
+            fingerprintVersion: changed.version, threshold: f.configuration.threshold, backend: f.configuration.backend),
+            threshold: f.configuration.threshold, backend: f.configuration.backend, resources: f.configuration.resources,
+            evidenceCandidateLimit: f.configuration.evidenceCandidateLimit, acceptanceID: f.configuration.acceptanceID)
+        let nextModel = CoreMLFingerprinter(configuration: changed, predict: { _ in
+            count.increment(); return [1] + Array(repeating: 0, count: 1023)
+        })
+        let next = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: nextModel,
+            configuration: configuration, indexDiagnostics: diagnostic)
+        try await next.reconcile(); await next.processDueWork(now: now)
+        XCTAssertEqual(rows.rows.last { $0["event"] == "accepted" }?["comparison"], "incomparable")
+        await assertEqual(await f.photos.readCount, 4)
+        XCTAssertEqual(count.value, 4, "Diagnostics must not infer twice")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND length(input_digest)=32 AND length(input_digest_contract)>0", at: f.db), 1)
+        let summaries = rows.rows.filter { $0["phase"] == "index-diagnostic-summary" }
+        for outcome in ["missing_baseline", "same_input", "different_input", "incomparable"] {
+            XCTAssertEqual(summaries.reduce(0) { $0 + (Int($1["comparison." + outcome] ?? "0") ?? 0) }, 1)
+        }
+        XCTAssertTrue(summaries.contains { Int($0["timing.input-digest-wall.count"] ?? "0") == 1 })
+    }
+
+    func testComparisonSummaryCountsAllRowsBeyondSampleAndDetailCapsWithoutSink() throws {
+        let diagnostics = IndexDiagnostics(sink: { _ in })
+        let operation = diagnostics.operation("work")
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        operation.bindScope(context: context, photosGeneration: 3)
+        for n in 0..<1000 {
+            let d = descriptor(context, asset: "private-asset-\(n)")
+            let task = RepresentationTask(descriptor: d, retryCount: 0, nextRetryAt: nil,
+                fingerprintVersion: "v", indexGeneration: 1)
+            operation.recordComparison(.sameInput, task: task)
+        }
+        let summary = operation.finish()
+        XCTAssertEqual(summary["comparison.same_input"], "1000")
+        XCTAssertEqual(summary["contextEpoch"], "1")
+        XCTAssertEqual(summary["photosGeneration"], "3")
+        XCTAssertEqual(summary["comparison.different_input"], "0")
+        XCTAssertEqual(summary["comparison.missing_baseline"], "0")
+        XCTAssertEqual(summary["comparison.incomparable"], "0")
+        XCTAssertLessThanOrEqual(Int(summary["detailed"] ?? "1000")!, 64)
+    }
+
+    func testCauseChainUsesContextAndCapturesAttemptBeforeLateEvent() throws {
+        let log = CoordinatorDiagnostics(), diagnostics = IndexDiagnostics(sink: { log.record($0) })
+        let context = LibraryContext(id: UUID(), epoch: 3)
+        let d = descriptor(context, asset: "PRIVATE-ASSET-SENTINEL")
+        diagnostics.recordCause(context: context, assetID: d.key.assetID, source: "history", generation: 2,
+            facts: ["content": "unknown", "category": "updated"], operation: "history-1")
+        let operation = diagnostics.operation("work")
+        let task = RepresentationTask(descriptor: d, retryCount: 0, nextRetryAt: nil,
+            fingerprintVersion: "v", indexGeneration: 4)
+        operation.record(["phase": "index-task", "event": "attempt"], task: task)
+        let attempt = try XCTUnwrap(log.rows.last)
+        diagnostics.recordCause(context: context, assetID: d.key.assetID, source: "live", generation: 3,
+            facts: ["assetContentChanged": "true", "visibleInputFields": "pixelSize", "metadataFields": "none"])
+        operation.recordComparison(.sameInput, task: task)
+        let accepted = try XCTUnwrap(log.rows.last)
+        XCTAssertEqual(accepted["causeHandle"], attempt["causeHandle"])
+        XCTAssertEqual(accepted["causeSource"], "history")
+        XCTAssertEqual(accepted["cause.content"], "unknown")
+        XCTAssertEqual(accepted["issuanceHandle"], attempt["issuanceHandle"])
+        XCTAssertEqual(accepted["contextEpoch"], "3")
+        XCTAssertEqual(accepted["comparison"], "same_input")
+        let next = diagnostics.operation("work")
+        next.record(["phase": "index-task", "event": "attempt"], task: task)
+        XCTAssertEqual(log.rows.last?["causeSource"], "live")
+        let other = descriptor(LibraryContext(id: context.id, epoch: 4), asset: d.key.assetID)
+        next.record(["phase": "index-catalog-sample"], descriptor: other)
+        XCTAssertNil(log.rows.last?["causeHandle"], "Another epoch cannot inherit an earlier cause")
+        let data = try JSONSerialization.data(withJSONObject: log.rows)
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("PRIVATE-ASSET-SENTINEL"))
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains(context.id.uuidString))
+    }
+
+    func testTimingsAggregateMonotonicElapsedWithoutPerPageLogs() throws {
+        let log = CoordinatorDiagnostics(), clock = DiagnosticClock()
+        let diagnostics = IndexDiagnostics(sink: { log.record($0) }, monotonic: { clock.now })
+        let operation = diagnostics.operation("reconcile")
+        for _ in 0..<1000 {
+            operation.measure(stage: "catalog", seconds: 0.002)
+            diagnostics.recordTiming(stage: "notification-queue", seconds: 0.003)
+        }
+        XCTAssertTrue(log.rows.isEmpty)
+        let summary = operation.finish()
+        XCTAssertEqual(summary["timing.catalog.count"], "1000")
+        XCTAssertEqual(Double(summary["timing.catalog.sumMS"] ?? "" )!, 2000, accuracy: 0.001)
+        XCTAssertEqual(Double(summary["timing.catalog.maxMS"] ?? "" )!, 2, accuracy: 0.001)
+        diagnostics.flushObservations(force: true)
+        XCTAssertEqual(log.rows.count, 2)
+        XCTAssertEqual(log.rows.last?["timing.notification-queue.count"], "1000")
+        XCTAssertEqual(log.rows.last?["measurement"], "monotonic-elapsed-wall")
+    }
+
     func testSliceStopsAtSixteenAttemptsAndContinuesOnNextCall() async throws {
         let f = try fixture()
         await f.photos.set((0..<40).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) })
@@ -110,9 +233,13 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         }
         diagnostics.flushObservations(force: true)
         let stream = Array(rows.rows.dropFirst(start))
-        XCTAssertLessThanOrEqual(stream.count, 24, "bound all coordinator/store output across four fixed windows")
+        XCTAssertLessThanOrEqual(stream.count, 29, "bound original observations plus fixed timing windows")
+        let timingWindows = stream.filter { $0["phase"] == "index-window-summary" }
+        XCTAssertLessThanOrEqual(timingWindows.count, 5)
+        XCTAssertEqual(timingWindows.reduce(0) { $0 + (Int($1["timing.catalog-delta.count"] ?? "0") ?? 0) }, 128)
+        XCTAssertEqual(timingWindows.reduce(0) { $0 + (Int($1["timing.db-delta.count"] ?? "0") ?? 0) }, 128)
         let data = try JSONSerialization.data(withJSONObject: stream, options: [.sortedKeys])
-        XCTAssertLessThan(data.count, 10_000)
+        XCTAssertLessThan(data.count, 15_000)
         XCTAssertEqual(stream.filter { $0["phase"] == "index-live-transfer-neutral" }.count, 8)
         let summaries = stream.filter { $0["phase"] == "index-observation-summary" && $0["category"] == "index-live-transfer-neutral" }
         XCTAssertEqual(summaries.reduce(0) { $0 + (Int($1["suppressed"] ?? "0") ?? 0) }, 120)
@@ -1444,6 +1571,8 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     private var admission: PhotosReaderAdmission = .available
     private var budgetExhausted = false
     func setBudgetExhausted(_ value: Bool) { budgetExhausted = value }
+    private var imageRed: CGFloat = 0
+    func setImageRed(_ value: CGFloat) { imageRed = value }
     private var readError: ReadExecutorError?
     private var afterRead: PhotosRepresentationError?
     func setAfterRead(_ error: PhotosRepresentationError?) { afterRead = error }
@@ -1565,8 +1694,11 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
         if failedAsset == descriptor.key.assetID { throw PhotoKitGatewayError.libraryUnavailable }
         let lease = try await budget.acquire(bytes: 256)
         let occupied = await budget.snapshot(); maxImagesObserved = max(maxImagesObserved, occupied.images)
-        let image = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
+        let imageContext = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        imageContext.setFillColor(CGColor(red: imageRed, green: 0, blue: 0, alpha: 1))
+        imageContext.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        let image = imageContext.makeImage()!
         if let gate = readGate { readGate = nil; await gate.hold() }
         if let afterRead { await lease.finishPhysicalWork(); throw afterRead }
         return .init(image: image, orientation: .up, descriptor: descriptor, lease: lease,

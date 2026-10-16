@@ -99,5 +99,7 @@ CREATE TABLE photos_content_change (
 );
 CREATE INDEX photos_content_change_asset ON photos_content_change(context_id, context_epoch, asset_id, content_changed);
 
--- v8 revokes persisted readiness when opening the previous input contract.
-PRAGMA user_version = 8;
+-- v9 preserves existing facts and publication; prior rows have no input baseline.
+ALTER TABLE photos_representation ADD COLUMN input_digest BLOB CHECK(input_digest IS NULL OR (typeof(input_digest) = 'blob' AND length(input_digest) = 32));
+ALTER TABLE photos_representation ADD COLUMN input_digest_contract TEXT CHECK(input_digest_contract IS NULL OR length(input_digest_contract) > 0);
+PRAGMA user_version = 9;

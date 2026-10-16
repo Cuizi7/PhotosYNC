@@ -26,6 +26,29 @@ struct PhotoKitCandidateAsset: Sendable {
     let identifier: String
     let candidates: [MatchCandidate]
     var inputUnchanged: Bool = false
+    // Diagnostic facts are independent of the conservative invalidation decision.
+    // nil means unavailable; an empty field list means observed with no difference.
+    var assetContentChanged: Bool? = nil
+    var visibleInputFields: [String]? = nil
+    var metadataFields: [String]? = nil
+
+    static func changedRepresentationFields(before: PhotoKitRepresentationAsset, after: PhotoKitRepresentationAsset) -> [String] {
+        var fields: [String] = []
+        if before.playbackStyle != after.playbackStyle { fields.append("playbackStyle") }
+        if before.resources.map({ $0.type.rawValue }).sorted() != after.resources.map({ $0.type.rawValue }).sorted() { fields.append("resourceTypes") }
+        if before.resources.map(\.uti).sorted() != after.resources.map(\.uti).sorted() { fields.append("resourceUTIs") }
+        if before.resources.map(\.filename).sorted() != after.resources.map(\.filename).sorted() { fields.append("resourceFilenames") }
+        let sizes: (PhotoKitRepresentationAsset) -> [String] = { $0.resources.map { resource in
+            resource.size.map { "\($0.width)x\($0.height)" } ?? "unknown"
+        }.sorted() }
+        if sizes(before) != sizes(after) { fields.append("resourceSizes") }
+        // Resource associations matter even if the independent field multisets match.
+        let associations: (PhotoKitRepresentationAsset) -> [String] = { $0.resources.map { resource in
+            "\(resource.type.rawValue):\(resource.uti):\(resource.filename.utf8.count):\(resource.filename):\(resource.size?.width ?? 0)x\(resource.size?.height ?? 0)"
+        }.sorted() }
+        if fields.isEmpty && associations(before) != associations(after) { fields.append("resourceAssociations") }
+        return fields
+    }
 }
 
 enum PhotoKitCandidateIndexChange: Sendable {
@@ -129,6 +152,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     public func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { indexDiagnostics.recordTiming(stage: "photos_candidate_snapshot_wall", seconds: ProcessInfo.processInfo.systemUptime - start) }
         for attempt in 0..<Self.candidateLoadAttempts {
             _ = try await usableGeneration()
             do {
@@ -209,7 +234,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         if offset == 0 { guard generation == expectedGeneration else { throw PhotoKitGatewayError.libraryChanged } }
         _ = try state.catalogCoverage(baseline: expectedGeneration)
         let context = state.snapshot().context
-        let page = try lifecycle.representationCatalog(offset: offset, limit: limit, context: context, generation: expectedGeneration)
+        let page = try measured("photos_catalog_body_wall") {
+            try lifecycle.representationCatalog(offset: offset, limit: limit, context: context, generation: expectedGeneration)
+        }
         _ = try await candidateSnapshot()
         _ = try state.catalogCoverage(baseline: expectedGeneration)
         guard page.context == context, page.generation == expectedGeneration, page.descriptors.count + page.exclusions.count <= limit,
@@ -218,8 +245,10 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         // Reconciliation acknowledgement belongs to the caller after all pages,
         // persisted facts and derived index publish succeed; fetching a last page
         // alone is not sufficient to clear the sticky dirty bit.
-        let evidence = try state.invalidationEvidence(generation: state.snapshot().generation,
-            pageAssetIDs: Set((page.descriptors + page.exclusions.map(\.descriptor)).map { $0.key.assetID }))
+        let evidence = try measured("photos_content_evidence_db_wall") {
+            try state.invalidationEvidence(generation: state.snapshot().generation,
+                pageAssetIDs: Set((page.descriptors + page.exclusions.map(\.descriptor)).map { $0.key.assetID }))
+        }
         return RepresentationPage(context: page.context, generation: page.generation, descriptors: page.descriptors,
                                   nextOffset: page.nextOffset, exclusions: page.exclusions,
                                   invalidatedAssetIDs: evidence.ids, invalidateAllCachedRepresentations: evidence.all, inputUnchangedAssetIDs: evidence.unchanged)
@@ -232,7 +261,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         guard delta.isValid, delta.changedAssetIDs.count + delta.deletedAssetIDs.count <= catalogBatchSize else { throw PhotoKitGatewayError.libraryChanged }
         let generation = try await usableGeneration()
         guard generation == delta.toGeneration, state.snapshot().context == delta.context else { throw PhotoKitGatewayError.libraryChanged }
-        let page = try lifecycle.representationDelta(assetIDs: delta.changedAssetIDs, context: delta.context, generation: generation)
+        let page = try measured("photos_delta_body_wall") {
+            try lifecycle.representationDelta(assetIDs: delta.changedAssetIDs, context: delta.context, generation: generation)
+        }
         try verifyUsable(generation: generation)
         let facts = page.descriptors + page.exclusions.map(\.descriptor)
         guard page.context == delta.context, page.generation == generation, page.nextOffset == nil,
@@ -240,8 +271,10 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
               Set(facts.map(\.key)).count == facts.count,
               Set(facts.map { $0.key.assetID }) == Set(delta.changedAssetIDs) else { throw PhotoKitGatewayError.libraryChanged }
         let transferred = try recoveringSession.map { try state.hasTransferredCatalogInvalidation($0) } ?? false
-        let evidence = try state.invalidationEvidence(generation: generation, pageAssetIDs: Set(delta.changedAssetIDs),
-            permittingUnverifiedInputEvidence: transferred)
+        let evidence = try measured("photos_content_evidence_db_wall") {
+            try state.invalidationEvidence(generation: generation, pageAssetIDs: Set(delta.changedAssetIDs),
+                permittingUnverifiedInputEvidence: transferred)
+        }
         guard !evidence.all || transferred else { throw PhotoKitGatewayError.libraryChanged }
         return RepresentationPage(context: delta.context, generation: generation, descriptors: page.descriptors,
             nextOffset: nil, exclusions: page.exclusions, invalidatedAssetIDs: evidence.ids, inputUnchangedAssetIDs: evidence.unchanged)
@@ -280,6 +313,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     public func contextCheckpoint() async throws -> LibraryResumeCheckpoint? {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { indexDiagnostics.recordTiming(stage: "photos_checkpoint_wall", seconds: ProcessInfo.processInfo.systemUptime - start) }
         do {
             let generation = try await usableGeneration()
             guard let token = try lifecycle.archivedChangeToken() else {
@@ -309,13 +344,17 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         var persisted = true, unknown = false
         let complete: Bool
         do {
-            complete = try lifecycle.replayPersistentChanges(previous.archivedChangeToken, onChange: { event in
+            complete = try measured("photos_history_replay_wall") { try lifecycle.replayPersistentChanges(previous.archivedChangeToken, onChange: { event in
                 if event == .fullReconcileRequired || event == .contextInvalidated { unknown = true }
-            }, onContentChange: { [state, catalogBatchSize] ids in
+            }, onContentChange: { [state, catalogBatchSize, indexDiagnostics] ids in
+                let start = ProcessInfo.processInfo.systemUptime
                 if !state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) { persisted = false }
+                indexDiagnostics.recordTiming(stage: "photos_history_content_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
+                for id in ids { indexDiagnostics.recordCause(context: ticket.context, assetID: id, source: "history", generation: ticket.generation,
+                    facts: ["category": "unknown", "content": "unknown", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
                 diagnostic.record(["phase": "photos-history-obligation", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers", "assets": String(ids.count)])
                 for id in ids { diagnostic.record(["phase": "photos-history-sample", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers"], assetID: id) }
-            })
+            }) }
         } catch {
             state.invalidateAllRepresentations()
             diagnostics(["phase": "photos-history-coverage", "result": "unknown", "reason": "history-unavailable"])
@@ -344,11 +383,21 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
             _ = try await usableGeneration()
             let generation = state.recordChange(expectingDetails: true)
             state.setReplayContext(checkpoint.context)
-            defer { state.finishChangeDetails(); state.setReplayContext(nil) }
+            let diagnostic = indexDiagnostics.operation("history-resume")
+            let start = ProcessInfo.processInfo.systemUptime
+            defer {
+                state.finishChangeDetails(); state.setReplayContext(nil)
+                indexDiagnostics.recordTiming(stage: "photos_history_replay_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
+                diagnostic.finish()
+            }
             guard try lifecycle.replayPersistentChanges(checkpoint.archivedChangeToken, onChange: { [state] event in
                 if event == .fullReconcileRequired || event == .contextInvalidated { state.invalidateAllRepresentations() }
-            }, onContentChange: { [state, catalogBatchSize] ids in
+            }, onContentChange: { [state, catalogBatchSize, indexDiagnostics] ids in
+                let start = ProcessInfo.processInfo.systemUptime
                 _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize))
+                indexDiagnostics.recordTiming(stage: "photos_history_content_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
+                for id in ids { indexDiagnostics.recordCause(context: checkpoint.context, assetID: id, source: "history", generation: generation,
+                    facts: ["category": "unknown", "content": "unknown", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
             }), let adoptedGeneration = state.adoptContext(checkpoint.context, generation: generation) else {
                 state.invalidateContext(); changeChannel.send(.contextInvalidated); return false
             }
@@ -461,10 +510,11 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     func recordLibraryChangeForTesting() { enqueueLibraryChange(nil) }
 
     private func enqueueLibraryChange(_ change: PHChange?) {
+        let diagnostic = indexDiagnostics.operation("live")
         candidateIndex.enqueueChange(
             change,
             recordChange: { [state] in state.recordObserverChange() },
-            lifecycle: lifecycle,
+            lifecycle: lifecycle, indexDiagnostics: indexDiagnostics, diagnostic: diagnostic,
             didIndex: { [weak self] generation in
                 guard let self else { return false }
                 return self.state.markIndexed(generation: generation)
@@ -472,7 +522,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
             onChange: { [state, changeChannel, catalogBatchSize, indexDiagnostics] event, knownNeutral in
                 switch event {
                 case .incremental(let delta):
+                    let persistStart = ProcessInfo.processInfo.systemUptime
                     if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.invalidateAllRepresentations() }
+                    indexDiagnostics.recordTiming(stage: "photos_live_catalog_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - persistStart)
                     // A large complete scope is durable; stream buffers hold only a wakeup.
                     if delta.changedAssetIDs.count + delta.deletedAssetIDs.count > max(1, catalogBatchSize / 2), state.hasStore {
                         changeChannel.send(.fullReconcileRequired)
@@ -485,23 +537,31 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                                 "assets": String(delta.changedAssetIDs.count), "event": String(delta.toGeneration)], assetID: delta.changedAssetIDs.first)
                         }
                     } else if !delta.changedAssetIDs.isEmpty || !delta.deletedAssetIDs.isEmpty {
-                        let diagnostic = indexDiagnostics.operation("live")
                         diagnostic.record(["phase": "photos-live-scope", "source": "live", "category": "inventory", "changed": String(delta.changedAssetIDs.count), "deleted": String(delta.deletedAssetIDs.count), "fromGeneration": String(delta.fromGeneration), "throughGeneration": String(delta.toGeneration)])
                         for id in delta.changedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "inventory-changed", "content": "unknown", "event": String(delta.toGeneration)], assetID: id) }
                         for id in delta.deletedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "deleted", "event": String(delta.toGeneration)], assetID: id) }
-                        diagnostic.finish()
                     }
                 case .contextInvalidated: state.invalidateAllRepresentations(); changeChannel.send(event)
                 case .fullReconcileRequired: state.invalidateAllRepresentations(); changeChannel.send(event)
                 }
             },
-            onContentChange: { [state, catalogBatchSize] ids in _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) },
+            onContentChange: { [state, catalogBatchSize, indexDiagnostics] ids in
+                let start = ProcessInfo.processInfo.systemUptime
+                _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize))
+                indexDiagnostics.recordTiming(stage: "photos_live_content_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
+            },
             didFinishDetails: { [state] in state.finishChangeDetails() },
             diagnostics: { [indexDiagnostics] fields in
                 var fields = fields; fields["source"] = "live"
                 indexDiagnostics.observation(fields)
             }
         )
+    }
+
+    private func measured<T>(_ stage: String, _ body: () throws -> T) rethrows -> T {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { indexDiagnostics.recordTiming(stage: stage, seconds: ProcessInfo.processInfo.systemUptime - start) }
+        return try body()
     }
 
     private func usableGeneration() async throws -> Int {
@@ -636,7 +696,25 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
             if object.objectWasDeleted { removed.insert(old.localIdentifier); return }
             guard let current = object.objectAfterChanges else { incompleteObjectDetails = true; return }
             var candidate = makeCandidate(current)
-            candidate.inputUnchanged = Self.sameRepresentationInputs(old, current, assetContentChanged: object.assetContentChanged)
+            let beforeFacts = PhotoKitRepresentationAsset(asset: old), afterFacts = PhotoKitRepresentationAsset(asset: current)
+            candidate.inputUnchanged = old.mediaType == current.mediaType && old.mediaSubtypes == current.mediaSubtypes &&
+                old.pixelWidth == current.pixelWidth && old.pixelHeight == current.pixelHeight &&
+                afterFacts.inputsUnchanged(from: beforeFacts, assetContentChanged: object.assetContentChanged)
+            candidate.assetContentChanged = object.assetContentChanged
+            var inputFields = PhotoKitCandidateAsset.changedRepresentationFields(before: beforeFacts, after: afterFacts)
+            if old.mediaType != current.mediaType { inputFields.append("mediaType") }
+            if old.mediaSubtypes != current.mediaSubtypes { inputFields.append("mediaSubtypes") }
+            if old.pixelWidth != current.pixelWidth { inputFields.append("pixelWidth") }
+            if old.pixelHeight != current.pixelHeight { inputFields.append("pixelHeight") }
+            candidate.visibleInputFields = inputFields.sorted()
+            var metadataFields: [String] = []
+            if old.modificationDate != current.modificationDate { metadataFields.append("modificationDate") }
+            if old.creationDate != current.creationDate { metadataFields.append("creationDate") }
+            if old.isFavorite != current.isFavorite { metadataFields.append("isFavorite") }
+            if old.isHidden != current.isHidden { metadataFields.append("isHidden") }
+            if old.duration != current.duration { metadataFields.append("duration") }
+            if old.location != current.location { metadataFields.append("location") }
+            candidate.metadataFields = metadataFields.sorted()
             changed.append(candidate)
         }
         guard !incompleteObjectDetails else {
@@ -653,12 +731,6 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
         return .incremental(removedAssetIDs: removed, insertedAssets: inserted, changedAssets: changed)
     }
 
-    private static func sameRepresentationInputs(_ before: PHAsset, _ after: PHAsset, assetContentChanged: Bool) -> Bool {
-        guard before.mediaType == after.mediaType, before.mediaSubtypes == after.mediaSubtypes,
-              before.pixelWidth == after.pixelWidth, before.pixelHeight == after.pixelHeight else { return false }
-        return PhotoKitRepresentationAsset(asset: after).inputsUnchanged(from: PhotoKitRepresentationAsset(asset: before),
-            assetContentChanged: assetContentChanged)
-    }
     func resetRepresentationCatalog() {
         representationQueue.sync { representationAssets = nil; representationGeneration = nil }
     }
@@ -817,16 +889,25 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
     }
 
     func enqueueChange(_ change: PHChange?, recordChange: @Sendable () -> (generation: Int, context: LibraryContext), lifecycle: any PhotoKitLifecycle,
+                       indexDiagnostics: IndexDiagnostics, diagnostic: IndexDiagnosticOperation,
                        didIndex: @escaping @Sendable (Int) -> Bool,
                        onChange: @escaping @Sendable (PhotosIndexChange, Bool) -> Void,
                        onContentChange: @escaping @Sendable ([String]) -> Void,
                        didFinishDetails: @escaping @Sendable () -> Void,
                        diagnostics: @escaping @Sendable ([String: String]) -> Void) {
+        let queuedAt = ProcessInfo.processInfo.systemUptime
         submissionLock.lock()
         let (generation, context) = recordChange()
         submissionProbe?(.observerRecorded)
         queue.async { [weak self] in
-            defer { didFinishDetails() }
+            let classificationStart = ProcessInfo.processInfo.systemUptime
+            indexDiagnostics.recordTiming(stage: "photos_notification_queue_wall", seconds: classificationStart - queuedAt)
+            var classificationFinished = false
+            defer {
+                didFinishDetails()
+                if !classificationFinished { indexDiagnostics.recordTiming(stage: "photos_notification_classification_wall", seconds: ProcessInfo.processInfo.systemUptime - classificationStart) }
+                diagnostic.finish()
+            }
             guard let self else { return }
             guard case let .incremental(removed, inserted, changed) = (try? lifecycle.candidateIndexChange(for: change)) else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "missing-or-unclassified-fetch-details", "contentScope": "unknown"])
@@ -850,6 +931,16 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "malformed-membership-details", "contentScope": "unknown"])
                 onChange(.fullReconcileRequired, false); return
             }
+            for asset in changed {
+                indexDiagnostics.recordCause(context: context, assetID: asset.identifier, source: "live", generation: generation,
+                    facts: ["category": "changed", "assetContentChanged": asset.assetContentChanged.map(String.init) ?? "unknown",
+                        "visibleInputFields": asset.visibleInputFields.map { $0.isEmpty ? "none" : $0.sorted().joined(separator: ",") } ?? "unknown",
+                        "metadataFields": asset.metadataFields.map { $0.isEmpty ? "none" : $0.sorted().joined(separator: ",") } ?? "unknown"], operation: diagnostic.id)
+            }
+            for asset in inserted { indexDiagnostics.recordCause(context: context, assetID: asset.identifier, source: "live", generation: generation,
+                facts: ["category": "inserted", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
+            for id in removed { indexDiagnostics.recordCause(context: context, assetID: id, source: "live", generation: generation,
+                facts: ["category": "deleted", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
             for id in removed { self.remove(id) }
             for asset in changed { self.remove(asset.identifier); self.insert(asset) }
             for asset in inserted { self.insert(asset) }
@@ -859,6 +950,8 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                 "inserted": String(inserted.count), "deleted": String(removed.count),
                 "contentChanged": String(changed.filter { !$0.inputUnchanged }.count),
                 "inputUnchanged": String(changed.filter(\.inputUnchanged).count)])
+            indexDiagnostics.recordTiming(stage: "photos_notification_classification_wall", seconds: ProcessInfo.processInfo.systemUptime - classificationStart)
+            classificationFinished = true
             onContentChange(changed.filter { !$0.inputUnchanged }.map(\.identifier) + removed.sorted())
             onChange(.incremental(.init(context: context, fromGeneration: generation - 1, toGeneration: generation,
                 changedAssetIDs: (inserted + changed).map(\.identifier).sorted(), deletedAssetIDs: removed.sorted())),
