@@ -2,11 +2,11 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.2 stable — release preparation
+## 0.2.2 stable
 
 0.2.2 fixes two details gaps: source rows summarize all current unresolved issues and open complete diagnostics, and the sync details popover shows the same gallery-analysis state and asset progress as the main menu. Directory recovery retains its existing complete-traversal boundary; video failures retain their actual metadata-read stage and system cause. This adds no video support, database migration, model or threshold change, permission change, or new dependency. Schema remains v8.
 
-Release preparation is dated **2026-10-16**. Canonical validation passed on frozen `125ada6`; integrated static code/spec/architecture review is approved with no P0–P2 findings. The reviewer’s check of the final validation evidence and actual onscreen popup/material acceptance remain pending; merge and release remain blocked. This documentation update records that tested snapshot and does not claim another suite run on later documentation commits. The 118-image gallery is static native content reviewed by the coordinator agent. The single authorized foreground attempt produced zero captures and did not pass popup acceptance. See [0.2.2 release notes](docs/release/0.2.2.md) and the [current validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md). [0.2.1 notes](docs/release/0.2.1.md) and its historical acceptance remain available.
+Canonical validation passed on frozen `125ada6`; integrated code/spec/architecture review and its final evidence reconciliation are approved, with no P0–P2 findings. The coordinator agent has accepted the new native UI content and controlled popup/material evidence; this is coordinator review, not personal user acceptance. Physical hover/focus, VoiceOver, actual MenuBarExtra interaction and full-display backdrop fidelity retain disclosed limits. Final release source and artifact identities come from the exact-main archive’s provenance and validation records. See [0.2.2 release notes](docs/release/0.2.2.md) and the [validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md). [0.2.1 notes](docs/release/0.2.1.md) and historical evidence are retained.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -30,10 +30,10 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Prepared release configuration: **0.2.2 stable (build 10)**, targeting
+Release configuration: **0.2.2 stable (build 10)**, targeting
 `outputs/releases/0.2.2/`; see [release notes](docs/release/0.2.2.md)
-and the [changelog](CHANGELOG.md). After the pending acceptance gates pass,
-the stable package must archive the exact main commit and run full acceptance;
+and the [changelog](CHANGELOG.md).
+The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
 [0.2.1 stable build 9](docs/release/0.2.1.md),

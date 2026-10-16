@@ -1,6 +1,6 @@
 # 0.2.2 来源诊断与图库分析详情验证记录
 
-记录更新：2026-10-16（Asia/Shanghai）；文件名保留设计日期。**状态：发行准备，合并与发布阻断。** 冻结 `125ada6` 的完整 canonical 已通过，静态代码/规格/架构评审已批准；评审者补核最终验证仍待完成，真实浮层/材质验收未通过。本页分别记录历史、最终自动结果和仍未完成的门槛。此次仅更新文档事实，未对较晚的文档提交重跑 suite。
+记录更新：2026-10-16（Asia/Shanghai）；文件名保留设计日期。**状态：完整自动验收通过；集成代码/规格/架构及 canonical 证据补核通过；协调代理已通过本轮新增内容原生 UI 验收，非用户本人验收。** 最后正式文案及新增 UI/ICC 证据仍由同一 deep reviewer 补核后再推进 PR #3 ready、squash merge 和发行。最终实际 main/tag/产物由对应归档验收、provenance 和下载校验绑定，不预填未知结果。此次只更新文档，不重跑 suite。
 
 基线 main/v0.2.1：`1291b53ee0d263709379eb016d78b6fb8070c762`。工作分支 `codex/source-diagnostics-022`，本步骤开始 HEAD `926fbdb`。2026-10-16 通过 GitHub REST 只读复核：main 仍为上述提交，latest 为 v0.2.1（draft=false、prerelease=false）；v0.2.2 tag 和 release 查询均 HTTP404。查询时点无冲突不保证稍后仍空闲；发布前须再核对。
 
@@ -44,7 +44,7 @@ python3 scripts/validate.py --output-dir "$PWD/work/022-integrated-validation" -
 | 构建与完整 XCTest | Debug/Release build-for-testing 完成；627 项，2 跳过，0 失败 |
 | Python Tools | 97 项通过 |
 | 权重/模型/runtime/固定语料 | 资源、实际模型执行及 runtime 门槛通过；固定 33 例实际运行，14 个内容 duplicate、11 个策略 skip，不混同两个口径 |
-| 四组独立规模子进程 | 100000、150000、200000、200000 + 100000 history 均通过，包含 60 秒 idle 观察 |
+| 四组独立规模子进程 | 100000、150000、200000、200000 + 100000 history 均通过，其中最大 history 场景包含 60.033 秒 idle 观察及 622.390ms resume query；前三组无独立 60 秒 idle 样本 |
 | 两项受控 continuation | stamp 与 advanced-preparation 均 GREEN exit0/fixture passed、预期 RED exit1/fixture failed，无 timeout |
 | 源码一致性 | 324 entries，前后 digest 相同，unchanged_after_validation=true；所有引用结果哈希匹配 |
 
@@ -60,20 +60,32 @@ python3 scripts/validate.py --output-dir "$PWD/work/022-integrated-validation" -
 
 ## 最终集成静态评审与已接受残余
 
-独立 deep reviewer 对 `1291b53..125ada6` 全部集成差异完成代码、规格和架构评审，结论 **APPROVED，无 P0/P1/P2**。报告为 ignored `.superpowers/sdd/2026-10-15-diagnostics-and-analysis-details/integrated-review.md`。同一评审者对刚完成 canonical 证据的补核仍待完成，不将静态批准写成已经补核验证。
+独立 deep reviewer 对 `1291b53..125ada6` 全部集成差异完成代码、规格和架构评审，结论 **APPROVED，无 P0/P1/P2**。报告为 ignored `.superpowers/sdd/2026-10-15-diagnostics-and-analysis-details/integrated-review.md`。同一评审者已在 `e0b9a97` addendum 完成 canonical 证据补核 PASS 和文档差异 APPROVED，核对 111 个 artifact-sha256 条目零不匹配；复用精确 `125ada6` 执行，不重跑 suite。此次新增 UI/ICC 证据与正式文案收尾仍需该评审者补核，不提前宣称其完成。
 
 协调代理明确接受 **P3 F1**：仅自定义 `PhotosGateway` 在 `saveScannedFile` 候选查询抛出非 typed 错误时，诊断可能继承前面的“读取媒体元数据”阶段。内置 `SystemPhotoKitLifecycle` 当前路径没有已证实触发点，不宣称已运行复现。后续最小修正可在 metadata 读取完成后结束该阶段、使用准确后续阶段或 nil，并加该 gateway 边界注入测试；本轮不扩展异常分类、重试或准入策略，不改冻结代码。
 
-## GUI 证据和未通过项目
+## GUI 历史证据与后续验收
 
 - 修正后静态 gallery：`work/022-ui-fixture-corrected/index.html`，clean `a0f5a6c`；`source.json`、manifest 和 SHA256SUMS 绑定 118 张明/暗 PNG 及编译输入。与保留的旧 gallery 比较，8 张 mixedIssues 图改变，其余 110 张字节一致。协调代理已审阅；这是静态原生内容，不是实际屏幕 popup/material，也不是用户本人验收。
 - 测试中同一 native popup/trigger 在进度更新与 ready 转换后保留，长内容实际滚动；它们证明逻辑和内容，不证明 active material、物理 hover、独立键盘固定/关闭或可见焦点恢复。
 - 保留早期 `work/022-ui-native-probe/`、`022-ui-native-check/`、`022-ui-native-check-stable/` 的失败：部分透明/不完整材质，native/CG 尺寸未收敛（CG 1×2），自己窗口截图失败。未当作视觉通过。
-- 唯一授权前台会话：`work/022-ui-controlled-once/source.json` 与 `controlled-manifest.json`，clean `3df233d`。原前台 loginwindow/PID417，QA PID31722；qaActivationCalls=1、elapsed=1.1928489s、userSwitchObserved=false、captures=0、status=unverified。QA 未成为前台，恢复 guard 为 false，restore.attempted=false；会话关闭自己宿主并退出，没有再次激活、全局输入、权限更改或新截图。wrapper exit0 只表示观察报告生成。没有仅凭这些观察推断权限失败或锁屏原因。
+- 早期一次授权前台会话：`work/022-ui-controlled-once/source.json` 与 `controlled-manifest.json`，clean `3df233d`。原前台 loginwindow/PID417，QA PID31722；qaActivationCalls=1、elapsed=1.1928489s、userSwitchObserved=false、captures=0、status=unverified。QA 未成为前台，恢复 guard 为 false，restore.attempted=false；会话关闭自己宿主并退出，没有再次激活、全局输入、权限更改或新截图。wrapper exit0 只表示观察报告生成。没有仅凭这些观察推断权限失败或锁屏原因。
 
-**真实屏幕打开浮层及材质验收未通过，继续阻断合并与发布。** 协调线程等待用户解锁后的合法后续安排；本步骤不重试激活。旧 0.2.1 用户视觉接受只覆盖其历史快照及未改变边界，不能替代本轮改变部分。
+**上述早期证据当时未满足真实浮层验收，原失败及绑定完整保留。** 后续由新的明确授权完成下述采集和协调代理验收；不将旧失败改写为成功，不自动复用 0.2.1 的历史视觉接受。
 
-## 本次发行准备检查
+## 新增原生 UI 与材质证据：协调代理验收通过
+
+2026-10-16，协调代理明确审阅并通过本轮新增内容的原生 UI 验收；这是**协调代理审阅，不是用户亲自验收**。产品、Core、Tests 和已提交 harness 不变，复用 `125ada6` canonical 与现有 deep review。新采集绑定 clean `e0b9a97` 和原始编译/源码哈希，私有 QA 宿主与审计不进入产品。
+
+- `work/022-ui-onscreen-resumed-20261016T074406/` 的 14 张真实原生浮层内容图覆盖明/暗、长问题列表滚动末项、同一浮层中的进度更新及 ready 转换。协调代理已审阅这些实际内容；它们与之前 118 张静态内容图分别保留。
+- v3 材质 A/B：`work/022-material-v3-capture-20261016T082619-99842c/`。同一 popup、内容、frame/appearance，A 无背景时显示灰底低对比，B 加入仅自己 QA 的真实 opaque 背景后文字可读。原始 PNG、controlled-manifest、capture-summary、offline audit 和 CAPTURE-SHA256SUMS 保留；没有改产品样式或 PNG。
+- v3 原协议因颜色门槛记录 `unverified`，这一状态不覆盖。直接 `NSBitmapImageRep.colorAt` 给出的 NSColor 被标成 Generic RGB，而 bitmap.colorSpace 实测为显示 ICC `LV273HUPR`；将原编码样本当 Generic RGB 直接转 sRGB 的最大误差约 0.054，不能据此认定真实背景不存在。
+- 协调代理随后独立审计原图：先将原采样分量赋予 image.colorSpace，再转 sRGB，四个原定角点最大误差 **0.0015423131（<0.001543）**，小于未改变的 **8/255** 门槛；LittleCMS 按嵌入 ICC 转换同样通过（8-bit 比较最大误差约 0.002353）。这是只读解释原 PNG，不是重写图片或放宽容差。
+- 独立审计原来源为 `/private/tmp/`，三份文件已原样归档在上述 v3 capture 目录：`photosync022-icc-audit.json`、`photosync022-color-icc-audit.swift`、`photosync022-color-icc-audit.log`。`COORDINATOR-AUDIT-SHA256SUMS` 和 `coordinator-audit-copy-verification.json` 绑定复制一致性；原 capture 清单 11 项哈希未变，原 manifest 仍为 unverified。审计脚本 SHA256 `1bdf5377ec0f189e03961011e321a95f8b7c59efa2e6bfd7fac4acdd7256d817`；日志 SHA256 `56495c499ab282380e6526db2d5bebf3f35b99ca1fdf79b2b7e53fd2fae821ba`。A/B 原 PNG SHA256 分别为 `c4b5ef0b9207487537172091f20d7865f8830f8d2d57369830f953cec3158077`、`35df0006ca3ae6775d97efa03bfbeb76d73a0672d7ac0389f90f793fb8c9763d`。
+
+**结论边界：** 独立 ICC 审计及协调代理对具体原图的视觉审阅补充满足本轮新增内容验收；不把原 manifest 改为 passed，也不声称颜色断言之后未到达的末尾断言运行或通过。NSWorkspace frontmost=QA 与 NSApp.active=false/keyWindow=nil 是分别记录的观察，不等价为同一 active/focus 结论，不推断原因。自己的窗口组及受控 QA 背景不是全显示器截图；物理 hover/focus、完整键盘、VoiceOver、真正 MenuBarExtra 和全屏背景真实性未新增验证。
+
+## 发行配置聚焦检查（历史）
 
 目标三种现有 App 配置均为 0.2.2/build10；Info.plist 继续 stable。package-release 仅更新 release_name、bundle 版本/build 断言、说明路径和 provenance build；Tests/Tools 对应 DMG/版本/锁/staging/notes fixture 同步，不改失败门槛。
 
@@ -87,26 +99,26 @@ git diff --check
 
 2026-10-16 实际结果：发行工具测试 **15 项，0 失败，57.217 秒，exit0（OK）**，日志 `work/022-task3-release-validation-tests.log`。覆盖当前版本产物与 provenance，以及失败/缺架构/脏源码/已有目标/锁冲突的拒绝路径。脚本语法和 diff 空白检查 exit0；另行 `plutil -lint PhotoSync.xcodeproj/project.pbxproj` exit0。只读断言核对三种现有版本配置、stable 渠道、脚本/fixture 相对基线严格只有批准的常量替换，以及四份文档全部本地链接存在，均通过。未运行生产打包入口或 broad suite；合成 fixture 内调用打包脚本不等于生成真实发行包。
 
-## 必须后续完成的门槛
+## 交付门槛与最终绑定
 
-1. 完成改变部分的真实原生浮层/材质截图，由协调代理明确审阅具体证据；分别标注普通原生宿主、真正 MenuBarExtra 和物理交互覆盖。不得将失败/无截图写为通过。
+1. 本轮新增原生内容/受控材质的协调代理验收已通过，范围见上；保留原失败和未运行断言，不扩展为物理交互、真实 MenuBarExtra 或全屏真实性通过。
 2. 最终自动验收已在 `125ada6` 完成，结果见上；保留 exact snapshot 和哈希绑定，不因只读评审或此次纯文档结果更新重复 suite。若后续行为/测试改变，必须按影响重新验证，不能复用旧快照冒称新快照已测。
-3. 集成静态 deep review 已 APPROVED，无 P0–P2；等待同一评审者补核最终 canonical 证据。P3 F1 按协调决定保留为已接受残余；等价只读 review 不强制重复相同快照验证。
-4. 协调线程已明确允许核对 final results 后独立推进 push、披露视觉缺口的 draft PR，创建后立即 attach；尚未创建时不预填编号。核对远端 diff/checks/mergeability。真实 popup 视觉关卡不扩大为创建 PR 的前置条件。squash merge 与 release 仍须满足上述完整验证、集成深度评审和协调代理对真实浮层/材质的必要审阅结论。
+3. 既有集成 deep review 及 canonical 补核已通过，无 P0–P2；同一评审者补核新增 UI/ICC 证据与本次正式文案后继续交付。P3 F1 保留为协调已接受残余；只读复核不重复相同快照 suite。
+4. 协调线程已明确授权在上述补核后推进现有 PR #3 ready 并 squash merge，核对远端 base/diff/checks/mergeability，确认 main 源码树与已验行为一致。后续 Git/PR/发行动作由主线程执行，本次文档提交不宣称这些动作已完成。
 5. 合并后核对 main tree 和实际提交，再从该干净提交运行 package-release，归档内重新完整验收并核验 Universal App/Core、0.2.2/stable/10、资源、图标、签名、DMG、provenance 和校验。保留 App、DMG、RELEASE-NOTES、CHANGELOG、完整 validation、构建日志及本地全目录 SHA256SUMS；已有目录、文件、符号链接或锁均不能覆盖/绕过；失败、缺报告、零测试、资源损坏及源码 manifest 变化不得跳过。
-6. 真正发布前，逐项检查 README、CHANGELOG、0.2.2 发行说明、此验证记录及最终 RELEASE-NOTES 与实际证据一致。依据真实完成状态更新“尚未发布”“待完成”“未创建”等准备阶段语句；历史采集失败和分阶段数量仍保留为有日期/快照绑定的历史，不改写成成功。不预填未知 main/tag/哈希，精确源码、manifest、验证哈希和产物绑定由实际 provenance 与校验记录给出。避免将准备阶段文本原样作为已完成发行说明上传。
+6. 正式文案与 README/CHANGELOG/RELEASE-NOTES 保持一致，只描述实际验收与限制；历史失败和分阶段数量保留日期/快照绑定，不改写成成功。最终 main/tag、归档 manifest、验收哈希和产物由实际 provenance/校验记录给出，不从本页推导未知结果；上传前由主线程核对。
 7. 发布前重新核对 v0.2.2，tag 绑定实际 main；GitHub stable/latest 四项资产为 `PhotosYNC-0.2.2.dmg`、`PhotosYNC.provenance`、`RELEASE-NOTES.md` 和只覆盖前三项的下载 `SHA256SUMS`，与本地全目录清单分离，上传后回读并下载校验。旧包/标签/证据保留。
 
 ## 分开报告的边界
 
 | 类别 | 当前状态 |
 | --- | --- |
-| 构建 | `125ada6` canonical 的 Debug/Release build-for-testing 通过；正式 Universal Release 打包未执行 |
+| 构建 | `125ada6` canonical 的 Debug/Release build-for-testing 通过；正式 Universal Release 由确切 main 归档的构建日志与 provenance 独立绑定 |
 | 自动测试 | `125ada6` 完整 canonical passed：627 XCTest/2 skip/0 fail、97 Tools、模型语料/四规模/两项 continuation 通过；较晚纯文档提交未重跑 |
-| 集成评审 | 静态 code/spec/architecture APPROVED，无 P0–P2，P3 F1 已接受；同一评审者补核最终验证仍待完成 |
-| GUI | 118 静态内容图已由协调代理审阅；真实屏幕 popup/material 仍未通过，物理键盘/hover/系统菜单/VoiceOver 有缺口 |
+| 集成评审 | code/spec/architecture APPROVED、canonical 补核 PASS，无 P0–P2，P3 F1 已接受；本次 UI/ICC 及正式文案由同一评审者补核 |
+| GUI | 118 静态图、14 张新增真实内容图及 v3 原图+ICC 补审已由协调代理验收；非用户亲自验收，物理键盘/hover/focus/系统菜单/VoiceOver/全屏真实性保留缺口 |
 | 真实 Photos/生产来源或数据库 | 本轮未执行；历史实测不标成本轮新测 |
 | 平台实机 | macOS13/14 与 Intel 本轮未运行；macOS13/Intel 按授权排除实机收尾门槛，最低版本与 Universal 构建要求保留 |
-| 签名及分发 | 本轮 release 包、tag、上传、安装/启动未执行；目标 ad-hoc，未 Developer ID、公证、stapling 或 Gatekeeper 验收 |
+| 签名及分发 | 确切 main 归档及实际 release 产物结果由 provenance/下载校验记录绑定；ad-hoc，未 Developer ID、公证、stapling 或 Gatekeeper 验收，本步骤不安装/启动生产 App |
 
-实际发行完成后由协调线程补录本次 main/tag/PR/release、包目录、验证与 provenance/DMG 哈希及限制；本页不使用占位成功或旧包校验值。
+实际交付的 main/tag/release、包目录、归档验证与 provenance/DMG 哈希由主线程核对并记录；本页不使用占位成功或旧包校验值。本步骤只提交正式文档，不执行 push、merge、package、tag 或 release。
