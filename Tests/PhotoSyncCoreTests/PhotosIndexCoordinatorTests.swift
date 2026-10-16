@@ -6,6 +6,34 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testSuccessfulInventoryConfirmsRequestWhileVectorsRemainPending() async throws {
+        let f = try fixture()
+        await f.photos.set([descriptor(f.photos.context)])
+        let receipt = await f.coordinator.libraryChanged(.fullReconcileRequired)
+        try await f.coordinator.reconcile()
+        let covered = await f.coordinator.reconciliationCovers(change: receipt)
+        XCTAssertTrue(covered)
+        let progress = await f.coordinator.progress()
+        XCTAssertEqual(progress.readyRepresentations, 0)
+        XCTAssertEqual(progress.totalRepresentations, 1)
+        try await assertNil(try await f.coordinator.readyToken())
+    }
+
+    func testPauseDuringFinalSnapshotDoesNotConfirmFullRequest() async throws {
+        let f = try fixture(), gate = CoordinatorGate()
+        await f.photos.set([])
+        let receipt = await f.coordinator.libraryChanged(.fullReconcileRequired)
+        await f.photos.gateSnapshot(4, using: gate)
+        let pass = Task { try await f.coordinator.reconcile() }
+        await gate.waitUntilEntered(); await f.coordinator.setPaused(true)
+        await gate.release(); _ = await pass.result
+        let covered = await f.coordinator.reconciliationCovers(change: receipt)
+        XCTAssertFalse(covered, "A pause in the successful path's final await must not confirm inventory")
+        await f.coordinator.setPaused(false); try await f.coordinator.reconcile()
+        let resumed = await f.coordinator.reconciliationCovers(change: receipt)
+        XCTAssertTrue(resumed)
+    }
+
     func testPendingContentCauseSurvivesLaterNeutralObservationBeforeMergedDelta() async throws {
         let rows = CoordinatorDiagnostics(), diagnostics = IndexDiagnostics(sink: { rows.record($0) })
         let f = try fixture(indexDiagnostics: diagnostics), d = descriptor(f.photos.context)

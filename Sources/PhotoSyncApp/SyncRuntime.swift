@@ -105,6 +105,7 @@ actor SyncRuntime {
     private var modelRecovery: Task<Void, Error>?
     private var manualModelRetryPending = false
     private var changePending = false
+    private var pendingFullChangeSerial: UInt64?
     private var indexEventPending = false
     private var pendingAdvancedScan = false
     private var nextProgressAt: Date?
@@ -606,32 +607,46 @@ actor SyncRuntime {
         await tick(force: true)
     }
 
-    private func libraryChanged(_ event: PhotosIndexChange) async {
+    func libraryChanged(_ event: PhotosIndexChange) async {
         indexEventPending = true
-        await advancedGraph?.coordinator.libraryChanged(event)
+        let receipt = await advancedGraph?.coordinator.libraryChanged(event)
         let name: String, count: Int?
         switch event {
         case .incremental(let delta): name = "incremental"; count = delta.changedAssetIDs.count + delta.deletedAssetIDs.count
-        case .fullReconcileRequired: name = "fullReconcileRequired"; count = nil; changePending = true
-        case .contextInvalidated: name = "contextInvalidated"; count = nil; changePending = true
+        case .fullReconcileRequired: name = "fullReconcileRequired"; count = nil
+        case .contextInvalidated: name = "contextInvalidated"; count = nil
+        }
+        if event == .fullReconcileRequired || event == .contextInvalidated {
+            if let receipt { pendingFullChangeSerial = max(pendingFullChangeSerial ?? receipt, receipt) }
+            else { changePending = true }
         }
         var fields = ["phase": "index-trigger", "trigger": "photos-event", "event": name, "unit": "eventAssetIDs"]
         fields["count"] = count.map(String.init)
         logger?.log(fields)
+        // The coordinator may finish a pass while this handler awaits its receipt.
+        await consumeCoveredFullChange()
         await tick()
+    }
+
+    private func consumeCoveredFullChange() async {
+        guard let receipt = pendingFullChangeSerial, let graph = advancedGraph else { return }
+        let covered = await graph.coordinator.reconciliationCovers(change: receipt)
+        // A newer event or forced request may arrive while the actor query waits.
+        // Only the captured event receipt is consumed; force and wake flags survive.
+        if covered && pendingFullChangeSerial == receipt { pendingFullChangeSerial = nil }
     }
 
     private func scheduleAdvancedWork(force: Bool) {
         guard let graph = advancedGraph else { return }
         if force { changePending = true }
-        let reconcile = schedule.requestPhotosReconciliation(now: now(), force: changePending)
+        let reconcile = schedule.requestPhotosReconciliation(now: now(), force: changePending || pendingFullChangeSerial != nil)
         guard advancedWork == nil else {
             // A due-work-only batch can be busy when a periodic reconcile becomes due.
             // Release a newly acquired schedule gate; explicit changes remain coalesced.
             if reconcile { schedule.finishedPhotosReconciliation() }
             return
         }
-        if reconcile { changePending = false }
+        if reconcile { changePending = false; pendingFullChangeSerial = nil }
         indexEventPending = false
         advancedWork = Task { await self.runAdvancedWork(graph, reconcile: reconcile) }
     }
@@ -670,11 +685,12 @@ actor SyncRuntime {
                 "readyAssets": String(p.readyAssets), "totalAssets": p.totalsKnown ? String(p.totalAssets) : "unknown"])
         }
         if !previousReady && publishedProgress?.state == .ready { pendingAdvancedScan = true }
+        await consumeCoveredFullChange()
         if reconcile { schedule.finishedPhotosReconciliation() }
         advancedWork = nil
         // A change delivered while busy is coalesced into one fresh batch. Zero legacy
         // reopens never marks that durable queue complete; the next existing tick retries it.
-        if changePending || indexEventPending { await tick() }
+        if changePending || pendingFullChangeSerial != nil || indexEventPending { await tick() }
         else if pendingAdvancedScan && round == nil { await tick(includeAdvanced: false) }
     }
 }

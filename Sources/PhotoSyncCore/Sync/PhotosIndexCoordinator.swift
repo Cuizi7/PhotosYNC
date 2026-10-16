@@ -26,6 +26,7 @@ public actor PhotosIndexCoordinator {
     private var needsReconciliation = true
     private var forceCacheInvalidation = true
     private var changeSerial: UInt64 = 0
+    private var reconciledChangeSerial: UInt64 = 0
     private var reconciledGeneration: Int?
     private var acknowledgedGeneration: Int?
     private var issue: String?
@@ -55,6 +56,7 @@ public actor PhotosIndexCoordinator {
         guard !paused else { throw CancellationError() }
         guard !reconciling else { throw PhotoKitGatewayError.libraryChanged }
         reconciling = true; acknowledgedGeneration = nil; pendingDelta = nil; pendingReinsertedIDs.removeAll()
+        let startChangeSerial = changeSerial
         let diagnostic = indexDiagnostics.operation("reconcile")
         let startedAt = ProcessInfo.processInfo.systemUptime
         var counts = IndexMutationCounts()
@@ -232,6 +234,11 @@ public actor PhotosIndexCoordinator {
             cloudWaiting = Dictionary(uniqueKeysWithValues: retainedCloudFailures.map { (Self.waitKey($0), $0) })
             modelWaiting = Dictionary(uniqueKeysWithValues: retainedModelFailures.map { (Self.waitKey($0), $0) })
             try await publishIfComplete()
+            // Inventory coverage is independent of all fingerprints being ready.
+            // Confirm only requests present before this pass, never later events.
+            if !paused && !needsReconciliation {
+                reconciledChangeSerial = max(reconciledChangeSerial, startChangeSerial)
+            }
         } catch {
             needsReconciliation = true; issue = "图库索引正在等待重新核对。"
             try? await store.invalidateIndexPublication()
@@ -471,12 +478,16 @@ public actor PhotosIndexCoordinator {
 
     /// Both runtime wakeups and this actor's subscription may deliver the same event.
     /// A fully covered incremental delivery is idempotent; gaps/overlap/overflow are full.
-    public func libraryChanged(_ event: PhotosIndexChange) async {
+    /// The receipt belongs only to this coordinator instance. It is not a Photos
+    /// generation, content revision or ready token, and must never be persisted.
+    @discardableResult
+    public func libraryChanged(_ event: PhotosIndexChange) async -> UInt64 {
         if case .incremental(let delta) = event, delta.isValid {
             let through = pendingDelta?.toGeneration ?? reconciledGeneration
-            if delta.context == reconciledContext, let through, delta.toGeneration <= through { return }
+            if delta.context == reconciledContext, let through, delta.toGeneration <= through { return changeSerial }
         }
         changeSerial &+= 1; acknowledgedGeneration = nil
+        let receipt = changeSerial
         switch event {
         case .incremental(let delta):
             if !needsReconciliation, !reconciling, delta.isValid, delta.context == reconciledContext,
@@ -484,7 +495,7 @@ public actor PhotosIndexCoordinator {
                 if pendingDelta == nil {
                     pendingDelta = delta
                     try? await store.invalidateIndexPublication()
-                    return
+                    return receipt
                 }
                 pendingReinsertedIDs.formUnion(Set(pendingDelta?.deletedAssetIDs ?? []).intersection(delta.changedAssetIDs))
                 var changed = Set(pendingDelta?.changedAssetIDs ?? [])
@@ -500,6 +511,13 @@ public actor PhotosIndexCoordinator {
             pendingDelta = nil; pendingReinsertedIDs.removeAll(); needsReconciliation = true
         }
         try? await store.invalidateIndexPublication()
+        return receipt
+    }
+
+    /// A completed full inventory covered this same-instance request. A failed or
+    /// currently invalid inventory cannot acknowledge it; pending vectors may remain.
+    public func reconciliationCovers(change receipt: UInt64) -> Bool {
+        !needsReconciliation && !reconciling && reconciledChangeSerial >= receipt
     }
 
     private func updateInventory() async throws {
