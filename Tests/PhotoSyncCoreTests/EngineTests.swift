@@ -5,6 +5,202 @@ import SQLite3
 @testable import PhotoSyncCore
 
 final class EngineTests: XCTestCase {
+    // Missing root admission used to fan one outage into a retry on every pending row.
+    func testUnavailableRootHoldsLargePendingQueueAndHealthySourceContinues() async throws {
+        let f = try await makeEngineFixture(sourceCount: 2)
+        let root = f.directories[0], id = f.sourceIDs[0]
+        for index in 0..<276 {
+            let name = "pending-\(index).jpg", url = root.appendingPathComponent("pending-\(index).jpg")
+            try FileManager.default.copyItem(at: root.appendingPathComponent("same.jpg"), to: url)
+            let file = SourceFile(sourceID: id, relativePath: name, url: url,
+                stamp: try await DirectoryReader().stamp(of: url),
+                metadata: try await MetadataReader().read(url: url, filename: name))
+            let recordID = try await f.store.save(file, decision: .importNew)
+            try await f.store.recordRetry(fileID: recordID, attemptID: nil, nextRetry: .distantPast,
+                error: "previous source read failure", definitelyNotCommitted: true)
+        }
+        let reader = RootOutageDirectory(sourceID: id, root: root, drop: .initial)
+        let rootGate = EngineTestGate()
+        await reader.holdRoot(rootGate)
+        let engine = SyncEngine(store: f.store, photos: f.photos,
+            directory: { source in
+                if source == id { return reader }; return DirectoryReader(sourceID: source) })
+        let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
+        let healthyImported = await engineEventually { await f.photos.createCount == 1 }
+        XCTAssertTrue(healthyImported)
+        let coldReads = await reader.stampCalls
+        XCTAssertEqual(coldReads, 0, "Cold-start pending waits for actual root evidence")
+        await rootGate.release(); await scan.value
+        let snapshot = await engine.snapshot(), reads = await reader.stampCalls
+        XCTAssertEqual(snapshot.sourceIssueDetails[id]?.map(\.path), [try SourceRegistry.normalizedURL(root).path])
+        XCTAssertNil(snapshot.sourceFileIssueCounts[id])
+        XCTAssertEqual(reads, 0)
+        XCTAssertEqual(snapshot.summary?.retryPending, 276)
+        XCTAssertEqual(snapshot.summary?.pending, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT SUM(retry_count) FROM file_record", at: f.databaseURL), 276)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_record WHERE last_error = 'previous source read failure'", at: f.databaseURL), 276)
+        XCTAssertEqual(snapshot.summary?.imported, 1)
+        XCTAssertNil(snapshot.blockingError)
+        await engine.scan(sourceIDs: [f.sourceIDs[1]])
+        let stillHeldReads = await reader.stampCalls
+        XCTAssertEqual(stillHeldReads, 0, "Other source rounds must not probe a held root's files")
+    }
+
+    func testOlderSuccessfulRootReadCannotReopenAfterNewerRootLoss() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], reader = RootOutageDirectory(sourceID: f.sourceIDs[0], root: f.directories[0], drop: .submissionStamp)
+        let failedStampGate = EngineTestGate(), olderRootGate = EngineTestGate()
+        await reader.holdDrop(failedStampGate)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        let first = Task { await engine.scan(sourceIDs: [id]) }
+        let stampHeld = await engineEventually { await failedStampGate.entered }
+        XCTAssertTrue(stampHeld)
+        await reader.holdNextRootResult(olderRootGate)
+        let second = Task { await engine.scan(sourceIDs: [id]) }
+        let oldSuccessHeld = await engineEventually { await olderRootGate.entered }
+        XCTAssertTrue(oldSuccessHeld)
+        await failedStampGate.release()
+        let outage = await engineEventually { await engine.snapshot().waitingSources[id]?.isSourceAvailability == true }
+        XCTAssertTrue(outage)
+        await olderRootGate.release(); await first.value; await second.value
+        let reads = await reader.stampCalls, snapshot = await engine.snapshot()
+        XCTAssertEqual(reads, 2, "An older root result cannot admit another child read after newer root loss")
+        XCTAssertEqual(snapshot.sourceIssueDetails[id]?.map(\.kind), [.sourceAvailability])
+        XCTAssertEqual(snapshot.summary?.pending, 1)
+        XCTAssertEqual(snapshot.summary?.retryPending, 0)
+    }
+
+    func testRootLossDuringScanConvergesBeforeReadingSiblingsAndRecovers() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let root = f.directories[0], id = f.sourceIDs[0]
+        for index in 0..<12 {
+            try FileManager.default.copyItem(at: root.appendingPathComponent("same.jpg"),
+                to: root.appendingPathComponent("sibling-\(index).jpg"))
+        }
+        let reader = RootOutageDirectory(sourceID: id, root: root, drop: .scanStamp)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: [id])
+        let unavailable = await engine.snapshot(), reads = await reader.stampCalls
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(unavailable.sourceIssueDetails[id]?.map(\.kind), [.sourceAvailability])
+        XCTAssertEqual(unavailable.latestScan.failedFiles, 0)
+        await reader.recover()
+        await engine.scan(sourceIDs: [id])
+        let restored = await engine.snapshot()
+        XCTAssertNil(restored.waitingSources[id])
+        XCTAssertEqual(restored.summary?.imported, 13)
+    }
+
+    func testRootLossDuringDrainPreservesPendingWithoutFileRetryAndResumes() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let root = f.directories[0], id = f.sourceIDs[0]
+        for index in 0..<12 {
+            try FileManager.default.copyItem(at: root.appendingPathComponent("same.jpg"),
+                to: root.appendingPathComponent("sibling-\(index).jpg"))
+        }
+        let reader = RootOutageDirectory(sourceID: id, root: root, drop: .submissionStamp)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: [id])
+        let unavailable = await engine.snapshot(), reads = await reader.stampCalls
+        XCTAssertEqual(reads, 14, "13 scan stamps then only the first failing pre-submit stamp")
+        XCTAssertEqual(unavailable.sourceIssueDetails[id]?.map(\.kind), [.sourceAvailability])
+        XCTAssertEqual(unavailable.summary?.pending, 13)
+        XCTAssertEqual(unavailable.summary?.retryPending, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT SUM(retry_count) FROM file_record", at: f.databaseURL), 0)
+        await reader.recover()
+        await engine.scan(sourceIDs: [id])
+        let restored = await engine.snapshot()
+        XCTAssertNil(restored.waitingSources[id])
+        XCTAssertEqual(restored.summary?.imported, 13)
+    }
+
+    func testConfirmedRootOutageUsesSourceRecoveryInsteadOfEarlierReadDeferral() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = f.directories[0]
+        try FileManager.default.copyItem(at: root.appendingPathComponent("same.jpg"), to: root.appendingPathComponent("second.jpg"))
+        let reader = RootOutageDirectory(sourceID: id, root: root, drop: .scanStamp)
+        await reader.deferFirstStamp()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: [id])
+        let snapshot = await engine.snapshot()
+        XCTAssertEqual(snapshot.waitingSources[id]?.kind, .sourceAvailability)
+        XCTAssertFalse(snapshot.deferredSources.contains(id), "Root outages must only use source recovery backoff")
+        XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+    }
+
+    func testRootProbeContentionDefersWithoutOutageOrRetryFanout() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = f.directories[0]
+        for index in 0..<12 {
+            try FileManager.default.copyItem(at: root.appendingPathComponent("same.jpg"),
+                to: root.appendingPathComponent("sibling-\(index).jpg"))
+        }
+        let reader = RootOutageDirectory(sourceID: id, root: root, drop: .submissionStamp)
+        await reader.deferRootProbe()
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await engine.scan(sourceIDs: [id])
+        let snapshot = await engine.snapshot(), reads = await reader.stampCalls
+        XCTAssertEqual(reads, 14, "A deferred root probe holds this source until its next source scan")
+        XCTAssertTrue(snapshot.deferredSources.contains(id))
+        XCTAssertNil(snapshot.waitingSources[id])
+        XCTAssertNil(snapshot.sourceIssueDetails[id])
+        XCTAssertEqual(snapshot.summary?.pending, 13)
+        XCTAssertEqual(snapshot.summary?.retryPending, 0)
+        XCTAssertEqual(snapshot.latestScan.failed, 0)
+        await reader.recover()
+        await engine.scan(sourceIDs: [id])
+        let recovered = await engine.snapshot()
+        XCTAssertEqual(recovered.summary?.imported, 13)
+    }
+
+    func testRootOutageCollapsesProjectionWithoutErasingIndependentFileEvidence() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = try SourceRegistry.normalizedURL(f.directories[0])
+        let file = try await engineSourceFile(sourceID: id, directory: root)
+        _ = try await f.store.save(file, decision: .importNew)
+        let reader = DiagnosticDirectory(sourceID: id)
+        await reader.setFileFailure(file.url, code: Int(EACCES))
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader }, now: { Date(timeIntervalSince1970: 100) })
+        await engine.scan(sourceIDs: [id])
+        let original = try await f.store.file(sourceID: id, relativePath: "same.jpg")
+        let originalError = try engineSQLString("SELECT last_error FROM file_record", at: f.databaseURL)
+        let originalDetails = await engine.snapshot().sourceIssueDetails[id]
+        XCTAssertEqual(originalDetails?.count, 2)
+        await reader.setFailure(root, code: Int(ENOENT))
+        await engine.scan(sourceIDs: [id])
+        let unavailable = await engine.snapshot()
+        XCTAssertEqual(unavailable.sourceIssueDetails[id]?.map(\.path), [root.path])
+        XCTAssertNil(unavailable.sourceFileIssueCounts[id])
+        let held = try await f.store.file(sourceID: id, relativePath: "same.jpg")
+        XCTAssertEqual(held?.retryCount, original?.retryCount)
+        XCTAssertEqual(try engineSQLString("SELECT last_error FROM file_record", at: f.databaseURL), originalError)
+        await reader.setFailure(root, code: nil)
+        await engine.scan(sourceIDs: [id])
+        let recoveredDetails = await engine.snapshot().sourceIssueDetails[id]
+        XCTAssertEqual(recoveredDetails, originalDetails, "Independent bad-file evidence returns after root recovery")
+    }
+
+    func testRootOutagePreservesAlreadyDispatchedSuccess() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let id = f.sourceIDs[0], root = f.directories[0], gate = EngineTestGate()
+        let reader = RootOutageDirectory(sourceID: id, root: root, drop: .never)
+        let engine = SyncEngine(store: f.store, photos: f.photos, directory: { _ in reader })
+        await f.photos.setCreationGate(gate)
+        let first = Task { await engine.scan(sourceIDs: [id]) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        await reader.disconnect()
+        let second = Task { await engine.scan(sourceIDs: [id]) }
+        let unavailable = await engineEventually { await engine.snapshot().waitingSources[id]?.isSourceAvailability == true }
+        XCTAssertTrue(unavailable)
+        await gate.release(); await first.value; await second.value
+        let record = try await f.store.file(sourceID: id, relativePath: "same.jpg")
+        XCTAssertEqual(record?.state, .imported)
+        XCTAssertEqual(record?.successID, "fake-1")
+        let creates = await f.photos.createCount
+        XCTAssertEqual(creates, 1)
+    }
+
     func testSourceIssueDetailsPreserveMixedDirectoriesFilesAndSubmission() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         let root = try SourceRegistry.normalizedURL(f.directories[0]), id = f.sourceIDs[0]
@@ -363,7 +559,6 @@ final class EngineTests: XCTestCase {
         let f = try await makeEngineFixture(sourceCount: 2)
         let missingSource = f.sourceIDs[0]
         let missing = try await engineSourceFile(sourceID: missingSource, directory: f.directories[0])
-        _ = try await f.store.save(missing, decision: .importNew)
         try FileManager.default.removeItem(at: missing.url)
         let scanGate = EngineTestGate()
         let stampGate = EngineTestGate()
@@ -374,6 +569,11 @@ final class EngineTests: XCTestCase {
             return DirectoryReader(sourceID: id)
         })
 
+        // Establish root evidence before exercising an overlapping held drain. Cold
+        // roots now intentionally forbid the pre-submit read this test needs to hold.
+        await engine.scan(sourceIDs: [missingSource])
+        _ = try await f.store.save(missing, decision: .importNew)
+        await heldReader.holdScan()
         let round = Task { await engine.scan(sourceIDs: f.sourceIDs) }
         let scanHeld = await engineEventually { await scanGate.entered }
         let drainHeld = await engineEventually { await stampGate.entered }
@@ -2047,13 +2247,18 @@ private struct FailingScanStampReader: DirectoryReading {
     }
 }
 
-private struct GatedMissingFileReader: DirectoryReading {
+private actor GatedMissingFileReader: DirectoryReading {
     let reader: DirectoryReader
     let scanGate: EngineTestGate
     let stampGate: EngineTestGate
+    private var holdsScan = false
+    init(reader: DirectoryReader, scanGate: EngineTestGate, stampGate: EngineTestGate) {
+        self.reader = reader; self.scanGate = scanGate; self.stampGate = stampGate
+    }
+    func holdScan() { holdsScan = true }
 
     func entries(in directory: URL) async throws -> [DirectoryEntry] {
-        await scanGate.wait()
+        if holdsScan { await scanGate.wait() }
         return try await reader.entries(in: directory)
     }
 
@@ -2235,6 +2440,7 @@ private actor Beta3SubmissionStampDirectory: DirectoryReading {
     private let reader: DirectoryReader
     private var scanStampsRemaining = 0
     private var failingSubmissionStamps = true
+    private var expectsRootProbe = false
 
     init(sourceID: UUID) {
         reader = DirectoryReader(sourceID: sourceID)
@@ -2245,7 +2451,8 @@ private actor Beta3SubmissionStampDirectory: DirectoryReading {
 
     func entries(in directory: URL) async throws -> [DirectoryEntry] {
         let entries = try await reader.entries(in: directory)
-        scanStampsRemaining += entries.filter { !$0.isDirectory && $0.failure == nil }.count
+        if expectsRootProbe { expectsRootProbe = false }
+        else { scanStampsRemaining += entries.filter { !$0.isDirectory && $0.failure == nil }.count }
         return entries
     }
 
@@ -2255,6 +2462,7 @@ private actor Beta3SubmissionStampDirectory: DirectoryReading {
             return try await reader.stamp(of: file)
         }
         if failingSubmissionStamps {
+            expectsRootProbe = true
             throw FixtureError.unavailable("submission stat unavailable")
         }
         return try await reader.stamp(of: file)
@@ -2366,5 +2574,61 @@ private struct DiagnosticPreparationModel: ImageFingerprinting {
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
         throw NSError(domain: "Fixture.Preparation", code: 8, userInfo: [NSLocalizedDescriptionKey: "preparation failed",
             NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: "preparation cause"])])
+    }
+}
+
+/// Real synthetic filesystem reads with faults only at root/file I/O boundaries.
+private actor RootOutageDirectory: DirectoryReading {
+    enum Drop: Sendable { case initial, scanStamp, submissionStamp, never }
+    private let reader: DirectoryReader
+    private let root: URL
+    private var drop: Drop
+    private var offline: Bool
+    private var scanStampsRemaining = 0
+    private var rootGate: EngineTestGate?
+    private var dropGate: EngineTestGate?
+    private var nextRootResultGate: EngineTestGate?
+    func holdDrop(_ gate: EngineTestGate) { dropGate = gate }
+    func holdNextRootResult(_ gate: EngineTestGate) { nextRootResultGate = gate }
+    private var defersRootProbe = false
+    private var defersFirstStamp = false
+    func deferFirstStamp() { defersFirstStamp = true }
+    func deferRootProbe() { defersRootProbe = true }
+    private(set) var stampCalls = 0
+    func holdRoot(_ gate: EngineTestGate) { rootGate = gate }
+    init(sourceID: UUID, root: URL, drop: Drop) {
+        reader = DirectoryReader(sourceID: sourceID); self.root = root; self.drop = drop
+        offline = drop == .initial
+    }
+    func disconnect() { offline = true }
+    func recover() { offline = false; drop = .never }
+    private func unavailable() -> NSError {
+        NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))])
+    }
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        if let rootGate { await rootGate.wait() }
+        if offline, defersRootProbe { throw ReadExecutorError.sourceBusy }
+        if offline { throw unavailable() }
+        let entries = try await reader.entries(in: directory)
+        if directory.resolvingSymlinksInPath().path == root.resolvingSymlinksInPath().path {
+            scanStampsRemaining = entries.filter { !$0.isDirectory }.count
+            if let gate = nextRootResultGate {
+                nextRootResultGate = nil
+                await gate.wait()
+            }
+        }
+        return entries
+    }
+    func stamp(of file: URL) async throws -> FileStamp {
+        stampCalls += 1
+        if defersFirstStamp, stampCalls == 1 { throw ReadExecutorError.sourceBusy }
+        if drop == .scanStamp || (drop == .submissionStamp && scanStampsRemaining == 0) {
+            if let dropGate { await dropGate.wait() }
+            offline = true
+        }
+        if offline { throw unavailable() }
+        scanStampsRemaining -= 1
+        return try await reader.stamp(of: file)
     }
 }

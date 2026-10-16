@@ -314,6 +314,11 @@ public actor SyncEngine {
     private var uncertainSubmissionErrors: [UUID: String] = [:]
     private var hasUncertainSubmissionBlock = false
     private var disabledSources: Set<UUID> = [] { didSet { refreshSubmissionState() } }
+    // Root admission is distinct from partial child-directory issues. Unknown roots
+    // cannot feed the shared pending drain until actual enumeration succeeds.
+    private var rootClosureRevisions: [UUID: UInt64] = [:]
+    private var verifiedRoots: Set<UUID> = [] { didSet { refreshSubmissionState() } }
+    private var unavailableRoots: [UUID: String] = [:] { didSet { refreshSubmissionState() } }
     private var removedSources: Set<UUID> = []
     private var rounds: [UUID: ScanRound] = [:]
     private var latestRoundID: UUID?
@@ -545,15 +550,29 @@ public actor SyncEngine {
             var lastFailure: String?
             scanLoop: while !directories.isEmpty, canScan(sourceID: sourceID) {
                 let folder = directories.removeFirst()
+                guard folder.relative.isEmpty || canReadSource(sourceID) else {
+                    directoryTraversalComplete = false
+                    break scanLoop
+                }
+                let rootClosureRevision = rootClosureRevisions[sourceID, default: 0]
                 do {
                     let entries = try await reader.entries(in: folder.url)
                     guard canScan(sourceID: sourceID) else {
                         directoryTraversalComplete = false
                         break scanLoop
                     }
+                    if folder.relative.isEmpty {
+                        guard rootClosureRevision == rootClosureRevisions[sourceID, default: 0] else {
+                            directoryTraversalComplete = false
+                            break scanLoop
+                        }
+                        verifiedRoots.insert(sourceID)
+                        unavailableRoots.removeValue(forKey: sourceID)
+                    }
+                    guard canReadSource(sourceID) else { directoryTraversalComplete = false; break scanLoop }
                     resolveDirectoryDiagnostic(sourceID, path: folder.url.path, runID: run)
                     for entry in entries {
-                        guard canScan(sourceID: sourceID) else {
+                        guard canReadSource(sourceID) else {
                             directoryTraversalComplete = false
                             break scanLoop
                         }
@@ -570,6 +589,9 @@ public actor SyncEngine {
                             // Resource attributes failed before the reader knew whether this
                             // entry was a file or a directory. Its descendants may be unvisited.
                             directoryTraversalComplete = false
+                            if try await holdSourceIfRootUnavailable(source, reader: reader, roundID: roundID, runID: run) {
+                                break scanLoop
+                            }
                             if classification == "image" || classification == "video" {
                                 checked += 1
                                 recordCandidateChecked(roundID)
@@ -594,12 +616,12 @@ public actor SyncEngine {
                         var readStage = "读取文件属性"
                         do {
                             let stamp = try await reader.stamp(of: entry.url)
-                            guard canScan(sourceID: sourceID) else {
+                            guard canReadSource(sourceID) else {
                                 directoryTraversalComplete = false
                                 break scanLoop
                             }
                             if let old = try await store.file(sourceID: sourceID, relativePath: relative) {
-                                guard canScan(sourceID: sourceID) else {
+                                guard canReadSource(sourceID) else {
                                     directoryTraversalComplete = false
                                     break scanLoop
                                 }
@@ -616,7 +638,7 @@ public actor SyncEngine {
                             }
                             readStage = "读取媒体元数据"
                             let info = try await metadataReader.read(url: entry.url, filename: entry.url.lastPathComponent)
-                            guard canScan(sourceID: sourceID) else {
+                            guard canReadSource(sourceID) else {
                                 directoryTraversalComplete = false
                                 break scanLoop
                             }
@@ -632,7 +654,7 @@ public actor SyncEngine {
                             break scanLoop
                         }
                         catch {
-                            guard canScan(sourceID: sourceID) else {
+                            guard canReadSource(sourceID) else {
                                 directoryTraversalComplete = false
                                 break scanLoop
                             }
@@ -641,6 +663,10 @@ public actor SyncEngine {
                                 // Leave all persisted scan-run failure fields untouched.
                                 recordDeferral(roundID, sourceID: sourceID)
                             } else {
+                                if try await holdSourceIfRootUnavailable(source, reader: reader, roundID: roundID, runID: run) {
+                                    directoryTraversalComplete = false
+                                    break scanLoop
+                                }
                                 failed += 1
                                 lastFailure = error.localizedDescription
                                 recordRoundFailure(roundID, fileLevel: true)
@@ -656,27 +682,36 @@ public actor SyncEngine {
                     directoryTraversalComplete = false
                     guard canScan(sourceID: sourceID) else { break scanLoop }
                     if SourceIssueText.isReadContention(error) {
+                        if folder.relative.isEmpty { closeRootAdmission(sourceID) }
                         recordDeferral(roundID, sourceID: sourceID)
                     } else {
+                        if !folder.relative.isEmpty,
+                           try await holdSourceIfRootUnavailable(source, reader: reader, roundID: roundID, runID: run) {
+                            break scanLoop
+                        }
                         failed += 1
                         lastFailure = error.localizedDescription
                         recordRoundFailure(roundID)
+                        if folder.relative.isEmpty {
+                            recordRootUnavailable(source, runID: run, error: error)
+                            break scanLoop
+                        }
                         setSourceIssue(sourceID, key: Self.directoryScanIssueKey,
                                        issue: SourceIssueText.directoryUnavailable(sourceURL: source.url, failingURL: folder.url,
-                                                                                   isRoot: folder.relative.isEmpty, error: error),
+                                                                                   isRoot: false, error: error),
                                        path: folder.url.path, stage: "枚举目录", runID: run, error: error)
                         logFailureOnce(phase: "directory", sourceID: sourceID, runID: run, path: folder.url.path, stage: "枚举目录", error: error)
                     }
                 }
             }
-            if !directories.isEmpty || !canScan(sourceID: sourceID) {
+            if !directories.isEmpty || !canReadSource(sourceID) {
                 directoryTraversalComplete = false
             }
-            if directoryTraversalComplete && directories.isEmpty && canScan(sourceID: sourceID) {
+            if directoryTraversalComplete && directories.isEmpty && canReadSource(sourceID) {
                 // File metadata failures do not make directory enumeration incomplete. A missing
                 // pending file is normal source deletion only after every directory answered.
                 for (relative, fileID) in unseenPending.sorted(by: { $0.key < $1.key }) {
-                    guard canScan(sourceID: sourceID) else { break }
+                    guard canReadSource(sourceID) else { break }
                     if try await store.removeConfirmedAbsentPending(fileID: fileID) {
                         resolveSourceIssue(sourceID, key: issueKey(for: fileID), runID: run,
                                            fileID: fileID, announceRecovery: false)
@@ -688,21 +723,24 @@ public actor SyncEngine {
                 }
                 // Absence of an unstored failed file is proven only by a complete, non-deferred
                 // round. Normal deletion closes its diagnostic without a recovery notification.
-                if canScan(sourceID: sourceID), !status.deferredSources.contains(sourceID) {
+                if canReadSource(sourceID), !status.deferredSources.contains(sourceID) {
                     for key in unseenScanIssueKeys.sorted() {
                         resolveSourceIssue(sourceID, key: key, runID: run, announceRecovery: false)
                     }
                 }
-                if canScan(sourceID: sourceID) {
+                if canReadSource(sourceID) {
                     resolveSourceIssue(sourceID, key: Self.directoryScanIssueKey, runID: run)
                 }
             }
             if let run {
                 let deferred = status.deferredSources.contains(sourceID)
-                let complete = failed == 0 && canScan(sourceID: sourceID)
+                let complete = failed == 0 && canReadSource(sourceID)
                 try await store.finishScan(runID: run, now: now(), complete: complete, checked: checked, failed: failed, error: lastFailure)
                 if !complete { interruptRound(roundID) }
-                if complete && !deferred {
+                // The drain can learn root loss while finishScan suspends this actor.
+                // A completed traversal must not erase that newer outage or normal wait.
+                if complete && !deferred && canReadSource(sourceID) && verifiedRoots.contains(sourceID)
+                    && !status.deferredSources.contains(sourceID) {
                     resolveScanIssues(sourceID, runID: run)
                     status.deferredSources.remove(sourceID)
                     status.advancedWaitingReasons.removeValue(forKey: sourceID)
@@ -805,7 +843,8 @@ public actor SyncEngine {
                 cursor = record.createdOrder
                 let context = SubmissionContext(roundID: roundID, runID: runID(for: record.file.sourceID, roundID: roundID))
                 guard canSubmit(sourceID: record.file.sourceID) else { continue }
-                guard try await store.source(id: record.file.sourceID).enabled else { continue }
+                let source = try await store.source(id: record.file.sourceID)
+                guard source.enabled, canSubmit(sourceID: source.id) else { continue }
                 if let retry = record.nextRetryAt, retry > now() { continue }
                 do {
                     let stamp = try await directory(record.file.sourceID).stamp(of: record.file.url)
@@ -833,6 +872,10 @@ public actor SyncEngine {
                         // let the independent source deferral schedule bring it back.
                         recordDeferral(context.roundID, sourceID: record.file.sourceID)
                     } else {
+                        if try await holdSourceIfRootUnavailable(source, reader: directory(source.id),
+                                                                 roundID: context.roundID, runID: context.runID) {
+                            continue
+                        }
                         let message = error.localizedDescription
                         // Nothing was submitted. A concurrent scan may supersede this file
                         // during either the stamp read or retry write. Reserve publication
@@ -860,7 +903,7 @@ public actor SyncEngine {
                     }
                     continue
                 }
-                guard canSubmit(sourceID: record.file.sourceID) else { break }
+                guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
                 var photoSnapshot: PhotosCandidateSnapshot
                 var advanced: AdvancedPreparation?
                 if record.file.metadata.kind == .image && usesAdvancedDedup {
@@ -872,6 +915,14 @@ public actor SyncEngine {
                     do { preparation = try await advancedDedup.prepare(fileID: record.id, file: record.file) }
                     catch let error as SyncStoreError { throw error }
                     catch {
+                        if SourceIssueText.isReadContention(error) {
+                            recordDeferral(context.roundID, sourceID: source.id)
+                            continue
+                        }
+                        if try await holdSourceIfRootUnavailable(source, reader: directory(source.id),
+                                                                 roundID: context.roundID, runID: context.runID) {
+                            continue
+                        }
                         // Preparation is still known not to have sent a Photos request.
                         // Share the single drain reservation so source-change resolution
                         // during retry persistence cancels this failure publication too.
@@ -920,7 +971,7 @@ public actor SyncEngine {
                         break
                     }
                     var local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
-                    guard canSubmit(sourceID: record.file.sourceID) else { break }
+                    guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
                     var candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
                     var decision = policy.evaluate(record.file.metadata, candidates: candidates)
                     var evidence = matchingCandidates(decision, candidates: candidates)
@@ -968,9 +1019,9 @@ public actor SyncEngine {
                         break
                     }
                 }
-                guard canSubmit(sourceID: record.file.sourceID) else { break }
+                guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
-                guard canSubmit(sourceID: record.file.sourceID) else { break }
+                guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
                 let attempt = UUID()
                 activeAttempt = attempt
                 do {
@@ -1004,7 +1055,7 @@ public actor SyncEngine {
                         try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: now(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
                     }
                     activeAttempt = nil
-                    break
+                    continue
                 }
                 do {
                     let submissionStarted = ProcessInfo.processInfo.systemUptime
@@ -1118,7 +1169,7 @@ public actor SyncEngine {
     private func refreshSubmissionState() {
         submissionState.update(paused: status.isPaused,
             blocked: storageFailed || status.blockingError != nil || !uncertainSubmissions.isEmpty,
-            disabled: disabledSources)
+            disabled: disabledSources.union(unavailableRoots.keys), verified: verifiedRoots)
     }
 
     private func recordAdvancedWait(_ reason: String, record: StoredFile, context: SubmissionContext) {
@@ -1158,11 +1209,54 @@ public actor SyncEngine {
     }
 
     private func canSubmit(sourceID: UUID) -> Bool {
-        !status.isPaused && !storageFailed && status.blockingError == nil && uncertainSubmissions.isEmpty && !disabledSources.contains(sourceID)
+        !status.isPaused && !storageFailed && status.blockingError == nil && uncertainSubmissions.isEmpty && !disabledSources.contains(sourceID) && verifiedRoots.contains(sourceID) && unavailableRoots[sourceID] == nil
     }
 
     private func canScan(sourceID: UUID) -> Bool {
         !status.isPaused && !storageFailed && status.blockingError == nil && !disabledSources.contains(sourceID)
+    }
+
+    private func canReadSource(_ sourceID: UUID) -> Bool {
+        canScan(sourceID: sourceID) && unavailableRoots[sourceID] == nil
+    }
+
+    private func closeRootAdmission(_ sourceID: UUID) {
+        rootClosureRevisions[sourceID, default: 0] &+= 1
+        verifiedRoots.remove(sourceID)
+    }
+
+    private func recordRootUnavailable(_ source: RegisteredSource, runID: UUID?, error: Error) {
+        closeRootAdmission(source.id)
+        unavailableRoots[source.id] = source.url.path
+        status.deferredSources.remove(source.id)
+        setSourceIssue(source.id, key: Self.directoryScanIssueKey,
+                       issue: SourceIssueText.directoryUnavailable(sourceURL: source.url, failingURL: source.url, isRoot: true, error: error),
+                       path: source.url.path, stage: "枚举目录", runID: runID, error: error)
+        logFailureOnce(phase: "directory", sourceID: source.id, runID: runID,
+                       path: source.url.path, stage: "枚举目录", error: error)
+    }
+
+    /// A failed child read alone cannot prove root loss. Probe through the same bounded
+    /// reader; a logical timeout only defers this round and never becomes outage evidence.
+    private func holdSourceIfRootUnavailable(_ source: RegisteredSource, reader: any DirectoryReading,
+                                             roundID: UUID, runID: UUID?) async throws -> Bool {
+        guard canReadSource(source.id) else { return true }
+        do {
+            _ = try await reader.entries(in: source.url)
+            return !canReadSource(source.id)
+        } catch {
+            guard canReadSource(source.id) else { return true }
+            if SourceIssueText.isReadContention(error) {
+                closeRootAdmission(source.id)
+                recordDeferral(roundID, sourceID: source.id)
+            } else {
+                recordRootUnavailable(source, runID: runID, error: error)
+                recordRoundFailure(roundID)
+                interruptRound(roundID)
+                if let runID { try await store.recordScanFailure(runID: runID, error: error.localizedDescription) }
+            }
+            return true
+        }
     }
 
     private func nextRetry(for record: StoredFile) -> Date {
@@ -1271,7 +1365,13 @@ public actor SyncEngine {
     private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil,
                                        attemptID: UUID? = nil, error: Error?, announceRecovery: Bool = true) {
         guard !removedSources.contains(sourceID) else { return }
-        let issues = sourceIssues[sourceID] ?? [:]
+        var issues = sourceIssues[sourceID] ?? [:]
+        if let root = unavailableRoots[sourceID], let directory = issues[Self.directoryScanIssueKey],
+           let diagnostic = directory.diagnostics["\(Self.directoryScanIssueKey):\(root)"] {
+            issues = [Self.directoryScanIssueKey: TrackedSourceIssue(
+                primary: SourceIssue(summary: diagnostic.summary, detail: diagnostic.detail, kind: diagnostic.kind),
+                diagnostics: [diagnostic.id: diagnostic])]
+        }
         let diagnostics = issues.values.flatMap { $0.diagnostics.values }.sorted(by: Self.diagnosticOrder)
         if diagnostics.isEmpty { status.sourceIssueDetails.removeValue(forKey: sourceID) }
         else { status.sourceIssueDetails[sourceID] = diagnostics }
@@ -1312,6 +1412,8 @@ public actor SyncEngine {
     }
 
     private func clearRemovedSourceStatus(_ sourceID: UUID) {
+        closeRootAdmission(sourceID)
+        unavailableRoots.removeValue(forKey: sourceID)
         status.sourcePhases.removeValue(forKey: sourceID)
         status.waitingSources.removeValue(forKey: sourceID)
         status.sourceFileIssueCounts.removeValue(forKey: sourceID)
@@ -1405,6 +1507,7 @@ public actor SyncEngine {
     /// unreadable file, and never notifies. It only marks the round so the UI can say "稍后继续"
     /// and so the source is retried shortly.
     private func recordDeferral(_ roundID: UUID, sourceID: UUID) {
+        guard unavailableRoots[sourceID] == nil else { return }
         status.deferredSources.insert(sourceID)
         updateRound(roundID) {
             $0.progress.deferred = true
@@ -1524,11 +1627,12 @@ private final class EngineSubmissionState: @unchecked Sendable {
     private let lock = NSLock()
     private var paused = false, blocked = false
     private var disabled: Set<UUID> = []
-    func update(paused: Bool, blocked: Bool, disabled: Set<UUID>) {
-        lock.lock(); self.paused = paused; self.blocked = blocked; self.disabled = disabled; lock.unlock()
+    private var verified: Set<UUID> = []
+    func update(paused: Bool, blocked: Bool, disabled: Set<UUID>, verified: Set<UUID>) {
+        lock.lock(); self.paused = paused; self.blocked = blocked; self.disabled = disabled; self.verified = verified; lock.unlock()
     }
     func allows(_ source: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return !paused && !blocked && !disabled.contains(source)
+        return !paused && !blocked && !disabled.contains(source) && verified.contains(source)
     }
 }

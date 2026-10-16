@@ -405,6 +405,7 @@ actor SyncRuntime {
         }
         guard let engine else { return }
         if includeAdvanced { scheduleAdvancedWork(force: force) }
+        let explicitForce = force
         let force = force || pendingAdvancedScan
         let now = now()
         if round != nil {
@@ -416,7 +417,17 @@ actor SyncRuntime {
         let ids: [UUID]
         if force {
             guard schedule.requestNow(now: now) else { return }
-            ids = Array(enabled)
+            // Index readiness reopens healthy work, but is not a manual request to
+            // bypass an unavailable source's recovery deadline.
+            let due = Set(schedule.dueRecoverySources(now: now)).intersection(enabled)
+            let unavailableRoots = Set(state.sources.compactMap { source -> UUID? in
+                let rootIssue = state.snapshot.sourceIssueDetails[source.id]?.contains {
+                    $0.kind == .sourceAvailability && $0.path == source.url.path
+                } == true
+                return rootIssue ? source.id : nil
+            })
+            ids = explicitForce ? Array(enabled)
+                : Array(enabled.subtracting(registeredFailures.intersection(unavailableRoots)).union(due))
         } else if schedule.request(now: now) {
             let due = Set(schedule.dueRecoverySources(now: now)).intersection(enabled)
             ids = Array(enabled.subtracting(registeredFailures).union(due))
@@ -491,7 +502,7 @@ actor SyncRuntime {
         }
         schedule.finished(now: now())
         round = nil
-        if pendingAdvancedScan { await tick(force: true, includeAdvanced: false) }
+        if pendingAdvancedScan { await tick(includeAdvanced: false) }
     }
 
     private var eligibleForWork: Bool {
