@@ -7,6 +7,110 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testAdmissionRetainsDrainingOwnerThenStallsAndLateDuplicateTerminalReleasesOnce() async throws {
+        let releasedSignal = expectation(description: "physical lease released exactly once")
+        let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "lease-released" { releasedSignal.fulfill() } })
+        let clock = RepresentationClock(), requester = ControlledRepresentationRequester()
+        let c = try configuration(timeout: 0.01), budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, monotonic: { clock.now }, indexDiagnostics: diagnostic)
+        let work = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started()
+        let busy = await reader.admission(); XCTAssertEqual(busy, .busy)
+        do { _ = try await work.value; XCTFail("logical timeout") } catch { XCTAssertEqual(error as? ReadExecutorError, .timedOut) }
+        let draining = await reader.admission(); XCTAssertEqual(draining, .draining)
+        clock.now = 59
+        for _ in 0..<100 { let state = await reader.admission(); XCTAssertEqual(state, .draining) }
+        clock.now = 60
+        let stalled = await reader.admission(); XCTAssertEqual(stalled, .stalled)
+        let occupied = await budget.snapshot(); XCTAssertEqual(occupied.images, 1)
+        requester.send(.cancelled); requester.send(.cancelled)
+        await fulfillment(of: [releasedSignal], timeout: 2)
+        let available = await reader.admission(); XCTAssertEqual(available, .available)
+        let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+    }
+
+    func testAdmissionBlocksAfterTerminalUntilSuccessfulConsumerLeaseFinishes() async throws {
+        let requester = ControlledRepresentationRequester(), c = try configuration()
+        let budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c)
+        let work = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); requester.send(.image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame))
+        let loaded = try await work.value
+        let active = await reader.physicalRequestCount; XCTAssertEqual(active, 0)
+        let held = await reader.admission(); XCTAssertEqual(held, .busy)
+        await loaded.lease.finishPhysicalWork()
+        let available = await reader.admission(); XCTAssertEqual(available, .available)
+    }
+
+    func testLateRequestAndConsumerLeaseKeepOriginalIssuanceAfterReplacement() async throws {
+        for heldLease in [false, true] {
+            for changedDescriptor in [false, true] {
+                let released = expectation(description: "old lease physically released")
+                let rows = RepresentationDiagnosticRows(), diagnostic = IndexDiagnostics(sink: {
+                    rows.append($0)
+                    if $0["event"] == "lease-released" { released.fulfill() }
+                })
+                let requester = ControlledRepresentationRequester(), c = try configuration(timeout: heldLease ? 30 : 0.01)
+                let budget = ImageWorkBudget(limits: c.resources), original = descriptor()
+                func issuance(_ descriptor: RepresentationDescriptor, generation: Int64) -> RepresentationTask {
+                    .init(descriptor: descriptor, retryCount: 0, nextRetryAt: nil,
+                        fingerprintVersion: c.fingerprint.version, indexGeneration: generation)
+                }
+                diagnostic.operation("work").record(["phase": "index-task", "event": "attempt"], task: issuance(original, generation: 1))
+                let oldHandle = try XCTUnwrap(rows.values.last?["issuanceHandle"])
+                let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, indexDiagnostics: diagnostic)
+                let work = Task { try await reader.read(original, isCurrent: { true }) }
+                await requester.started()
+                var loaded: LoadedRepresentation?
+                if heldLease {
+                    requester.send(.image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame))
+                    loaded = try await work.value
+                } else {
+                    await requester.cancellationRequested()
+                    do { _ = try await work.value; XCTFail("timeout") } catch { XCTAssertEqual(error as? ReadExecutorError, .timedOut) }
+                }
+                let replacement = RepresentationDescriptor(key: original.key, context: original.context,
+                    revision: changedDescriptor ? "replacement" : original.revision, size: original.size,
+                    equivalentToOriginal: original.equivalentToOriginal, revisionIsReliable: original.revisionIsReliable)
+                diagnostic.operation("work").record(["phase": "index-task", "event": "attempt"], task: issuance(replacement, generation: 2))
+                let newHandle = try XCTUnwrap(rows.values.last?["issuanceHandle"])
+                XCTAssertNotEqual(oldHandle, newHandle)
+                if heldLease { await loaded!.lease.finishPhysicalWork(); loaded = nil }
+                else { requester.send(.cancelled) }
+                await fulfillment(of: [released], timeout: 2)
+                let events = rows.values.filter { $0["phase"] == "photos-reader" }
+                XCTAssertTrue(events.contains { $0["event"] == "lease-released" })
+                XCTAssertTrue(events.allSatisfy { $0["issuanceHandle"] == oldHandle }, "old callbacks cannot consult replacement identity")
+                XCTAssertEqual(Set(events.compactMap { $0["descriptorHandle"] }).count, 1)
+                let physical = await budget.snapshot(); XCTAssertEqual(physical.images, 0)
+            }
+        }
+    }
+
+    func testAnonymousReaderLifecycleJoinsTaskIssuanceAndReleasesOnlyOnce() async throws {
+        let rows = RepresentationDiagnosticRows(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
+        let requester = ControlledRepresentationRequester(), c = try configuration()
+        let budget = ImageWorkBudget(limits: c.resources)
+        let descriptor = RepresentationDescriptor(key: .init(assetID: "PRIVATE-ID-SENTINEL", kind: .original),
+            context: .init(id: UUID(), epoch: 1), revision: "PRIVATE-EXIF-PATH-SENTINEL", size: nil, equivalentToOriginal: false, revisionIsReliable: true)
+        let task = RepresentationTask(descriptor: descriptor, retryCount: 0, nextRetryAt: nil,
+            fingerprintVersion: c.fingerprint.version, indexGeneration: 1, issuanceRevision: "PRIVATE-ISSUANCE-SENTINEL")
+        diagnostic.operation("work").record(["phase": "index-task", "event": "attempt"], task: task)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, indexDiagnostics: diagnostic)
+        let read = Task { try await reader.read(descriptor, isCurrent: { true }) }
+        await requester.started()
+        requester.send(.failure(NSError(domain: NSCocoaErrorDomain, code: -1)))
+        do { _ = try await read.value; XCTFail("terminal failure expected") } catch {}
+        requester.send(.failure(NSError(domain: NSCocoaErrorDomain, code: -1)))
+        diagnostic.flushObservations()
+        let events = rows.values.filter { $0["phase"] == "photos-reader" }
+        XCTAssertEqual(events.compactMap { $0["event"] }, ["admission", "request", "terminal", "drain", "lease-released"])
+        XCTAssertEqual(Set(events.compactMap { $0["issuanceHandle"] }), Set(rows.values.filter { $0["phase"] == "index-task" }.compactMap { $0["issuanceHandle"] }))
+        let physical = await budget.snapshot(); XCTAssertEqual(physical.images, 0)
+        let output = String(decoding: try JSONSerialization.data(withJSONObject: rows.values), as: UTF8.self)
+        XCTAssertFalse(output.contains("PRIVATE-"))
+    }
+
     func testEncodedStreamUsesIdenticalSourceTensorAndUnappliedOrientation() async throws {
         let configuration = try p8Configuration()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -374,9 +478,11 @@ final class PhotosRepresentationTests: XCTestCase {
     }
 
     func testTimeoutAfterChunksKeepsPhysicalRequestUntilLateTerminal() async throws {
+        let releasedSignal = expectation(description: "physical lease released")
+        let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "lease-released" { releasedSignal.fulfill() } })
         let requester = ControlledRepresentationRequester()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(timeout: 0.01))
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(timeout: 0.01), indexDiagnostics: diagnostic)
         let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
         await requester.started()
         requester.send(.chunk(Data()))
@@ -385,10 +491,7 @@ final class PhotosRepresentationTests: XCTestCase {
         let occupied = await reader.physicalRequestCount
         XCTAssertEqual(occupied, 1)
         requester.send(.cancelled)
-        for _ in 0..<10_000 {
-            if await budget.snapshot().images == 0 { break }
-            await Task.yield()
-        }
+        await fulfillment(of: [releasedSignal], timeout: 2)
         let released = await budget.snapshot()
         XCTAssertEqual(released.images, 0)
     }
@@ -1114,4 +1217,19 @@ private struct ValidationFailingRepresentationRequester: PhotosRepresentationReq
 private final class CyclicRepresentationCallbackError: NSError, @unchecked Sendable {
     override var userInfo: [String: Any] { [NSUnderlyingErrorKey: self] }
     override var description: String { "synthetic cyclic callback" }
+}
+
+private final class RepresentationDiagnosticRows: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [[String: String]] = []
+    func append(_ row: [String: String]) { lock.lock(); rows.append(row); lock.unlock() }
+    var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return rows }
+}
+
+private final class RepresentationClock: @unchecked Sendable {
+    private let lock = NSLock(); private var value: TimeInterval = 0
+    var now: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
+    }
 }

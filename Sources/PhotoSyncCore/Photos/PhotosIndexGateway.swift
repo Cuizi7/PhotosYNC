@@ -103,6 +103,17 @@ public struct PhotosCatalogChangeBatch: Sendable {
     }
 }
 
+/// Advisory, level-triggered capacity of the physical reader and shared image budget.
+/// Polling never reserves capacity or cancels/releases physical work. Available is
+/// only an observation; a later read can still lose the capacity race. Busy includes
+/// requests, cleanup and consumer-held shared-budget leases. Draining means logical
+/// waiting ended while physical request/cleanup ownership remains. Stalled means
+/// draining lasted at least 60 monotonic seconds, without forced release or a
+/// guarantee of recovery if the system never completes the request.
+public enum PhotosReaderAdmission: String, Equatable, Sendable {
+    case available, busy, draining, stalled
+}
+
 public protocol PhotosIndexGateway: PhotosGateway {
     func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession
     func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage
@@ -139,6 +150,13 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// advances independently. Publish/acknowledge only complete ready facts.
     func representationDelta(_ delta: PhotosIndexDelta) async throws -> RepresentationPage
     func changes() -> AsyncStream<PhotosIndexChange>
+    /// Return a prompt, non-reserving advisory snapshot; do not wait for a slot.
+    /// Include physical ownership, pending cleanup and consumer-held shared-budget
+    /// leases, even when the active request set is empty. Recheck ownership after
+    /// awaits. Callers poll on runtime ticks and must still handle capacity errors
+    /// from a later read: `.available` is not an acquisition guarantee. Polling must
+    /// not claim, cancel or release work; draining/stalled retain physical ownership.
+    func representationReadAdmission() async -> PhotosReaderAdmission
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation
     /// Capture BEFORE the complete catalog acquisition; nil means no resumable
     /// checkpoint is available. The caller persists a nonnil value only alongside
@@ -258,6 +276,9 @@ public struct LibraryResumeCheckpoint: Codable, Equatable, Sendable {
 }
 
 public extension PhotosIndexGateway {
+    /// Convenience only for resource-free fakes. Real adapters must report their
+    /// actual reader/shared-budget capacity, including cleanup and held leases.
+    func representationReadAdmission() async -> PhotosReaderAdmission { .available }
     func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession { .init(baselineGeneration: expectedGeneration) }
     func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage {
         try await representationCatalog(offset: offset, limit: limit, expectedGeneration: session.baselineGeneration)

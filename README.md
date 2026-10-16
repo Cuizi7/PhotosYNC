@@ -2,11 +2,13 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.2 stable
+## 0.2.3 stable
 
-0.2.2 fixes two details gaps: source rows summarize all current unresolved issues and open complete diagnostics, and the sync details popover shows the same gallery-analysis state and asset progress as the main menu. Directory recovery retains its existing complete-traversal boundary; video failures retain their actual metadata-read stage and system cause. This adds no video support, database migration, model or threshold change, permission change, or new dependency. Schema remains v8.
+0.2.3 (build 11) corrects gallery-index retry deadlines to use the actual failure time, processes work in fair finite slices, and waits for physical reader and shared-budget capacity before admitting more work. A timed-out read retains its owner until real completion; after 60 monotonic seconds it shows an aggregate stalled wait. Later runtime ticks resume after actual cleanup and lease release. A system request that never completes has no guaranteed automatic recovery.
 
-Canonical validation passed on frozen `125ada6`; integrated code/spec/architecture review and its final evidence reconciliation are approved, with no P0–P2 findings. The coordinator agent has accepted the new native UI content and controlled popup/material evidence; this is coordinator review, not personal user acceptance. Physical hover/focus, VoiceOver, actual MenuBarExtra interaction and full-display backdrop fidelity retain disclosed limits. Final release source and artifact identities come from the exact-main archive’s provenance and validation records. See [0.2.2 release notes](docs/release/0.2.2.md) and the [validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md). [0.2.1 notes](docs/release/0.2.1.md) and historical evidence are retained.
+Bounded anonymous causal diagnostics link history/live events, invalidation, task attempts and physical request/lease lifetimes within a run. Up to eight sticky sample assets receive capped detail; neutral events and unchanged polling states are coalesced. This does not establish the root cause or fix repeated conservative history invalidation, and it does not guarantee whole-log retention under arbitrary error traffic. Schema remains v8 with no new migration or cleanup; import success history remains protected. See [0.2.3 release notes](docs/release/0.2.3.md) and the [approved scope](docs/superpowers/specs/2026-10-16-index-recovery-023.md).
+
+A release requires independent integrated review and full candidate validation to pass. Focused checks alone do not establish final acceptance; exact-main archive validation and the resulting package's provenance bind the final source and complete results. [0.2.2 notes](docs/release/0.2.2.md), its [validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md), and earlier evidence are retained. This iteration adds no real Photos/production or macOS 13/Intel hardware evidence.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -30,12 +32,13 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Release configuration: **0.2.2 stable (build 10)**, targeting
-`outputs/releases/0.2.2/`; see [release notes](docs/release/0.2.2.md)
+Release configuration: **0.2.3 stable (build 11)**, targeting
+`outputs/releases/0.2.3/`; see [release notes](docs/release/0.2.3.md)
 and the [changelog](CHANGELOG.md).
 The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
+[0.2.2 stable build 10](docs/release/0.2.2.md),
 [0.2.1 stable build 9](docs/release/0.2.1.md),
 [0.2.0 stable build 8](docs/release/0.2.0.md) and
 [0.2.0 beta build 7](docs/release/0.2.0-beta.md) notes and artifacts are retained.

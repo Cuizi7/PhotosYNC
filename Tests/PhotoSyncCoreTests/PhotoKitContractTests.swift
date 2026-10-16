@@ -107,6 +107,66 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testWholeGatewayNeutralStreamIsBoundedWithContentAndUnknownControls() async throws {
+        let rows = HistoryPendingTrace(), clock = GatewayDiagnosticClock()
+        let diagnostic = IndexDiagnostics(sink: { rows.append($0) }, monotonic: { clock.now })
+        let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = [candidate(key: "PRIVATE-NEUTRAL-ID")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, indexDiagnostics: diagnostic)
+        _ = try await gateway.candidateSnapshot()
+        for window in 0..<960 {
+            clock.now = Double(window * 30)
+            for i in 0..<8 {
+                let changed: [PhotoKitCandidateAsset] = i.isMultiple(of: 2) ?
+                    [.init(identifier: "PRIVATE-NEUTRAL-ID", candidates: [candidate(key: "PRIVATE-NEUTRAL-ID")], inputUnchanged: true)] : []
+                lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: changed)
+                gateway.recordLibraryChangeForTesting()
+                _ = try await gateway.candidateSnapshot()
+            }
+        }
+        diagnostic.flushObservations(force: true)
+        let neutralRows = rows.rows
+        XCTAssertEqual(neutralRows.count, 8640, "count every new live phase, not only observation inputs")
+        XCTAssertEqual(neutralRows.filter { $0["phase"] == "photos-live-neutral" }.count, 1920)
+        XCTAssertEqual(neutralRows.filter { $0["category"] == "photos-live-neutral" }.reduce(0) { $0 + (Int($1["assetObservations"] ?? "0") ?? 0) }, 3840)
+        let data = try JSONSerialization.data(withJSONObject: neutralRows, options: [.sortedKeys])
+        XCTAssertLessThan(data.count, 3_000_000)
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("PRIVATE-NEUTRAL-ID"))
+        for _ in 0..<2 {
+            lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                [.init(identifier: "PRIVATE-NEUTRAL-ID", candidates: [candidate(key: "PRIVATE-NEUTRAL-ID")])])
+            gateway.recordLibraryChangeForTesting(); _ = try await gateway.candidateSnapshot()
+        }
+        lifecycle.nextChange = .reload
+        gateway.recordLibraryChangeForTesting(); _ = try await gateway.candidateSnapshot()
+        let controls = Array(rows.rows.dropFirst(neutralRows.count))
+        XCTAssertEqual(controls.filter { $0["phase"] == "photos-change-classification" && $0["contentChanged"] == "1" }.count, 2)
+        XCTAssertEqual(controls.filter { $0["phase"] == "photos-live-scope" }.count, 2)
+        XCTAssertEqual(controls.filter { $0["contentScope"] == "unknown" }.count, 1)
+        if let destination = ProcessInfo.processInfo.environment["PHOTOSYNC_GATEWAY_DIAGNOSTIC_EVIDENCE"] {
+            let lines = try rows.rows.map { try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) + Data([10]) }
+            try lines.reduce(into: Data(), { $0.append($1) }).write(to: URL(fileURLWithPath: destination))
+        }
+    }
+
+    func testSharedAnonymousContextLinksHistoryLiveAndConservativeInvalidation() async throws {
+        let rows = HistoryPendingTrace(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
+        let f = try continuityFixture(indexDiagnostics: diagnostic)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        f.lifecycle.persistentToken = 2
+        try await f.coordinator.reconcile()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [.init(identifier: "page0", candidates: [candidate(key: "page0")])])
+        f.gateway.recordLibraryChangeForTesting()
+        _ = try await f.gateway.candidateSnapshot()
+        let history = rows.rows.filter { $0["phase"] == "photos-history-sample" }
+        let live = rows.rows.filter { $0["phase"] == "photos-live-sample" }
+        XCTAssertEqual(Set(history.compactMap { $0["assetHandle"] }), Set(live.compactMap { $0["assetHandle"] }))
+        XCTAssertFalse(history.isEmpty); XCTAssertTrue(history.allSatisfy { $0["category"] == "unknown" && $0["reason"] == "conservative-history-identifiers" })
+        XCTAssertEqual(Set(rows.rows.compactMap { $0["run"] }), [diagnostic.run])
+        XCTAssertTrue(rows.rows.contains { $0["phase"] == "index-invalidation" && $0["readyToPending"] == "1" })
+        XCTAssertFalse(rows.rows.contains { $0["asset"] != nil || $0["token"] != nil })
+    }
+
     func testHistoryCoverageClosesExistingSnapshotFenceWithoutChangingRawGeneration() async throws {
         let f = try continuityFixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
@@ -683,7 +743,7 @@ final class PhotoKitContractTests: XCTestCase {
         guard case .incremental = await events.next() else { return XCTFail("successful retry acknowledges delivery") }
     }
 
-    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil,
+    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil, indexDiagnostics: IndexDiagnostics? = nil,
                                    diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> (root: URL, db: URL, store: SyncStore,
         context: LibraryContext, lifecycle: FakePhotoKitLifecycle, gateway: PhotoKitGateway, configuration: DedupConfiguration,
         fingerprint: Fingerprint, coordinator: PhotosIndexCoordinator) {
@@ -706,10 +766,10 @@ final class PhotoKitContractTests: XCTestCase {
         let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }
         let reader = readProbe.map { PhotosRepresentationReader(requester: $0,
             budget: ImageWorkBudget(limits: configuration.resources),
-            configuration: configuration) }
-        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, diagnostics: diagnostics)
+            configuration: configuration, indexDiagnostics: indexDiagnostics) }
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics)
         return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
-            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, diagnostics: diagnostics))
+            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics))
     }
 
     func testRealGatewayCoordinatorMergesClassifiedEventsDuringEveryCatalogPage() async throws {
@@ -1332,5 +1392,14 @@ private final class ContractReadProbe: PhotosRepresentationRequesting, @unchecke
         XCTFail("retained ready images must not be read again")
         completion(.failure(PhotosRepresentationError.unavailable))
         return {}
+    }
+}
+
+private final class GatewayDiagnosticClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 0
+    var now: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
     }
 }

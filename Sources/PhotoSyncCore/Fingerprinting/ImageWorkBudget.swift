@@ -37,11 +37,17 @@ public actor ImageWorkBudget {
         return ImageLease(budget: self, id: id, reservedBytes: requested)
     }
 
+    /// Matches acquire without reserving; callers must still handle a racing claim.
+    public func canAcquire(bytes requested: Int64) -> Bool {
+        requested > 0 && requested <= maxBytes && reservations.count < maxImages && requested <= maxBytes - bytes
+    }
+
     public func snapshot() -> Snapshot { Snapshot(images: reservations.count, bytes: bytes) }
 
-    fileprivate func release(_ id: UUID) {
-        guard let released = reservations.removeValue(forKey: id) else { return }
+    fileprivate func release(_ id: UUID) -> Bool {
+        guard let released = reservations.removeValue(forKey: id) else { return false }
         bytes -= released
+        return true
     }
 }
 
@@ -54,9 +60,20 @@ public final class ImageLease: @unchecked Sendable {
     private let ownershipLock = NSLock()
     private var cleanup: (@Sendable () -> Void)?
     private var finished = false
+    private var indexDiagnostic: IndexDiagnosticOperation?
+    private var diagnosticDescriptor: RepresentationDescriptor?
 
     fileprivate init(budget: ImageWorkBudget, id: UUID, reservedBytes: Int64) {
         self.budget = budget; self.id = id; self.reservedBytes = reservedBytes
+    }
+    /// Attached before publication. Reporting follows actual cleanup and budget
+    /// release, and never invokes a sink while holding the ownership lock.
+    func setIndexDiagnostic(_ diagnostic: IndexDiagnosticOperation?, descriptor: RepresentationDescriptor) {
+        ownershipLock.lock(); indexDiagnostic = diagnostic; diagnosticDescriptor = descriptor; ownershipLock.unlock()
+    }
+    private func diagnosticFacts() -> (IndexDiagnosticOperation?, RepresentationDescriptor?) {
+        ownershipLock.lock(); defer { ownershipLock.unlock() }
+        return (indexDiagnostic, diagnosticDescriptor)
     }
     /// Attach encoded backing while a lazy decoded image can still consume it.
     func retainPhysicalResource(cleanup: @escaping @Sendable () -> Void) {
@@ -77,12 +94,17 @@ public final class ImageLease: @unchecked Sendable {
     }
     public func finishPhysicalWork() async {
         finishOwnership()
-        await budget.release(id)
+        let released = await budget.release(id)
+        let (diagnostic, descriptor) = diagnosticFacts()
+        if released { diagnostic?.record(["phase": "photos-reader", "event": "lease-released"], descriptor: descriptor) }
     }
     deinit {
         finishOwnership()
         let budget = budget, id = id
-        Task { await budget.release(id) }
+        let (diagnostic, descriptor) = diagnosticFacts()
+        Task {
+            if await budget.release(id) { diagnostic?.record(["phase": "photos-reader", "event": "lease-released"], descriptor: descriptor) }
+        }
     }
 }
 

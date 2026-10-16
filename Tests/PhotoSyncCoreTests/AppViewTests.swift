@@ -479,6 +479,20 @@ final class AppViewTests: XCTestCase {
         }
     }
 
+    func testReaderCapacityAndStalledWaitingAreVisibleInNativeDetails() throws {
+        for issue in ["正在等待图像读取资源，稍后自动继续。", "正在等待系统结束图像读取，完成后自动继续。"] {
+            var snapshot = EngineSnapshot()
+            snapshot.indexProgress = IndexProgress(state: .waiting, totalsKnown: true, totalAssets: 40,
+                readyAssets: 16, totalRepresentations: 40, readyRepresentations: 16, excludedAssets: 0, issue: issue)
+            _ = try measure(SyncDetailsContent(snapshot: snapshot), width: 300, minimumHeight: 0) { host in
+                let text = try self.allScrolledText(in: host)
+                XCTAssertTrue(text.contains(issue), text)
+                XCTAssertTrue(text.contains("16") && text.contains("40"), text)
+                XCTAssertFalse(text.contains("文件失败"), text)
+            }
+        }
+    }
+
     func testOpenDetailsUpdateAndRemainOpenWhenAnalysisBecomesReady() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
