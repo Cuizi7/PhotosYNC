@@ -436,22 +436,26 @@ extension RuntimeIntegrationTests {
         await runtime.tick(force: true)
         await runtime.waitForRound()
         let firstCalls = await reader.calls
-        XCTAssertEqual(firstCalls, 1)
+        // One scheduled traversal plus one bounded root verification after metadata fails.
+        XCTAssertEqual(firstCalls, 2)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: root.appendingPathComponent("state.sqlite")), 1)
         let firstState = await runtime.current()
-        XCTAssertNotNil(firstState.snapshot.waitingSources[sourceID])
+        XCTAssertEqual(firstState.snapshot.waitingSources[sourceID]?.kind, .file)
 
         // A readable source with one bad file must not be quarantined on the source recovery curve.
         clock.set(5)
         await runtime.tick()
         await runtime.waitForRound()
         let afterEarlyTick = await reader.calls
-        XCTAssertEqual(afterEarlyTick, 1)
+        XCTAssertEqual(afterEarlyTick, 2, "No traversal or root probe before the ordinary scan deadline")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: root.appendingPathComponent("state.sqlite")), 1)
 
         clock.set(1_800)
         await runtime.tick()
         await runtime.waitForRound()
         let afterRegularTick = await reader.calls
-        XCTAssertEqual(afterRegularTick, 2)
+        XCTAssertEqual(afterRegularTick, 4, "Each scheduled bad-file scan verifies its still-readable root")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: root.appendingPathComponent("state.sqlite")), 2)
     }
 
     func testDirectoryRecoveryToFileIssueClearsSourceBackoffWithoutPrematureRecoveryNotification() async throws {
@@ -492,7 +496,9 @@ extension RuntimeIntegrationTests {
         await runtime.tick()
         await runtime.waitForRound()
         let callsAfterBackoffClears = await reader.calls
-        XCTAssertEqual(callsAfterBackoffClears, 2)
+        // Initial root failure, recovery traversal, then the bad file's healthy-root probe.
+        XCTAssertEqual(callsAfterBackoffClears, 3, "A file issue must not schedule another early source round")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: fixture.databaseURL), 2)
 
         await metadata.recover()
         clock.set(1_800)
