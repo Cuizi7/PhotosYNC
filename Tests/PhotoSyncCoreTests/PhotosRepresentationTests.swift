@@ -7,6 +7,51 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testLateRequestAndConsumerLeaseKeepOriginalIssuanceAfterReplacement() async throws {
+        for heldLease in [false, true] {
+            for changedDescriptor in [false, true] {
+                let released = expectation(description: "old lease physically released")
+                let rows = RepresentationDiagnosticRows(), diagnostic = IndexDiagnostics(sink: {
+                    rows.append($0)
+                    if $0["event"] == "lease-released" { released.fulfill() }
+                })
+                let requester = ControlledRepresentationRequester(), c = try configuration(timeout: heldLease ? 30 : 0.01)
+                let budget = ImageWorkBudget(limits: c.resources), original = descriptor()
+                func issuance(_ descriptor: RepresentationDescriptor, generation: Int64) -> RepresentationTask {
+                    .init(descriptor: descriptor, retryCount: 0, nextRetryAt: nil,
+                        fingerprintVersion: c.fingerprint.version, indexGeneration: generation)
+                }
+                diagnostic.operation("work").record(["phase": "index-task", "event": "attempt"], task: issuance(original, generation: 1))
+                let oldHandle = try XCTUnwrap(rows.values.last?["issuanceHandle"])
+                let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, indexDiagnostics: diagnostic)
+                let work = Task { try await reader.read(original, isCurrent: { true }) }
+                await requester.started()
+                var loaded: LoadedRepresentation?
+                if heldLease {
+                    requester.send(.image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame))
+                    loaded = try await work.value
+                } else {
+                    await requester.cancellationRequested()
+                    do { _ = try await work.value; XCTFail("timeout") } catch { XCTAssertEqual(error as? ReadExecutorError, .timedOut) }
+                }
+                let replacement = RepresentationDescriptor(key: original.key, context: original.context,
+                    revision: changedDescriptor ? "replacement" : original.revision, size: original.size,
+                    equivalentToOriginal: original.equivalentToOriginal, revisionIsReliable: original.revisionIsReliable)
+                diagnostic.operation("work").record(["phase": "index-task", "event": "attempt"], task: issuance(replacement, generation: 2))
+                let newHandle = try XCTUnwrap(rows.values.last?["issuanceHandle"])
+                XCTAssertNotEqual(oldHandle, newHandle)
+                if heldLease { await loaded!.lease.finishPhysicalWork(); loaded = nil }
+                else { requester.send(.cancelled) }
+                await fulfillment(of: [released], timeout: 2)
+                let events = rows.values.filter { $0["phase"] == "photos-reader" }
+                XCTAssertTrue(events.contains { $0["event"] == "lease-released" })
+                XCTAssertTrue(events.allSatisfy { $0["issuanceHandle"] == oldHandle }, "old callbacks cannot consult replacement identity")
+                XCTAssertEqual(Set(events.compactMap { $0["descriptorHandle"] }).count, 1)
+                let physical = await budget.snapshot(); XCTAssertEqual(physical.images, 0)
+            }
+        }
+    }
+
     func testAnonymousReaderLifecycleJoinsTaskIssuanceAndReleasesOnlyOnce() async throws {
         let rows = RepresentationDiagnosticRows(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
         let requester = ControlledRepresentationRequester(), c = try configuration()

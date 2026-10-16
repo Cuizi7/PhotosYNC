@@ -293,6 +293,7 @@ public actor PhotosIndexCoordinator {
                         let latest = try await photos.candidateSnapshot()
                         guard !needsReconciliation, !reconciling, pendingDelta == nil,
                               latest.generation == reconciledGeneration else {
+                            diagnostic.record(["phase": "index-task", "event": "rejected", "reason": "inventory-not-current", "stage": "currentness"], task: task)
                             acknowledgedGeneration = nil; continue
                         }
                         completionStage = "sqlite-completion"
@@ -304,6 +305,7 @@ public actor PhotosIndexCoordinator {
                         // Eligibility revoked before a new model phase is deferred work,
                         // not a damaged image. The owned task has returned and released
                         // its lease; keep its existing durable issuance/deadline unchanged.
+                        diagnostic.record(["phase": "index-task", "event": "deferred", "reason": "cancelled", "stage": "owned-work"], task: task)
                         return
                     } catch {
                         let stageFailure = error as? RepresentationStageFailure
@@ -313,6 +315,7 @@ public actor PhotosIndexCoordinator {
                             (underlying as? PhotosRepresentationError)?.isIsolatableReadFailure == true
                         let latest = try? await photos.candidateSnapshot()
                         if needsReconciliation || reconciling || pendingDelta != nil || latest?.generation != reconciledGeneration {
+                            diagnostic.record(["phase": "index-task", "event": "rejected", "reason": "stale-failure", "stage": stage], task: task)
                             if pendingDelta == nil { needsReconciliation = true }; acknowledgedGeneration = nil
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
@@ -331,6 +334,8 @@ public actor PhotosIndexCoordinator {
                                 else { modelWaiting.removeValue(forKey: waitKey) }
                                 if case .iCloudUnavailable = underlying as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
                                 else { cloudWaiting.removeValue(forKey: waitKey) }
+                            } else {
+                                diagnostic.record(["phase": "index-task", "event": "rejected", "reason": "stale-failure-issuance", "stage": stage], task: task)
                             }
                         }
                     }

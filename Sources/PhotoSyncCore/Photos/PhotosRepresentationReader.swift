@@ -67,7 +67,7 @@ public actor PhotosRepresentationReader {
                      isCurrent: @escaping @Sendable () -> Bool) async throws -> LoadedRepresentation {
         try Task.checkCancellation()
         guard active.isEmpty else { throw ReadExecutorError.resourceExhausted }
-        let diagnostic = indexDiagnostics?.operation("request")
+        let diagnostic = indexDiagnostics?.operation("request", descriptor: descriptor)
         diagnostic?.record(["phase": "photos-reader", "event": "admission"], descriptor: descriptor)
         let lease = try await budget.acquire(bytes: configuration.resources.maxDecodedBytes)
         lease.setIndexDiagnostic(diagnostic, descriptor: descriptor)

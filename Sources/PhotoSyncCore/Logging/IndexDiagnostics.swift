@@ -13,7 +13,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
     private var issuances: [String: (descriptor: String, issuance: String)] = [:]
     private var readerCounts: [String: Int] = [:]
     private var states: [String: (value: String, suppressed: Int, start: TimeInterval)] = [:]
-    private var neutral: [String: (start: TimeInterval, emitted: Int, suppressed: Int)] = [:]
+    private var neutral: [String: (start: TimeInterval, emitted: Int, suppressed: Int, assets: Int)] = [:]
     private let monotonic: @Sendable () -> TimeInterval
 
     public init(sink: @escaping @Sendable ([String: String]) -> Void,
@@ -25,9 +25,10 @@ public final class IndexDiagnostics: @unchecked Sendable {
         return category + "-" + HMAC<SHA256>.authenticationCode(for: bytes, using: secret).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
     public func tokenHandle(_ value: Data) -> String { handle("range", value.base64EncodedString()) }
-    public func operation(_ category: String) -> IndexDiagnosticOperation {
+    public func operation(_ category: String, descriptor: RepresentationDescriptor? = nil) -> IndexDiagnosticOperation {
         lock.lock(); sequence &+= 1; let id = "\(category)-\(sequence)"; lock.unlock()
-        return IndexDiagnosticOperation(context: self, id: id)
+        return IndexDiagnosticOperation(context: self, id: id, identityBound: descriptor != nil,
+            identity: descriptor.flatMap { sample($0) })
     }
     fileprivate func assetSample(_ assetID: String) -> [String: String]? {
         let asset = handle("asset", assetID)
@@ -59,9 +60,9 @@ public final class IndexDiagnostics: @unchecked Sendable {
     }
     /// Coalesce only high-frequency neutral observations. Unknown scope, content
     /// changes, errors and state transitions always retain their existing facts.
-    public func observation(_ fields: [String: String]) {
+    public func observation(_ fields: [String: String], assetID: String? = nil) {
         let phase = fields["phase"] ?? ""
-        let isNeutral = phase == "photos-notification" ||
+        let isNeutral = phase == "photos-notification" || phase == "photos-live-neutral" ||
             (phase == "photos-fetch-details" && fields["fallback"] == nil) ||
             (phase == "photos-change-classification" && fields["contentScope"] == "known" &&
              fields["contentChanged"] == "0" && fields["inserted"] == "0" && fields["deleted"] == "0")
@@ -69,16 +70,21 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let now = monotonic()
         var summary: [String: String]?
         lock.lock()
-        var bucket = neutral[phase] ?? (now, 0, 0)
+        var bucket = neutral[phase] ?? (now, 0, 0, 0)
         if now - bucket.start >= 30 {
-            if bucket.suppressed > 0 { summary = ["phase": "index-observation-summary", "category": phase, "suppressed": String(bucket.suppressed)] }
-            bucket = (now, 0, 0)
+            if bucket.suppressed > 0 { summary = ["phase": "index-observation-summary", "category": phase, "suppressed": String(bucket.suppressed), "assetObservations": String(bucket.assets)] }
+            bucket = (now, 0, 0, 0)
         }
+        bucket.assets += Int(fields["assets"] ?? "0") ?? 0
         let admitted = bucket.emitted < 2
         if admitted { bucket.emitted += 1 } else { bucket.suppressed += 1 }
         neutral[phase] = bucket; lock.unlock()
         if let summary { emit(summary) }
-        if admitted { emit(fields) }
+        if admitted {
+            var fields = fields
+            if let assetID, let sample = assetSample(assetID) { fields.merge(sample) { _, new in new } }
+            emit(fields)
+        }
     }
     /// Fixed small set of runtime states, used by periodic admission polling.
     /// Repeated waits accumulate; the next transition/flush reports their count.
@@ -107,7 +113,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let readyStates = states.filter { force || now - $0.value.start >= 30 }
         let readyNeutral = neutral.filter { force || now - $0.value.start >= 30 }
         for (key, value) in readyStates { states[key] = (value.value, 0, now) }
-        for (key, value) in readyNeutral { neutral[key] = (value.start, value.emitted, 0) }
+        for (key, value) in readyNeutral { neutral[key] = (value.start, value.emitted, 0, 0) }
         lock.unlock()
         if !readers.isEmpty {
             var fields = readers.mapValues(String.init); fields["phase"] = "index-reader-summary"; emit(fields)
@@ -116,7 +122,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
             emit(["phase": "index-state-summary", "category": category, "state": state.value, "suppressed": String(state.suppressed)])
         }
         for (category, bucket) in readyNeutral where bucket.suppressed > 0 {
-            emit(["phase": "index-observation-summary", "category": category, "suppressed": String(bucket.suppressed)])
+            emit(["phase": "index-observation-summary", "category": category, "suppressed": String(bucket.suppressed), "assetObservations": String(bucket.assets)])
         }
     }
 }
@@ -126,11 +132,20 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
     private let context: IndexDiagnostics
     private let lock = NSLock()
     private var emitted = 0, suppressed = 0
-    fileprivate init(context: IndexDiagnostics, id: String) { self.context = context; self.id = id }
+    private let identityBound: Bool
+    private let identity: [String: String]?
+    /// A physical request owns the identity captured before admission. Its late
+    /// terminal/drain/lease events never consult the shared latest-task cache.
+    fileprivate init(context: IndexDiagnostics, id: String, identityBound: Bool, identity: [String: String]?) {
+        self.context = context; self.id = id; self.identityBound = identityBound; self.identity = identity
+    }
     public func record(_ fields: [String: String], descriptor: RepresentationDescriptor? = nil, task: RepresentationTask? = nil, assetID: String? = nil) {
         context.countReader(fields)
         var fields = fields
-        if let descriptor = task?.descriptor ?? descriptor {
+        if identityBound {
+            guard let identity else { lock.lock(); suppressed += 1; lock.unlock(); return }
+            fields.merge(identity) { _, new in new }
+        } else if let descriptor = task?.descriptor ?? descriptor {
             guard let sample = context.sample(descriptor) else {
                 lock.lock(); suppressed += 1; lock.unlock(); return
             }
@@ -145,10 +160,10 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
         if admitted { emitted += 1 } else { suppressed += 1 }
         lock.unlock()
         guard admitted else { return }
-        if let task {
+        if let task, !identityBound {
             fields["issuanceHandle"] = context.handle("issuance", "\(task.indexGeneration):\(task.issuanceRevision):\(fields["descriptorHandle"] ?? "unknown")")
             fields["taskGeneration"] = String(task.indexGeneration)
-            context.linkIssuance(fields)
+            if fields["event"] == "attempt" { context.linkIssuance(fields) }
         }
         fields["operation"] = id; context.emit(fields)
     }

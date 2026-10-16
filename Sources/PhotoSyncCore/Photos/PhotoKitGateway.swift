@@ -464,7 +464,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 guard let self else { return false }
                 return self.state.markIndexed(generation: generation)
             },
-            onChange: { [state, changeChannel, catalogBatchSize, indexDiagnostics] event in
+            onChange: { [state, changeChannel, catalogBatchSize, indexDiagnostics] event, knownNeutral in
                 switch event {
                 case .incremental(let delta):
                     if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.invalidateAllRepresentations() }
@@ -472,7 +472,14 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                     if delta.changedAssetIDs.count + delta.deletedAssetIDs.count > max(1, catalogBatchSize / 2), state.hasStore {
                         changeChannel.send(.fullReconcileRequired)
                     } else { changeChannel.send(event) }
-                    if !delta.changedAssetIDs.isEmpty || !delta.deletedAssetIDs.isEmpty {
+                    if knownNeutral {
+                        // Diagnostic classification only: the original catalog
+                        // persistence and publication above always run unchanged.
+                        if !delta.changedAssetIDs.isEmpty {
+                            indexDiagnostics.observation(["phase": "photos-live-neutral", "source": "live", "category": "input-unchanged",
+                                "assets": String(delta.changedAssetIDs.count), "event": String(delta.toGeneration)], assetID: delta.changedAssetIDs.first)
+                        }
+                    } else if !delta.changedAssetIDs.isEmpty || !delta.deletedAssetIDs.isEmpty {
                         let diagnostic = indexDiagnostics.operation("live")
                         diagnostic.record(["phase": "photos-live-scope", "source": "live", "category": "inventory", "changed": String(delta.changedAssetIDs.count), "deleted": String(delta.deletedAssetIDs.count), "fromGeneration": String(delta.fromGeneration), "throughGeneration": String(delta.toGeneration)])
                         for id in delta.changedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "inventory-changed", "content": "unknown", "event": String(delta.toGeneration)], assetID: id) }
@@ -806,7 +813,7 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
 
     func enqueueChange(_ change: PHChange?, recordChange: @Sendable () -> (generation: Int, context: LibraryContext), lifecycle: any PhotoKitLifecycle,
                        didIndex: @escaping @Sendable (Int) -> Bool,
-                       onChange: @escaping @Sendable (PhotosIndexChange) -> Void,
+                       onChange: @escaping @Sendable (PhotosIndexChange, Bool) -> Void,
                        onContentChange: @escaping @Sendable ([String]) -> Void,
                        didFinishDetails: @escaping @Sendable () -> Void,
                        diagnostics: @escaping @Sendable ([String: String]) -> Void) {
@@ -818,12 +825,12 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
             guard let self else { return }
             guard case let .incremental(removed, inserted, changed) = (try? lifecycle.candidateIndexChange(for: change)) else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "missing-or-unclassified-fetch-details", "contentScope": "unknown"])
-                onChange(.fullReconcileRequired); return
+                onChange(.fullReconcileRequired, false); return
             }
             guard self.indexedGeneration == generation - 1 else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "candidate-baseline-gap", "contentScope": "unknown",
                     "expectedBaseline": String(generation - 1), "actualBaseline": self.indexedGeneration.map(String.init) ?? "none"])
-                onChange(.fullReconcileRequired); return
+                onChange(.fullReconcileRequired, false); return
             }
             let insertedIDs = Set(inserted.map(\.identifier))
             let changedIDs = Set(changed.map(\.identifier))
@@ -836,7 +843,7 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                   inserted.allSatisfy({ self.byAsset[$0.identifier] == nil }),
                   changed.allSatisfy({ self.byAsset[$0.identifier] != nil }) else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "malformed-membership-details", "contentScope": "unknown"])
-                onChange(.fullReconcileRequired); return
+                onChange(.fullReconcileRequired, false); return
             }
             for id in removed { self.remove(id) }
             for asset in changed { self.remove(asset.identifier); self.insert(asset) }
@@ -849,7 +856,8 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                 "inputUnchanged": String(changed.filter(\.inputUnchanged).count)])
             onContentChange(changed.filter { !$0.inputUnchanged }.map(\.identifier) + removed.sorted())
             onChange(.incremental(.init(context: context, fromGeneration: generation - 1, toGeneration: generation,
-                changedAssetIDs: (inserted + changed).map(\.identifier).sorted(), deletedAssetIDs: removed.sorted())))
+                changedAssetIDs: (inserted + changed).map(\.identifier).sorted(), deletedAssetIDs: removed.sorted())),
+                inserted.isEmpty && removed.isEmpty && changed.allSatisfy(\.inputUnchanged))
         }
         submissionLock.unlock()
         // Diagnostics may call injected hooks; admission is closed and ordered work

@@ -6,6 +6,31 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testSampledStaleSuccessFailureAndCancellationHaveTerminalOutcomes() async throws {
+        for outcome in ["success", "failure", "cancelled"] {
+            let rows = CoordinatorDiagnostics(), f = try fixture(diagnostics: { rows.record($0) }), gate = CoordinatorGate()
+            let d = descriptor(f.photos.context)
+            await f.photos.set([d]); try await f.coordinator.reconcile(); await f.model.setGate(gate)
+            let work = Task { await f.coordinator.processDueWork(now: now) }
+            await gate.waitUntilEntered()
+            let attempt = try XCTUnwrap(rows.rows.first { $0["phase"] == "index-task" && $0["event"] == "attempt" })
+            if outcome == "failure" { await f.model.setAfterGate(.failure(.invalidImage)) }
+            if outcome == "cancelled" { await f.model.setAfterGate(.cancelled) }
+            else {
+                await f.photos.set([descriptor(f.photos.context, revision: "new")])
+                await f.coordinator.libraryChanged(.fullReconcileRequired)
+            }
+            await f.coordinator.setPaused(true)
+            await gate.release(); await work.value
+            let terminal = rows.rows.filter { $0["phase"] == "index-task" && $0["event"] != "attempt" && $0["issuanceHandle"] == attempt["issuanceHandle"] }
+            XCTAssertEqual(terminal.count, 1)
+            XCTAssertEqual(terminal.first?["event"], outcome == "cancelled" ? "deferred" : "rejected")
+            XCTAssertEqual(terminal.first?["reason"], outcome == "success" ? "inventory-not-current" : outcome == "failure" ? "stale-failure" : "cancelled")
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE retry_count=0 AND next_retry_at IS NULL", at: f.db), 1)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 0)
+        }
+    }
+
     func testDiagnosticHandlesAreRunLocalAndNeutralOvernightVolumeIsBounded() throws {
         let log = CoordinatorDiagnostics(), clock = DiagnosticClock()
         let diagnostic = IndexDiagnostics(sink: { log.record($0) }, monotonic: { clock.now })
@@ -54,6 +79,10 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let details = rows.filter { $0["assetHandle"] != nil }
         XCTAssertFalse(details.isEmpty)
         XCTAssertLessThanOrEqual(Set(details.compactMap { $0["assetHandle"] }).count, 8)
+        let attempts = rows.filter { $0["phase"] == "index-task" && $0["event"] == "attempt" }
+        for handle in Set(attempts.compactMap { $0["assetHandle"] }) {
+            XCTAssertEqual(Set(attempts.filter { $0["assetHandle"] == handle }.compactMap { $0["issuanceHandle"] }).count, 2)
+        }
         let reconciles = Set(details.compactMap { $0["operation"] })
         XCTAssertGreaterThanOrEqual(reconciles.count, 2)
         XCTAssertTrue(rows.contains { $0["phase"] == "index-diagnostic-summary" && Int($0["suppressed"] ?? "0") ?? 0 > 0 })
@@ -1042,7 +1071,11 @@ private actor CoordinatorGate {
     func release() { open = true; blocked?.resume(); blocked = nil }
 }
 
+private enum CoordinatorAfterGate: Sendable { case cancelled, failure(PhotosRepresentationError) }
+
 private actor CoordinatorModel: ImageFingerprinting {
+    private var afterGate: CoordinatorAfterGate?
+    func setAfterGate(_ outcome: CoordinatorAfterGate) { afterGate = outcome }
     private let version: String
     private(set) var count = 0
     private var gate: CoordinatorGate?
@@ -1057,6 +1090,9 @@ private actor CoordinatorModel: ImageFingerprinting {
         if let failure { throw failure }
         if unavailable { throw ModelExecutionUnavailable(detail: "test index") }
         count += 1; if let gate { self.gate = nil; await gate.hold() }
+        if let afterGate {
+            switch afterGate { case .cancelled: throw CancellationError(); case .failure(let error): throw error }
+        }
         try Task.checkCancellation()
         return try Fingerprint(version: version, values: [1] + Array(repeating: 0, count: 1023))
     }

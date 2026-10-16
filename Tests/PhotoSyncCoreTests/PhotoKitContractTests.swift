@@ -107,6 +107,47 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testWholeGatewayNeutralStreamIsBoundedWithContentAndUnknownControls() async throws {
+        let rows = HistoryPendingTrace(), clock = GatewayDiagnosticClock()
+        let diagnostic = IndexDiagnostics(sink: { rows.append($0) }, monotonic: { clock.now })
+        let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = [candidate(key: "PRIVATE-NEUTRAL-ID")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, indexDiagnostics: diagnostic)
+        _ = try await gateway.candidateSnapshot()
+        for window in 0..<960 {
+            clock.now = Double(window * 30)
+            for i in 0..<8 {
+                let changed: [PhotoKitCandidateAsset] = i.isMultiple(of: 2) ?
+                    [.init(identifier: "PRIVATE-NEUTRAL-ID", candidates: [candidate(key: "PRIVATE-NEUTRAL-ID")], inputUnchanged: true)] : []
+                lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: changed)
+                gateway.recordLibraryChangeForTesting()
+                _ = try await gateway.candidateSnapshot()
+            }
+        }
+        diagnostic.flushObservations(force: true)
+        let neutralRows = rows.rows
+        XCTAssertEqual(neutralRows.count, 8640, "count every new live phase, not only observation inputs")
+        XCTAssertEqual(neutralRows.filter { $0["phase"] == "photos-live-neutral" }.count, 1920)
+        XCTAssertEqual(neutralRows.filter { $0["category"] == "photos-live-neutral" }.reduce(0) { $0 + (Int($1["assetObservations"] ?? "0") ?? 0) }, 3840)
+        let data = try JSONSerialization.data(withJSONObject: neutralRows, options: [.sortedKeys])
+        XCTAssertLessThan(data.count, 3_000_000)
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("PRIVATE-NEUTRAL-ID"))
+        for _ in 0..<2 {
+            lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                [.init(identifier: "PRIVATE-NEUTRAL-ID", candidates: [candidate(key: "PRIVATE-NEUTRAL-ID")])])
+            gateway.recordLibraryChangeForTesting(); _ = try await gateway.candidateSnapshot()
+        }
+        lifecycle.nextChange = .reload
+        gateway.recordLibraryChangeForTesting(); _ = try await gateway.candidateSnapshot()
+        let controls = Array(rows.rows.dropFirst(neutralRows.count))
+        XCTAssertEqual(controls.filter { $0["phase"] == "photos-change-classification" && $0["contentChanged"] == "1" }.count, 2)
+        XCTAssertEqual(controls.filter { $0["phase"] == "photos-live-scope" }.count, 2)
+        XCTAssertEqual(controls.filter { $0["contentScope"] == "unknown" }.count, 1)
+        if let destination = ProcessInfo.processInfo.environment["PHOTOSYNC_GATEWAY_DIAGNOSTIC_EVIDENCE"] {
+            let lines = try rows.rows.map { try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) + Data([10]) }
+            try lines.reduce(into: Data(), { $0.append($1) }).write(to: URL(fileURLWithPath: destination))
+        }
+    }
+
     func testSharedAnonymousContextLinksHistoryLiveAndConservativeInvalidation() async throws {
         let rows = HistoryPendingTrace(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
         let f = try continuityFixture(indexDiagnostics: diagnostic)
@@ -1351,5 +1392,14 @@ private final class ContractReadProbe: PhotosRepresentationRequesting, @unchecke
         XCTFail("retained ready images must not be read again")
         completion(.failure(PhotosRepresentationError.unavailable))
         return {}
+    }
+}
+
+private final class GatewayDiagnosticClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 0
+    var now: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
     }
 }
