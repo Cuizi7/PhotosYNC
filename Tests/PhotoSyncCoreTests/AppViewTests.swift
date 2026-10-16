@@ -6,6 +6,24 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testAnalysisDetailsUseSameAssetProgressAsMenu() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+        model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+            totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+            readyRepresentations: 6789, excludedAssets: 99, issue: nil)
+        for (view, width) in [(AnyView(StatusMenu(model: model)), CGFloat(320)), (AnyView(SyncDetailsContent(snapshot: model.state.snapshot)), CGFloat(300))] {
+            _ = try measure(view, width: width, minimumHeight: 0) { host in
+                XCTAssertEqual(SyncStatusPresentation(snapshot: model.state.snapshot).analysis?.progressText, "已分析 2192 / 15702 张")
+                let texts = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+                XCTAssertTrue(texts.contains("已分析") && texts.contains("2192") && texts.contains("15702"), texts)
+                XCTAssertFalse(texts.contains("6789"), texts)
+                XCTAssertFalse(texts.contains("45000"), texts)
+            }
+        }
+    }
+
     func testFeedbackNativeActionsHaveEqualColumns() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -101,8 +119,25 @@ final class AppViewTests: XCTestCase {
             snapshot.waitingSources[UUID()] = SourceIssue(summary: "文件问题", detail: "synthetic", kind: .file)
             _ = try UIReviewCapture.render(SyncDetailsContent(snapshot: snapshot), width: 300, appearance: .aqua) { host, _ in
                 let texts = try self.recognizedText(in: host).map(\.text)
-                XCTAssertTrue(texts.contains(expected), "Missing scan state \(expected): \(texts)")
-                XCTAssertEqual(texts.contains("检查候选"), state != .notStarted)
+                if let directory = ProcessInfo.processInfo.environment["PHOTOSYNC_UI_DIAGNOSTICS"] {
+                    try self.capture(host, name: "scan-state-\(state)-deferred-\(deferred)", directory: directory)
+                    let url = URL(fileURLWithPath: directory).appendingPathComponent("scan-state-\(state)-deferred-\(deferred).txt")
+                    try ("state=\(state) deferred=\(deferred) bounds=\(host.bounds)\n" + (texts + ["AX:"] + self.nativeAccessibility(in: host).map { "\(type(of: $0)) role=\($0.accessibilityRole()?.rawValue ?? "nil") label=\($0.accessibilityLabel() ?? "nil") value=\(String(describing: $0.accessibilityValue())) children=\($0.accessibilityChildren()?.count ?? 0)" }).joined(separator: "\n")).write(to: url, atomically: true, encoding: .utf8)
+                }
+                // Exact row semantics are asserted from the same pure projection consumed
+                // by the native view; OCR remains a visual observation, not a Unicode parser.
+                let rows = SyncStatusPresentation(snapshot: snapshot).scanDetailRows
+                let values = Dictionary(uniqueKeysWithValues: rows.map { ($0.title, $0.value) })
+                XCTAssertTrue(texts.contains(expected), "Missing visible state: \(texts)")
+                XCTAssertEqual(texts.contains("检查候选"), state != .notStarted, "Exact visible row: \(texts)")
+                XCTAssertEqual(values["检查候选"], state == .notStarted ? nil : "0")
+                XCTAssertEqual(values["新增导入"], state == .notStarted ? nil : "0")
+                XCTAssertEqual(values["状态"], state == .notStarted ? nil : expected)
+                XCTAssertEqual(values["时间"], state == .notStarted ? nil : (snapshot.latestScan.endedAt ?? date).formatted(date: .abbreviated, time: .shortened))
+                XCTAssertEqual(values["开始"], state == .completed ? date.formatted(date: .abbreviated, time: .shortened) : nil)
+                XCTAssertNil(values["本次读取失败"])
+                XCTAssertNil(values["来源等待恢复"])
+                XCTAssertFalse(rows.contains { $0.value.contains("99") })
                 XCTAssertEqual(texts.contains("时间"), state != .notStarted)
                 XCTAssertEqual(texts.contains("开始"), state == .completed)
                 XCTAssertFalse(texts.contains("本次读取失败"))
@@ -143,7 +178,15 @@ final class AppViewTests: XCTestCase {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
-        try VNImageRequestHandler(cgImage: try XCTUnwrap(bitmap.cgImage)).perform([request])
+        // One fixed observation scale for the entire corpus. The original native bitmap
+        // remains the evidence artifact; no vocabulary hints or character replacement.
+        let original = try XCTUnwrap(bitmap.cgImage)
+        let context = try XCTUnwrap(CGContext(data: nil, width: original.width * 2,
+            height: original.height * 2, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.interpolationQuality = .high
+        context.draw(original, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
+        try VNImageRequestHandler(cgImage: try XCTUnwrap(context.makeImage())).perform([request])
         return (request.results ?? []).compactMap { result in
             guard let candidate = result.topCandidates(1).first else { return nil }
             let text = candidate.string
@@ -189,6 +232,33 @@ final class AppViewTests: XCTestCase {
             if scenario == .unknown { XCTAssertEqual(model.state.snapshot.summary?.importing, 1) }
             if scenario == .many { XCTAssertEqual(model.state.sources.count, 30) }
         }
+    }
+
+    func testReviewIssueSnapshotsKeepLegacyAndDetailedProjectionsConsistent() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (scenario, expectedKind, expectedCount, expectedPrimaryID) in [
+            (UIReviewScenario.mixedIssues, SourceIssueKind.sourceAvailability, 2, "directory-a"),
+            (.longIssues, .file, 20, "read-00")
+        ] {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            let sourceID = try XCTUnwrap(model.state.sources.first?.id)
+            let details = try XCTUnwrap(model.state.snapshot.sourceIssueDetails[sourceID])
+            let primary = try XCTUnwrap(model.state.snapshot.waitingSources[sourceID])
+            let expected = try XCTUnwrap(details.first { $0.id == expectedPrimaryID })
+            XCTAssertEqual(primary.kind, expectedKind, scenario.rawValue)
+            XCTAssertEqual(primary.summary, expected.summary, scenario.rawValue)
+            XCTAssertEqual(primary.detail, expected.detail, scenario.rawValue)
+            XCTAssertEqual(model.state.snapshot.sourceFileIssueCounts[sourceID], expectedCount, scenario.rawValue)
+            XCTAssertEqual(details.filter { $0.kind == .file }.count, expectedCount, scenario.rawValue)
+            XCTAssertFalse(model.recoveryPending(for: sourceID), scenario.rawValue)
+            if scenario == .mixedIssues { XCTAssertEqual(model.statusDescription, "等待恢复") }
+            else { XCTAssertTrue(details.allSatisfy { $0.kind == .file }) }
+        }
+        let permission = try XCTUnwrap(reviewIssues().first { $0.id == "scan-same" })
+        XCTAssertEqual(permission.summary, "文件无法访问，请检查访问权限。")
+        XCTAssertEqual(permission.summary, SourceIssueText.fileUnreadable(relativePath: "same.jpg",
+            url: URL(fileURLWithPath: permission.path), error: NSError(domain: NSPOSIXErrorDomain, code: 13)).summary)
     }
 
     // A missing/nonconvergent renderer must fail even when output is not requested.
@@ -305,17 +375,166 @@ final class AppViewTests: XCTestCase {
         }
     }
 
-    func testSourceRowKeepsFileFailureCountInTwoLines() throws {
+    func testSourceRowShowsOneProblemSummary() throws {
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-            let size = try measure(SourceRowLabel(
-                url: URL(fileURLWithPath: "/Volumes/非常长的父目录/旅行与家庭照片归档"),
-                status: String(repeating: "来源目录暂时不可用，正在等待恢复。", count: 12),
-                detail: "synthetic raw detail", fileIssueCount: 7).frame(width: 292),
-                width: 292, appearance: appearance, minimumHeight: 0,
-                inspect: { try self.capture($0, name: "source-row-\(appearance.rawValue)") })
-            XCTAssertEqual(size.width, 292, accuracy: 1)
+            let size = try measure(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源/旅行"),
+                status: "原来的人话", issues: reviewIssues()).frame(width: 292),
+                width: 292, appearance: appearance, minimumHeight: 0) { host in
+                let texts = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+                XCTAssertEqual(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源"), status: "原来的人话", issues: reviewIssues()).statusText, "发现 5 项问题")
+                XCTAssertTrue(texts.contains("发现") && texts.contains("5") && texts.contains("项问题"), texts)
+                XCTAssertFalse(texts.contains("读取失败"), texts)
+                XCTAssertFalse(texts.contains("原来的人话"), texts)
+            }
             XCTAssertLessThanOrEqual(size.height, 42)
         }
+    }
+
+    func testSourceDetailsGroupCompletePathsAndCauses() throws {
+        let issues = reviewIssues()
+        let groups = SourceIssuesContent(sourceURL: URL(fileURLWithPath: "/示例来源"), issues: issues, recoveryPending: false).groups
+        XCTAssertEqual(groups.map(\.title), ["目录与连接", "读取与解析", "导入与提交"])
+        XCTAssertEqual(groups.map { $0.members.count }, [2, 2, 1])
+        XCTAssertEqual(groups[0].members.map(\.path), ["/示例来源/A", "/示例来源/B"])
+        XCTAssertEqual(groups.flatMap(\.members).map(\.id).sorted(), issues.map(\.id).sorted())
+        XCTAssertEqual(groups[1].members[0].path, "/示例来源/same.jpg")
+        XCTAssertEqual(groups[2].members[0].path, "/示例来源/same.jpg")
+        _ = try measure(SourceIssuesContent(sourceURL: URL(fileURLWithPath: "/示例来源"),
+            issues: issues, recoveryPending: false), width: 360, minimumHeight: 0) { host in
+            let texts = try self.allScrolledText(in: host)
+            for title in ["目录与连接", "读取与解析", "导入与提交"] {
+                XCTAssertTrue(texts.contains(title), texts)
+            }
+            XCTAssertEqual(issues.filter { $0.path == "/示例来源/same.jpg" }.count, 2)
+            XCTAssertTrue(texts.contains("same.jpg"), texts)
+            XCTAssertTrue(texts.contains("5") && texts.contains("项问题"), texts)
+            for detail in ["NSPOSIXErrorDomain", "NSCocoaErrorDomain", "读取时长"] {
+                XCTAssertTrue(texts.contains(detail), texts)
+            }
+        }
+        _ = try measure(SourceIssuesContent(sourceURL: URL(fileURLWithPath: "/示例来源"),
+            issues: Array(issues.prefix(1)), recoveryPending: false), width: 360, minimumHeight: 0) { host in
+            let text = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+            XCTAssertEqual(SourceIssuesContent(sourceURL: URL(fileURLWithPath: "/示例来源"), issues: Array(issues.prefix(1)), recoveryPending: false).groups.map(\.title), ["目录与连接"])
+            XCTAssertTrue(text.contains("连接") && text.contains("NSPOSIXErrorDomain"), text)
+            XCTAssertFalse(text.contains("读取与解析"), text)
+            XCTAssertFalse(text.contains("导入与提交"), text)
+        }
+    }
+
+    func testRecoveryPendingDoesNotInventIssueCount() throws {
+        _ = try measure(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源"), status: "已启用",
+            issues: [], recoveryPending: true).frame(width: 292), width: 292, minimumHeight: 0) { host in
+            let text = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+            XCTAssertTrue(text.contains("等待确认来源恢复"), text)
+            XCTAssertFalse(text.contains("项问题"), text)
+        }
+    }
+
+    func testLongSourceIssuesScrollWithoutTruncatingFinalItem() throws {
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let size = try measure(SourceIssuesContent(sourceURL: URL(fileURLWithPath: "/示例来源"),
+                issues: reviewIssues(long: true), recoveryPending: true), width: 360, appearance: appearance,
+                minimumHeight: 0) { host in
+                XCTAssertLessThanOrEqual(host.bounds.height, 420)
+                let scroll = try XCTUnwrap(self.scrollViews(in: host).first)
+                XCTAssertGreaterThan(scroll.documentView?.bounds.height ?? 0, scroll.bounds.height)
+                try UIReviewCapture.scrollToBottom(host)
+                let text = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+                XCTAssertTrue(text.contains("FINAL-19"), text)
+                XCTAssertTrue(text.contains("CAUSE-END-19"), text)
+            }
+            XCTAssertEqual(size.width, 360, accuracy: 1)
+            XCTAssertLessThanOrEqual(size.height, 420)
+        }
+    }
+
+    func testAnalysisDetailsCoverUnknownZeroWaitingPausedAndReady() throws {
+        for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
+            var snapshot = EngineSnapshot()
+            snapshot.summary = SyncStatusSummary(imported: 12, retainedImported: 3)
+            snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
+                totalAssets: 0, readyAssets: 0, totalRepresentations: 999,
+                readyRepresentations: 888, excludedAssets: 2, issue: state == .waiting ? "正在等待 iCloud 图像，连接恢复后自动继续" : nil)
+            snapshot.isPaused = true
+            _ = try measure(SyncDetailsContent(snapshot: snapshot), width: 300, minimumHeight: 0) { host in
+                let text = try self.allScrolledText(in: host)
+                XCTAssertEqual(text.contains("图库分析"), state != .ready, text)
+                XCTAssertTrue(text.contains("已发现") && text.contains("文件") && text.contains("已导入"), text)
+                XCTAssertTrue(text.contains("本次扫描"), text)
+                XCTAssertTrue(text.contains("统计当前启用来源") && text.contains("记录") && text.contains("此前扫描"), text)
+                XCTAssertTrue(text.contains("仅统计本轮扫描事件"), text)
+                if state != .ready {
+                    XCTAssertTrue(text.contains("统计 Photos 图库中的项目"), text)
+                    XCTAssertTrue((state == .preparing ? text.contains("正在读取图库") : (text.contains("已分析") && text.contains("0"))), text)
+                }
+                if state == .waiting { XCTAssertTrue(text.contains("iCloud"), text) }
+                XCTAssertFalse(text.contains("888"), text)
+            }
+        }
+    }
+
+    func testOpenDetailsUpdateAndRemainOpenWhenAnalysisBecomesReady() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+        _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: .aqua) { host, window in
+            let before = Set(NSApp.windows.map(\.windowNumber))
+            window.orderFront(nil)
+            defer { window.orderOut(nil) }
+            let button = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first)
+            button.performClick(nil)
+            let popup = try XCTUnwrap(self.waitForWindow(excluding: before))
+            defer { popup.orderOut(nil); popup.close() }
+            let content = try XCTUnwrap(popup.contentView)
+            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+                totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+                readyRepresentations: 6789, excludedAssets: 99, issue: nil)
+            XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { $0.contains("2192") && $0.contains("15702") } ?? false })
+            model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
+                totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
+                readyRepresentations: 45000, excludedAssets: 99, issue: nil)
+            XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { !$0.contains("图库分析") && $0.contains("已导入") && $0.contains("本次扫描") } ?? false })
+            XCTAssertTrue(popup.isVisible)
+            XCTAssertTrue(NSApp.windows.contains { $0 === popup })
+            let updated = self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first
+            XCTAssertTrue(updated === button, "The native trigger must retain its identity across ready")
+            XCTAssertEqual(SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel, "查看同步详情")
+        }
+    }
+
+    private func allScrolledText(in host: NSView) throws -> String {
+        let scroll = try XCTUnwrap(scrollViews(in: host).first)
+        let maximum = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
+        var text: [String] = []
+        var offset: CGFloat = 0
+        repeat {
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: offset))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            host.layoutSubtreeIfNeeded()
+            text += try recognizedText(in: host).map(\.text)
+            if offset >= maximum { break }
+            offset = min(maximum, offset + max(1, scroll.contentView.bounds.height - 50))
+        } while true
+        return text.joined(separator: "\n")
+    }
+
+    private func waitUntil(_ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        } while Date() < deadline
+        return condition()
+    }
+
+    private func waitForWindow(excluding ids: Set<Int>) -> NSWindow? {
+        var result: NSWindow?
+        _ = waitUntil {
+            result = NSApp.windows.first { $0.isVisible && !ids.contains($0.windowNumber) }
+            return result != nil
+        }
+        return result
     }
 
     func testSettingsSourceViewportBoundsThirtyMixedSources() async throws {
@@ -533,7 +752,7 @@ extension AppViewTests {
                 let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
                 XCTAssertEqual(size.width, 320, accuracy: 1)
                 XCTAssertLessThanOrEqual(size.height, 680)
-                try renderMenu(model, name: "source-unavailable-\(state.rawValue)-\(appearance.rawValue)", appearance: appearance)
+                try renderMenu(model, name: "source-unavailable-\(state)-\(appearance.rawValue)", appearance: appearance)
             }
         }
     }
@@ -562,7 +781,7 @@ extension AppViewTests {
                 XCTAssertEqual(size.width, 320, accuracy: 1)
                 XCTAssertLessThanOrEqual(size.height, 680)
                 XCTAssertEqual(model.analysis == nil, state == .ready)
-                try renderMenu(model, name: "\(state.rawValue)-\(appearance.rawValue)", appearance: appearance)
+                try renderMenu(model, name: "\(state)-\(appearance.rawValue)", appearance: appearance)
             }
         }
     }

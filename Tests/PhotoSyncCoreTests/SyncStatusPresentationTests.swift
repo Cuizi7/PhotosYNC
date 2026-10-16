@@ -2,6 +2,39 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testAnalysisAssetProgressIgnoresRepresentationAndSourceCounts() {
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(imported: 800, skipped: 100, pending: 9)
+        snapshot.latestScan = ScanProgress(state: .completed, checkedCandidates: 456, newlyImported: 123)
+        snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+            totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+            readyRepresentations: 6789, excludedAssets: 99, issue: "原始分析原因")
+        let analysis = SyncStatusPresentation(snapshot: snapshot).analysis
+        XCTAssertEqual(analysis?.progressText, "已分析 2192 / 15702 张")
+        XCTAssertEqual(analysis?.title, "正在分析图库")
+        XCTAssertEqual(analysis?.detail, "原始分析原因")
+        XCTAssertEqual(analysis?.fraction ?? -1, 2192.0 / 15702.0, accuracy: 0.000001)
+        XCTAssertEqual(SyncDetailsButton(snapshot: snapshot).accessibilityLabel, "查看图库分析与同步详情")
+    }
+
+    func testScanDetailRowsKeepExactValuesDatesAndOptionalRows() {
+        let start = Date(timeIntervalSince1970: 1_791_878_400)
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(imported: 900, skipped: 800, pending: 700)
+        snapshot.latestScan = ScanProgress(state: .interrupted, checkedCandidates: 86,
+            newlyImported: 24, failed: 99, failedFiles: 3, deferred: true,
+            startedAt: start, endedAt: start.addingTimeInterval(60))
+        snapshot.waitingSources[UUID()] = SourceIssue(summary: "目录等待", detail: "synthetic", kind: .sourceAvailability)
+        snapshot.waitingSources[UUID()] = SourceIssue(summary: "文件问题", detail: "synthetic", kind: .file)
+        let rows = SyncStatusPresentation(snapshot: snapshot).scanDetailRows
+        XCTAssertEqual(rows.map(\.title), ["检查候选", "新增导入", "状态", "本次读取失败", "来源等待恢复", "时间", "开始"])
+        XCTAssertEqual(rows.map(\.value), ["86", "24", "稍后继续", "3 个文件", "1 个来源",
+            start.addingTimeInterval(60).formatted(date: .abbreviated, time: .shortened),
+            start.formatted(date: .abbreviated, time: .shortened)])
+        snapshot.latestScan.state = .notStarted
+        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).scanDetailRows.isEmpty)
+    }
+
     func testUnavailableCountsAreNotPresentedAsZeroAndNoScanIsNotCompleted() {
         var snapshot = EngineSnapshot()
         XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).summary, "正在读取同步统计…")

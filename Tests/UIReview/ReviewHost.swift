@@ -26,7 +26,7 @@ enum ReviewHost {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("PhotosYNC-UIReview-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let app = NSApplication.shared
-        app.setActivationPolicy(args.contains("--interactive") || args.contains("--probe") ? .accessory : .prohibited)
+        app.setActivationPolicy(args.contains("--interactive") || args.contains("--probe") || args.contains("--controlled-capture") ? .accessory : .prohibited)
         var manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: output.appendingPathComponent("source.json"))) as? [String: Any] ?? [:]
         manifest["hostBundle"] = ["identifier": Bundle.main.bundleIdentifier ?? "missing",
             "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "missing",
@@ -36,13 +36,23 @@ enum ReviewHost {
             "System integrations disabled by injected-model isolation; this is not a product enablement change.",
             "XCTest renders use XCTest Bundle.main metadata; this host uses the same build's app version metadata.",
             "No screen/accessibility permission requests, no global events, no foreground activation."]
-        manifest["humanAcceptance"] = "候选证据，等待用户验收"
+        manifest["humanAcceptance"] = "候选证据，等待协调代理审阅；未声称用户本人验收"
         manifest["controlActiveStateOverride"] = "SwiftUI environment controlActiveState=.active; affects control appearance only; does not activate app/window or certify focus/hover"
+        if args.contains("--controlled-capture") {
+            try controlledCapture(output: output, root: root, manifest: manifest)
+            return
+        }
         if args.contains("--probe") {
             var observations: [[String: Any]] = []
-            for scenario in [UIReviewScenario.syncing, .analyzing, .many] {
-                let model = try makeUIReviewModel(scenario: scenario, root: root)
-                for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            let scenarios = argument("--scenario").flatMap(UIReviewScenario.init(rawValue:)).map { [$0] }
+                ?? [UIReviewScenario.syncing, .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero, .mixedIssues, .longIssues]
+            for scenario in scenarios {
+                let appearances: [(String, NSAppearance.Name)] = argument("--appearance").map {
+                    [($0, $0 == "dark" ? .darkAqua : .aqua)]
+                } ?? [("light", .aqua), ("dark", .darkAqua)]
+                for (look, appearance) in appearances {
+                    // Dynamic probes mutate their snapshot; each appearance starts fresh.
+                    let model = try makeUIReviewModel(scenario: scenario, root: root)
                     // This process is a test-only host. Native alert/popover chrome must use
                     // the selected fixture appearance too, without changing the user's OS.
                     app.appearance = NSAppearance(named: appearance)
@@ -54,7 +64,7 @@ enum ReviewHost {
                     _ = waitUntil { window.isVisible }
                     let staticName = "probe-\(scenario.rawValue)-\(look).png"
                     _ = try UIReviewCapture.write(host, to: output.appendingPathComponent(staticName))
-                    observations.append(try probe(host: host, window: window, model: model, scenario: scenario,
+                    observations.append(try probeDetails(host: host, window: window, model: model, scenario: scenario,
                         appearance: look, output: output))
                     manifest["interactions"] = observations
                     try save(manifest, output: output, name: "probe-manifest.json")
@@ -175,9 +185,30 @@ enum ReviewHost {
                         }
                     }
                 }
+                if [.mixedIssues, .longIssues, .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero].contains(scenario) {
+                    let sourceDetails = scenario == .mixedIssues || scenario == .longIssues
+                    let details = sourceDetails
+                        ? AnyView(SourceIssuesContent(sourceURL: model.state.sources[0].url,
+                            issues: model.state.snapshot.sourceIssueDetails[model.state.sources[0].id] ?? [], recoveryPending: false))
+                        : AnyView(SyncDetailsContent(snapshot: model.state.snapshot))
+                    let width: CGFloat = sourceDetails ? 360 : 300
+                    let kind = sourceDetails ? "source-details" : "sync-details"
+                    _ = try UIReviewCapture.render(details, width: width, appearance: appearance) { host, window in
+                        for position in ["top", "bottom"] {
+                            if position == "bottom" { try UIReviewCapture.scrollToBottom(host) }
+                            let filename = "\(scenario.rawValue)-\(look)-\(kind)-\(position).png"
+                            var item = try UIReviewCapture.write(host, to: output.appendingPathComponent(filename))
+                            item.merge(["scenario": scenario.rawValue, "appearance": look, "surface": "\(kind)-\(position)",
+                                "file": filename, "windowID": window.windowNumber, "input": inputs(model),
+                                "limitation": "Standalone native content on test window background; not an opened popover/material capture"], uniquingKeysWith: { _, b in b })
+                            captures.append(item)
+                        }
+                    }
+                }
             }
         }
-        guard captures.count == 70 else { throw UIReviewError.invalid("Incomplete matrix: \(captures.count)/70") }
+        let expected = UIReviewScenario.allCases.count * 4 + 2 + 7 * 4
+        guard captures.count == expected else { throw UIReviewError.invalid("Incomplete matrix: \(captures.count)/\(expected)") }
         manifest["captures"] = captures
         manifest["interactions"] = probes
         try save(manifest, output: output, name: "manifest.json")
@@ -194,6 +225,7 @@ enum ReviewHost {
             "retryPending": s.map { $0.retryPending as Any } ?? NSNull(),
             "checkedCandidates": model.state.snapshot.latestScan.checkedCandidates,
             "newlyImported": model.state.snapshot.latestScan.newlyImported,
+            "analysisState": model.state.snapshot.indexProgress.map { String(describing: $0.state) as Any } ?? NSNull(),
             "analysisReadyAssets": model.state.snapshot.indexProgress.map { $0.readyAssets as Any } ?? NSNull(),
             "analysisTotalAssets": model.state.snapshot.indexProgress.map { $0.totalAssets as Any } ?? NSNull(),
             "status": model.statusDescription, "fixtureDate": "2026-10-13"]
@@ -259,27 +291,9 @@ enum ReviewHost {
             point = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
             hitView = target as? NSView
         } else {
-            // Coordinates were visually checked against this scenario's real compiled PNG.
-            // Fail closed if its geometry changes; never infer a target in an unrelated window.
-            let expectedHeight: CGFloat = scenario == .many ? 669 : (scenario == .syncing ? 213 : 225)
-            guard abs(host.bounds.height - expectedHeight) <= 1 else {
-                result["status"] = "unverified"
-                result["failure"] = "AX target unavailable and capture-verified fallback geometry changed"
-                return result
-            }
-            let topPoint = scenario == .many ? NSPoint(x: 535, y: 165)
-                : NSPoint(x: scenario == .syncing ? 138 : 151, y: 47)
-            let local = NSPoint(x: topPoint.x, y: host.isFlipped ? topPoint.y : host.bounds.height - topPoint.y)
-            point = host.convert(local, to: nil)
-            hitView = host.hitTest(point)
-            result["inputMethod"] = "NSWindow-scoped mouse at visually verified own-view PNG coordinate; AX target unavailable"
-            result["targetPointInWindow"] = [point.x, point.y]
-            result["hitView"] = String(describing: hitView)
-            guard hitView != nil else {
-                result["status"] = "unverified"
-                result["failure"] = "No own-window hit target at capture-verified coordinate"
-                return result
-            }
+            result["status"] = "unverified"
+            result["failure"] = "Native AX target not exposed; stale hardcoded coordinate fallback removed"
+            return result
         }
         window.acceptsMouseMovedEvents = true
         func mouse(_ type: NSEvent.EventType, at location: NSPoint? = nil) {
@@ -380,6 +394,341 @@ enum ReviewHost {
         return result
     }
 
+    /// Opens the real production popover by a native button in this test host's view tree.
+    /// No activation, global pointer, key event, permissions or production runtime are used.
+    static func probeDetails(host: NSView, window: NSWindow, model: AppModel, scenario: UIReviewScenario,
+        appearance: String, output: URL) throws -> [String: Any] {
+        func buttons(_ view: NSView) -> [NSButton] {
+            ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap(buttons)
+        }
+        let candidates = buttons(host).filter { $0.isEnabled && $0.bounds.width > 0 && $0.bounds.height > 0 }
+        let isSource = scenario == .mixedIssues || scenario == .longIssues
+        // Menu content has one native info button followed by the single synthetic source's
+        // summary button. Locate real controls, then use their actual native frames.
+        let candidateIndex = isSource ? 1 : 0
+        var result: [String: Any] = ["scenario": scenario.rawValue, "appearance": appearance,
+            "pid": ProcessInfo.processInfo.processIdentifier, "hostWindowID": window.windowNumber,
+            "applicationActive": NSApp.isActive, "hostKeyWindow": window.isKeyWindow,
+            "activationRequested": false, "globalInputInjected": false,
+            "buttonDiscovery": "NSView tree native NSButton order in single-source synthetic menu; no hardcoded coordinate",
+            "nativeButtons": candidates.map { ["title": $0.title, "frame": String(describing: host.convert($0.bounds, from: $0))] },
+            "input": inputs(model)]
+        guard candidates.indices.contains(candidateIndex) else {
+            result["status"] = "unverified"; result["failure"] = "Expected native details button absent"; return result
+        }
+        let trigger = candidates[candidateIndex]
+        let before = Set(NSApp.windows.map(\.windowNumber))
+        trigger.performClick(nil)
+        func presentations() -> [NSWindow] { NSApp.windows.filter { $0.isVisible && !before.contains($0.windowNumber) } }
+        result["nativeClickOpened"] = waitUntil { !presentations().isEmpty }
+        guard let popup = presentations().first, let content = popup.contentView else {
+            result["status"] = "unverified"; result["failure"] = "Native performClick produced no popup in non-key host"; return result
+        }
+        defer { for popup in presentations() { popup.orderOut(nil); popup.close() } }
+        var captures: [[String: Any]] = []
+        var compositorAvailable = true
+        let popupID = CGWindowID(popup.windowNumber)
+        let paintStart = Date()
+        let paintDeadline = paintStart.addingTimeInterval(3)
+        var paintFrames: [[String: Any]] = []
+        var stablePaintFrames = 0
+        var lastBounds = ""
+        repeat {
+            let records = CGWindowListCopyWindowInfo([.optionIncludingWindow], popupID) as? [[String: Any]] ?? []
+            let own = records.first {
+                ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == popupID &&
+                    ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ProcessInfo.processInfo.processIdentifier
+            }
+            let bounds = own?[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+            let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+            let onScreen = (own?[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true
+            let matches = onScreen && abs(width - popup.frame.width) <= 2 && abs(height - popup.frame.height) <= 2
+            stablePaintFrames = matches ? stablePaintFrames + 1 : 0
+            let signature = "\(width)x\(height)/\(popup.frame.size)/\(onScreen)"
+            if signature != lastBounds || stablePaintFrames == 3 {
+                paintFrames.append(["elapsedMilliseconds": Int(Date().timeIntervalSince(paintStart) * 1000),
+                    "cgBounds": bounds, "nativeFrame": String(describing: popup.frame),
+                    "onScreen": onScreen, "matchesNativeSize": matches, "stableFrames": stablePaintFrames])
+                lastBounds = signature
+            }
+            if stablePaintFrames >= 3 { break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        } while Date() < paintDeadline
+        let paintObserved = stablePaintFrames >= 3
+        result["paintObservation"] = paintFrames
+        result["paintTimeoutSeconds"] = 3
+        compositorAvailable = paintObserved
+        result["popupOnScreenObserved"] = paintObserved
+        result["popupWindowID"] = popup.windowNumber
+        result["popupFrame"] = String(describing: popup.frame)
+        result["screenVisibleFrames"] = NSScreen.screens.map { String(describing: $0.visibleFrame) }
+        let ownRecords = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        result["ownWindowServerRecords"] = ownRecords.filter {
+            ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ProcessInfo.processInfo.processIdentifier
+        }.map { record in
+            ["windowID": record[kCGWindowNumber as String] ?? NSNull(),
+             "bounds": record[kCGWindowBounds as String] ?? NSNull(),
+             "onScreen": record[kCGWindowIsOnscreen as String] ?? NSNull(),
+             "layer": record[kCGWindowLayer as String] ?? NSNull()]
+        }
+        func capture(_ phase: String) throws {
+            content.layoutSubtreeIfNeeded(); content.displayIfNeeded()
+            let filename = "popover-\(scenario.rawValue)-\(appearance)-\(phase).png"
+            var entry: [String: Any] = ["phase": phase, "file": filename, "windowID": popup.windowNumber,
+                "visible": popup.isVisible, "keyWindow": popup.isKeyWindow, "input": inputs(model)]
+            do {
+                entry.merge(try UIReviewCapture.write(content, to: output.appendingPathComponent(filename)), uniquingKeysWith: { _, b in b })
+                entry["captureAccepted"] = true
+            } catch { entry["captureAccepted"] = false; entry["captureError"] = String(describing: error) }
+            if entry["captureAccepted"] as? Bool != true,
+               let raw = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: raw)
+                let rawName = "raw-\(filename)"
+                try raw.representation(using: .png, properties: [:])?.write(to: output.appendingPathComponent(rawName))
+                entry["rawUnvalidatedFile"] = rawName
+            }
+            if compositorAvailable {
+                let acquisition = try compositorCapture(window: popup, output: output,
+                    name: "compositor-\(scenario.rawValue)-\(appearance)-\(phase).png")
+                entry["compositor"] = acquisition
+                compositorAvailable = acquisition["status"] as? String == "captured"
+            } else {
+                entry["compositor"] = ["status": "unverified", "failure": paintObserved
+                    ? "Not retried after the same own-window acquisition failure"
+                    : "Own popup CG bounds did not converge to its native frame; acquisition not attempted"]
+            }
+            captures.append(entry)
+        }
+        _ = waitUntil { content.bounds.width >= (isSource ? 360 : 300) && content.bounds.height > 100 }
+        try capture("opened")
+        if scenario == .longIssues {
+            try UIReviewCapture.scrollToBottom(content)
+            try capture("bottom")
+        }
+        if scenario == .analyzing {
+            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+                totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+                readyRepresentations: 6789, excludedAssets: 99, issue: "合成更新原因")
+            // Drain the same host's update; this does not reconstruct any views or popovers.
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try capture("progress")
+            model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
+                totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
+                readyRepresentations: 45000, excludedAssets: 99, issue: nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try capture("ready")
+            result["samePopupVisibleAfterReady"] = popup.isVisible
+            result["sameTriggerAfterReady"] = buttons(host).first === trigger
+            result["readyAccessibilityNameProjection"] = SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel
+        }
+        result["presentations"] = captures
+        if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: popup.windowNumber,
+            context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) {
+            popup.sendEvent(event)
+        }
+        result["escapeDismissed"] = waitUntil { presentations().isEmpty }
+        result["status"] = compositorAvailable ? "native-capture-awaiting-coordinator-inspection" : "unverified-native-material"
+        if !compositorAvailable { result["failure"] = "Real popup observed; native material acquisition failed. Bitmap/text evidence does not certify popover appearance." }
+        result["limitations"] = ["Programmatic native click is not physical hover/Space/Return/outside click acceptance",
+            "Non-key test host cannot certify visible focus ring or physical focus restoration",
+            "See each compositor acquisition; cacheDisplay alone does not certify native material appearance",
+            "No real MenuBarExtra popup, Photos, sources or production database"]
+        return result
+    }
+
+    /// Explicitly opt-in, one activation, one bounded synthetic QA session.
+    static func controlledCapture(output: URL, root: URL, manifest initial: [String: Any]) throws {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard let original = NSWorkspace.shared.frontmostApplication, original.processIdentifier != ownPID else {
+            throw UIReviewError.invalid("Need a distinct original frontmost app before the one allowed QA activation")
+        }
+        let originalPID = original.processIdentifier
+        let started = Date()
+        let deadline = started.addingTimeInterval(30)
+        var manifest = initial
+        var observations: [[String: Any]] = []
+        var captures: [[String: Any]] = []
+        var windows: [NSWindow] = []
+        var activated = false
+        var userSwitched = false
+        var failure: String?
+        var restore: [String: Any] = ["attempted": false]
+        manifest["limitations"] = ["Explicit authorization for one synthetic QA foreground activation, maximum 30 seconds.",
+            "Only own PID/windowID compositor captures; stop immediately after observing a user switch.",
+            "No global keys/mouse, permission requests, system settings changes, production runtime or Photos access.",
+            "Acquisition is not user acceptance; every original screenshot and frontmost guard is recorded."]
+        manifest["controlActiveStateOverride"] = "Synthetic SwiftUI appearance override; separate single QA activation is explicitly recorded below."
+        manifest["controlledSession"] = ["originalFrontmost": ["pid": originalPID, "bundleID": original.bundleIdentifier ?? "unknown"],
+            "qaPID": ownPID, "qaActivationCalls": 0, "maximumSeconds": 30,
+            "status": "prepared-before-activation", "startedAt": started.ISO8601Format()]
+        try save(manifest, output: output, name: "controlled-manifest.json")
+        func frontmost() -> [String: Any] {
+            let app = NSWorkspace.shared.frontmostApplication
+            return ["pid": app.map { $0.processIdentifier as Any } ?? NSNull(), "bundleID": app?.bundleIdentifier ?? "unknown"]
+        }
+        func mayContinue() -> Bool {
+            guard Date() < deadline else { return false }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID else {
+                userSwitched = true
+                return false
+            }
+            return true
+        }
+        func closeOwnWindows() {
+            for window in NSApp.windows where window.isVisible { window.orderOut(nil); window.close() }
+            windows.removeAll()
+        }
+        func capture(_ popup: NSWindow, scenario: UIReviewScenario, look: String, phase: String) throws {
+            guard mayContinue(), deadline.timeIntervalSinceNow > 6 else { throw UIReviewError.invalid("QA foreground/session deadline ended before capture") }
+            let popupID = CGWindowID(popup.windowNumber)
+            let paintDeadline = min(deadline, Date().addingTimeInterval(3))
+            var frames: [[String: Any]] = []
+            var stable = 0
+            repeat {
+                guard mayContinue() else { break }
+                let records = CGWindowListCopyWindowInfo([.optionIncludingWindow], popupID) as? [[String: Any]] ?? []
+                let own = records.first { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == ownPID && ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == popupID }
+                let bounds = own?[kCGWindowBounds as String] as? [String: Any] ?? [:]
+                let w = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+                let h = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+                let matches = abs(w - popup.frame.width) <= 2 && abs(h - popup.frame.height) <= 2 && w > 100 && h > 100
+                stable = matches ? stable + 1 : 0
+                frames.append(["elapsedMilliseconds": Int(Date().timeIntervalSince(started) * 1000), "cgBounds": bounds,
+                    "nativeFrame": String(describing: popup.frame), "stableFrames": stable, "frontmost": frontmost()])
+                if stable >= 3 { break }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            } while Date() < paintDeadline
+            guard mayContinue(), stable >= 3, deadline.timeIntervalSinceNow > 6 else {
+                observations.append(["scenario": scenario.rawValue, "appearance": look, "phase": phase, "paintFrames": frames])
+                throw UIReviewError.invalid("Native/CG popup dimensions or session guard did not converge; no activation retry")
+            }
+            let entryFront = frontmost()
+            let acquisition = try compositorCapture(window: popup, output: output,
+                name: "controlled-\(scenario.rawValue)-\(look)-\(phase).png", captureAllowed: mayContinue)
+            captures.append(["scenario": scenario.rawValue, "appearance": look, "phase": phase,
+                "pid": ownPID, "windowID": popup.windowNumber, "nativeFrame": String(describing: popup.frame),
+                "frontmostBefore": entryFront, "frontmostAfter": frontmost(), "paintFrames": frames, "acquisition": acquisition])
+            guard mayContinue(), acquisition["status"] as? String == "captured" else {
+                throw UIReviewError.invalid("One controlled native acquisition did not succeed; no reactivation/retry")
+            }
+        }
+        do {
+            for scenario in [UIReviewScenario.mixedIssues, .longIssues, .analyzing] {
+                for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+                    if activated, !mayContinue() { throw UIReviewError.invalid("User switched away or bounded session expired") }
+                    guard deadline.timeIntervalSinceNow > 6 else { throw UIReviewError.invalid("Bounded session time budget reached") }
+                    let model = try makeUIReviewModel(scenario: scenario, root: root)
+                    NSApp.appearance = NSAppearance(named: appearance)
+                    let window = try interactiveWindow(AnyView(StatusMenu(model: model)), width: 320, appearance: appearance)
+                    windows.append(window)
+                    if !activated {
+                        // Persist the original foreground immediately before the sole QA activation.
+                        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == originalPID else {
+                            userSwitched = true
+                            throw UIReviewError.invalid("Original foreground changed before QA activation; session stopped")
+                        }
+                        manifest["frontmostBeforeActivation"] = frontmost()
+                        try save(manifest, output: output, name: "controlled-manifest.json")
+                        guard deadline.timeIntervalSinceNow > 6 else { throw UIReviewError.invalid("Session budget expired before the sole QA activation") }
+                        // The sole QA activation. There is no reactivation path.
+                        window.orderFront(nil)
+                        NSApp.activate(ignoringOtherApps: true)
+                        activated = true
+                        guard waitUntil({
+                            let currentPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                            if let currentPID, currentPID != originalPID, currentPID != ownPID {
+                                userSwitched = true
+                                return true
+                            }
+                            return currentPID == ownPID
+                        }), !userSwitched, NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID else {
+                            throw UIReviewError.invalid("The single QA activation did not become frontmost or a user switch was observed")
+                        }
+                    }
+                    guard mayContinue() else { throw UIReviewError.invalid("QA no longer frontmost before own-window presentation") }
+                    window.makeKeyAndOrderFront(nil)
+                    // Keep one QA host visible between scenes so closing the prior scene
+                    // does not itself surrender foreground and resemble a user switch.
+                    for previous in windows where previous !== window {
+                        previous.contentView = nil; previous.orderOut(nil); previous.close()
+                    }
+                    windows = [window]
+                    guard let host = window.contentView else { throw UIReviewError.invalid("Missing synthetic menu host") }
+                    func buttons(_ view: NSView) -> [NSButton] {
+                        ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap(buttons)
+                    }
+                    let candidates = buttons(host).filter { $0.isEnabled && $0.bounds.width > 0 && $0.bounds.height > 0 }
+                    let index = scenario == .analyzing ? 0 : 1
+                    guard candidates.indices.contains(index), mayContinue() else { throw UIReviewError.invalid("Native details trigger unavailable or QA lost foreground") }
+                    let trigger = candidates[index]
+                    let before = Set(NSApp.windows.map(\.windowNumber))
+                    trigger.performClick(nil)
+                    var popup: NSWindow?
+                    guard waitUntil({
+                        guard mayContinue() else { return true }
+                        popup = NSApp.windows.first { $0.isVisible && !before.contains($0.windowNumber) }
+                        return popup != nil
+                    }), mayContinue(), let popup else { throw UIReviewError.invalid("No native popup in the authorized foreground session") }
+                    observations.append(["scenario": scenario.rawValue, "appearance": look,
+                        "hostWindowID": window.windowNumber, "popupWindowID": popup.windowNumber, "input": inputs(model)])
+                    try capture(popup, scenario: scenario, look: look, phase: "opened")
+                    if scenario != .analyzing {
+                        guard let content = popup.contentView else { throw UIReviewError.invalid("Missing source popup content") }
+                        try UIReviewCapture.scrollToBottom(content)
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                        try capture(popup, scenario: scenario, look: look, phase: "bottom")
+                    } else {
+                        model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+                            totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
+                            readyRepresentations: 6789, excludedAssets: 99, issue: "合成更新原因")
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                        try capture(popup, scenario: scenario, look: look, phase: "progress")
+                        model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
+                            totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
+                            readyRepresentations: 45000, excludedAssets: 99, issue: nil)
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                        try capture(popup, scenario: scenario, look: look, phase: "ready")
+                        observations.append(["scenario": scenario.rawValue, "appearance": look,
+                            "samePopupVisibleAfterReady": popup.isVisible, "sameTriggerAfterReady": buttons(host).first === trigger,
+                            "readyAccessibilityNameProjection": SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel])
+                    }
+                    popup.orderOut(nil); popup.close()
+                }
+            }
+        } catch { failure = String(describing: error) }
+        let frontBeforeRestore = frontmost()
+        // Restore before normal own-window cleanup, only while QA still owns foreground
+        // and no user switch has ever been observed. Never activateAllWindows or retry.
+        if activated, !userSwitched, NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID,
+           let liveOriginal = NSRunningApplication(processIdentifier: originalPID), !liveOriginal.isTerminated,
+           liveOriginal.bundleIdentifier == original.bundleIdentifier {
+            restore = ["attempted": true, "accepted": liveOriginal.activate(options: [])]
+            let restoreDeadline = min(deadline, Date().addingTimeInterval(0.75))
+            var observed = false
+            var thirdParty = false
+            repeat {
+                let currentPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                if currentPID == originalPID { observed = true; break }
+                if let currentPID, currentPID != ownPID { thirdParty = true; break }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            } while Date() < restoreDeadline
+            restore["observedOriginalFrontmost"] = observed
+            restore["stoppedOnThirdPartySwitch"] = thirdParty
+            restore["frontmostAtObservationEnd"] = frontmost()
+        }
+        closeOwnWindows()
+        manifest["controlledSession"] = ["originalFrontmost": ["pid": originalPID, "bundleID": original.bundleIdentifier ?? "unknown"],
+            "qaPID": ownPID, "qaActivationCalls": activated ? 1 : 0, "maximumSeconds": 30,
+            "elapsedSeconds": Date().timeIntervalSince(started), "userSwitchObserved": userSwitched,
+            "frontmostBeforeRestore": frontBeforeRestore, "restore": restore, "frontmostAfter": frontmost(),
+            "status": failure == nil ? "acquired-awaiting-coordinator-inspection" : "unverified",
+            "failure": failure.map { $0 as Any } ?? NSNull(), "observations": observations, "captures": captures,
+            "systemSettingsChanged": false, "globalInputInjected": false]
+        try save(manifest, output: output, name: "controlled-manifest.json")
+    }
+
     static func userOpenCaptureResult(_ acquisition: [String: Any]) -> [String: Any] {
         var result: [String: Any] = ["compositor": acquisition]
         if acquisition["status"] as? String == "captured" {
@@ -393,7 +742,8 @@ enum ReviewHost {
         return result
     }
 
-    static func compositorCapture(window: NSWindow, output: URL, name: String) throws -> [String: Any] {
+    static func compositorCapture(window: NSWindow, output: URL, name: String, captureAllowed: (() -> Bool)? = nil) throws -> [String: Any] {
+        if captureAllowed?() == false { return ["status": "unverified", "failure": "Controlled foreground/session guard ended before acquisition"] }
         guard CGPreflightScreenCaptureAccess() else {
             return ["status": "unverified", "failure": "Screen Recording preflight false; no permission requested"]
         }
@@ -415,12 +765,17 @@ enum ReviewHost {
         catch { return ["status": "unverified", "failure": String(describing: error)] }
         let deadline = Date().addingTimeInterval(5)
         while process.isRunning, Date() < deadline {
+            if captureAllowed?() == false {
+                process.terminate()
+                return ["status": "unverified", "failure": "Controlled foreground/session guard ended during acquisition"]
+            }
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         }
         if process.isRunning {
             process.terminate()
             return ["status": "unverified", "failure": "Own-window screencapture exceeded bounded five-second deadline"]
         }
+        if captureAllowed?() == false { return ["status": "unverified", "failure": "Controlled foreground/session guard ended after acquisition"] }
         let diagnostic = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             return ["status": "unverified", "exitCode": process.terminationStatus, "failure": diagnostic]

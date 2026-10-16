@@ -177,6 +177,12 @@ final class AppModel: ObservableObject {
     var enabledWaiting: [UUID: SourceIssue] {
         state.snapshot.waitingSources.filter { enabledSourceIDs.contains($0.key) }
     }
+    /// The directory aggregate can outlive its last diagnostic until traversal confirms recovery.
+    func recoveryPending(for sourceID: UUID) -> Bool {
+        state.snapshot.waitingSources[sourceID]?.isSourceAvailability == true &&
+            !(state.snapshot.sourceIssueDetails[sourceID] ?? []).contains { $0.kind == .sourceAvailability }
+    }
+
     func fileIssueCount(for sourceID: UUID) -> Int {
         state.snapshot.sourceFileIssueCounts[sourceID] ?? 0
     }

@@ -70,18 +70,64 @@ public struct SourceIssue: Equatable, Sendable {
     public var isSourceAvailability: Bool { kind == .sourceAvailability }
 }
 
+/// One current diagnostic identity. Paths and stages are captured at failure time, without I/O.
+public struct SourceIssueDetail: Equatable, Sendable, Identifiable {
+    public var id: String
+    public var kind: SourceIssueKind
+    public var path: String
+    public var summary: String
+    public var stage: String?
+    public var detail: String
+
+    public init(id: String, kind: SourceIssueKind, path: String, summary: String, stage: String?, detail: String) {
+        self.id = id; self.kind = kind; self.path = path; self.summary = summary
+        self.stage = stage; self.detail = detail
+    }
+}
+
+private struct TrackedSourceIssue {
+    var primary: SourceIssue
+    var diagnostics: [String: SourceIssueDetail]
+}
+
 /// Wording for failures the engine can classify from the operation that failed. A missing volume
 /// is not a mysterious file error to the person reading the menu: it is an unmounted disk or share.
 enum SourceIssueText {
     static func directoryUnavailable(sourceURL: URL, failingURL: URL, isRoot: Bool, error: Error) -> SourceIssue {
         SourceIssue(summary: directorySummary(sourceURL: sourceURL, isRoot: isRoot, error: error),
-                    detail: "\(failingURL.path): \(error.localizedDescription)",
+                    detail: "\(failingURL.path): \(systemDiagnostic(error))",
                     kind: .sourceAvailability)
     }
 
     static func fileUnreadable(relativePath: String, url: URL, error: Error) -> SourceIssue {
-        SourceIssue(summary: "文件无法读取，可能已损坏或没有权限。",
-                    detail: "\(url.path): \(error.localizedDescription)", kind: .file)
+        let isVideoMetadata = underlyingNSErrorChain(error).contains { $0.domain == "PhotoSync.VideoMetadata" }
+        return SourceIssue(summary: readableSummary(subject: "文件", error: error) ?? (isVideoMetadata
+            ? "视频元数据读取失败，具体原因尚无法确定。"
+            : "文件暂时无法读取，具体原因尚无法确定。"),
+            detail: "\(url.path): \(systemDiagnostic(error))", kind: .file)
+    }
+
+    static func entryUnreadable(url: URL, error: Error) -> SourceIssue {
+        SourceIssue(summary: readableSummary(subject: "目录项", error: error) ?? "目录项暂时无法读取，具体原因尚无法确定。",
+                    detail: "\(url.path): \(systemDiagnostic(error))", kind: .file)
+    }
+
+    private static func readableSummary(subject: String, error: Error) -> String? {
+        for failure in underlyingNSErrorChain(error) {
+            if (failure.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(failure.code)) ||
+               (failure.domain == NSPOSIXErrorDomain && [Int(ENOENT), Int(ENOTDIR), Int(ENODEV)].contains(failure.code)) {
+                return "\(subject)路径不可用，请检查磁盘或网络连接。"
+            }
+            if (failure.domain == NSCocoaErrorDomain && failure.code == NSFileReadNoPermissionError) ||
+               (failure.domain == NSPOSIXErrorDomain && [Int(EACCES), Int(EPERM)].contains(failure.code)) {
+                return "\(subject)无法访问，请检查访问权限。"
+            }
+            if failure.domain == NSPOSIXErrorDomain,
+               [Int(ENETDOWN), Int(ENETUNREACH), Int(ENOTCONN), Int(ECONNRESET), Int(ETIMEDOUT), Int(EPIPE), Int(EHOSTDOWN)].contains(failure.code) {
+                return "\(subject)所在的网络共享连接已中断，恢复后会自动继续。"
+            }
+        }
+        return nil
     }
 
     /// A stamp read happens before any Photos submission, so a failed one never leaves the import
@@ -174,16 +220,20 @@ enum SourceIssueText {
     }
 
     /// Wrapped failures keep their cause in `NSUnderlyingErrorKey`; the outer error is often a
-    /// generic transport error, so classification has to look a few levels down.
-    private static func underlyingNSErrorChain(_ error: Error) -> [NSError] {
+    /// generic transport error. Keep every available cause and stop at repeated objects.
+    static func underlyingNSErrorChain(_ error: Error) -> [NSError] {
         var errors: [NSError] = []
+        var seen: Set<ObjectIdentifier> = []
         var current: NSError? = error as NSError
-        for _ in 0..<4 {
-            guard let nsError = current else { break }
-            errors.append(nsError)
-            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        while let failure = current, seen.insert(ObjectIdentifier(failure)).inserted {
+            errors.append(failure)
+            current = failure.userInfo[NSUnderlyingErrorKey] as? NSError
         }
         return errors
+    }
+
+    static func systemDiagnostic(_ error: Error) -> String {
+        underlyingNSErrorChain(error).map { "\($0.domain) \($0.code): \($0.localizedDescription)" }.joined(separator: " <- ")
     }
 
     /// `/Volumes/<name>` that the source path depends on but that does not exist right now.
@@ -214,6 +264,9 @@ public struct EngineSnapshot: Sendable {
     /// Unresolved file-level scan issues per source. They are reported next to that source's
     /// primary message and disappear when the file is readable again or a clean scan completes.
     public var sourceFileIssueCounts: [UUID: Int] = [:]
+    /// Current diagnostic identities, sorted by full path and ID. Empty sources have no key.
+    /// An availability recovery marker may remain in waitingSources without any diagnostics.
+    public var sourceIssueDetails: [UUID: [SourceIssueDetail]] = [:]
     /// Sources whose last round left work for a later attempt because a read was deferred. They
     /// are waiting, not failing: nothing is reported for them and they are retried within seconds.
     public var deferredSources: Set<UUID> = []
@@ -265,7 +318,7 @@ public actor SyncEngine {
     private var rounds: [UUID: ScanRound] = [:]
     private var latestRoundID: UUID?
     private var reportedWaitingSources: Set<UUID> = []
-    private var sourceIssues: [UUID: [String: SourceIssue]] = [:]
+    private var sourceIssues: [UUID: [String: TrackedSourceIssue]] = [:]
     /// One signature per source, phase, and file identity so an unchanged failure is not journaled every round.
     private var lastFailureLogSignatures: [String: String] = [:]
     // The single drain may await retry persistence while a scan resolves the same file.
@@ -450,7 +503,7 @@ public actor SyncEngine {
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                                        issue: SourceIssue(summary: SourceIssueText.uncertainImport,
                                                           detail: "An earlier Photos import is awaiting confirmation.", kind: .submission),
-                                       fileID: record.id, attemptID: attempt, error: nil)
+                                       path: record.file.url.path, stage: "核对导入结果", fileID: record.id, attemptID: attempt, error: nil)
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
@@ -460,7 +513,7 @@ public actor SyncEngine {
                     } else {
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                                        issue: SourceIssue(summary: SourceIssueText.uncertainImport, detail: error.localizedDescription, kind: .submission),
-                                       fileID: record.id, attemptID: attempt, error: error)
+                                       path: record.file.url.path, stage: "核对导入结果", fileID: record.id, attemptID: attempt, error: error)
                     }
                 }
             }
@@ -485,18 +538,32 @@ public actor SyncEngine {
             var directories: [(url: URL, relative: String)] = [(source.url, "")]
             // Only an exhaustive traversal may retire pending files absent from the source.
             var unseenPending = try await store.pendingPaths(sourceID: sourceID)
+            // Failed metadata may have no stored row. Track only old diagnostics for absence
+            // reconciliation, using this traversal's observations and no additional I/O.
+            var unseenScanIssueKeys = Set(sourceIssues[sourceID]?.keys.filter { $0.hasPrefix("scan:file:") } ?? [])
             var directoryTraversalComplete = true
             var lastFailure: String?
             scanLoop: while !directories.isEmpty, canScan(sourceID: sourceID) {
                 let folder = directories.removeFirst()
                 do {
-                    for entry in try await reader.entries(in: folder.url) {
+                    let entries = try await reader.entries(in: folder.url)
+                    guard canScan(sourceID: sourceID) else {
+                        directoryTraversalComplete = false
+                        break scanLoop
+                    }
+                    resolveDirectoryDiagnostic(sourceID, path: folder.url.path, runID: run)
+                    for entry in entries {
                         guard canScan(sourceID: sourceID) else {
                             directoryTraversalComplete = false
                             break scanLoop
                         }
-                        if entry.isDirectory { directories.append((entry.url, folder.relative + entry.url.lastPathComponent + "/")); continue }
                         let relative = folder.relative + entry.url.lastPathComponent
+                        unseenScanIssueKeys.remove(fileScanIssueKey(relative))
+                        if entry.isDirectory {
+                            resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run)
+                            directories.append((entry.url, relative + "/"))
+                            continue
+                        }
                         unseenPending.removeValue(forKey: relative)
                         let classification = MetadataReader.classification(entry.url)
                         if let failure = entry.failure {
@@ -510,19 +577,21 @@ public actor SyncEngine {
                             failed += 1
                             recordRoundFailure(roundID, fileLevel: true)
                             lastFailure = failure
-                            let entryError = NSError(domain: "PhotoSync.DirectoryEntry", code: 1, userInfo: [NSLocalizedDescriptionKey: failure])
+                            let entryError = entry.failureCause ?? NSError(domain: "PhotoSync.DirectoryEntry", code: 1, userInfo: [NSLocalizedDescriptionKey: failure])
                             setSourceIssue(sourceID, key: fileScanIssueKey(relative),
-                                           issue: SourceIssueText.fileUnreadable(relativePath: relative, url: entry.url, error: entryError),
-                                           runID: run, error: entryError)
-                            logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, error: entryError)
+                                           issue: SourceIssueText.entryUnreadable(url: entry.url, error: entryError),
+                                           path: entry.url.path, stage: "读取目录项属性", runID: run, error: entryError)
+                            logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, stage: "读取目录项属性", error: entryError)
                             continue
                         }
                         guard classification == "image" || classification == "video" else {
+                            resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run)
                             logEvent(phase: "classification", result: classification, sourceID: sourceID, runID: run, path: entry.url.path)
                             continue
                         }
                         checked += 1
                         recordCandidateChecked(roundID)
+                        var readStage = "读取文件属性"
                         do {
                             let stamp = try await reader.stamp(of: entry.url)
                             guard canScan(sourceID: sourceID) else {
@@ -545,6 +614,7 @@ public actor SyncEngine {
                                 resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run, fileID: old.id)
                                 continue
                             }
+                            readStage = "读取媒体元数据"
                             let info = try await metadataReader.read(url: entry.url, filename: entry.url.lastPathComponent)
                             guard canScan(sourceID: sourceID) else {
                                 directoryTraversalComplete = false
@@ -562,6 +632,10 @@ public actor SyncEngine {
                             break scanLoop
                         }
                         catch {
+                            guard canScan(sourceID: sourceID) else {
+                                directoryTraversalComplete = false
+                                break scanLoop
+                            }
                             if SourceIssueText.isReadContention(error) {
                                 // Bounded-reader contention is queue pressure, not a bad file.
                                 // Leave all persisted scan-run failure fields untouched.
@@ -572,14 +646,15 @@ public actor SyncEngine {
                                 recordRoundFailure(roundID, fileLevel: true)
                                 setSourceIssue(sourceID, key: fileScanIssueKey(relative),
                                                issue: SourceIssueText.fileUnreadable(relativePath: relative, url: entry.url, error: error),
-                                               runID: run, error: error)
-                                logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, error: error)
+                                               path: entry.url.path, stage: MetadataReader.videoMetadataStage(error) ?? readStage, runID: run, error: error)
+                                logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, stage: MetadataReader.videoMetadataStage(error) ?? readStage, error: error)
                             }
                         }
                     }
                 } catch let error as SyncStoreError { throw error }
                 catch {
                     directoryTraversalComplete = false
+                    guard canScan(sourceID: sourceID) else { break scanLoop }
                     if SourceIssueText.isReadContention(error) {
                         recordDeferral(roundID, sourceID: sourceID)
                     } else {
@@ -589,8 +664,8 @@ public actor SyncEngine {
                         setSourceIssue(sourceID, key: Self.directoryScanIssueKey,
                                        issue: SourceIssueText.directoryUnavailable(sourceURL: source.url, failingURL: folder.url,
                                                                                    isRoot: folder.relative.isEmpty, error: error),
-                                       runID: run, error: error)
-                        logFailureOnce(phase: "directory", sourceID: sourceID, runID: run, path: folder.url.path, error: error)
+                                       path: folder.url.path, stage: "枚举目录", runID: run, error: error)
+                        logFailureOnce(phase: "directory", sourceID: sourceID, runID: run, path: folder.url.path, stage: "枚举目录", error: error)
                     }
                 }
             }
@@ -609,6 +684,13 @@ public actor SyncEngine {
                                            announceRecovery: false)
                         logEvent(phase: "source-file", result: "deleted", sourceID: sourceID, runID: run,
                                  fileID: fileID, path: source.url.appendingPathComponent(relative).path)
+                    }
+                }
+                // Absence of an unstored failed file is proven only by a complete, non-deferred
+                // round. Normal deletion closes its diagnostic without a recovery notification.
+                if canScan(sourceID: sourceID), !status.deferredSources.contains(sourceID) {
+                    for key in unseenScanIssueKeys.sorted() {
+                        resolveSourceIssue(sourceID, key: key, runID: run, announceRecovery: false)
                     }
                 }
                 if canScan(sourceID: sourceID) {
@@ -770,10 +852,10 @@ public actor SyncEngine {
                         recordRoundFailure(context.roundID)
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                                        issue: SourceIssueText.submissionStampFailed(error: error),
-                                       runID: context.runID, fileID: record.id, error: error)
+                                       path: record.file.url.path, stage: "提交前读取来源文件", runID: context.runID, fileID: record.id, error: error)
                         logFailureOnce(phase: "submission-stamp", sourceID: record.file.sourceID,
                                        keyPath: record.file.relativePath, runID: context.runID,
-                                       fileID: record.id, path: record.file.url.path, error: error)
+                                       fileID: record.id, path: record.file.url.path, stage: "提交前读取来源文件", error: error)
                         if let run = context.runID { try await store.recordScanFailure(runID: run, error: message) }
                     }
                     continue
@@ -807,7 +889,8 @@ public actor SyncEngine {
                         guard canSubmit(sourceID: record.file.sourceID) else { continue }
                         recordRoundFailure(context.roundID)
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
-                            issue: SourceIssueText.submissionStampFailed(error: error), runID: context.runID, fileID: record.id, error: error)
+                            issue: SourceIssueText.submissionStampFailed(error: error), path: record.file.url.path,
+                            stage: "准备照片判重", runID: context.runID, fileID: record.id, error: error)
                         continue
                     }
                     guard canSubmit(sourceID: record.file.sourceID) else { continue }
@@ -979,8 +1062,10 @@ public actor SyncEngine {
                     setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                                    issue: SourceIssue(summary: definite ? "有文件导入失败，稍后会自动重试。" : SourceIssueText.uncertainImport,
                                                       detail: error.localizedDescription, kind: .submission),
-                                   runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
-                    logEvent(phase: "submission", result: "failed", sourceID: record.file.sourceID, runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
+                                   path: record.file.url.path, stage: "提交导入", runID: context.runID, fileID: record.id, attemptID: attempt, error: error)
+                    logEvent(phase: "submission", result: "failed", sourceID: record.file.sourceID, runID: context.runID,
+                             fileID: record.id, attemptID: attempt, path: record.file.url.path, error: error,
+                             detail: "提交导入: \(SourceIssueText.systemDiagnostic(error))")
                     // A gateway reporting unknown may still own a physical request. Keep this
                     // instance and stop submissions until its own lifecycle permits recovery.
                     if !definite {
@@ -1091,11 +1176,49 @@ public actor SyncEngine {
     private static let directoryScanIssueKey = "scan:directory"
     private func fileScanIssueKey(_ relativePath: String) -> String { "scan:file:\(relativePath)" }
 
-    private func setSourceIssue(_ sourceID: UUID, key: String, issue: SourceIssue, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
-        // A source that was disabled or removed mid-scan must not reappear as waiting afterwards.
+    private func setSourceIssue(_ sourceID: UUID, key: String, issue: SourceIssue, path: String,
+                                stage: String? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, error: Error?) {
         guard !removedSources.contains(sourceID), !disabledSources.contains(sourceID) else { return }
-        sourceIssues[sourceID, default: [:]][key] = issue
+        let diagnosticID = key == Self.directoryScanIssueKey ? "\(key):\(path)" : key
+        let operation = stage.map { " [\($0)]" } ?? ""
+        let detail = "\(path)\(operation): " + (error.map { SourceIssueText.systemDiagnostic($0) } ?? issue.detail)
+        let diagnostic = SourceIssueDetail(id: diagnosticID, kind: issue.kind, path: path,
+                                           summary: issue.summary, stage: stage, detail: detail)
+        var tracked = (key == Self.directoryScanIssueKey ? sourceIssues[sourceID]?[key] : nil)
+            ?? TrackedSourceIssue(primary: issue, diagnostics: [:])
+        tracked.diagnostics[diagnosticID] = diagnostic
+        sourceIssues[sourceID, default: [:]][key] = refreshedPrimary(tracked)
+        // Individual submission evidence must outlive the snapshot even when this source's
+        // once-per-outage waiting notification has already been sent for another file.
+        if issue.kind == .submission {
+            logFailureOnce(phase: "submission-diagnostic", sourceID: sourceID, keyPath: diagnosticID,
+                           runID: runID, fileID: fileID, attemptID: attemptID, path: path, stage: stage,
+                           result: "unresolved", error: error, detail: diagnostic.detail)
+        }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID, error: error)
+    }
+
+    private func refreshedPrimary(_ tracked: TrackedSourceIssue) -> TrackedSourceIssue {
+        var result = tracked
+        if let first = tracked.diagnostics.values.sorted(by: Self.diagnosticOrder).first {
+            result.primary = SourceIssue(summary: first.summary, detail: first.detail, kind: first.kind)
+        } else {
+            // Keep the source-availability marker until the existing exhaustive traversal gate.
+            result.primary = SourceIssue(summary: "等待确认来源恢复", detail: "正在等待完整目录遍历，以确认来源已恢复。", kind: tracked.primary.kind)
+        }
+        return result
+    }
+
+    private static func diagnosticOrder(_ lhs: SourceIssueDetail, _ rhs: SourceIssueDetail) -> Bool {
+        lhs.path == rhs.path ? lhs.id < rhs.id : lhs.path < rhs.path
+    }
+
+    private func resolveDirectoryDiagnostic(_ sourceID: UUID, path: String, runID: UUID?) {
+        guard var tracked = sourceIssues[sourceID]?[Self.directoryScanIssueKey],
+              tracked.diagnostics.removeValue(forKey: "\(Self.directoryScanIssueKey):\(path)") != nil else { return }
+        sourceIssues[sourceID]?[Self.directoryScanIssueKey] = refreshedPrimary(tracked)
+        lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|directory|\(path)")
+        syncSourceIssueStatus(sourceID, runID: runID, error: nil)
     }
 
     private func resolveSourceIssue(_ sourceID: UUID, key: String, runID: UUID? = nil, fileID: UUID? = nil,
@@ -1121,6 +1244,7 @@ public actor SyncEngine {
         // failure must not re-enable identical log rows for any other file in this source.
         if key.hasPrefix("file:"), let fileID {
             lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|submission-stamp|\(fileID.uuidString)")
+            lastFailureLogSignatures.removeValue(forKey: "\(sourceID.uuidString)|submission-diagnostic|\(fileID.uuidString)")
         }
         syncSourceIssueStatus(sourceID, runID: runID, fileID: fileID, attemptID: attemptID,
                               error: nil, announceRecovery: announceRecovery)
@@ -1137,17 +1261,20 @@ public actor SyncEngine {
 
     /// The source line shows the most explanatory unresolved problem: a missing directory first,
     /// then a blocked import, then unreadable files.
-    private func primaryIssue(_ issues: [String: SourceIssue]) -> SourceIssue? {
-        if let issue = issues[Self.directoryScanIssueKey] { return issue }
-        if let key = issues.keys.filter({ $0.hasPrefix("file:") }).sorted().first { return issues[key] }
-        if let key = issues.keys.filter({ $0.hasPrefix("scan:file:") }).sorted().first { return issues[key] }
-        return issues.keys.sorted().first.flatMap { issues[$0] }
+    private func primaryIssue(_ issues: [String: TrackedSourceIssue]) -> SourceIssue? {
+        if let issue = issues[Self.directoryScanIssueKey] { return issue.primary }
+        if let key = issues.keys.filter({ $0.hasPrefix("file:") }).sorted().first { return issues[key]?.primary }
+        if let key = issues.keys.filter({ $0.hasPrefix("scan:file:") }).sorted().first { return issues[key]?.primary }
+        return issues.keys.sorted().first.flatMap { issues[$0]?.primary }
     }
 
     private func syncSourceIssueStatus(_ sourceID: UUID, runID: UUID? = nil, fileID: UUID? = nil,
                                        attemptID: UUID? = nil, error: Error?, announceRecovery: Bool = true) {
         guard !removedSources.contains(sourceID) else { return }
         let issues = sourceIssues[sourceID] ?? [:]
+        let diagnostics = issues.values.flatMap { $0.diagnostics.values }.sorted(by: Self.diagnosticOrder)
+        if diagnostics.isEmpty { status.sourceIssueDetails.removeValue(forKey: sourceID) }
+        else { status.sourceIssueDetails[sourceID] = diagnostics }
         if let issue = primaryIssue(issues) {
             status.waitingSources[sourceID] = issue
             let fileIssues = issues.keys.filter { $0.hasPrefix("scan:file:") }.count
@@ -1188,6 +1315,7 @@ public actor SyncEngine {
         status.sourcePhases.removeValue(forKey: sourceID)
         status.waitingSources.removeValue(forKey: sourceID)
         status.sourceFileIssueCounts.removeValue(forKey: sourceID)
+        status.sourceIssueDetails.removeValue(forKey: sourceID)
         status.deferredSources.remove(sourceID)
         status.advancedWaitingReasons.removeValue(forKey: sourceID)
         sourceIssues.removeValue(forKey: sourceID)
@@ -1207,14 +1335,16 @@ public actor SyncEngine {
     /// fileID is the preferred dedupe identity; keyPath is its fallback while path stays the
     /// logged physical location.
     private func logFailureOnce(phase: String, sourceID: UUID, keyPath: String? = nil, runID: UUID? = nil,
-                                fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil,
-                                result: String = "failed", error: Error? = nil) {
+                                fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, stage: String? = nil,
+                                result: String = "failed", error: Error? = nil, detail: String? = nil) {
         let identity = fileID?.uuidString ?? keyPath ?? path ?? ""
         let key = "\(sourceID.uuidString)|\(phase)|\(identity)"
-        let signature = "\(result)|\(error?.localizedDescription ?? "")"
+        let diagnostic = detail ?? error.map { SourceIssueText.systemDiagnostic($0) } ?? ""
+        let signature = "\(result)|\(stage ?? "")|\(diagnostic)"
         guard lastFailureLogSignatures[key] != signature else { return }
         lastFailureLogSignatures[key] = signature
-        logEvent(phase: phase, result: result, sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, path: path, error: error)
+        let logDetail = detail ?? stage.map { "\($0): \(diagnostic)" }
+        logEvent(phase: phase, result: result, sourceID: sourceID, runID: runID, fileID: fileID, attemptID: attemptID, path: path, error: error, detail: logDetail)
     }
 
     private func logEvent(phase: String, result: String, sourceID: UUID? = nil, runID: UUID? = nil, fileID: UUID? = nil, attemptID: UUID? = nil, path: String? = nil, error: Error? = nil, detail: String? = nil) {
@@ -1226,6 +1356,7 @@ public actor SyncEngine {
         if let path { fields["path"] = path }
         if let error { fields["error"] = error.localizedDescription }
         if let detail { fields["detail"] = detail }
+        else if let error { fields["detail"] = SourceIssueText.systemDiagnostic(error) }
         logger?.log(fields)
     }
 

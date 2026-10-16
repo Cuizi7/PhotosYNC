@@ -16,6 +16,8 @@
 
 ## 2. 全局约束
 
+2026-10-15 本轮必要展示变更见[来源诊断与图库分析详情设计](2026-10-15-diagnostics-and-analysis-details-design.md)：以完整诊断单一摘要、共享原生浮层和同快照分析组替代本节对应旧约定，其余边界不变。
+
 - 最低 macOS 13；使用原生 SwiftUI/AppKit，不增加第三方运行时依赖。
 - 只改视图、只读的视图计算、视图局部交互状态和对应测试；不修改后端逻辑或接口。
 - 冻结 `AppModel.swift`、`SyncStatusPresentation.swift`、`SyncRuntime.swift`、`PhotoSyncApp.swift`、整个 `Sources/PhotoSyncCore/`、数据库 schema、权限调用、扫描/调度/判重/提交/恢复逻辑。
@@ -63,6 +65,8 @@ known      = processed + incomplete
 
 ## 4. 菜单信息层级和详情
 
+2026-10-15 本轮必要展示变更见[来源诊断与图库分析详情设计](2026-10-15-diagnostics-and-analysis-details-design.md)：以完整诊断单一摘要、共享原生浮层和同快照分析组替代本节对应旧约定，其余边界不变。
+
 顺序：状态标题与活动指示 → 现有全局阻断/恢复提示 → 当前阶段进度 → 来源两行列表 → 下次扫描 → 固定操作区。
 
 - 标题和图标直接消费 `model.statusDescription`、`model.status.symbol`，不新写业务状态优先级。
@@ -82,6 +86,8 @@ known      = processed + incomplete
 hover 在 200ms 后打开，移出按钮和 popover 的联合区域后 200ms 关闭，进入任一处取消关闭；点击或键盘 Space/Return 打开并保持，Escape/点击外部关闭，关闭后恢复到触发按钮的焦点。窗口消失取消延迟任务。局部交互状态属于视图，不写 model/store；不要造成移动到详情时立刻消失的闪烁。
 
 ## 5. 两行来源路径（菜单、设置、demo 共用）
+
+2026-10-15 本轮必要展示变更见[来源诊断与图库分析详情设计](2026-10-15-diagnostics-and-analysis-details-design.md)：以完整诊断单一摘要、共享原生浮层和同快照分析组替代本节对应旧约定，其余边界不变。
 
 第一行是同一基线上的一条完整路径：父级前缀 `.caption + .secondary`，末级名称 `.caption + .primary`，整行字号和字重一致，仅通过颜色突出末级名称；浅色末级深色，深色末级为正常浅色主文字，不能用蓝色链接色。`.lineLimit(1)`，整体从**开头**省略，尽量完整保留末级文件夹名；末级自身也超长时同样按头部省略，保持可见后缀，不压缩字体。
 

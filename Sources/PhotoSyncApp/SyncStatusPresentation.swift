@@ -104,6 +104,31 @@ struct SyncStatusPresentation {
             explanation: "完成图库分析后开始导入。部分照片可能需要从 iCloud 下载。")
     }
 
+    /// Exact displayed rows, preserving scan events separately from standing records.
+    var scanDetailRows: [(title: String, value: String)] {
+        let scan = snapshot.latestScan
+        guard scan.state != .notStarted else { return [] }
+        let state: String
+        switch scan.state {
+        case .notStarted: return []
+        case .running: state = "进行中"
+        case .completed: state = "已完成"
+        case .interrupted: state = scan.deferred ? "稍后继续" : "已中断"
+        }
+        var rows = [(title: "检查候选", value: "\(scan.checkedCandidates)"),
+            (title: "新增导入", value: "\(scan.newlyImported)"), (title: "状态", value: state)]
+        if scan.failedFiles > 0 { rows.append(("本次读取失败", "\(scan.failedFiles) 个文件")) }
+        let unavailableSources = snapshot.waitingSources.values.filter(\.isSourceAvailability).count
+        if unavailableSources > 0 { rows.append(("来源等待恢复", "\(unavailableSources) 个来源")) }
+        if let date = scan.endedAt ?? scan.startedAt {
+            rows.append(("时间", date.formatted(date: .abbreviated, time: .shortened)))
+        }
+        if let started = scan.startedAt, scan.endedAt != nil {
+            rows.append(("开始", started.formatted(date: .abbreviated, time: .shortened)))
+        }
+        return rows
+    }
+
     var baseSummary: String {
         guard let s = snapshot.summary else { return summary }
         return "已导入 \(s.imported) · 已跳过 \(s.skipped) · 待处理 \(s.pending)"

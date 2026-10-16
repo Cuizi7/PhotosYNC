@@ -41,9 +41,6 @@ struct StatusMenu: View {
                     .font(.headline).accessibilityLabel(model.statusDescription)
                     .accessibilityIdentifier("photosync-status")
                 Spacer()
-                if model.analysis == nil && !model.state.sources.contains(where: \.enabled) {
-                    SyncDetailsButton(snapshot: model.state.snapshot)
-                }
                 if model.state.snapshot.activeWork {
                     ProgressView().controlSize(.small)
                 }
@@ -65,24 +62,34 @@ struct StatusMenu: View {
             if let hint = model.recoveryAdvice {
                 Text(hint).font(.caption).foregroundStyle(.secondary)
             }
-            if let analysis = model.analysis {
-                LibraryAnalysisView(analysis: analysis, snapshot: model.state.snapshot).tint(.accentColor)
-                if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                // Keep the trigger outside the changing analysis/standing-state branches.
+                HStack(spacing: 6) {
+                    if let analysis = model.analysis {
+                        StatusMenuSingleLine(text: analysis.progressText)
+                    } else if model.state.sources.contains(where: \.enabled) {
+                        StatusMenuSingleLine(text: standingSummary)
+                    }
+                    SyncDetailsButton(snapshot: model.state.snapshot)
+                }
+                if let analysis = model.analysis {
+                    LibraryAnalysisView(analysis: analysis).tint(.accentColor)
+                    if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
+                        Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if model.state.sources.contains(where: \.enabled) {
+                    SyncProgressView(summary: model.state.snapshot.summary,
+                        stale: model.state.snapshot.summaryError != nil)
+                } else if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
                     Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
                 }
-            } else if model.state.sources.contains(where: \.enabled) {
-                SyncProgressView(summary: model.state.snapshot.summary,
-                    stale: model.state.snapshot.summaryError != nil, snapshot: model.state.snapshot)
-            } else if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
-                Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
-                if let issue = model.enabledWaiting[source.id] {
-                    SourceRowLabel(url: source.url, status: issue.summary, detail: issue.detail,
-                        fileIssueCount: model.fileIssueCount(for: source.id))
-                } else if let phase = model.state.snapshot.advancedWaitingReasons[source.id] ?? model.state.snapshot.sourcePhases[source.id] {
-                    SourceRowLabel(url: source.url, status: phase,
-                        fileIssueCount: model.fileIssueCount(for: source.id))
+                let issues = model.state.snapshot.sourceIssueDetails[source.id] ?? []
+                if model.enabledWaiting[source.id] != nil || !issues.isEmpty || model.state.snapshot.advancedWaitingReasons[source.id] != nil || model.state.snapshot.sourcePhases[source.id] != nil {
+                    SourceRowLabel(url: source.url,
+                        status: model.enabledWaiting[source.id]?.summary ?? model.state.snapshot.advancedWaitingReasons[source.id] ?? model.state.snapshot.sourcePhases[source.id] ?? "已启用",
+                        issues: issues, recoveryPending: model.recoveryPending(for: source.id))
                 }
             }
             if let warning = model.notificationWarning {
@@ -93,6 +100,13 @@ struct StatusMenu: View {
                 Text("下次扫描：\(next.formatted(date: .omitted, time: .shortened))").font(.caption)
             }
         }
+    }
+
+    private var standingSummary: String {
+        guard let metrics = SyncProgressMetrics(summary: model.state.snapshot.summary) else {
+            return model.state.snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用"
+        }
+        return metrics.known == 0 ? "已发现 0 个文件" : "已处理 \(metrics.processed) / 已发现 \(metrics.known)"
     }
 
     private var actions: some View {
@@ -154,13 +168,8 @@ struct StatusMenuSingleLine: View {
 
 struct LibraryAnalysisView: View {
     let analysis: SyncStatusPresentation.Analysis
-    let snapshot: EngineSnapshot
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                StatusMenuSingleLine(text: analysis.progressText)
-                SyncDetailsButton(snapshot: snapshot)
-            }
             if let fraction = analysis.fraction {
                 ProgressView(value: fraction).accessibilityLabel(analysis.progressText)
             } else {

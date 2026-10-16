@@ -5,6 +5,7 @@ import SwiftUI
 enum UIReviewScenario: String, CaseIterable {
     case syncing, analyzing, preparing, icloud, paused, pausing, completed, offline
     case fileIssue, unauthorized, unknown, summaryLoading, summaryStale, empty, single, many, longLeaf
+    case mixedIssues, longIssues, recoveryPending, analysisPaused, analysisZero
 }
 
 @MainActor
@@ -40,11 +41,11 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         state.snapshot.latestScan.state = .running
         state.snapshot.latestScan.endedAt = nil
         if let first { state.snapshot.sourcePhases[first] = "正在导入，保留原始文件" }
-    case .analyzing, .preparing, .icloud:
+    case .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero:
         state.snapshot.activeWork = true
         state.snapshot.indexProgress = IndexProgress(
-            state: scenario == .preparing ? .preparing : (scenario == .icloud ? .waiting : .updating),
-            totalsKnown: scenario != .preparing, totalAssets: 100000, readyAssets: 42680,
+            state: scenario == .preparing ? .preparing : (scenario == .icloud ? .waiting : (scenario == .analysisPaused ? .paused : .updating)),
+            totalsKnown: scenario != .preparing, totalAssets: scenario == .analysisZero ? 0 : 100000, readyAssets: scenario == .analysisZero ? 0 : 42680,
             totalRepresentations: 150000, readyRepresentations: 64020, excludedAssets: 3,
             issue: scenario == .icloud ? "正在等待 iCloud 图像，连接恢复后自动继续" : nil)
         if let first { state.snapshot.advancedWaitingReasons[first] = "等待图库分析完成后继续" }
@@ -58,7 +59,12 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
                 state.snapshot.waitingSources[source.id] = SourceIssue(
                     summary: "来源目录暂时不可用，正在等待恢复。请检查磁盘或网络连接。",
                     detail: "合成诊断：未挂载；完整路径 \(source.url.path)", kind: .sourceAvailability)
-                state.snapshot.sourceFileIssueCounts[source.id] = 7
+                state.snapshot.sourceIssueDetails[source.id] = reviewIssues().map { issue in
+                    var issue = issue
+                    issue.path = source.url.path + String(issue.path.dropFirst("/示例来源".count))
+                    return issue
+                }
+                state.snapshot.sourceFileIssueCounts[source.id] = 2
             }
         }
     case .offline:
@@ -79,8 +85,36 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         state.snapshot.blockingSummary = "Photos 提交结果尚未确认，正在等待核对。"
         state.snapshot.blockingError = "合成 unknown 提交诊断"
         state.snapshot.recoveryHint = .uncertainSubmission(message: "合成 unknown 提交诊断")
+    case .mixedIssues, .longIssues:
+        if let first {
+            let issues = reviewIssues(long: scenario == .longIssues)
+            state.snapshot.sourceIssueDetails[first] = issues
+            let primary = issues.filter { $0.kind == .sourceAvailability }.sorted {
+                $0.path == $1.path ? $0.id < $1.id : $0.path < $1.path
+            }.first ?? issues[0]
+            state.snapshot.waitingSources[first] = SourceIssue(summary: primary.summary, detail: primary.detail, kind: primary.kind)
+            state.snapshot.sourceFileIssueCounts[first] = issues.filter { $0.kind == .file }.count
+        }
+    case .recoveryPending:
+        if let first {
+            state.snapshot.waitingSources[first] = SourceIssue(summary: "等待确认来源恢复", detail: "合成目录恢复标记", kind: .sourceAvailability)
+        }
     case .summaryLoading: state.snapshot.summary = nil
     case .summaryStale: state.snapshot.summaryError = "合成统计读取失败，保留上次统计"
+    }
+    if let first, scenario == .offline {
+        state.snapshot.sourceIssueDetails[first] = [SourceIssueDetail(id: "offline-directory", kind: .sourceAvailability,
+            path: state.sources[0].url.path, summary: "来源磁盘尚未挂载，正在等待恢复。", stage: "枚举来源目录",
+            detail: "NSPOSIXErrorDomain Code=2 合成卷诊断")]
+    }
+    if let first, scenario == .fileIssue {
+        state.snapshot.sourceIssueDetails[first] = [
+            SourceIssueDetail(id: "file-a", kind: .file, path: state.sources[0].url.path + "/a.jpg",
+                summary: "访问权限不足。", stage: nil, detail: "NSPOSIXErrorDomain Code=13"),
+            SourceIssueDetail(id: "file-b", kind: .file, path: state.sources[0].url.path + "/b.mov",
+                summary: "视频元数据读取失败。", stage: "读取时长", detail: "AVFoundationErrorDomain Code=-11800"),
+            SourceIssueDetail(id: "file-c", kind: .file, path: state.sources[0].url.path + "/c.jpg",
+                summary: "文件暂时无法读取，具体原因尚无法确定。", stage: nil, detail: "NSCocoaErrorDomain Code=256")]
     }
     let model = AppModel(runtime: runtime, initialState: state)
     guard !model.allowsSystemIntegrations else { throw UIReviewError.invalid("System integrations must be disabled") }
@@ -190,4 +224,23 @@ enum UIReviewCapture {
         host.layoutSubtreeIfNeeded()
         host.displayIfNeeded()
     }
+}
+
+/// Values captured in a synthetic snapshot. No path is opened by this fixture.
+func reviewIssues(long: Bool = false) -> [SourceIssueDetail] {
+    if long {
+        return (0..<20).map { index in
+            SourceIssueDetail(id: String(format: "read-%02d", index), kind: .file,
+                path: "/示例来源/家人/旅行👨‍👩‍👧‍👦/假日e\u{301}/" + String(repeating: "长目录与原始文件名称/", count: 5) + String(format: "FINAL-%02d.jpg", index),
+                summary: "文件暂时无法读取，具体原因尚无法确定。", stage: "读取公共元数据",
+                detail: String(repeating: "NSCocoaErrorDomain Code=256 合成诊断：无法完成读取。", count: 4) + String(format: " CAUSE-END-%02d", index))
+        }
+    }
+    return [
+        SourceIssueDetail(id: "directory-b", kind: .sourceAvailability, path: "/示例来源/B", summary: "目录暂时不可用。", stage: "枚举目录", detail: "NSPOSIXErrorDomain Code=2"),
+        SourceIssueDetail(id: "directory-a", kind: .sourceAvailability, path: "/示例来源/A", summary: "访问权限不足。", stage: nil, detail: "NSCocoaErrorDomain Code=257"),
+        SourceIssueDetail(id: "scan-same", kind: .file, path: "/示例来源/same.jpg", summary: "文件无法访问，请检查访问权限。", stage: nil, detail: "NSPOSIXErrorDomain Code=13"),
+        SourceIssueDetail(id: "video", kind: .file, path: "/示例来源/video.mov", summary: "视频元数据读取失败。", stage: "读取时长", detail: "AVFoundationErrorDomain Code=-11800"),
+        SourceIssueDetail(id: "submit-same", kind: .submission, path: "/示例来源/same.jpg", summary: "导入结果尚未确认。", stage: "提交原始文件", detail: "NSCocoaErrorDomain Code=512")
+    ]
 }
