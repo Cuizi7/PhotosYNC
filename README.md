@@ -2,13 +2,15 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.3 stable
+## 0.2.4 stable
 
-0.2.3 (build 11) corrects gallery-index retry deadlines to use the actual failure time, processes work in fair finite slices, and waits for physical reader and shared-budget capacity before admitting more work. A timed-out read retains its owner until real completion; after 60 monotonic seconds it shows an aggregate stalled wait. Later runtime ticks resume after actual cleanup and lease release. A system request that never completes has no guaranteed automatic recovery.
+0.2.4 (build 12) holds new work for an unavailable source root until actual root enumeration proves recovery. Other sources and Photos indexing continue. Independent child/file errors and already dispatched Photos results retain their existing recovery and persistence rules.
 
-Bounded anonymous causal diagnostics link history/live events, invalidation, task attempts and physical request/lease lifetimes within a run. Up to eight sticky sample assets receive capped detail; neutral events and unchanged polling states are coalesced. This does not establish the root cause or fix repeated conservative history invalidation, and it does not guarantee whole-log retention under arbitrary error traffic. The 0.2.3 release uses schema v8; the unreleased input-diagnostic update adds nullable baselines in schema v9 without reindexing or cleanup. Import success history remains protected. See [0.2.3 release notes](docs/release/0.2.3.md) and the [approved scope](docs/superpowers/specs/2026-10-16-index-recovery-023.md).
+Gallery recomputation now compares the exact prepared model input with its last successful baseline and reports same, different, missing or incompatible input contracts. Schema v9 adds nullable diagnostic baselines while retaining existing vectors, tasks, index/checkpoint state and import history. Old rows gain baselines only through normally scheduled successful computation; upgrading does not trigger a full-library reread or rebuild. Older apps reject schema v9. Bounded anonymous causal evidence and elapsed-wall stage summaries include failure/cancellation without altering the model, 0.98 threshold, resource selection, readiness or scheduling policy. Same input does not prove full-resolution original-pixel identity; different input alone does not establish a PhotoKit pixel edit.
 
-A release requires independent integrated review and full candidate validation to pass. Focused checks alone do not establish final acceptance; exact-main archive validation and the resulting package's provenance bind the final source and complete results. [0.2.2 notes](docs/release/0.2.2.md), its [validation record](docs/release/2026-10-15-diagnostics-and-analysis-validation.md), and earlier evidence are retained. This iteration adds no real Photos/production or macOS 13/Intel hardware evidence.
+The retry/fair-slice/physical-reader protections from 0.2.3 remain. This release does not fix repeated conservative history invalidation or repeated reconciliation scheduling, and a system request that never completes still has no guaranteed automatic recovery. See the [0.2.4 release notes](docs/release/0.2.4.md), [input-diagnostic measurement notes](docs/release/2026-10-16-input-diagnostics-validation.md), and [source-root contract](docs/superpowers/specs/2026-10-16-source-root-availability.md).
+
+A release requires independent review and exact-main archive validation through the normal packager. Provenance binds the actual source, complete tests and artifact checks; older logs do not establish a newly built package. Historical [0.2.3 notes](docs/release/0.2.3.md), [0.2.2 notes](docs/release/0.2.2.md) and their evidence remain. No new real Photos/production or macOS 13/Intel hardware evidence is claimed.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -32,12 +34,13 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Release configuration: **0.2.3 stable (build 11)**, targeting
-`outputs/releases/0.2.3/`; see [release notes](docs/release/0.2.3.md)
+Release configuration: **0.2.4 stable (build 12)**, targeting
+`outputs/releases/0.2.4/`; see [release notes](docs/release/0.2.4.md)
 and the [changelog](CHANGELOG.md).
 The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
+[0.2.3 stable build 11](docs/release/0.2.3.md),
 [0.2.2 stable build 10](docs/release/0.2.2.md),
 [0.2.1 stable build 9](docs/release/0.2.1.md),
 [0.2.0 stable build 8](docs/release/0.2.0.md) and
@@ -63,7 +66,7 @@ Only supported bitmap images and videos are considered. RAW files, Live Photo pa
 
 PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source file. It sends additions to Photos only. It also never deletes or overwrites a Photos asset. Import completion means PhotoKit accepted the addition; it does not mean the asset has finished syncing to iCloud.
 
-## Model input diagnostics (unreleased)
+## Model input diagnostics
 
 For gallery recomputation, SHA-256 describes the exact prepared 320 × 320 Float32 model input. The independent successful baseline is stored per context, epoch, asset and original/current representation. Accepted tasks report `same_input`, `different_input`, `missing_baseline` or `incomparable`; older or diagnostic-free test implementations additionally report `missing_input`. Schema v9 adds two nullable columns without creating new tasks, discarding vectors or altering the index policy. Older schema-v8 apps reject an upgraded database; direct downgrade remains unsupported.
 
