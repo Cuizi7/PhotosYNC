@@ -185,6 +185,11 @@ final class AppViewTests: XCTestCase {
             height: original.height * 2, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
         context.interpolationQuality = .high
+        // Transparent cacheDisplay text needs an opaque background in the OCR input only.
+        let dark = view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let background: CGFloat = dark ? 0 : 1
+        context.setFillColor(CGColor(red: background, green: background, blue: background, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: context.width, height: context.height))
         context.draw(original, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
         try VNImageRequestHandler(cgImage: try XCTUnwrap(context.makeImage())).perform([request])
         return (request.results ?? []).compactMap { result in
