@@ -1,5 +1,6 @@
 import CoreGraphics
 import CoreML
+import CryptoKit
 import ImageIO
 import XCTest
 @testable import PhotoSyncCore
@@ -20,6 +21,33 @@ private final class PhysicalStartCounter: @unchecked Sendable {
     }
 }
 
+private final class FingerprintPhaseRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values = [(FingerprintTimingStage, Double)]()
+
+    func record(_ stage: FingerprintTimingStage, _ seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        values.append((stage, seconds))
+    }
+
+    func snapshot() -> [(FingerprintTimingStage, Double)] {
+        lock.lock(); defer { lock.unlock() }
+        return values
+    }
+}
+
+private struct CompatibleTimedFingerprinter: ImageFingerprinting {
+    let result: FingerprintResult
+
+    func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        result.fingerprint
+    }
+
+    func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult {
+        result
+    }
+}
+
 final class FingerprintTests: XCTestCase {
     private func configuration(side: Int = 4) throws -> FingerprintConfiguration {
         try FingerprintConfiguration(modelSHA256: String(repeating: "a", count: 64), inputSide: side,
@@ -34,6 +62,229 @@ final class FingerprintTests: XCTestCase {
                        bytesPerRow: width * 4, space: space ?? CGColorSpace(name: CGColorSpace.sRGB)!,
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+    }
+
+    func testPreparedDigestHashesExplicitLittleEndianLogicalValuesExcludingPadding() throws {
+        let config = try configuration(side: 1)
+        let storage = UnsafeMutablePointer<Float>.allocate(capacity: 12)
+        storage.initialize(repeating: .nan, count: 12)
+        defer { storage.deinitialize(count: 12); storage.deallocate() }
+        storage[0] = 1; storage[4] = -0.0; storage[8] = Float(bitPattern: 1)
+        let tensor = try MLMultiArray(dataPointer: storage, shape: [1, 3, 1, 1], dataType: .float32,
+                                      strides: [12, 4, 2, 1], deallocator: nil)
+        let digest = try PreparedTensorDigest.compute(tensor, configuration: config)
+        let bytes = Data([0, 0, 128, 63, 0, 0, 0, 128, 1, 0, 0, 0])
+        XCTAssertEqual(digest.bytes, Data(SHA256.hash(data: bytes)))
+        storage[1] = 42; storage[5] = -123; storage[11] = .infinity
+        XCTAssertEqual(try PreparedTensorDigest.compute(tensor, configuration: config), digest)
+        storage[4] = .infinity
+        XCTAssertThrowsError(try PreparedTensorDigest.compute(tensor, configuration: config))
+    }
+
+    func testDigestExcludesRowAndElementPadding() throws {
+        let config = try configuration(side: 2)
+        let storage = UnsafeMutablePointer<Float>.allocate(capacity: 60)
+        storage.initialize(repeating: .nan, count: 60)
+        defer { storage.deinitialize(count: 60); storage.deallocate() }
+        let padded = try MLMultiArray(dataPointer: storage, shape: [1, 3, 2, 2], dataType: .float32,
+                                     strides: [60, 20, 6, 2], deallocator: nil)
+        let contiguous = try MLMultiArray(shape: [1, 3, 2, 2], dataType: .float32)
+        for c in 0..<3 {
+            for y in 0..<2 {
+                for x in 0..<2 {
+                    let value = Float(c * 4 + y * 2 + x) / 12
+                    storage[c * 20 + y * 6 + x * 2] = value
+                    contiguous[[0, NSNumber(value: c), NSNumber(value: y), NSNumber(value: x)]] = NSNumber(value: value)
+                }
+            }
+        }
+        XCTAssertEqual(try PreparedTensorDigest.compute(padded, configuration: config),
+                       try PreparedTensorDigest.compute(contiguous, configuration: config))
+    }
+
+    func testSynthetic320InputDigestOverheadProbe() throws {
+        let config = try configuration(side: 320)
+        var pixels = [UInt8](repeating: 255, count: 640 * 480 * 4)
+        for pixel in 0..<(640 * 480) {
+            pixels[pixel * 4] = UInt8(pixel % 251)
+            pixels[pixel * 4 + 1] = UInt8((pixel / 640) % 251)
+            pixels[pixel * 4 + 2] = UInt8((pixel / 7) % 251)
+        }
+        let source = image(width: 640, height: 480, pixels: pixels)
+        let started = ProcessInfo.processInfo.systemUptime
+        let tensor = try ImagePreprocessor.prepare(image: source, orientation: .right, configuration: config)
+        let preprocessing = ProcessInfo.processInfo.systemUptime - started
+        var samples = [Double]()
+        var first: ModelInputDigest?
+        for _ in 0..<12 {
+            let begin = ProcessInfo.processInfo.systemUptime
+            let digest = try PreparedTensorDigest.compute(tensor, configuration: config)
+            samples.append(ProcessInfo.processInfo.systemUptime - begin)
+            if let first { XCTAssertEqual(digest, first) } else { first = digest }
+        }
+        // A bounded aggregate only: no tensor bytes, input hashes, metadata, paths or asset IDs.
+        print("input_digest_probe count=12 tensor_bytes=1228800 preprocessing_wall_seconds=\(preprocessing) digest_wall_sum_seconds=\(samples.reduce(0, +)) digest_wall_max_seconds=\(samples.max()!) additional_prepares=0 additional_predictions=0")
+    }
+
+    func testActualPreparedInputDigestDistinguishesInputAndIndependentContract() throws {
+        let config = try configuration()
+        let red = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
+        let blue = image(width: 1, height: 1, pixels: [0, 0, 255, 255])
+        let first = try ImagePreprocessor.prepare(image: red, orientation: .up, configuration: config)
+        let second = try ImagePreprocessor.prepare(image: red, orientation: .up, configuration: config)
+        let changed = try ImagePreprocessor.prepare(image: blue, orientation: .up, configuration: config)
+        let digest = try PreparedTensorDigest.compute(first, configuration: config, runtimeIdentity: "runtime-a")
+        XCTAssertEqual(try PreparedTensorDigest.compute(second, configuration: config, runtimeIdentity: "runtime-a"), digest)
+        XCTAssertNotEqual(try PreparedTensorDigest.compute(changed, configuration: config, runtimeIdentity: "runtime-a").bytes, digest.bytes)
+        let newRuntime = try PreparedTensorDigest.compute(first, configuration: config, runtimeIdentity: "runtime-b")
+        XCTAssertEqual(newRuntime.bytes, digest.bytes)
+        XCTAssertNotEqual(newRuntime.contract, digest.contract)
+        let differentModel = try FingerprintConfiguration(modelSHA256: String(repeating: "b", count: 64), inputSide: 4,
+            resizeMode: .stretchFullFrame, colorSpace: "sRGB", mean: [0, 0, 0], std: [1, 1, 1])
+        XCTAssertNotEqual(try PreparedTensorDigest.compute(first, configuration: differentModel, runtimeIdentity: "runtime-a").contract, digest.contract)
+        XCTAssertThrowsError(try ModelInputDigest(bytes: Data(count: 31), contract: "test"))
+        XCTAssertThrowsError(try ModelInputDigest(bytes: Data(count: 32), contract: ""))
+    }
+
+    func testDiagnosticResultUsesExactlyPredictedPreparedTensorOncePerCall() async throws {
+        let config = try configuration()
+        let calls = PhysicalStartCounter()
+        let red = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
+        let blue = image(width: 1, height: 1, pixels: [0, 0, 255, 255])
+        let expectedRed = try PreparedTensorDigest.compute(ImagePreprocessor.prepare(image: red, orientation: .up, configuration: config), configuration: config)
+        let expectedBlue = try PreparedTensorDigest.compute(ImagePreprocessor.prepare(image: blue, orientation: .up, configuration: config), configuration: config)
+        let fingerprinter = CoreMLFingerprinter(configuration: config, predict: { input in
+            _ = calls.increment()
+            let digest = try PreparedTensorDigest.compute(input, configuration: config)
+            XCTAssertTrue(digest == expectedRed || digest == expectedBlue)
+            return [1] + Array(repeating: 0, count: 1023)
+        })
+        let a = try await fingerprinter.fingerprintWithDiagnostics(image: red, orientation: .up)
+        let b = try await fingerprinter.fingerprintWithDiagnostics(image: blue, orientation: .up)
+        XCTAssertEqual(a.inputDigest, expectedRed); XCTAssertEqual(b.inputDigest, expectedBlue)
+        XCTAssertEqual(calls.current(), 2)
+        XCTAssertGreaterThan(a.timings.preprocessingSeconds, 0)
+        XCTAssertGreaterThan(a.timings.digestSeconds, 0)
+        XCTAssertGreaterThanOrEqual(a.timings.modelQueueSeconds, 0)
+        XCTAssertGreaterThan(a.timings.predictionSeconds, 0)
+        XCTAssertEqual(a.fingerprint.values[0], 1)
+        _ = try await fingerprinter.fingerprint(image: red, orientation: .up)
+        XCTAssertEqual(calls.current(), 3, "legacy source path predicts once as well")
+    }
+
+    func testSuccessfulDiagnosticHookReportsEachResultStageExactlyOnce() async throws {
+        let events = FingerprintPhaseRecorder()
+        let model = CoreMLFingerprinter(configuration: try configuration(), predict: { _ in
+            [1] + Array(repeating: 0, count: 1023)
+        })
+        let output = try await model.fingerprintWithDiagnostics(
+            image: image(width: 1, height: 1, pixels: [255, 0, 0, 255]), orientation: .up,
+            onTiming: { events.record($0, $1) })
+        let measured = events.snapshot()
+        XCTAssertEqual(measured.map { $0.0.rawValue },
+            ["preprocessing-wall", "input-digest-wall", "model-queue-wall", "prediction-wall"])
+        XCTAssertEqual(measured.map { $0.1 }, [output.timings.preprocessingSeconds, output.timings.digestSeconds,
+            output.timings.modelQueueSeconds, output.timings.predictionSeconds])
+        XCTAssertNotNil(output.inputDigest)
+    }
+
+    func testCompatibleTimingHookReportsOnlyMeasuredResultStages() async throws {
+        let source = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
+        let fingerprint = try Fingerprint(version: "test", values: [1] + Array(repeating: 0, count: 1023))
+        let measured: any ImageFingerprinting = CompatibleTimedFingerprinter(result: .init(fingerprint: fingerprint,
+            timings: .init(preprocessingSeconds: 1, digestSeconds: 2, modelQueueSeconds: 3, predictionSeconds: 4)))
+        let events = FingerprintPhaseRecorder()
+        _ = try await measured.fingerprintWithDiagnostics(image: source, orientation: .up,
+            onTiming: { events.record($0, $1) })
+        XCTAssertEqual(events.snapshot().map { $0.0 }, [.preprocessing, .digest, .modelQueue, .prediction])
+        XCTAssertEqual(events.snapshot().map { $0.1 }, [1, 2, 3, 4])
+        let unmeasured: any ImageFingerprinting = CompatibleTimedFingerprinter(result: .init(fingerprint: fingerprint))
+        let unknown = FingerprintPhaseRecorder()
+        _ = try await unmeasured.fingerprintWithDiagnostics(image: source, orientation: .up,
+            onTiming: { unknown.record($0, $1) })
+        XCTAssertTrue(unknown.snapshot().isEmpty)
+    }
+
+    func testDiagnosticPhaseTimingsSurvivePredictionFailureWithOriginalError() async throws {
+        let events = FingerprintPhaseRecorder(), starts = PhysicalStartCounter()
+        let model = CoreMLFingerprinter(configuration: try configuration(), predict: { _ in
+            _ = starts.increment()
+            throw ModelExecutionUnavailable(detail: "controlled unavailable")
+        })
+        do {
+            _ = try await model.fingerprintWithDiagnostics(
+                image: image(width: 1, height: 1, pixels: [255, 0, 0, 255]), orientation: .up,
+                onTiming: { events.record($0, $1) })
+            XCTFail("prediction must fail")
+        } catch let error as ModelExecutionUnavailable {
+            XCTAssertEqual(error.detail, "controlled unavailable")
+        } catch { XCTFail("error classification changed: \(error)") }
+        XCTAssertEqual(starts.current(), 1)
+        let measured = events.snapshot()
+        XCTAssertEqual(measured.map { $0.0 }, [.preprocessing, .digest, .modelQueue, .prediction])
+        XCTAssertTrue(measured.allSatisfy { $0.1.isFinite && $0.1 >= 0 })
+    }
+
+    func testDiagnosticPhaseTimingsSurviveDigestFailureWithoutStartingPrediction() async throws {
+        let events = FingerprintPhaseRecorder(), starts = PhysicalStartCounter()
+        let config = try FingerprintConfiguration(modelSHA256: String(repeating: "a", count: 64), inputSide: 4,
+            resizeMode: .stretchFullFrame, colorSpace: "sRGB", mean: [0, 0, 0],
+            std: [Float.leastNonzeroMagnitude, 1, 1])
+        let model = CoreMLFingerprinter(configuration: config, predict: { _ in
+            _ = starts.increment(); return [1] + Array(repeating: 0, count: 1023)
+        })
+        do {
+            _ = try await model.fingerprintWithDiagnostics(
+                image: image(width: 1, height: 1, pixels: [255, 0, 0, 255]), orientation: .up,
+                onTiming: { events.record($0, $1) })
+            XCTFail("nonfinite prepared input must fail")
+        } catch { XCTAssertEqual(error as? AdvancedDedupError, .invalidImage) }
+        XCTAssertEqual(starts.current(), 0)
+        XCTAssertEqual(events.snapshot().map { $0.0 }, [.preprocessing, .digest])
+    }
+
+    func testDiagnosticPhaseTimingsWaitForCancelledPhysicalPrediction() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let events = FingerprintPhaseRecorder(), starts = PhysicalStartCounter()
+        let model = CoreMLFingerprinter(configuration: try configuration(), predict: { _ in
+            _ = starts.increment(); entered.signal(); release.wait()
+            return [1] + Array(repeating: 0, count: 1023)
+        })
+        let source = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
+        let task = Task { try await model.fingerprintWithDiagnostics(image: source, orientation: .up,
+            onTiming: { events.record($0, $1) }) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        task.cancel()
+        XCTAssertEqual(events.snapshot().map { $0.0 }, [.preprocessing, .digest, .modelQueue])
+        release.signal()
+        do { _ = try await task.value; XCTFail("cancelled waiter must stay cancelled") }
+        catch is CancellationError { } catch { XCTFail("cancellation classification changed: \(error)") }
+        XCTAssertEqual(starts.current(), 1)
+        XCTAssertEqual(events.snapshot().map { $0.0 }, [.preprocessing, .digest, .modelQueue, .prediction])
+    }
+
+    func testDiagnosticCancelledQueueReportsWaitWithoutPrediction() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let queued = DispatchSemaphore(value: 0)
+        let events = FingerprintPhaseRecorder(), starts = PhysicalStartCounter(), submissions = PhysicalStartCounter()
+        let model = CoreMLFingerprinter(configuration: try configuration(), predict: { _ in
+            _ = starts.increment(); entered.signal(); release.wait()
+            return [1] + Array(repeating: 0, count: 1023)
+        }, onSubmitted: { if submissions.increment() == 2 { queued.signal() } })
+        let source = image(width: 1, height: 1, pixels: [255, 0, 0, 255])
+        let first = Task { try await model.fingerprint(image: source, orientation: .up) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        let second = Task { try await model.fingerprintWithDiagnostics(image: source, orientation: .up,
+            onTiming: { events.record($0, $1) }) }
+        XCTAssertEqual(queued.wait(timeout: .now() + 5), .success)
+        second.cancel()
+        XCTAssertEqual(events.snapshot().map { $0.0 }, [.preprocessing, .digest])
+        release.signal()
+        _ = try await first.value
+        do { _ = try await second.value; XCTFail("cancelled queue entry must stay cancelled") }
+        catch is CancellationError { } catch { XCTFail("cancellation classification changed: \(error)") }
+        XCTAssertEqual(starts.current(), 1)
+        XCTAssertEqual(events.snapshot().map { $0.0 }, [.preprocessing, .digest, .modelQueue])
     }
 
     func testAllEightEXIFOrientations() throws {

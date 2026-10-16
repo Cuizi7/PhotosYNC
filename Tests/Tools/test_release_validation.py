@@ -79,7 +79,7 @@ class ReleaseFixture:
         return self.events.read_text().splitlines()
 
     def release_path(self) -> Path:
-        return self.root / "outputs" / "releases" / "0.2.3"
+        return self.root / "outputs" / "releases" / "0.2.4"
 
     def _write_repository(self) -> None:
         for relative in ("scripts", "Tests/Tools", "docs/release", "PhotoSync.xcodeproj"):
@@ -91,7 +91,7 @@ class ReleaseFixture:
         (self.root / "PhotoSync.xcodeproj" / "project.pbxproj").write_text("fixture project\n")
         (self.root / "Sources").mkdir()
         (self.root / "Sources" / "fixture.swift").write_text("let fixture = true\n")
-        (self.root / "docs/release/0.2.3.md").write_text("fixture release notes\n")
+        (self.root / "docs/release/0.2.4.md").write_text("fixture release notes\n")
         (self.root / "CHANGELOG.md").write_text("fixture changelog\n")
         (self.root / "Tests/Tools/test_fixture.py").write_text(
             "import unittest\n\n"
@@ -356,10 +356,10 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertTrue((release / "validation" / "validation-report.md").is_file())
         self.assertEqual((release / "CHANGELOG.md").read_text(), "fixture changelog\n")
         self.assertEqual((release / "RELEASE-NOTES.md").read_text(), "fixture release notes\n")
-        self.assertTrue((release / "PhotosYNC-0.2.3.dmg").is_file())
+        self.assertTrue((release / "PhotosYNC-0.2.4.dmg").is_file())
         provenance = (release / "PhotosYNC.provenance").read_text().splitlines()
-        self.assertIn("release=0.2.3", provenance)
-        self.assertIn("build_number=11", provenance)
+        self.assertIn("release=0.2.4", provenance)
+        self.assertIn("build_number=12", provenance)
         self.assertIn("signing=ad-hoc; notarized=no", provenance)
         self.assertTrue((release / "SHA256SUMS").is_file())
         self.assertIn(
@@ -457,7 +457,7 @@ class ReleaseValidationTests(unittest.TestCase):
                 try:
                     release = fixture.release_path()
                     if case == "dirty":
-                        (fixture.root / "docs/release/0.2.3.md").write_text("changed\n")
+                        (fixture.root / "docs/release/0.2.4.md").write_text("changed\n")
                     elif case == "untracked":
                         (fixture.root / "untracked.txt").write_text("untracked\n")
                     elif case == "file":
@@ -470,7 +470,7 @@ class ReleaseValidationTests(unittest.TestCase):
                         release.parent.mkdir(parents=True, exist_ok=True)
                         release.symlink_to(fixture.root / "missing-release-target")
                     else:
-                        lock = release.parent / ".0.2.3.lock"
+                        lock = release.parent / ".0.2.4.lock"
                         lock.mkdir(parents=True)
                     result = fixture.run_packager()
                     self.assertNotEqual(result.returncode, 0)
@@ -495,8 +495,8 @@ class ReleaseValidationTests(unittest.TestCase):
 
     def assert_no_transient_release_paths(self, fixture: ReleaseFixture) -> None:
         release_root = fixture.release_path().parent
-        self.assertFalse((release_root / ".0.2.3.lock").exists())
-        self.assertEqual(list(release_root.glob(".0.2.3.staging.*")), [])
+        self.assertFalse((release_root / ".0.2.4.lock").exists())
+        self.assertEqual(list(release_root.glob(".0.2.4.staging.*")), [])
 
 
 _FAKE_XCODEBUILD = """#!/bin/sh
@@ -540,8 +540,8 @@ case " $* " in
 <plist version="1.0"><dict>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleExecutable</key><string>PhotosYNC</string>
-<key>CFBundleShortVersionString</key><string>0.2.3</string>
-<key>CFBundleVersion</key><string>11</string>
+<key>CFBundleShortVersionString</key><string>0.2.4</string>
+<key>CFBundleVersion</key><string>12</string>
 <key>PhotoSyncReleaseChannel</key><string>stable</string>
 </dict></plist>
 PLIST

@@ -1,10 +1,228 @@
 import CryptoKit
+import CoreGraphics
 import Foundation
 import SQLite3
 import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testPreparedInputBaselinesCompareAfterMetadataAndInputChangesAndReopen() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let originalInput = try preparedDigest(red: 32)
+        let editedInput = try preparedDigest(red: 224)
+        XCTAssertNotEqual(originalInput.bytes, editedInput.bytes)
+        let changedPipeline = try preparedDigest(red: 224, runtime: "fixture-runtime-v2")
+        XCTAssertEqual(changedPipeline.bytes, editedInput.bytes)
+        XCTAssertNotEqual(changedPipeline.contract, editedInput.contract)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        var item = descriptor(context)
+        try await store.upsertRepresentations([item], generation: generation)
+        var task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertEqual(try await store.completeRepresentation(task, result: digestResult(originalInput)), .missingBaseline)
+        try assertBaseline(originalInput, at: db)
+
+        // A changed catalog revision is not by itself evidence of changed model input.
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        item = descriptor(context, revision: "metadata-only")
+        try await store.upsertRepresentations([item], generation: generation)
+        try assertBaseline(originalInput, at: db)
+        task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertEqual(try await store.completeRepresentation(task, result: digestResult(originalInput)), .sameInput)
+
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
+        _ = try await store.invalidateRepresentations(assetIDs: [item.key.assetID], generation: generation)
+        try assertBaseline(originalInput, at: db)
+        task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertEqual(try await store.completeRepresentation(task, result: digestResult(editedInput)), .differentInput)
+        try assertBaseline(editedInput, at: db)
+
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 4, fingerprintVersion: "v2")
+        try await store.upsertRepresentations([item], generation: generation)
+        // The old digest contract survives a descriptor/fingerprint-version upsert.
+        try assertBaseline(editedInput, at: db)
+        task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertEqual(try await store.completeRepresentation(task, result: digestResult(changedPipeline, version: "v2")), .incomparable)
+        let reopened = try SyncStore(url: db)
+        generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 5, fingerprintVersion: "v2")
+        _ = try await reopened.invalidateRepresentations(assetIDs: nil, generation: generation)
+        task = try await unwrap(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertEqual(try await reopened.completeRepresentation(task, result: digestResult(changedPipeline, version: "v2")), .sameInput)
+        try assertBaseline(changedPipeline, at: db)
+        _ = try await reopened.invalidateRepresentations(assetIDs: nil, generation: generation)
+        task = try await unwrap(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await reopened.completeRepresentation(task, fingerprint: fingerprint("v2")))
+        try assertBaseline(changedPipeline, at: db)
+    }
+
+    func testDigestBaselineRetainsOnFailureMissingInputAndRejectedTaskAndRollsBackWithVector() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let input = try preparedDigest(red: 32), edit = try preparedDigest(red: 224)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        let item = descriptor(context)
+        try await store.upsertRepresentations([item], generation: generation)
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertEqual(try await store.completeRepresentation(old, result: digestResult(input)), .missingBaseline)
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        _ = try await store.invalidateRepresentations(assetIDs: [item.key.assetID], generation: generation)
+        try await assertNil(try await store.completeRepresentation(old, result: digestResult(edit)))
+        try assertBaseline(input, at: db)
+        let retry = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await store.failRepresentation(retry, nextRetryAt: .distantPast, detail: "synthetic", failureKind: .photosRead))
+        try assertBaseline(input, at: db)
+        // No diagnostic input (e.g. a legacy fake) cannot erase the successful baseline.
+        try await assertEqual(try await store.completeRepresentation(retry, result: digestResult(nil)), .missingInput)
+        try assertBaseline(input, at: db)
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
+        _ = try await store.invalidateRepresentations(assetIDs: [item.key.assetID], generation: generation)
+        let replaced = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await store.upsertRepresentations([descriptor(context, revision: "replacement")], generation: generation)
+        try await assertNil(try await store.completeRepresentation(replaced, result: digestResult(edit)))
+        try assertBaseline(input, at: db)
+        let next = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try injectEngineSQL("CREATE TRIGGER reject_digest_completion BEFORE DELETE ON fingerprint_task BEGIN SELECT RAISE(FAIL, 'synthetic completion rollback'); END", at: db)
+        await XCTAssertThrowsErrorAsync(try await store.completeRepresentation(next, result: digestResult(edit)))
+        try assertBaseline(input, at: db)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='pending'", at: db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task", at: db), 1)
+        try injectEngineSQL("DROP TRIGGER reject_digest_completion", at: db)
+        try await assertEqual(try await store.completeRepresentation(next, result: digestResult(edit)), .differentInput)
+        try assertBaseline(edit, at: db)
+        try await assertNil(try await store.completeRepresentation(retry, result: digestResult(input)))
+        try assertBaseline(edit, at: db)
+    }
+
+    func testDigestBaselineSeparatesKindsContextsAndEpochs() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = try preparedDigest(red: 32), edit = try preparedDigest(red: 224)
+        let id = UUID()
+        let contexts = [LibraryContext(id: id, epoch: 1), LibraryContext(id: id, epoch: 2), LibraryContext(id: UUID(), epoch: 1)]
+        var previousContextTask: RepresentationTask?
+        for (offset, context) in contexts.enumerated() {
+            let original = descriptor(context)
+            let current = RepresentationDescriptor(key: .init(assetID: original.key.assetID, kind: .current), context: context,
+                revision: "A", size: original.size, equivalentToOriginal: false, revisionIsReliable: true)
+            let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: offset + 1, fingerprintVersion: "v1")
+            if let previousContextTask {
+                try await assertNil(try await store.completeRepresentation(previousContextTask, result: digestResult(edit)))
+            }
+            try await store.upsertRepresentations([original,current], generation: generation)
+            let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 2)
+            XCTAssertEqual(tasks.count, 2)
+            for task in tasks {
+                try await assertEqual(try await store.completeRepresentation(task,
+                    result: digestResult(task.descriptor.key.kind == .original ? input : edit)), .missingBaseline)
+            }
+            _ = try await store.invalidateRepresentations(assetIDs: nil, generation: generation)
+            for task in try await store.nextRepresentationTasks(now: Date(), limit: 2) {
+                try await assertEqual(try await store.completeRepresentation(task,
+                    result: digestResult(task.descriptor.key.kind == .original ? input : edit)), .sameInput)
+            }
+            _ = try await store.invalidateRepresentations(assetIDs: nil, generation: generation)
+            previousContextTask = try await store.nextRepresentationTasks(now: Date(), limit: 2).first { $0.descriptor.key.kind == .original }
+        }
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE input_digest IS NOT NULL", at: db), 6)
+        let hex = input.bytes.map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE kind='original' AND input_digest=X'\(hex)'", at: db), 3)
+    }
+
+    private func preparedDigest(red: UInt8, runtime: String = "fixture-runtime-v1") throws -> ModelInputDigest {
+        let config = try FingerprintConfiguration(modelSHA256: String(repeating: "a", count: 64), inputSide: 320,
+            resizeMode: .stretchFullFrame, colorSpace: "sRGB", mean: [0.485,0.456,0.406], std: [0.229,0.224,0.225])
+        let bytes = Data([red, 64, 128, 255, 16, 32, 192, 255, 255, red, 48, 255, 32, 64, red, 255])
+        let image = try XCTUnwrap(CGImage(width: 2, height: 2, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 8,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: CGDataProvider(data: bytes as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+        let tensor = try ImagePreprocessor.prepare(image: image, orientation: .right, configuration: config)
+        return try PreparedTensorDigest.compute(tensor, configuration: config, runtimeIdentity: runtime)
+    }
+
+    private func digestResult(_ digest: ModelInputDigest?, version: String = "v1") throws -> FingerprintResult {
+        FingerprintResult(fingerprint: try fingerprint(version), inputDigest: digest)
+    }
+
+    private func assertBaseline(_ digest: ModelInputDigest, at db: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+        var handle: OpaquePointer?, statement: OpaquePointer?
+        guard sqlite3_open(db.path, &handle) == SQLITE_OK else { throw FixtureError.unavailable("sqlite") }
+        defer { sqlite3_finalize(statement); sqlite3_close(handle) }
+        guard sqlite3_prepare_v2(handle, "SELECT input_digest,input_digest_contract FROM photos_representation", -1, &statement, nil) == SQLITE_OK else { throw FixtureError.unavailable("baseline") }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW, file: file, line: line)
+        let pointer = try XCTUnwrap(sqlite3_column_blob(statement, 0), file: file, line: line)
+        let bytes = Data(bytes: pointer, count: Int(sqlite3_column_bytes(statement, 0)))
+        XCTAssertEqual(bytes, digest.bytes, file: file, line: line)
+        let contract = try XCTUnwrap(sqlite3_column_text(statement, 1), file: file, line: line)
+        XCTAssertEqual(String(cString: contract), digest.contract, file: file, line: line)
+    }
+
+    func testV8DigestMigrationPreservesExactIndexTasksVectorsAndHistory() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try await store.registerSource(url: root)
+        let file = try await prepared(store, source, root, "success.jpg")
+        let attempt = UUID()
+        try await store.beginAttempt(fileID: file.fileID, attemptID: attempt)
+        try await store.markImported(fileID: file.fileID, attemptID: attempt, identifier: "retained", sourceFingerprint: file)
+        let context = LibraryContext(id: UUID(), epoch: 3)
+        _ = try await seedReadGap(store, context: context)
+        let historyBefore = try facts(at: db)
+        let tables = ["dedup_index_state", "fingerprint_task", "photos_representation", "photos_content_change", "file_fingerprint", "photos_index_exclusion"]
+        // Strip only the new nullable columns when this test runs after implementation.
+        if try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('photos_representation') WHERE name='input_digest'", at: db) > 0 {
+            try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN input_digest; ALTER TABLE photos_representation DROP COLUMN input_digest_contract", at: db)
+        }
+        for table in tables { try injectEngineSQL("CREATE TABLE before_\(table) AS SELECT * FROM \(table)", at: db) }
+        try injectEngineSQL("PRAGMA user_version=8", at: db)
+        let upgraded = try SyncStore(url: db)
+        withExtendedLifetime(upgraded) {}
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('photos_representation') WHERE name IN ('input_digest','input_digest_contract')", at: db), 2)
+        XCTAssertEqual(try facts(at: db), historyBefore)
+        for table in tables {
+            let columns = try sqlColumnNames(table, at: db).filter { !["input_digest", "input_digest_contract"].contains($0) }.joined(separator: ",")
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT \(columns) FROM \(table) EXCEPT SELECT * FROM before_\(table))", at: db), 0, table)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_\(table) EXCEPT SELECT \(columns) FROM \(table))", at: db), 0, table)
+        }
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE input_digest IS NOT NULL OR input_digest_contract IS NOT NULL", at: db), 0)
+        XCTAssertThrowsError(try injectEngineSQL("UPDATE photos_representation SET input_digest=zeroblob(31)", at: db))
+        XCTAssertThrowsError(try injectEngineSQL("UPDATE photos_representation SET input_digest_contract=''", at: db))
+    }
+
+    func testV8DigestMigrationRollsBackBothDDLAndVersionOnFailure() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await seedReadGap(store, context: .init(id: UUID(), epoch: 1))
+        try injectEngineSQL("""
+            ALTER TABLE photos_representation DROP COLUMN input_digest;
+            ALTER TABLE photos_representation DROP COLUMN input_digest_contract;
+            CREATE TABLE state_before AS SELECT * FROM dedup_index_state;
+            CREATE TABLE tasks_before AS SELECT * FROM fingerprint_task;
+            -- A case-insensitive SQLite column collision injects failure on the second ALTER.
+            ALTER TABLE photos_representation ADD COLUMN INPUT_DIGEST_CONTRACT TEXT;
+            PRAGMA user_version=8;
+            """, at: db)
+        XCTAssertThrowsError(try SyncStore(url: db))
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('photos_representation') WHERE name='input_digest'", at: db), 0)
+        for table in ["dedup_index_state", "fingerprint_task"] {
+            let before = table == "dedup_index_state" ? "state_before" : "tasks_before"
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM \(table) EXCEPT SELECT * FROM \(before))", at: db), 0)
+        }
+    }
+
+    private func sqlColumnNames(_ table: String, at db: URL) throws -> [String] {
+        var handle: OpaquePointer?, statement: OpaquePointer?
+        guard sqlite3_open(db.path, &handle) == SQLITE_OK else { throw FixtureError.unavailable("sqlite") }
+        defer { sqlite3_finalize(statement); sqlite3_close(handle) }
+        guard sqlite3_prepare_v2(handle, "PRAGMA table_info(\(table))", -1, &statement, nil) == SQLITE_OK else { throw FixtureError.unavailable("columns") }
+        var names = [String]()
+        while sqlite3_step(statement) == SQLITE_ROW { names.append(String(cString: sqlite3_column_text(statement, 1))) }
+        return names
+    }
+
     func testNewInputContractIsDefaultAndLegacyJSONKeepsExactIdentity() throws {
         let old = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -29,7 +247,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         let before = try facts(at: db)
         try injectEngineSQL("CREATE TABLE preserved_vectors AS SELECT * FROM file_fingerprint; PRAGMA user_version=7", at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
         XCTAssertEqual(try facts(at: db), before)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM preserved_vectors EXCEPT SELECT * FROM file_fingerprint)", at: db), 0)
         try await assertNil(try await reopened.indexReadiness())
@@ -57,7 +275,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("CREATE TABLE preserved_source AS SELECT file_id,size,modified_ns,purpose,width,height,hex(vector) AS bytes,attempt_id FROM file_fingerprint WHERE fingerprint_version='\(oldVersion)'", at: db)
         try injectEngineSQL("PRAGMA user_version=7", at: db)
         let upgraded = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
         try await assertNil(try await upgraded.indexReadiness())
         try await upgraded.rebindEquivalentSourceFingerprints(to: config.fingerprint)
         XCTAssertEqual(try facts(at: db), before)
@@ -673,7 +891,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE attempt_id = ''", at: db), 2)
             }
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 2)
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 8)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 9)
         }
     }
 
@@ -834,7 +1052,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try makeV3(at: db)
         let before = try facts(at: db)
         let store = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
         XCTAssertEqual(try facts(at: db), before)
         let generation = try await store.beginIndexReconciliation(context: LibraryContext(id: UUID(), epoch: 1), photosGeneration: 4, fingerprintVersion: "new-model")
         try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
@@ -853,9 +1071,9 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 3)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE name = 'dedup_index_state'", at: db), 0)
         XCTAssertEqual(try facts(at: db), before)
-        try injectEngineSQL("PRAGMA user_version = 9", at: db)
+        try injectEngineSQL("PRAGMA user_version = 10", at: db)
         XCTAssertThrowsError(try SyncStore(url: db))
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
     }
 
     func testStaleTaskCannotPublish() async throws {
@@ -1260,7 +1478,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 try await assertNil(try await reopened.indexPublication())
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: db), 1)
             }
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 8)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 9)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('fingerprint_task') WHERE name='failure_kind'", at: db), fail ? 0 : 1)
             XCTAssertEqual(try facts(at: db), before)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM vectors_before EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
@@ -1301,7 +1519,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
             PRAGMA user_version=5;
             """, at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_vectors EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_tasks EXCEPT SELECT asset_id,revision,generation,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: db), 0)
         let publication = try await reopened.indexPublication(); XCTAssertNil(publication)
@@ -1454,7 +1672,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("UPDATE photos_representation SET tombstoned=0; PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS photos_representation_readiness", at: db)
         let upgraded = try SyncStore(url: db)
         XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
         let after = try await upgraded.indexReadiness(); XCTAssertNil(after)
         let publication = try await upgraded.indexPublication()
         XCTAssertEqual(try photosVector(at: db), vector)
@@ -1483,7 +1701,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         // Reproduce the previous unreleased integration-v4 shape without its reverse index.
         try injectEngineSQL("PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS dedup_dependency_candidate;", at: db)
         let migrated = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 8)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
         try await assertEqual(try await migrated.state(of: dependent.fileID), .skipped)
         try assertReverseDependencyLookup(at: db)

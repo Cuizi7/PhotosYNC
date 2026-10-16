@@ -107,6 +107,84 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testLiveUnknownFactsStayUnknownAndCarryScopedCause() async throws {
+        let rows = HistoryPendingTrace(), diagnostics = IndexDiagnostics(sink: { rows.append($0) })
+        let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = [candidate(key: "PRIVATE-CAUSE")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, indexDiagnostics: diagnostics)
+        _ = try await gateway.candidateSnapshot()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+            [.init(identifier: "PRIVATE-CAUSE", candidates: [candidate(key: "PRIVATE-CAUSE")])])
+        gateway.recordLibraryChangeForTesting(); _ = try await gateway.candidateSnapshot()
+        let cause = try XCTUnwrap(rows.rows.first { $0["phase"] == "index-cause" && $0["source"] == "live" })
+        XCTAssertEqual(cause["assetContentChanged"], "unknown")
+        XCTAssertEqual(cause["visibleInputFields"], "unknown")
+        XCTAssertEqual(cause["metadataFields"], "unknown")
+        XCTAssertNotNil(cause["contextHandle"])
+        XCTAssertEqual(cause["causeGeneration"], "1")
+        XCTAssertNotNil(cause["causeOperation"])
+        XCTAssertFalse(String(describing: rows.rows).contains("PRIVATE-CAUSE"))
+    }
+
+    func testLiveContentFlagIsIndependentOfVisibleInputAndMetadataFields() async throws {
+        let rows = HistoryPendingTrace(), diagnostics = IndexDiagnostics(sink: { rows.append($0) })
+        let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = [candidate(key: "PRIVATE-FACTS")]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128, indexDiagnostics: diagnostics)
+        _ = try await gateway.candidateSnapshot()
+        for (content, input, metadata) in [(false, [String](), ["modificationDate"]), (true, [], []), (false, ["resourceFilenames"], [])] {
+            lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [
+                .init(identifier: "PRIVATE-FACTS", candidates: [candidate(key: "PRIVATE-FACTS")], inputUnchanged: !content && input.isEmpty,
+                    assetContentChanged: content, visibleInputFields: input, metadataFields: metadata)])
+            gateway.recordLibraryChangeForTesting(); _ = try await gateway.candidateSnapshot()
+        }
+        let causes = rows.rows.filter { $0["phase"] == "index-cause" && $0["source"] == "live" }
+        XCTAssertEqual(causes.map { $0["assetContentChanged"] }, ["false", "true", "false"])
+        XCTAssertEqual(causes.map { $0["visibleInputFields"] }, ["none", "none", "resourceFilenames"])
+        XCTAssertEqual(causes.map { $0["metadataFields"] }, ["modificationDate", "none", "none"])
+        XCTAssertEqual(Set(causes.compactMap { $0["assetHandle"] }).count, 1)
+        XCTAssertEqual(Set(causes.compactMap { $0["causeOperation"] }).count, 3)
+        XCTAssertFalse(String(describing: rows.rows).contains("PRIVATE-FACTS"))
+    }
+
+    func testVisibleInputDifferenceUsesResourceFactsWithoutTreatingMetadataAsInput() throws {
+        let first = PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "PRIVATE-A.jpg", size: try PixelSize(width: 32, height: 24))
+        let before = PhotoKitRepresentationAsset(identifier: "PRIVATE-ID", modificationDate: Date(timeIntervalSince1970: 1), playbackStyle: .image, resources: [first])
+        let metadataOnly = PhotoKitRepresentationAsset(identifier: "PRIVATE-ID", modificationDate: Date(timeIntervalSince1970: 2), playbackStyle: .image, resources: [first])
+        XCTAssertEqual(PhotoKitCandidateAsset.changedRepresentationFields(before: before, after: metadataOnly), [])
+        let changed = PhotoKitRepresentationAsset(identifier: "PRIVATE-ID", modificationDate: before.modificationDate, playbackStyle: .livePhoto,
+            resources: [.init(type: .fullSizePhoto, uti: "public.png", filename: "PRIVATE-B.png", size: try PixelSize(width: 64, height: 24))])
+        XCTAssertEqual(PhotoKitCandidateAsset.changedRepresentationFields(before: before, after: changed),
+            ["playbackStyle", "resourceTypes", "resourceUTIs", "resourceFilenames", "resourceSizes"])
+        let reordered = PhotoKitRepresentationAsset(identifier: "PRIVATE-ID", modificationDate: nil, playbackStyle: .image, resources: [changed.resources[0], first])
+        let reversed = PhotoKitRepresentationAsset(identifier: "PRIVATE-ID", modificationDate: nil, playbackStyle: .image, resources: [first, changed.resources[0]])
+        XCTAssertEqual(PhotoKitCandidateAsset.changedRepresentationFields(before: reordered, after: reversed), [])
+    }
+
+    func testGatewayWallTimingSeparatesCatalogEvidenceAndNotificationStages() async throws {
+        let rows = HistoryPendingTrace(), diagnostics = IndexDiagnostics(sink: { rows.append($0) })
+        let f = try continuityFixture(indexDiagnostics: diagnostics)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        f.lifecycle.persistentToken = 2
+        try await f.coordinator.reconcile()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+            [.init(identifier: "page0", candidates: [candidate(key: "page0")], inputUnchanged: true)])
+        f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+        diagnostics.flushObservations(force: true)
+        let summaries = rows.rows.filter { $0["phase"] == "index-window-summary" }
+        XCTAssertFalse(summaries.isEmpty)
+        for stage in ["photos_catalog_body_wall", "photos_content_evidence_db_wall", "photos_checkpoint_wall", "photos_history_replay_wall",
+                      "photos_history_content_persist_wall", "photos_notification_queue_wall", "photos_notification_classification_wall",
+                      "photos_candidate_snapshot_wall", "photos_live_content_persist_wall", "photos_live_catalog_persist_wall"] {
+            let summary = try XCTUnwrap(summaries.last { $0["timing.\(stage).count"] != nil }, stage)
+            XCTAssertEqual(summary["measurement"], "monotonic-elapsed-wall")
+            XCTAssertGreaterThan(Int(summary["timing.\(stage).count"] ?? "0") ?? 0, 0, stage)
+            let sum = try XCTUnwrap(Double(summary["timing.\(stage).sumMS"] ?? ""), stage)
+            let max = try XCTUnwrap(Double(summary["timing.\(stage).maxMS"] ?? ""), stage)
+            XCTAssertGreaterThanOrEqual(sum, max, stage)
+            XCTAssertGreaterThanOrEqual(max, 0, stage)
+        }
+    }
+
     func testWholeGatewayNeutralStreamIsBoundedWithContentAndUnknownControls() async throws {
         let rows = HistoryPendingTrace(), clock = GatewayDiagnosticClock()
         let diagnostic = IndexDiagnostics(sink: { rows.append($0) }, monotonic: { clock.now })
@@ -125,11 +203,19 @@ final class PhotoKitContractTests: XCTestCase {
         }
         diagnostic.flushObservations(force: true)
         let neutralRows = rows.rows
-        XCTAssertEqual(neutralRows.count, 8640, "count every new live phase, not only observation inputs")
+        let causeRows = neutralRows.filter { $0["phase"] == "index-cause" }
+        let timingRows = neutralRows.filter { $0["phase"] == "index-window-summary" }
+        XCTAssertEqual(causeRows.count, 3840, "four changed assets per fixed window, with no per-event operation summary")
+        XCTAssertEqual(timingRows.count, 960, "one aggregate per 30-second window over eight hours")
+        XCTAssertEqual(neutralRows.count - causeRows.count - timingRows.count, 8640, "existing phases retain their original bounded volume")
+        XCTAssertEqual(timingRows.reduce(0) { $0 + (Int($1["cause.live"] ?? "0") ?? 0) }, 3840,
+            "full cause counts survive detail sampling")
         XCTAssertEqual(neutralRows.filter { $0["phase"] == "photos-live-neutral" }.count, 1920)
         XCTAssertEqual(neutralRows.filter { $0["category"] == "photos-live-neutral" }.reduce(0) { $0 + (Int($1["assetObservations"] ?? "0") ?? 0) }, 3840)
         let data = try JSONSerialization.data(withJSONObject: neutralRows, options: [.sortedKeys])
-        XCTAssertLessThan(data.count, 3_000_000)
+        XCTAssertLessThan(data.count, 5_000_000, "eight-hour synthetic stream includes bounded causal and timing evidence")
+        let forbiddenKeys: Set<String> = ["asset", "assetID", "token", "path", "inputDigest", "input_digest", "digest", "hash"]
+        XCTAssertTrue(neutralRows.allSatisfy { forbiddenKeys.isDisjoint(with: $0.keys) })
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("PRIVATE-NEUTRAL-ID"))
         for _ in 0..<2 {
             lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
@@ -162,6 +248,10 @@ final class PhotoKitContractTests: XCTestCase {
         let live = rows.rows.filter { $0["phase"] == "photos-live-sample" }
         XCTAssertEqual(Set(history.compactMap { $0["assetHandle"] }), Set(live.compactMap { $0["assetHandle"] }))
         XCTAssertFalse(history.isEmpty); XCTAssertTrue(history.allSatisfy { $0["category"] == "unknown" && $0["reason"] == "conservative-history-identifiers" })
+        let causes = rows.rows.filter { $0["phase"] == "index-cause" && $0["source"] == "history" }
+        XCTAssertFalse(causes.isEmpty)
+        XCTAssertTrue(causes.allSatisfy { $0["content"] == "unknown" && $0["assetContentChanged"] == "unknown" &&
+            $0["visibleInputFields"] == "unknown" && $0["metadataFields"] == "unknown" && $0["contextHandle"] != nil && $0["causeOperation"] != nil })
         XCTAssertEqual(Set(rows.rows.compactMap { $0["run"] }), [diagnostic.run])
         XCTAssertTrue(rows.rows.contains { $0["phase"] == "index-invalidation" && $0["readyToPending"] == "1" })
         XCTAssertFalse(rows.rows.contains { $0["asset"] != nil || $0["token"] != nil })

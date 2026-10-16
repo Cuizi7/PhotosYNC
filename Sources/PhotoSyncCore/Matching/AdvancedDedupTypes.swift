@@ -9,6 +9,58 @@ public enum AdvancedDedupError: Error, Equatable {
     case invalidModelOutput
 }
 
+/// Diagnostic evidence for one successful prepared model input; never an asset identity.
+public struct ModelInputDigest: Equatable, Sendable {
+    public let bytes: Data
+    public let contract: String
+
+    public init(bytes: Data, contract: String) throws {
+        guard bytes.count == 32, !contract.isEmpty else { throw AdvancedDedupError.invalidConfiguration }
+        self.bytes = bytes; self.contract = contract
+    }
+}
+
+/// Disjoint elapsed wall stages, reported per call even when later work throws.
+public enum FingerprintTimingStage: String, Sendable {
+    case preprocessing = "preprocessing-wall"
+    case digest = "input-digest-wall"
+    case modelQueue = "model-queue-wall"
+    case prediction = "prediction-wall"
+}
+
+/// Monotonic elapsed wall time. Queue wait and prediction are disjoint, not CPU measurements.
+public struct FingerprintTimings: Equatable, Sendable {
+    public let preprocessingSeconds: Double
+    public let digestSeconds: Double
+    public let modelQueueSeconds: Double
+    public let predictionSeconds: Double
+
+    public init(preprocessingSeconds: Double = 0, digestSeconds: Double = 0,
+                modelQueueSeconds: Double = 0, predictionSeconds: Double = 0) {
+        self.preprocessingSeconds = preprocessingSeconds; self.digestSeconds = digestSeconds
+        self.modelQueueSeconds = modelQueueSeconds; self.predictionSeconds = predictionSeconds
+    }
+}
+
+public struct FingerprintResult: Sendable {
+    public let fingerprint: Fingerprint
+    public let inputDigest: ModelInputDigest?
+    public let timings: FingerprintTimings
+
+    public init(fingerprint: Fingerprint, inputDigest: ModelInputDigest? = nil,
+                timings: FingerprintTimings = .init()) {
+        self.fingerprint = fingerprint; self.inputDigest = inputDigest; self.timings = timings
+    }
+}
+
+public enum InputDigestComparison: String, Sendable {
+    case sameInput = "same_input"
+    case differentInput = "different_input"
+    case missingBaseline = "missing_baseline"
+    case incomparable
+    case missingInput = "missing_input"
+}
+
 public struct PixelSize: Codable, Equatable, Sendable {
     public let width: Int
     public let height: Int

@@ -866,7 +866,7 @@ private func p9SeedScale(db url: URL, count: Int, context: LibraryContext, gener
     guard sqlite3_open(url.path, &db) == SQLITE_OK else { throw FixtureError.unavailable("scale sqlite open") }
     defer { sqlite3_finalize(statement); sqlite3_close(db) }
     guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK,
-          sqlite3_prepare_v2(db, "INSERT INTO photos_representation VALUES(?,1,?,?, 'r1',256,256,0,1,?,'ready',?,?,0)", -1, &statement, nil) == SQLITE_OK else {
+          sqlite3_prepare_v2(db, "INSERT INTO photos_representation (context_id,context_epoch,asset_id,kind,revision,width,height,equivalent_to_original,revision_is_reliable,seen_generation,state,fingerprint_version,vector,tombstoned) VALUES(?,1,?,?, 'r1',256,256,0,1,?,'ready',?,?,0)", -1, &statement, nil) == SQLITE_OK else {
         throw FixtureError.unavailable("scale sqlite prepare")
     }
     let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
