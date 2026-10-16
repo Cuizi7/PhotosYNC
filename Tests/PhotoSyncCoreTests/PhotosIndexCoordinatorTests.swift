@@ -109,6 +109,51 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id<'032' AND retry_count>0", at: f.db), 32)
     }
 
+    func testMetadataOnlyNonemptyDeltasPreserveRotationIssuanceAndFailureBackoff() async throws {
+        let f = try fixture()
+        var all = (0..<40).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) }
+        let ids = all.map { $0.key.assetID }
+        await f.photos.set(all)
+        await f.photos.setReadFailures(Dictionary(uniqueKeysWithValues: all.prefix(32).map { ($0.key.assetID, PhotosRepresentationError.unavailable) }))
+        try await f.coordinator.reconcile()
+        let cutoff = now.addingTimeInterval(100)
+        let initial = Dictionary(uniqueKeysWithValues: try await f.store.nextRepresentationTasks(now: cutoff, limit: 40).map { ($0.descriptor.key.assetID, $0) })
+        XCTAssertEqual(initial.count, 40)
+        for slice in 0..<3 {
+            let revision = slice == 0 ? "r1" : "metadata-\(slice)"
+            if slice > 0 {
+                // Nonempty producer evidence changes metadata-derived revision only;
+                // every asset's actual representation input remains unchanged.
+                all = ids.map { descriptor(f.photos.context, asset: $0, revision: revision) }
+                await f.photos.preserveDeltaInputs(ids)
+                let neutral = await f.photos.changeFacts(all, changed: ids)
+                await f.coordinator.libraryChanged(.incremental(neutral))
+            }
+            await f.coordinator.processDueWork(now: cutoff)
+            let prefix = (0..<min(40, (slice + 1) * 16)).map { String(format: "%03d", $0) }
+            let wrapped = slice == 2 ? (0..<8).map { String(format: "%03d", $0) } : []
+            await assertEqual(await f.photos.readAssetIDs, prefix + wrapped)
+            let remaining = try await f.store.nextRepresentationTasks(now: cutoff, limit: 40)
+            XCTAssertEqual(remaining.count, slice == 2 ? 32 : 40)
+            for task in remaining {
+                let asset = task.descriptor.key.assetID
+                let original = try XCTUnwrap(initial[asset])
+                XCTAssertEqual(task.descriptor.revision, revision)
+                XCTAssertEqual(task.descriptor.context, original.descriptor.context)
+                XCTAssertEqual(task.issuanceRevision, original.issuanceRevision, "Metadata continuity cannot reissue the task")
+                XCTAssertEqual(task.indexGeneration, original.indexGeneration)
+                let ordinal = try XCTUnwrap(Int(asset))
+                let retries = slice == 2 && ordinal < 8 ? 2 : (ordinal < min(32, (slice + 1) * 16) ? 1 : 0)
+                XCTAssertEqual(task.retryCount, retries, "Neutral metadata must preserve prior failures")
+                XCTAssertEqual(task.nextRetryAt, retries == 0 ? nil : now.addingTimeInterval(retries == 2 ? 15 : 5))
+            }
+        }
+        await assertEqual(await f.photos.deltaRequests, [ids, ids])
+        await assertEqual(await f.model.count, 8)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id>='032' AND state='ready' AND vector IS NOT NULL AND revision='metadata-2'", at: f.db), 8)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id<'032' AND retry_count>0", at: f.db), 32)
+    }
+
     func testRotatingKeysetServesNewLowKeyAndDueRetriesAcrossWrap() async throws {
         let clock = DiagnosticClock(); clock.now = 1000
         let f = try fixture(wallNow: { Date(timeIntervalSince1970: clock.now) })
