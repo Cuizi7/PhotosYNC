@@ -88,6 +88,8 @@ private actor ProbeDirectory: DirectoryReading {
     private let advancedStamp: FileStamp?
     private var rounds = 0
     private var sameStampCalls = 0
+    private var expectsRootProbe = false
+    func expectRootProbe() { expectsRootProbe = true }
 
     init(root: URL, markerGate: ProbeGate, advancedStamp: FileStamp? = nil) {
         self.advancedStamp = advancedStamp
@@ -96,6 +98,12 @@ private actor ProbeDirectory: DirectoryReading {
     }
 
     func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        // Child failures now verify root availability before retry persistence.
+        // That bounded probe is healthy I/O, not another logical scan round.
+        if expectsRootProbe {
+            expectsRootProbe = false
+            return [DirectoryEntry(url: root.appendingPathComponent("same.jpg"), isDirectory: false, stamp: nil)]
+        }
         rounds += 1
         guard rounds <= 2 else {
             throw NSError(domain: "ContinuationRace", code: 10, userInfo: [
@@ -117,6 +125,7 @@ private actor ProbeDirectory: DirectoryReading {
             case 1:
                 return FileStamp(size: 1, modifiedNanoseconds: 1)
             case 2:
+                expectsRootProbe = true
                 throw NSError(domain: "ContinuationRace", code: 15, userInfo: [
                     NSLocalizedDescriptionKey: "probe submission stamp failed"
                 ])
@@ -131,6 +140,7 @@ private actor ProbeDirectory: DirectoryReading {
             // The second scan reaches this only after it persisted sourceChanged and resolved
             // that row's issue.  Hold it so observation happens before the intentional failure.
             await markerGate.wait()
+            expectsRootProbe = true
             throw NSError(domain: "ContinuationRace", code: 12, userInfo: [
                 NSLocalizedDescriptionKey: "probe marker failure after observation"
             ])
@@ -189,9 +199,12 @@ private actor ProbePhotos: PhotosIndexGateway {
 }
 
 private actor ThrowingProbeModel: ImageFingerprinting {
+    private let directory: ProbeDirectory
+    init(directory: ProbeDirectory) { self.directory = directory }
     private(set) var calls = 0
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
         calls += 1
+        await directory.expectRootProbe()
         throw NSError(domain: "ContinuationRace", code: 16, userInfo: [
             NSLocalizedDescriptionKey: "probe advanced preparation failed"
         ])
@@ -337,7 +350,7 @@ private func runProbe(temporaryRoot: URL) async throws -> [String: String] {
     }
     let directory = ProbeDirectory(root: temporaryRoot, markerGate: markerGate, advancedStamp: advancedStamp)
     let photos = ProbePhotos()
-    let model = ThrowingProbeModel()
+    let model = ThrowingProbeModel(directory: directory)
     var coordinator: PhotosIndexCoordinator?
     var service: AdvancedDedupService?
     if isAdvanced {

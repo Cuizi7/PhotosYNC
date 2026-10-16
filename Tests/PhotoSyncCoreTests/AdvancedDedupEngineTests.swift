@@ -3,6 +3,35 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class AdvancedDedupEngineTests: XCTestCase {
+    func testRootAdmissionIsRecheckedAtQueuedNativeMutationBoundary() async throws {
+        for unavailable in [false, true] {
+            let directory = EngineRootAvailabilityDirectory()
+            let f = try await fixture(directory: { _ in directory }); try await ready(f)
+            let gate = EngineBoundaryGate(); await f.photos.setBeforeGate(gate)
+            let first = Task { await f.engine.scanEnabledSources() }
+            await gate.waitUntilEntered()
+            await directory.holdRoot(unavailable: unavailable)
+            let second = Task { await f.engine.scanEnabledSources() }
+            let observed = await engineEventually {
+                let snapshot = await f.engine.snapshot()
+                return unavailable ? snapshot.waitingSources[f.source]?.isSourceAvailability == true
+                    : snapshot.deferredSources.contains(f.source)
+            }
+            XCTAssertTrue(observed)
+            await gate.release(); await first.value; await second.value
+            let count = await f.photos.createCount
+            let row = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+            XCTAssertEqual(count, 0, "No mutation after root admission closes: unavailable=\(unavailable)")
+            XCTAssertEqual(row?.state, .pending)
+            XCTAssertEqual(row?.retryCount, 0)
+            await directory.recover()
+            f.clock.advance(6)
+            await f.engine.scanEnabledSources()
+            let recovered = try await f.store.file(sourceID: f.source, relativePath: "a.png")
+            XCTAssertEqual(recovered?.state, .imported)
+        }
+    }
+
     func testUnavailableModelWaitDoesNotCreateSourceOrSubmissionError() async throws {
         let f = try await fixture(); try await ready(f)
         await f.model.setUnavailable(true)
@@ -271,7 +300,8 @@ final class AdvancedDedupEngineTests: XCTestCase {
         let engine: SyncEngine; let store: SyncStore; let photos: EngineIndexPhotos
         let coordinator: PhotosIndexCoordinator; let model: EngineIndexModel; let budget: ImageWorkBudget; let configuration: DedupConfiguration; let source: UUID; let root: URL; let clock: EngineIndexClock
     }
-    private func fixture(second: Bool = false, maximumDecodedBytes: Int64? = nil, logger: RunLogger? = nil) async throws -> Fixture {
+    private func fixture(second: Bool = false, maximumDecodedBytes: Int64? = nil, logger: RunLogger? = nil,
+                         directory: @escaping SyncEngine.DirectoryFactory = { DirectoryReader(sourceID: $0) }) async throws -> Fixture {
         let root = try temporaryDirectory()
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let sourceURL = root.appendingPathComponent("source")
@@ -300,7 +330,7 @@ final class AdvancedDedupEngineTests: XCTestCase {
         let service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator, fingerprinter: model,
             configuration: c, executor: ReadExecutor(maxConcurrentOperations: c.resources.maxInFlightTasks), budget: budget)
         let clock = EngineIndexClock()
-        let engine = SyncEngine(store: store, photos: photos, logger: logger, advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, dedupConfiguration: c, now: { clock.now })
+        let engine = SyncEngine(store: store, photos: photos, directory: directory, logger: logger, advancedDedup: service, indexCoordinator: coordinator, requiresAdvancedDedup: true, dedupConfiguration: c, now: { clock.now })
         return Fixture(engine: engine, store: store, photos: photos, coordinator: coordinator, model: model, budget: budget, configuration: c, source: source, root: sourceURL, clock: clock)
     }
     private func writeImage(_ url: URL, type: String = "public.png", frames: Int = 1, width: Int = 2, height: Int = 2) throws {
@@ -436,4 +466,19 @@ extension AdvancedDedupEngineTests {
         let b = try await f.store.file(sourceID: f.source, relativePath: "b.png")
         XCTAssertEqual(a?.state, .imported); XCTAssertEqual(b?.state, .skipped)
     }
+}
+
+private actor EngineRootAvailabilityDirectory: DirectoryReading {
+    private let reader = DirectoryReader()
+    private var rootHold: Bool?
+    func holdRoot(unavailable: Bool) { rootHold = unavailable }
+    func recover() { rootHold = nil }
+    func entries(in directory: URL) async throws -> [DirectoryEntry] {
+        if let unavailable = rootHold {
+            if unavailable { throw CocoaError(.fileReadNoSuchFile) }
+            throw ReadExecutorError.sourceBusy
+        }
+        return try await reader.entries(in: directory)
+    }
+    func stamp(of file: URL) async throws -> FileStamp { try await reader.stamp(of: file) }
 }

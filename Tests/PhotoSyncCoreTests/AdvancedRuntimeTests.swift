@@ -5,6 +5,52 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testIndexReadinessDoesNotBypassUnavailableSourceRecoveryDeadline() async throws {
+        let clock = P12Clock()
+        let f = try await fixture(taskCount: 40, now: { clock.value })
+        let initial = await f.runtime.current()
+        let sourceURL = try XCTUnwrap(initial.sources.first?.url)
+        let databaseURL = sourceURL.deletingLastPathComponent().appendingPathComponent("test.sqlite")
+        try FileManager.default.removeItem(at: sourceURL)
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let first = await f.runtime.current()
+        XCTAssertEqual(first.snapshot.waitingSources[f.sourceID]?.kind, .sourceAvailability)
+        let scanCount = try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL)
+        XCTAssertEqual(scanCount, 1)
+        for _ in 0..<3 { await f.runtime.tick(); await f.runtime.waitForRound() }
+        let ready = await f.runtime.current()
+        XCTAssertEqual(ready.snapshot.indexProgress?.state, .ready, "Photos indexing continues while the source is held")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL), 1,
+            "Automatic index readiness must not trigger an early source-root probe")
+        clock.advance(5)
+        await f.runtime.tick(); await f.runtime.waitForRound()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL), 2)
+    }
+
+    func testIndexReadinessStillProcessesHealthyRootWithOnlyChildDirectoryIssue() async throws {
+        let f = try await fixture(taskCount: 40)
+        let initial = await f.runtime.current()
+        let sourceURL = try XCTUnwrap(initial.sources.first?.url)
+        let child = sourceURL.appendingPathComponent("unreadable-child")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: child.path)
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: child.path) }
+        let media = try sourceFixtureDirectory()
+        addTeardownBlock { try? FileManager.default.removeItem(at: media) }
+        try FileManager.default.copyItem(at: media.appendingPathComponent("normal.jpg"), to: sourceURL.appendingPathComponent("healthy.jpg"))
+        let databaseURL = sourceURL.deletingLastPathComponent().appendingPathComponent("test.sqlite")
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let first = await f.runtime.current()
+        XCTAssertEqual(first.snapshot.sourceIssueDetails[f.sourceID]?.first?.path, child.path)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL), 1)
+        for _ in 0..<3 { await f.runtime.tick(); await f.runtime.waitForRound() }
+        let ready = await f.runtime.current()
+        XCTAssertEqual(ready.snapshot.indexProgress?.state, .ready)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL), 2,
+            "Child-only errors must retain the healthy root's automatic index-ready kick")
+        XCTAssertEqual(ready.snapshot.summary?.pending, 0)
+    }
+
     func testPeriodicTickContinuesFiniteSlicesAndResumesAfterCapacityRelease() async throws {
         let f = try await fixture(taskCount: 40)
         await f.runtime.tick(force: true); await f.runtime.waitForRound()
