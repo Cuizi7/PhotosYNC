@@ -13,7 +13,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
     private var issuances: [String: (descriptor: String, issuance: String)] = [:]
     private var readerCounts: [String: Int] = [:]
     private var states: [String: (value: String, suppressed: Int, start: TimeInterval)] = [:]
-    private var neutral: [String: (start: TimeInterval, emitted: Int, suppressed: Int, assets: Int)] = [:]
+    private var neutral: [String: (start: TimeInterval, emitted: Int, suppressed: Int, assets: Int, batches: Int)] = [:]
     private let monotonic: @Sendable () -> TimeInterval
 
     public init(sink: @escaping @Sendable ([String: String]) -> Void,
@@ -62,7 +62,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
     /// changes, errors and state transitions always retain their existing facts.
     public func observation(_ fields: [String: String], assetID: String? = nil) {
         let phase = fields["phase"] ?? ""
-        let isNeutral = phase == "photos-notification" || phase == "photos-live-neutral" ||
+        let isNeutral = phase == "photos-notification" || phase == "photos-live-neutral" || phase == "index-live-transfer-neutral" ||
             (phase == "photos-fetch-details" && fields["fallback"] == nil) ||
             (phase == "photos-change-classification" && fields["contentScope"] == "known" &&
              fields["contentChanged"] == "0" && fields["inserted"] == "0" && fields["deleted"] == "0")
@@ -70,12 +70,14 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let now = monotonic()
         var summary: [String: String]?
         lock.lock()
-        var bucket = neutral[phase] ?? (now, 0, 0, 0)
+        var bucket = neutral[phase] ?? (now, 0, 0, 0, 0)
         if now - bucket.start >= 30 {
             if bucket.suppressed > 0 { summary = ["phase": "index-observation-summary", "category": phase, "suppressed": String(bucket.suppressed), "assetObservations": String(bucket.assets)] }
-            bucket = (now, 0, 0, 0)
+            if bucket.batches > 0 { summary?["batchObservations"] = String(bucket.batches) }
+            bucket = (now, 0, 0, 0, 0)
         }
         bucket.assets += Int(fields["assets"] ?? "0") ?? 0
+        bucket.batches += Int(fields["batches"] ?? "0") ?? 0
         let admitted = bucket.emitted < 2
         if admitted { bucket.emitted += 1 } else { bucket.suppressed += 1 }
         neutral[phase] = bucket; lock.unlock()
@@ -113,7 +115,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let readyStates = states.filter { force || now - $0.value.start >= 30 }
         let readyNeutral = neutral.filter { force || now - $0.value.start >= 30 }
         for (key, value) in readyStates { states[key] = (value.value, 0, now) }
-        for (key, value) in readyNeutral { neutral[key] = (value.start, value.emitted, 0, 0) }
+        for (key, value) in readyNeutral { neutral[key] = (value.start, value.emitted, 0, 0, 0) }
         lock.unlock()
         if !readers.isEmpty {
             var fields = readers.mapValues(String.init); fields["phase"] = "index-reader-summary"; emit(fields)
@@ -122,7 +124,9 @@ public final class IndexDiagnostics: @unchecked Sendable {
             emit(["phase": "index-state-summary", "category": category, "state": state.value, "suppressed": String(state.suppressed)])
         }
         for (category, bucket) in readyNeutral where bucket.suppressed > 0 {
-            emit(["phase": "index-observation-summary", "category": category, "suppressed": String(bucket.suppressed), "assetObservations": String(bucket.assets)])
+            var fields = ["phase": "index-observation-summary", "category": category, "suppressed": String(bucket.suppressed), "assetObservations": String(bucket.assets)]
+            if bucket.batches > 0 { fields["batchObservations"] = String(bucket.batches) }
+            emit(fields)
         }
     }
 }
@@ -166,6 +170,13 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
             if fields["event"] == "attempt" { context.linkIssuance(fields) }
         }
         fields["operation"] = id; context.emit(fields)
+    }
+    /// Only successful, store-proven neutral batches use this fixed bucket.
+    /// Keep operation detail/finish empty so fresh operations do not add a flood.
+    public func recordNeutralTransfer(assets: Int, generation: Int64, fromGeneration: Int, throughGeneration: Int) {
+        context.observation(["phase": "index-live-transfer-neutral", "source": "live", "operation": id,
+            "reason": assets == 0 ? "empty" : "input-unchanged", "assets": String(assets), "batches": "1",
+            "readyToPending": "0", "generation": String(generation), "fromGeneration": String(fromGeneration), "throughGeneration": String(throughGeneration)])
     }
     public func finish() {
         lock.lock(); let emitted = emitted, suppressed = suppressed; lock.unlock()

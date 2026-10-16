@@ -1429,7 +1429,7 @@ public final class SyncStore: @unchecked Sendable {
             String(batch.interval.context.epoch), String(delta.fromGeneration), String(delta.toGeneration),
             batch.interval.changedAssetIDs, batch.interval.deletedAssetIDs])
         let digest = SHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
-        let result: (generation: Int64, invalidated: Int) = try await perform {
+        let result: (generation: Int64, invalidated: Int, mutations: IndexMutationCounts, finished: IndexMutationCounts) = try await perform {
             try self.transaction {
                 guard delta.isValid, let state = try self.indexStateRow(),
                       try self.libraryContext(state) == delta.context, try self.int64(state[7]) == (firstBatch ? 1 : 0),
@@ -1456,20 +1456,32 @@ public final class SyncStore: @unchecked Sendable {
                 try self.execute("UPDATE dedup_index_state SET generation = ?, photos_generation = ?, published_generation = NULL, reconciliation_complete = 0 WHERE id = 1",
                                  [.int64(generation), .int64(Int64(delta.toGeneration))])
                 let invalidated = try self.invalidateRepresentationsSync(assetIDs: page.invalidatedAssetIDs, state: state, generation: generation)
-                _ = try self.upsertRepresentationsSync(page.descriptors, state: state, generation: generation, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
+                let mutations = try self.upsertRepresentationsSync(page.descriptors, state: state, generation: generation, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
                 let affected = changed.union(delta.deletedAssetIDs)
                 let seen = Set(page.descriptors.map(\.key))
-                _ = try self.finishRepresentationKeys(seen, context: delta.context, generation: generation, assetIDs: affected)
+                let finished = try self.finishRepresentationKeys(seen, context: delta.context, generation: generation, assetIDs: affected)
                 let excluded = Set(page.exclusions.filter { $0.reason != .nonImage }.map { $0.descriptor.key.assetID }).subtracting(seen.map(\.assetID))
                 try self.updateExclusions(excluded, context: delta.context, affectedIDs: affected)
                 if lastBatch { try self.finishInventory(checkpoint: retainedCheckpoint, context: delta.context) }
                 else { try self.execute("UPDATE dedup_index_state SET reconcile_cursor = ? WHERE id=1", [.text("delta:\(digest):\(batch.offset + batch.count)")]) }
                 self.publishedIndexToken = nil
-                return (generation, invalidated)
+                return (generation, invalidated, mutations, finished)
             }
         }
-        diagnostic?.record(["phase": "index-invalidation", "source": "live", "reason": "content-obligation", "readyToPending": String(result.invalidated), "generation": String(result.generation), "fromGeneration": String(delta.fromGeneration), "throughGeneration": String(delta.toGeneration)])
-        diagnostic?.finish()
+        // Diagnostic classification only, after the unchanged transaction. Zero
+        // invalidation alone does not prove continuity or unchanged membership.
+        let neutral = delta.deletedAssetIDs.isEmpty && page.invalidatedAssetIDs.isEmpty && page.exclusions.isEmpty &&
+            Set(delta.changedAssetIDs).isSubset(of: Set(page.inputUnchangedAssetIDs)) &&
+            result.invalidated == 0 && result.mutations.added == 0 && result.mutations.changed == 0 && result.finished.deleted == 0
+        if neutral {
+            diagnostic?.recordNeutralTransfer(assets: delta.changedAssetIDs.count, generation: result.generation,
+                fromGeneration: delta.fromGeneration, throughGeneration: delta.toGeneration)
+        } else {
+            diagnostic?.record(["phase": "index-invalidation", "source": "live", "reason": "content-obligation", "readyToPending": String(result.invalidated),
+                "added": String(result.mutations.added), "changed": String(result.mutations.changed), "deleted": String(result.finished.deleted),
+                "deletedAssets": String(delta.deletedAssetIDs.count), "generation": String(result.generation), "fromGeneration": String(delta.fromGeneration), "throughGeneration": String(delta.toGeneration)])
+            diagnostic?.finish()
+        }
         return result.generation
     }
 

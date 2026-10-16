@@ -87,6 +87,99 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await assertEqual(await f.photos.readCount, 17)
     }
 
+    func testCoordinatorStoreNeutralTransferStreamIsBoundedAndPreservesRetryFacts() async throws {
+        let rows = CoordinatorDiagnostics(), clock = DiagnosticClock()
+        let diagnostics = IndexDiagnostics(sink: { rows.record($0) }, monotonic: { clock.now })
+        let f = try fixture(indexDiagnostics: diagnostics)
+        let ids = ["healthy", "retry"]
+        var all = ids.map { descriptor(f.photos.context, asset: $0) }
+        await f.photos.set(all); await f.photos.setReadFailures(["retry": .unavailable])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let initialTasks = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(100), limit: 2)
+        let original = try XCTUnwrap(initialTasks.first)
+        let start = rows.rows.count
+        for window in 0..<4 {
+            clock.now = Double(window * 30)
+            for index in 0..<32 {
+                let changed = index.isMultiple(of: 2) ? ids : []
+                if !changed.isEmpty { all = ids.map { descriptor(f.photos.context, asset: $0, revision: "metadata-\(window)-\(index)") } }
+                await f.photos.preserveDeltaInputs(changed)
+                let delta = await f.photos.changeFacts(all, changed: changed)
+                await f.coordinator.libraryChanged(.incremental(delta)); await f.coordinator.processDueWork(now: now)
+            }
+        }
+        diagnostics.flushObservations(force: true)
+        let stream = Array(rows.rows.dropFirst(start))
+        XCTAssertLessThanOrEqual(stream.count, 24, "bound all coordinator/store output across four fixed windows")
+        let data = try JSONSerialization.data(withJSONObject: stream, options: [.sortedKeys])
+        XCTAssertLessThan(data.count, 10_000)
+        XCTAssertEqual(stream.filter { $0["phase"] == "index-live-transfer-neutral" }.count, 8)
+        let summaries = stream.filter { $0["phase"] == "index-observation-summary" && $0["category"] == "index-live-transfer-neutral" }
+        XCTAssertEqual(summaries.reduce(0) { $0 + (Int($1["suppressed"] ?? "0") ?? 0) }, 120)
+        XCTAssertEqual(summaries.reduce(0) { $0 + (Int($1["assetObservations"] ?? "0") ?? 0) }, 128)
+        XCTAssertEqual(summaries.reduce(0) { $0 + (Int($1["batchObservations"] ?? "0") ?? 0) }, 128)
+        XCTAssertFalse(stream.contains { $0["phase"] == "index-invalidation" || $0["phase"] == "index-diagnostic-summary" })
+        let finalTasks = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(100), limit: 2)
+        let retained = try XCTUnwrap(finalTasks.first)
+        XCTAssertEqual(retained.issuanceRevision, original.issuanceRevision)
+        XCTAssertEqual(retained.indexGeneration, original.indexGeneration)
+        XCTAssertEqual(retained.retryCount, original.retryCount); XCTAssertEqual(retained.nextRetryAt, original.nextRetryAt)
+        await assertEqual(await f.photos.readCount, 2); await assertEqual(await f.model.count, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db), 1)
+        if let destination = ProcessInfo.processInfo.environment["PHOTOSYNC_TRANSFER_DIAGNOSTIC_EVIDENCE"] {
+            let lines = try stream.map { try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) + Data([10]) }
+            try lines.reduce(into: Data(), { $0.append($1) }).write(to: URL(fileURLWithPath: destination))
+        }
+    }
+
+    func testCoordinatorStoreMeaningfulZeroInvalidationControlsAreNotCoalesced() async throws {
+        let rows = CoordinatorDiagnostics(), diagnostics = IndexDiagnostics(sink: { rows.record($0) })
+        let f = try fixture(indexDiagnostics: diagnostics)
+        var healthy = descriptor(f.photos.context, asset: "healthy")
+        await f.photos.set([healthy]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        var controls: [[String: String]] = []
+        for kind in ["content", "unproven", "inserted-with-proof", "changed-shape-with-proof", "deleted"] {
+            let start = rows.rows.count
+            let added = descriptor(f.photos.context, asset: "new")
+            await f.photos.invalidateDelta(kind == "content" ? ["healthy"] : [])
+            await f.photos.preserveDeltaInputs(kind == "inserted-with-proof" ? ["new"] : kind == "changed-shape-with-proof" ? ["healthy"] : [])
+            if kind == "changed-shape-with-proof" {
+                healthy = .init(key: healthy.key, context: healthy.context, revision: healthy.revision,
+                    size: try PixelSize(width: 16, height: 8), equivalentToOriginal: false, revisionIsReliable: true)
+            }
+            let all = kind == "inserted-with-proof" ? [healthy, added] : [healthy]
+            let changed = kind == "deleted" ? [] : [kind == "inserted-with-proof" ? "new" : "healthy"]
+            let delta = await f.photos.changeFacts(all, deleted: kind == "deleted" ? ["new"] : [], changed: changed)
+            await f.coordinator.libraryChanged(.incremental(delta)); await f.coordinator.processDueWork(now: now)
+            let events = Array(rows.rows.dropFirst(start)).filter { $0["phase"] == "index-invalidation" && $0["source"] == "live" }
+            XCTAssertEqual(events.count, 1, kind)
+            XCTAssertEqual(events.first?["readyToPending"], kind == "content" ? "1" : "0", kind)
+            XCTAssertNotNil(events.first?["operation"], kind)
+            controls.append(contentsOf: events)
+        }
+        XCTAssertEqual(controls.count, 5)
+        let failed = descriptor(f.photos.context, asset: "failed")
+        await f.photos.setReadFailures(["failed": .unavailable])
+        await f.photos.invalidateDelta([]); await f.photos.preserveDeltaInputs([])
+        let insertion = await f.photos.changeFacts([healthy, failed], changed: ["failed"])
+        await f.coordinator.libraryChanged(.incremental(insertion)); await f.coordinator.processDueWork(now: now)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='failed' AND state='failed'", at: f.db), 1)
+        await f.photos.invalidateDelta(["failed"]); await f.photos.preserveDeltaInputs(["failed"])
+        let invalidationStart = rows.rows.count
+        let failureEdit = await f.photos.changeFacts([healthy, failed], changed: ["failed"])
+        await f.coordinator.libraryChanged(.incremental(failureEdit)); await f.coordinator.processDueWork(now: now)
+        let failedEvents = Array(rows.rows.dropFirst(invalidationStart)).filter { $0["phase"] == "index-invalidation" && $0["source"] == "live" }
+        XCTAssertEqual(failedEvents.count, 1, "an explicit obligation remains meaningful when no row was ready")
+        XCTAssertEqual(failedEvents.first?["readyToPending"], "0")
+        XCTAssertEqual(failedEvents.first?["added"], "0"); XCTAssertEqual(failedEvents.first?["changed"], "0"); XCTAssertEqual(failedEvents.first?["deleted"], "0")
+        await f.photos.setPages([.init(context: f.photos.context, generation: 8, descriptors: [healthy, failed], nextOffset: nil, invalidateAllCachedRepresentations: true)])
+        await f.coordinator.libraryChanged(.fullReconcileRequired)
+        let start = rows.rows.count
+        await f.coordinator.processDueWork(now: now)
+        XCTAssertTrue(rows.rows.dropFirst(start).contains { $0["phase"] == "index-invalidation" && $0["reason"] == "catalog-unknown" && $0["readyToPending"] == "2" }, "unknown invalidation also updates the retained tombstoned row")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0 AND state='ready'", at: f.db), 1)
+    }
+
     func testNeutralGenerationAdvancesDoNotRestartRotationOrStarveHealthyHighKeys() async throws {
         let f = try fixture()
         let all = (0..<40).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) }
@@ -1277,7 +1370,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let db: URL; let store: SyncStore; let photos: CoordinatorPhotos; let model: CoordinatorModel
         let configuration: DedupConfiguration; let coordinator: PhotosIndexCoordinator
     }
-    private func fixture(wallNow: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }, monotonic: @escaping @Sendable () -> TimeInterval = { 0 }, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> Fixture {
+    private func fixture(indexDiagnostics: IndexDiagnostics? = nil, wallNow: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }, monotonic: @escaping @Sendable () -> TimeInterval = { 0 }, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -1287,7 +1380,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let photos = CoordinatorPhotos(limits: configuration.resources), model = CoordinatorModel(version: configuration.fingerprint.version)
         return Fixture(db: db, store: store, photos: photos, model: model, configuration: configuration,
             coordinator: PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-                configuration: configuration, wallNow: wallNow, monotonic: monotonic, diagnostics: diagnostics))
+                configuration: configuration, wallNow: wallNow, monotonic: monotonic, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics))
     }
     private func descriptor(_ context: LibraryContext, asset: String = "asset", kind: RepresentationKind = .original,
                             revision: String = "r1", equivalent: Bool = false) -> RepresentationDescriptor {
