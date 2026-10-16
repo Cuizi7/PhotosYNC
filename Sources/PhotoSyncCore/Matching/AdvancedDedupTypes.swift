@@ -20,6 +20,14 @@ public struct ModelInputDigest: Equatable, Sendable {
     }
 }
 
+/// Disjoint elapsed wall stages, reported per call even when later work throws.
+public enum FingerprintTimingStage: String, Sendable {
+    case preprocessing = "preprocessing-wall"
+    case digest = "input-digest-wall"
+    case modelQueue = "model-queue-wall"
+    case prediction = "prediction-wall"
+}
+
 /// Monotonic elapsed wall time. Queue wait and prediction are disjoint, not CPU measurements.
 public struct FingerprintTimings: Equatable, Sendable {
     public let preprocessingSeconds: Double

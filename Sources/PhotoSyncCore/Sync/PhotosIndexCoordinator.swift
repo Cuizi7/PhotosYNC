@@ -136,16 +136,20 @@ public actor PhotosIndexCoordinator {
                     readyToPending += changed
                     diagnostic.record(["phase": "index-invalidation", "source": "catalog", "reason": "content-obligation", "readyToPending": String(changed), "assets": String(page.invalidatedAssetIDs.count), "generation": String(current)])
                 }
-                let diagnosticStarted = ProcessInfo.processInfo.systemUptime
-                for descriptor in page.descriptors {
-                    diagnostic.record(["phase": "index-catalog-sample", "source": "catalog", "generation": String(current),
-                        "explicitInvalidation": allInvalidated || page.invalidatedAssetIDs.contains(descriptor.key.assetID) ? "true" : "false"], descriptor: descriptor)
-                }
-                diagnostic.measure(stage: "diagnostic", seconds: ProcessInfo.processInfo.systemUptime - diagnosticStarted)
                 let mutations = try await measured("db-upsert", diagnostic) {
                     try await store.upsertRepresentations(page.descriptors, generation: current,
                         inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
                 }
+                let diagnosticStarted = ProcessInfo.processInfo.systemUptime
+                for descriptor in page.descriptors {
+                    if allInvalidated || page.invalidatedAssetIDs.contains(descriptor.key.assetID) {
+                        diagnostic.bindInvalidation(descriptor, indexGeneration: current, photosGeneration: page.generation,
+                            unknownScope: allInvalidated, reason: allInvalidated ? (forceCacheInvalidation ? "continuity-unknown" : "catalog-unknown") : "content-obligation")
+                    }
+                    diagnostic.record(["phase": "index-catalog-sample", "source": "catalog", "generation": String(current),
+                        "explicitInvalidation": allInvalidated || page.invalidatedAssetIDs.contains(descriptor.key.assetID) ? "true" : "false"], descriptor: descriptor)
+                }
+                diagnostic.measure(stage: "diagnostic", seconds: ProcessInfo.processInfo.systemUptime - diagnosticStarted)
                 counts.added += mutations.added; counts.changed += mutations.changed
                 seenKeys.formUnion(page.descriptors.map(\.key))
                 eligibleAssets.formUnion(page.descriptors.map { $0.key.assetID })
@@ -179,12 +183,16 @@ public actor PhotosIndexCoordinator {
                             readyToPending += changed
                             diagnostic.record(["phase": "index-invalidation", "source": "live-catalog", "reason": "content-obligation", "readyToPending": String(changed), "generation": String(generation!)])
                         }
-                        for descriptor in page.descriptors {
-                            diagnostic.record(["phase": "index-catalog-sample", "source": "live-catalog", "generation": String(generation!),
-                                "explicitInvalidation": page.invalidatedAssetIDs.contains(descriptor.key.assetID) ? "true" : "false"], descriptor: descriptor)
-                        }
                         let mutations = try await measured("db-upsert", diagnostic) {
                             try await store.upsertRepresentations(page.descriptors, generation: generation!, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
+                        }
+                        for descriptor in page.descriptors {
+                            if allInvalidated || page.invalidatedAssetIDs.contains(descriptor.key.assetID) {
+                                diagnostic.bindInvalidation(descriptor, indexGeneration: generation!, photosGeneration: page.generation,
+                                    unknownScope: allInvalidated, reason: allInvalidated ? "continuity-unknown" : "content-obligation")
+                            }
+                            diagnostic.record(["phase": "index-catalog-sample", "source": "live-catalog", "generation": String(generation!),
+                                "explicitInvalidation": page.invalidatedAssetIDs.contains(descriptor.key.assetID) ? "true" : "false"], descriptor: descriptor)
                         }
                         counts.added += mutations.added; counts.changed += mutations.changed
                         seenKeys = seenKeys.filter { !affected.contains($0.assetID) }
@@ -312,12 +320,9 @@ public actor PhotosIndexCoordinator {
                             let result: FingerprintResult
                             do {
                                 defer { diagnostic.measure(stage: "fingerprint-total-wall", seconds: ProcessInfo.processInfo.systemUptime - fingerprintStarted) }
-                                result = try await model.fingerprintWithDiagnostics(image: loaded!.image, orientation: loaded!.orientation)
+                                result = try await model.fingerprintWithDiagnostics(image: loaded!.image, orientation: loaded!.orientation,
+                                    onTiming: { stage, seconds in diagnostic.measure(stage: stage.rawValue, seconds: seconds) })
                             }
-                            diagnostic.measure(stage: "preprocessing-wall", seconds: result.timings.preprocessingSeconds)
-                            diagnostic.measure(stage: "input-digest-wall", seconds: result.timings.digestSeconds)
-                            diagnostic.measure(stage: "model-queue-wall", seconds: result.timings.modelQueueSeconds)
-                            diagnostic.measure(stage: "prediction-wall", seconds: result.timings.predictionSeconds)
                             // Release the last owned bitmap reference before making
                             // its physical budget slot available to another consumer.
                             loaded = nil
@@ -523,18 +528,22 @@ public actor PhotosIndexCoordinator {
                     nextOffset: page.nextOffset, exclusions: page.exclusions,
                     invalidatedAssetIDs: Set(page.invalidatedAssetIDs).union(reinserted.intersection(batch.changedAssetIDs)).sorted(),
                     invalidateAllCachedRepresentations: page.invalidateAllCachedRepresentations, inputUnchangedAssetIDs: page.inputUnchangedAssetIDs)
-                if !effectivePage.invalidatedAssetIDs.isEmpty || !batch.deletedAssetIDs.isEmpty ||
-                    !Set(batch.changedAssetIDs).isSubset(of: Set(effectivePage.inputUnchangedAssetIDs)) {
-                    for descriptor in effectivePage.descriptors {
-                        diagnostic.record(["phase": "index-catalog-sample", "source": "live", "photosGeneration": String(delta.toGeneration),
-                            "explicitInvalidation": effectivePage.invalidatedAssetIDs.contains(descriptor.key.assetID) ? "true" : "false"], descriptor: descriptor)
-                    }
-                }
-                _ = try await measuredWindow("db-delta") {
+                let committedGeneration = try await measuredWindow("db-delta") {
                     try await store.applyIndexDeltaBatch(slice, page: effectivePage,
                         fingerprintVersion: configuration.fingerprint.version, checkpoint: index == offsets.count - 1 ? checkpoint : nil,
                         diagnostic: indexDiagnostics.operation("live-delta"))
                 }
+                if !effectivePage.invalidatedAssetIDs.isEmpty || !batch.deletedAssetIDs.isEmpty ||
+                    !Set(batch.changedAssetIDs).isSubset(of: Set(effectivePage.inputUnchangedAssetIDs)) {
+                    for descriptor in effectivePage.descriptors {
+                        if effectivePage.invalidatedAssetIDs.contains(descriptor.key.assetID) {
+                            diagnostic.bindInvalidation(descriptor, indexGeneration: committedGeneration, photosGeneration: page.generation)
+                        }
+                        diagnostic.record(["phase": "index-catalog-sample", "source": "live", "photosGeneration": String(delta.toGeneration), "generation": String(committedGeneration),
+                            "explicitInvalidation": effectivePage.invalidatedAssetIDs.contains(descriptor.key.assetID) ? "true" : "false"], descriptor: descriptor)
+                    }
+                }
+
             }
             guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
             let snapshot = try await photos.candidateSnapshot()

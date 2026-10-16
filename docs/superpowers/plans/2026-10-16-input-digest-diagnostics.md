@@ -27,6 +27,7 @@ Use only approved diagnostics, nullable schema v9 and synthetic fixtures; preser
 - `ImageFingerprinting.fingerprintWithDiagnostics(image:orientation:) async throws -> FingerprintResult`, with default wrapper for legacy fakes. CoreML overrides the one-pass path.
 - `InputDigestComparison: String` cases sameInput=same_input, differentInput=different_input, missingBaseline=missing_baseline, incomparable=incomparable, missingInput=missing_input (legacy fake/result with no diagnostic tensor).
 - `SyncStore.completeRepresentation(_:result:) async throws -> InputDigestComparison?`: nil rejected; compare only after existing guard; old fingerprint API remains compatible and preserves baseline when input absent.
+- `ImageFingerprinting.fingerprintWithDiagnostics(image:orientation:onTiming:)` reports executed `FingerprintTimingStage` elapsed samples, including throws/cancellation, without wrapping original errors.
 - Parent owns IndexDiagnostics extensions and coordinator calls. Gateway owner will coordinate exact diagnostic APIs with parent before implementation; no concurrent edits to logging/coordinator.
 
 ### Task 1: Prepared tensor evidence
@@ -44,3 +45,10 @@ Owner: parent, IndexDiagnostics.swift, PhotosIndexCoordinator.swift, PhotosIndex
 ### Task 4: Integrated acceptance and delivery
 
 Run tester focused integration, deep_reviewer on complete diff; fix in-scope findings and recheck affected behavior only. Freeze commit/tree. Run one fresh complete scripts/validate.py; preserve failures. Commit/push only this scope; create PR against main and attach. Record migration/overhead/evidence and unverified real Photos/platform boundaries; no merge/release.
+
+## Execution record
+
+- Tasks 1–3 implemented; initial integrated candidate `b93b02c` passed 279 focused tests.
+- One complete deep review found two diagnostic P2 defects: latest observation could replace pending invalidation provenance, and failed predictions lost completed phase timings. Both are fixed within the approved logging/model-diagnostic boundaries.
+- Causal RED reproduced 7 assertions across 2 tests; corrected gateway/coordinator 138-test run passed. Tensor partial-timing RED reproduced 4 failure/cancel cases; corrected 28-test run passed. Source/product policy unchanged; no new persistent causal index.
+- Final scoped review and the single fresh complete validator are recorded with the frozen commit/tree in the PR/local handoff; no release or merge is included.

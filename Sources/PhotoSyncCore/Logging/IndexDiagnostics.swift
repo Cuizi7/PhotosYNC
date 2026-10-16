@@ -1,6 +1,23 @@
 import CryptoKit
 import Foundation
 
+private struct DiagnosticCauseEvent {
+    let sequence: UInt64
+    let generation: Int?
+    let fields: [String: String]
+}
+private struct DiagnosticCauseWindow {
+    let context: LibraryContext
+    var events: [DiagnosticCauseEvent] = []
+    var omittedThrough: UInt64 = 0
+}
+private struct BoundDiagnosticCause {
+    let context: LibraryContext
+    let indexGeneration: Int64
+    let revision: String
+    let fields: [String: String]
+}
+
 private struct DiagnosticElapsed {
     var count = 0
     var sum: TimeInterval = 0
@@ -25,9 +42,11 @@ public final class IndexDiagnostics: @unchecked Sendable {
     private var samples = Set<String>()
     private var sequence: UInt64 = 0
     private var issuances: [String: (descriptor: String, issuance: String, causes: [String: String])] = [:]
-    // At most one latest cause per sampled asset, and one attempt snapshot per kind.
-    // Context is stored in the value so a library switch cannot grow the maps.
-    private var causes: [String: (context: LibraryContext, fields: [String: String])] = [:]
+    // Four obligation observations per sampled asset; neutral observations do not replace
+    // pending provenance. Bindings/accepted watermarks/attempt snapshots have at most 16 keys.
+    private var causes: [String: DiagnosticCauseWindow] = [:]
+    private var boundCauses: [String: BoundDiagnosticCause] = [:]
+    private var acceptedCauseSequences: [String: UInt64] = [:]
     private var causeCounts: [String: Int] = [:]
     private var causeDetails = 0
     private var windowTimings: [String: DiagnosticElapsed] = [:]
@@ -58,7 +77,8 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let selected = samples.contains(asset); lock.unlock()
         return selected ? ["assetHandle": asset] : nil
     }
-    fileprivate func sample(_ descriptor: RepresentationDescriptor, includeIssuance: Bool = true) -> [String: String]? {
+    fileprivate func sample(_ descriptor: RepresentationDescriptor, includeIssuance: Bool = true,
+                            task: RepresentationTask? = nil, generation: Int64? = nil) -> [String: String]? {
         guard var fields = assetSample(descriptor.key.assetID) else { return nil }
         // Encode the full descriptor, including unknown revision reliability. Never
         // retain a per-library descriptor map just to produce diagnostic handles.
@@ -69,10 +89,16 @@ public final class IndexDiagnostics: @unchecked Sendable {
         fields.merge(scope(descriptor.context)) { _, new in new }
         let asset = fields["assetHandle"]!
         let key = asset + ":" + descriptor.key.kind.rawValue
-        lock.lock(); let issuance = issuances[key], cause = causes[asset]; lock.unlock()
-        if cause?.context == descriptor.context { fields.merge(cause!.fields) { _, new in new } }
+        lock.lock(); let issuance = issuances[key], cause = boundCauses[key]; lock.unlock()
+        let matchingRevision = cause?.revision == descriptor.revision || (task != nil && cause?.revision == task?.issuanceRevision)
+        let matchingGeneration = (task?.indexGeneration ?? generation).map { $0 == cause?.indexGeneration } ?? true
+        if cause?.context == descriptor.context, matchingRevision, matchingGeneration {
+            fields.merge(cause!.fields) { _, new in new }
+        } else if task != nil {
+            fields.merge(["causeSource": "unknown", "causeRelation": "unattributed", "cause.content": "unknown"]) { _, new in new }
+        }
         if includeIssuance, issuance?.descriptor == fields["descriptorHandle"], let issuance {
-            fields = fields.filter { !$0.key.hasPrefix("cause") }
+            fields = fields.filter { !Self.isProvenance($0.key) }
             fields.merge(issuance.causes) { _, new in new }
             fields["issuanceHandle"] = issuance.issuance
         }
@@ -81,7 +107,47 @@ public final class IndexDiagnostics: @unchecked Sendable {
     fileprivate func linkIssuance(_ fields: [String: String]) {
         guard let asset = fields["assetHandle"], let kind = fields["representation"],
               let descriptor = fields["descriptorHandle"], let issuance = fields["issuanceHandle"] else { return }
-        lock.lock(); issuances[asset + ":" + kind] = (descriptor, issuance, fields.filter { $0.key.hasPrefix("cause") }); lock.unlock()
+        lock.lock(); issuances[asset + ":" + kind] = (descriptor, issuance, fields.filter { Self.isProvenance($0.key) }); lock.unlock()
+    }
+    private static func isProvenance(_ key: String) -> Bool { key.hasPrefix("cause") || key.hasPrefix("invalidation") }
+    fileprivate func bindInvalidation(_ descriptor: RepresentationDescriptor, indexGeneration: Int64,
+                                      photosGeneration: Int, operation: String, unknownScope: Bool, reason: String) {
+        guard let sample = assetSample(descriptor.key.assetID), let asset = sample["assetHandle"] else { return }
+        let key = asset + ":" + descriptor.key.kind.rawValue
+        lock.lock()
+        let watermark = acceptedCauseSequences[key, default: 0]
+        let window = causes[asset]
+        let events = window?.context == descriptor.context ? (window?.events.filter {
+            $0.sequence > watermark && ($0.generation.map { $0 <= photosGeneration } ?? false)
+        } ?? []) : []
+        let omitted = window?.context == descriptor.context && (window?.omittedThrough ?? 0) > watermark
+        var fields: [String: String]
+        if !unknownScope, events.count == 1, !omitted {
+            fields = events[0].fields
+        } else {
+            sequence &+= 1
+            fields = ["causeHandle": "cause-\(sequence)", "causeSequence": String(sequence),
+                "causeSource": unknownScope || events.isEmpty ? "unknown" : "mixed", "cause.content": "unknown",
+                "causeGeneration": String(photosGeneration), "cause.category": reason]
+            if !unknownScope, !events.isEmpty { fields["causeHandles"] = events.compactMap { $0.fields["causeHandle"] }.joined(separator: ",") }
+            if !unknownScope, omitted { fields["causeOmitted"] = "true" }
+        }
+        fields["causeRelation"] = "bound-invalidation"
+        fields["invalidationOperation"] = operation; fields["invalidationIndexGeneration"] = String(indexGeneration)
+        fields["invalidationPhotosGeneration"] = String(photosGeneration)
+        fields["invalidationScope"] = unknownScope ? "all" : "asset"
+        boundCauses[key] = BoundDiagnosticCause(context: descriptor.context, indexGeneration: indexGeneration,
+            revision: descriptor.revision, fields: fields)
+        lock.unlock()
+    }
+    fileprivate func accepted(_ task: RepresentationTask) {
+        let asset = handle("asset", task.descriptor.key.assetID), key = asset + ":" + task.descriptor.key.kind.rawValue
+        lock.lock()
+        if let bound = boundCauses[key], bound.context == task.descriptor.context,
+           bound.indexGeneration == task.indexGeneration, let sequence = UInt64(bound.fields["causeSequence"] ?? "") {
+            acceptedCauseSequences[key] = max(acceptedCauseSequences[key, default: 0], sequence)
+        }
+        lock.unlock()
     }
     public func scope(_ context: LibraryContext) -> [String: String] {
         ["contextHandle": handle("context", context.id.uuidString), "contextEpoch": String(context.epoch)]
@@ -89,7 +155,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
     /// Facts name public fields, never their values. History identifiers remain unknown
     /// content evidence. Correlation is bounded, run-local and best effort across restarts.
     public func recordCause(context: LibraryContext, assetID: String, source: String, generation: Int?,
-                            facts: [String: String], operation: String? = nil) {
+                            facts: [String: String], operation: String? = nil, inputObligation: Bool = true) {
         let source = ["history", "live", "catalog"].contains(source) ? source : "unknown"
         lock.lock(); causeCounts[source, default: 0] += 1; lock.unlock()
         guard let sample = assetSample(assetID), let asset = sample["assetHandle"] else { return }
@@ -98,10 +164,15 @@ public final class IndexDiagnostics: @unchecked Sendable {
         var chain = facts.reduce(into: [String: String]()) { $0["cause." + $1.key] = $1.value }
         lock.lock()
         sequence &+= 1
-        chain["causeHandle"] = "cause-\(sequence)"
+        chain["causeHandle"] = "cause-\(sequence)"; chain["causeSequence"] = String(sequence)
         chain["causeSource"] = source; chain["causeGeneration"] = generation.map(String.init) ?? "unknown"
         if let operation { chain["causeOperation"] = operation }
-        causes[asset] = (context, chain)
+        if inputObligation {
+            var window = causes[asset].flatMap { $0.context == context ? $0 : nil } ?? DiagnosticCauseWindow(context: context)
+            if window.events.count == 4 { window.omittedThrough = window.events.removeFirst().sequence }
+            window.events.append(DiagnosticCauseEvent(sequence: sequence, generation: generation, fields: chain))
+            causes[asset] = window
+        }
         let admitted = causeDetails < 64
         if admitted { causeDetails += 1 }
         lock.unlock()
@@ -109,6 +180,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
             var row = facts
             row.merge(chain) { _, new in new }; row.merge(scope(context)) { _, new in new }
             row["phase"] = "index-cause"; row["source"] = source; row["assetHandle"] = asset
+            row["inputObligation"] = String(inputObligation)
             emit(row)
         }
     }
@@ -231,7 +303,7 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
             guard let identity else { lock.lock(); suppressed += 1; lock.unlock(); return }
             fields.merge(identity) { _, new in new }
         } else if let descriptor = task?.descriptor ?? descriptor {
-            guard let sample = context.sample(descriptor, includeIssuance: task != nil && fields["event"] != "attempt") else {
+            guard let sample = context.sample(descriptor, includeIssuance: task != nil && fields["event"] != "attempt", task: task, generation: fields["generation"].flatMap(Int64.init)) else {
                 lock.lock(); suppressed += 1; lock.unlock(); return
             }
             fields.merge(sample) { _, new in new }
@@ -240,16 +312,16 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
             guard let sample = context.assetSample(assetID) else { lock.lock(); suppressed += 1; lock.unlock(); return }
             fields.merge(sample) { _, new in new }
         }
-        lock.lock()
-        let admitted = emitted < 64
-        if admitted { emitted += 1 } else { suppressed += 1 }
-        lock.unlock()
-        guard admitted else { return }
         if let task, !identityBound {
             fields["issuanceHandle"] = context.handle("issuance", "\(task.indexGeneration):\(task.issuanceRevision):\(fields["descriptorHandle"] ?? "unknown")")
             fields["taskGeneration"] = String(task.indexGeneration)
             if fields["event"] == "attempt" { context.linkIssuance(fields) }
         }
+        lock.lock()
+        let admitted = emitted < 64
+        if admitted { emitted += 1 } else { suppressed += 1 }
+        lock.unlock()
+        guard admitted else { return }
         fields["operation"] = id; context.emit(fields)
     }
     /// Only successful, store-proven neutral batches use this fixed bucket.
@@ -258,6 +330,11 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
         context.observation(["phase": "index-live-transfer-neutral", "source": "live", "operation": id,
             "reason": assets == 0 ? "empty" : "input-unchanged", "assets": String(assets), "batches": "1",
             "readyToPending": "0", "generation": String(generation), "fromGeneration": String(fromGeneration), "throughGeneration": String(throughGeneration)])
+    }
+    public func bindInvalidation(_ descriptor: RepresentationDescriptor, indexGeneration: Int64,
+                                 photosGeneration: Int, unknownScope: Bool = false, reason: String = "content-obligation") {
+        context.bindInvalidation(descriptor, indexGeneration: indexGeneration, photosGeneration: photosGeneration,
+            operation: id, unknownScope: unknownScope, reason: reason)
     }
     /// Bind the operation's inventory boundary, independently of detail sampling.
     public func bindScope(context library: LibraryContext, photosGeneration: Int, indexGeneration: Int64? = nil) {
@@ -270,6 +347,7 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
     public func recordComparison(_ comparison: InputDigestComparison, task: RepresentationTask) {
         lock.lock(); comparisons[comparison, default: 0] += 1; lock.unlock()
         record(["phase": "index-task", "event": "accepted", "comparison": comparison.rawValue], task: task)
+        context.accepted(task)
     }
     public func measure(stage: String, seconds: TimeInterval) {
         guard seconds.isFinite, seconds >= 0 else { return }

@@ -8,11 +8,25 @@ import ImageIO
 public protocol ImageFingerprinting: Sendable {
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint
     func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult
+    func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation,
+                                    onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult
 }
 
 public extension ImageFingerprinting {
     func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult {
         FingerprintResult(fingerprint: try await fingerprint(image: image, orientation: orientation))
+    }
+
+    func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation,
+                                    onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult {
+        let result = try await fingerprintWithDiagnostics(image: image, orientation: orientation)
+        let measured: [(FingerprintTimingStage, Double)] = [
+            (.preprocessing, result.timings.preprocessingSeconds), (.digest, result.timings.digestSeconds),
+            (.modelQueue, result.timings.modelQueueSeconds), (.prediction, result.timings.predictionSeconds)
+        ]
+        // Compatible fakes may not measure individual stages. Do not invent samples for them.
+        for (stage, seconds) in measured where seconds.isFinite && seconds > 0 { onTiming(stage, seconds) }
+        return result
     }
 }
 
@@ -179,17 +193,41 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
     }
 
     public func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult {
+        try await fingerprintWithDiagnostics(image: image, orientation: orientation, onTiming: { _, _ in })
+    }
+
+    /// Each executed stage reports once, including failures. The callback must remain bounded and
+    /// synchronous; it runs outside ownership locks, and does not receive image or digest data.
+    public func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation,
+                                           onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult {
         try Task.checkCancellation()
         guard eligibility.isEligible else { throw CancellationError() }
-        let prepareStart = ProcessInfo.processInfo.systemUptime
-        let tensor = try ImagePreprocessor.prepare(image: image, orientation: orientation, configuration: configuration)
-        let prepareEnd = ProcessInfo.processInfo.systemUptime
-        let digest = try PreparedTensorDigest.compute(tensor, configuration: configuration)
-        let digestEnd = ProcessInfo.processInfo.systemUptime
-        let prediction = try await predictPrepared(tensor)
-        return FingerprintResult(fingerprint: prediction.fingerprint, inputDigest: digest,
-            timings: .init(preprocessingSeconds: prepareEnd - prepareStart, digestSeconds: digestEnd - prepareEnd,
+        let prepared = try Self.measured(.preprocessing, onTiming: onTiming) {
+            try ImagePreprocessor.prepare(image: image, orientation: orientation, configuration: configuration)
+        }
+        let digest = try Self.measured(.digest, onTiming: onTiming) {
+            try PreparedTensorDigest.compute(prepared.value, configuration: configuration)
+        }
+        let prediction = try await predictPrepared(prepared.value, onTiming: onTiming)
+        return FingerprintResult(fingerprint: prediction.fingerprint, inputDigest: digest.value,
+            timings: .init(preprocessingSeconds: prepared.seconds, digestSeconds: digest.seconds,
                            modelQueueSeconds: prediction.queueSeconds, predictionSeconds: prediction.predictionSeconds))
+    }
+
+    private nonisolated static func measured<Value>(_ stage: FingerprintTimingStage,
+        onTiming: (@Sendable (FingerprintTimingStage, Double) -> Void)?,
+        operation: () throws -> Value) rethrows -> (value: Value, seconds: Double) {
+        let started = ProcessInfo.processInfo.systemUptime
+        var seconds = 0.0
+        defer { onTiming?(stage, seconds) }
+        do {
+            let value = try operation()
+            seconds = ProcessInfo.processInfo.systemUptime - started
+            return (value, seconds)
+        } catch {
+            seconds = ProcessInfo.processInfo.systemUptime - started
+            throw error
+        }
     }
 
     /// Probe seam: the same serialized prediction path, after independently timed preprocessing.
@@ -200,7 +238,8 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
         try await predictPrepared(tensor).fingerprint
     }
 
-    private func predictPrepared(_ tensor: MLMultiArray) async throws -> (fingerprint: Fingerprint, queueSeconds: Double, predictionSeconds: Double) {
+    private func predictPrepared(_ tensor: MLMultiArray,
+        onTiming: (@Sendable (FingerprintTimingStage, Double) -> Void)? = nil) async throws -> (fingerprint: Fingerprint, queueSeconds: Double, predictionSeconds: Double) {
         try Task.checkCancellation()
         guard tensor.shape.map(\.intValue) == [1, 3, configuration.inputSide, configuration.inputSide],
               tensor.dataType == .float32 else { throw AdvancedDedupError.invalidConfiguration }
@@ -213,17 +252,19 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
         let output: (values: [Float], queueSeconds: Double, predictionSeconds: Double) = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
+                    let queueSeconds = ProcessInfo.processInfo.systemUptime - enqueued
+                    onTiming?(.modelQueue, queueSeconds)
                     if flag.isCancelled || !eligibility.isEligible {
                         continuation.resume(throwing: CancellationError())
                         return
                     }
                     do {
-                        let started = ProcessInfo.processInfo.systemUptime
-                        let values: [Float]
-                        if let execution { values = try execution.predict(input.tensor, cancelled: { flag.isCancelled }, eligible: { eligibility.isEligible }) }
-                        else { values = try prediction!(input.tensor) }
+                        let result = try Self.measured(.prediction, onTiming: onTiming) {
+                            if let execution { return try execution.predict(input.tensor, cancelled: { flag.isCancelled }, eligible: { eligibility.isEligible }) }
+                            return try prediction!(input.tensor)
+                        }
                         if flag.isCancelled { continuation.resume(throwing: CancellationError()) }
-                        else { continuation.resume(returning: (values, started - enqueued, ProcessInfo.processInfo.systemUptime - started)) }
+                        else { continuation.resume(returning: (result.value, queueSeconds, result.seconds)) }
                     } catch { continuation.resume(throwing: flag.isCancelled ? CancellationError() : error) }
                 }
                 submitted?()

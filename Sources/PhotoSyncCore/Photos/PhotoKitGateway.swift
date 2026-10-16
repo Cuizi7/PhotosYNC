@@ -935,7 +935,8 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                 indexDiagnostics.recordCause(context: context, assetID: asset.identifier, source: "live", generation: generation,
                     facts: ["category": "changed", "assetContentChanged": asset.assetContentChanged.map(String.init) ?? "unknown",
                         "visibleInputFields": asset.visibleInputFields.map { $0.isEmpty ? "none" : $0.sorted().joined(separator: ",") } ?? "unknown",
-                        "metadataFields": asset.metadataFields.map { $0.isEmpty ? "none" : $0.sorted().joined(separator: ",") } ?? "unknown"], operation: diagnostic.id)
+                        "metadataFields": asset.metadataFields.map { $0.isEmpty ? "none" : $0.sorted().joined(separator: ",") } ?? "unknown"], operation: diagnostic.id,
+                    inputObligation: !asset.inputUnchanged)
             }
             for asset in inserted { indexDiagnostics.recordCause(context: context, assetID: asset.identifier, source: "live", generation: generation,
                 facts: ["category": "inserted", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
