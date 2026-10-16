@@ -196,10 +196,12 @@ scripts/build-dmg.sh "$PWD/outputs/PhotosYNC.app" "$PWD/outputs/PhotosYNC.dmg"
 - 开发验收使用 `python3 scripts/validate.py --output-dir "$PWD/work/validation-<唯一名称>" --derived-data "$PWD/work/validation-<唯一名称>-derived"`。不要用仅 `xcodebuild build`、几项 selected tests 或旧日志宣告完整验收。
 - 发布使用 `scripts/package-release.sh`。它要求干净的已提交源码（非 ignored 的未跟踪文件也须处理），先归档该提交，再在同一归档中完整验证和正常 Universal Release 构建。不允许先在旧工作树测试，再包装不同源码。
 - 验收包含完整无过滤 XCTest、`Tests/Tools` 合成数据测试和受控续体竞态回归。XCTest 退出码、完整结束标志、实际数量大于零及失败数为零须同时满足；任何失败、超时、缺失工具/报告或零测试都不能绕过。
+- 规模验证使用显式 profile（2026-10-16 修订）：开发验收和打包统一默认 `--scale-profile release`，只跑 20 万表示＋10 万成功历史，保留既有性能阈值、大媒体和 60 秒空闲/恢复检查。索引、候选查询、缓存、SQLite、预处理/模型性能或资源行为、规模 harness/阈值变更及性能调查使用 `--scale-profile full`，跑原四档（10/15/20 万无历史、20 万＋10 万历史）。前三级对应 0%/50%/100% 编辑比例；最大混合档不等同于零/半数编辑比例的全部性能形态。作者/评审显式选择，不做自动 Git 分类。JSON/人类报告及 provenance 必须分别写明 profile、必需集合和实际执行集合；缺失、失败、畸形、重复或多余不匹配证据均拒绝。旧包四档记录保持历史原样，不能把单档声称为四档通过。完整规则见 `Design/Validation.md` 的 Scale profiles。
 - `scripts/test-continuation-race.py` 从当前 Core 创建隔离副本并插入唯一 await 门闩，执行版本控制的 `Tests/Regression/ContinuationRace.swift`。锚点改变须失败并修复 harness，不能跳过；门闩及测试代码不得进入发行 App。它补的是 retry 写入成功之后、失败提示发布之前的竞争，不得以较早的 retry 写入前竞争测试替代。
 - 发布包必须通过版本/channel/build、Universal app/Core 架构、图标资源、逐层签名、DMG 和校验值检查。provenance 必须绑定实际源码提交与本次验证证据；不得复用旧的成功标记。
 - 已有发布路径（目录、文件或符号链接）不得覆盖。发布锁冲突须停止；不能删除他人锁或在旧发布目录内嵌套新 package 来规避拒绝。失败保留独立 work 证据，不留下被宣称成功的发布目录。
 - 独立 review 按本文件风险等级执行；等价只读 review 不使既有测试失效，修复后仅重审新差异。最终完整验收必须覆盖最后一次行为/测试变更。用户明确授权的本地 squash merge 不重复询问；合并后核对源码树，并从 main 的确切提交执行发布入口。
+- 开发阶段优先运行受影响检查；最终打包归档执行一次 canonical。独立 QA 核对同一快照的结果、哈希和 provenance，不因只读 review 重跑同一完整套；不引入跨提交成功缓存，也不削减功能、续体或产物门槛。
 
 ### 何时需要针对性系统验证
 

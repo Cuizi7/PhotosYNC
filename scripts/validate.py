@@ -34,6 +34,10 @@ CONTINUATION_TIMEOUT_SECONDS = 5 * 60
 TOOLCHAIN_TIMEOUT_SECONDS = 60
 PERFORMANCE_CONTRACT = "background-preparation-v2"
 PREPARATION_P95_BUDGET_MS = 2000
+SCALE_PROFILES = {
+    "release": ((200000, 100000),),
+    "full": ((100000, 0), (150000, 0), (200000, 0), (200000, 100000)),
+}
 
 EXCLUDED_MANIFEST_DIRECTORIES = {
     ".git",
@@ -74,6 +78,10 @@ def parser() -> argparse.ArgumentParser:
         description="Build and run the complete PhotosYNC local release validation gate."
     )
     argument_parser.add_argument(
+        "--scale-profile", choices=tuple(SCALE_PROFILES), default="release",
+        help="release: maximum mixed sample (default); full: all four scale/distribution samples.",
+    )
+    argument_parser.add_argument(
         "--output-dir",
         type=Path,
         required=True,
@@ -98,7 +106,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         prepare_paths(source_root=source_root, output_dir=output_dir, derived_data=arguments.derived_data)
         output_dir.mkdir()
         output_created = True
-        validate(source_root=source_root, output_dir=output_dir, derived_data=arguments.derived_data)
+        validate(source_root=source_root, output_dir=output_dir, derived_data=arguments.derived_data,
+                 scale_profile=arguments.scale_profile)
     except (OSError, ValidationError, json.JSONDecodeError) as error:
         if output_created:
             write_failure(output_dir, error)
@@ -134,7 +143,7 @@ def prepare_paths(*, source_root: Path, output_dir: Path, derived_data: Path) ->
     derived_data.parent.mkdir(parents=True, exist_ok=True)
 
 
-def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None:
+def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_profile: str = "release") -> None:
     environment = child_environment()
     for name in ("PHOTOSYNC_SCALE_REPRESENTATIONS", "PHOTOSYNC_SCALE_HISTORY", "PHOTOSYNC_SCALE_BUILD_CONFIGURATION"):
         environment.pop(name, None)
@@ -231,7 +240,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
         raise ValidationError("Optimized scale test bundle missing")
     scale_results = {}
     scale_phases = [phase_record("scale-build", scale_build, output_dir)]
-    for count, history_count in ((100000, 0), (150000, 0), (200000, 0), (200000, 100000)):
+    for count, history_count in SCALE_PROFILES[scale_profile]:
         sample = str(count) if history_count == 0 else f"{count}-history-{history_count}"
         scale_environment = dict(environment, PHOTOSYNC_SCALE_REPRESENTATIONS=str(count),
                                  PHOTOSYNC_SCALE_HISTORY=str(history_count), PHOTOSYNC_SCALE_BUILD_CONFIGURATION="Release")
@@ -245,34 +254,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
         if not summaries or tuple(map(int, summaries[-1])) != (1, 0) or "Selected tests' passed" not in output:
             raise ValidationError(f"Scale {count} did not finish its one selected XCTest")
         report = output_dir / f"scale-{sample}.json"
-        result = json.loads(report.read_text())
-        validate_preparation_budget(result, label=f"Scale {count}")
-        if (result.get("representations") != count
-                or result.get("success_history_vectors") != history_count
-                or result.get("budget_pass") is not True
-                or result.get("index_change_ready_within_2s") is not True):
-            raise ValidationError(f"Scale {count} failed current runtime/resource budgets")
-        if (result.get("delta_path_verified") is not True
-                or result.get("index_change_sample_count_per_operation", 0) < 5
-                or not isinstance(result.get("query_io"), dict)
-                or not isinstance(result.get("unchanged_full_io"), dict)):
-            raise ValidationError(f"Scale {count} lacks verified delta/write measurements")
-        row_keys = {"rows." + table for table in (
-            "photos_representation", "fingerprint_task", "photos_index_exclusion", "dedup_index_state")}
-        if not all(row_keys.issubset(result[field]) for field in ("query_io", "unchanged_full_io")):
-            raise ValidationError(f"Scale {count} lacks per-table row-write observations")
-        if any(value != 0 for key, value in result["query_io"].items() if key.startswith("rows.")):
-            raise ValidationError(f"Scale {count} query wrote persistent rows")
-        if any(result["unchanged_full_io"].get("rows." + table, 0) != 0
-               for table in ("photos_representation", "fingerprint_task")):
-            raise ValidationError(f"Scale {count} unchanged inventory rewrote representation/task rows")
-        if history_count == 100000:
-            idle = result.get("idle_60s", {})
-            if (idle.get("elapsed_seconds", 0) < 60 or idle.get("after", {}).get("footprint_bytes", 0) <= 0
-                    or idle.get("after", {}).get("rss_bytes", 0) <= 0 or "resume_query_ms" not in idle):
-                raise ValidationError("Maximum scale lacks 60-second idle/resume resource evidence")
-        if count == 200000 and len(result.get("large_source_samples", [])) != 2:
-            raise ValidationError("Maximum scale lacks both representative large-source measurements")
+        validate_scale_result(read_json(report), count=count, history_count=history_count)
         scale_results[sample] = {"result": report.name, "result_sha256": sha256_file(report)}
         scale_phases.append(phase_record(f"scale-{sample}", scale, output_dir))
 
@@ -336,6 +318,11 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
 
     evidence = {
         "status": "passed",
+        "scale_validation": {
+            "profile": scale_profile,
+            "required_samples": scale_sample_names(scale_profile),
+            "executed_samples": list(scale_results),
+        },
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "root": ".",
@@ -382,6 +369,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path) -> None
             "runtime_load_sha256": sha256_file(output_dir / "runtime-load.json"),
         },
     }
+    validate_scale_evidence(evidence, output_dir=output_dir, expected_profile=scale_profile)
     write_text(output_dir / "validation-report.md", format_report(evidence))
     write_json(output_dir / "validation.json", evidence)
 
@@ -435,6 +423,98 @@ def validate_preparation_budget(result: Any, *, label: str) -> None:
                 or not 0 <= p95 <= PREPARATION_P95_BUDGET_MS
                 or not math.isfinite(p95)):
             raise ValidationError(f"{label} {field} preparation P95 must be finite and within 0..{PREPARATION_P95_BUDGET_MS} ms")
+
+
+def scale_sample_names(profile: str) -> list[str]:
+    return [str(count) if history == 0 else f"{count}-history-{history}" for count, history in SCALE_PROFILES[profile]]
+
+
+def read_json(path: Path) -> Any:
+    """Evidence must not silently discard duplicate keys or accept NaN/Infinity."""
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValidationError(f"Duplicate JSON key in {path.name}: {key}")
+            result[key] = value
+        return result
+
+    def invalid_constant(value: str) -> None:
+        raise ValidationError(f"Non-finite JSON number in {path.name}: {value}")
+
+    return json.loads(path.read_text(), object_pairs_hook=object_pairs, parse_constant=invalid_constant)
+
+
+def validate_scale_result(result: Any, *, count: int, history_count: int) -> None:
+    validate_preparation_budget(result, label=f"Scale {count}")
+    rss = result.get("rss_peak_bytes")
+    if (result.get("representations") != count or result.get("success_history_vectors") != history_count
+            or result.get("budget_pass") is not True or result.get("index_change_ready_within_2s") is not True
+            or type(rss) is not int or not 0 < rss <= 4 * 1024**3):
+        raise ValidationError(f"Scale {count} failed current runtime/resource budgets")
+    observations = result.get("index_change_sample_count_per_operation")
+    if (result.get("delta_path_verified") is not True or type(observations) is not int or observations < 5
+            or not isinstance(result.get("query_io"), dict) or not isinstance(result.get("unchanged_full_io"), dict)):
+        raise ValidationError(f"Scale {count} lacks verified delta/write measurements")
+    row_keys = {"rows." + table for table in (
+        "photos_representation", "fingerprint_task", "photos_index_exclusion", "dedup_index_state")}
+    for field in ("query_io", "unchanged_full_io"):
+        rows = result[field]
+        if (not row_keys.issubset(rows) or any(type(value) is not int or value < 0
+                for key, value in rows.items() if key.startswith("rows."))):
+            raise ValidationError(f"Scale {count} lacks valid per-table row-write observations")
+    if any(value != 0 for key, value in result["query_io"].items() if key.startswith("rows.")):
+        raise ValidationError(f"Scale {count} query wrote persistent rows")
+    if any(result["unchanged_full_io"]["rows." + table] != 0 for table in ("photos_representation", "fingerprint_task")):
+        raise ValidationError(f"Scale {count} unchanged inventory rewrote representation/task rows")
+    if history_count == 100000:
+        idle = result.get("idle_60s")
+        if not isinstance(idle, dict) or not isinstance(idle.get("after"), dict):
+            raise ValidationError("Maximum scale lacks 60-second idle/resume resource evidence")
+        values = (idle.get("elapsed_seconds"), idle["after"].get("footprint_bytes"),
+                  idle["after"].get("rss_bytes"), idle.get("resume_query_ms"))
+        if (any(type(value) not in (int, float) or not math.isfinite(value) for value in values)
+                or values[0] < 60 or values[1] <= 0 or values[2] <= 0 or values[3] < 0):
+            raise ValidationError("Maximum scale lacks 60-second idle/resume resource evidence")
+    if count == 200000 and (not isinstance(result.get("large_source_samples"), list) or len(result["large_source_samples"]) != 2):
+        raise ValidationError("Maximum scale lacks both representative large-source measurements")
+
+
+def validate_scale_evidence(evidence: Any, *, output_dir: Path, expected_profile: str) -> None:
+    """Used by both producer and packager; never trust a profile's claimed set."""
+    required = scale_sample_names(expected_profile)
+    contract = evidence.get("scale_validation") if isinstance(evidence, dict) else None
+    if (not isinstance(contract, dict) or contract.get("profile") != expected_profile
+            or contract.get("required_samples") != required or contract.get("executed_samples") != required):
+        raise ValidationError("Scale profile/required/executed samples do not match the requested profile")
+    advanced = evidence.get("advanced_dedup")
+    results = advanced.get("scale") if isinstance(advanced, dict) else None
+    if not isinstance(results, dict) or set(results) != set(required):
+        raise ValidationError("Scale evidence does not contain exactly the required samples")
+    phases = evidence.get("phases")
+    if not isinstance(phases, list) or any(not isinstance(p, dict) or not isinstance(p.get("name"), str) for p in phases):
+        raise ValidationError("Scale execution phases are malformed")
+    if [p["name"] for p in phases if p["name"].startswith("scale-")] != ["scale-build", *[f"scale-{s}" for s in required]]:
+        raise ValidationError("Scale execution phases are missing, duplicated or unexpected")
+    report_files = {p.name for p in output_dir.glob("scale-*.json")}
+    if "scale-2.json" in report_files:
+        # Complete XCTest also exercises the measurement harness on two rows.
+        # Keep/validate that functional evidence, but do not claim it as a
+        # profile's optimized performance sample or allow other extra reports.
+        smoke = output_dir / "scale-2.json"
+        if not smoke.is_file() or smoke.is_symlink():
+            raise ValidationError("Functional scale smoke must be a regular report")
+        validate_scale_result(read_json(smoke), count=2, history_count=0)
+        report_files.remove(smoke.name)
+    if report_files != {f"scale-{s}.json" for s in required}:
+        raise ValidationError("Scale report files are missing or unexpected")
+    for (count, history), sample in zip(SCALE_PROFILES[expected_profile], required):
+        entry = results[sample]
+        path = output_dir / f"scale-{sample}.json"
+        if (not isinstance(entry, dict) or entry.get("result") != path.name or not path.is_file()
+                or path.is_symlink() or entry.get("result_sha256") != sha256_file(path)):
+            raise ValidationError(f"Scale {sample} report path/hash does not match")
+        validate_scale_result(read_json(path), count=count, history_count=history)
 
 
 def run_command(
@@ -665,6 +745,9 @@ def format_report(evidence: dict[str, Any]) -> str:
             "Status: passed",
             f"XCTest: {evidence['xctest']['test_count']} tests, 0 failures",
             f"Python tool tests: {evidence['tool_tests']['test_count']} tests, OK",
+            f"Scale profile: {evidence['scale_validation']['profile']}",
+            f"Required scale samples: {', '.join(evidence['scale_validation']['required_samples'])}",
+            f"Executed scale samples: {', '.join(evidence['scale_validation']['executed_samples'])}",
             "Continuation race: passed",
             f"Source manifest: {evidence['source']['manifest_sha256']}",
             "",
