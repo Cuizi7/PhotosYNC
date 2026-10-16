@@ -1668,20 +1668,31 @@ public final class SyncStore: @unchecked Sendable {
 
     /// Polling does not claim work. One coordinator must deduplicate and retain
     /// its physical in-flight ownership until each consumer has actually finished.
-    public func nextRepresentationTasks(now: Date, limit: Int) async throws -> [RepresentationTask] {
+    /// Cursor selection reads at most `limit` rows across suffix and wrap queries.
+    public func nextRepresentationTasks(now: Date, limit: Int, after cursor: RepresentationKey? = nil) async throws -> [RepresentationTask] {
         guard limit > 0 else { return [] }
         return try await perform {
             guard let state = try self.indexStateRow() else { return [] }
             let context = try self.libraryContext(state), version = try self.text(state[4])
-            let rows = try self.rows("""
+            func select(after: Bool, limit: Int) throws -> [[Value]] {
+                let keyClause = cursor == nil ? "" : (after
+                    ? " AND (r.asset_id > ? OR (r.asset_id = ? AND r.kind > ?))"
+                    : " AND (r.asset_id < ? OR (r.asset_id = ? AND r.kind <= ?))")
+                var bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .text(version), .int64(try self.int64(state[2])), .double(now.timeIntervalSince1970)]
+                if let cursor { bindings += [.text(cursor.assetID), .text(cursor.assetID), .text(cursor.kind.rawValue)] }
+                bindings.append(.int64(Int64(limit)))
+                return try self.rows("""
                 SELECT r.asset_id, r.kind, r.revision, r.width, r.height, r.equivalent_to_original, r.revision_is_reliable,
                 t.retry_count, t.next_retry_at, t.generation, COALESCE(t.issuance_revision,t.revision) FROM fingerprint_task t JOIN photos_representation r
                 ON r.context_id = t.context_id AND r.context_epoch = t.context_epoch AND r.asset_id = t.asset_id AND r.kind = t.kind
                 AND r.revision = t.revision AND r.fingerprint_version = t.fingerprint_version
                 WHERE t.context_id = ? AND t.context_epoch = ? AND t.fingerprint_version = ?
                 AND r.tombstoned = 0 AND r.seen_generation = t.generation AND t.generation > 0 AND t.generation <= ? AND r.state <> 'ready'
-                AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?) ORDER BY r.asset_id, r.kind LIMIT ?
-                """, [.text(context.id.uuidString), .int64(context.epoch), .text(version), .int64(try self.int64(state[2])), .double(now.timeIntervalSince1970), .int64(Int64(limit))])
+                AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?) \(keyClause) ORDER BY r.asset_id, r.kind LIMIT ?
+                """, bindings)
+            }
+            var rows = try select(after: true, limit: limit)
+            if cursor != nil && rows.count < limit { rows += try select(after: false, limit: limit - rows.count) }
             return try rows.map { row in
                 guard let kind = RepresentationKind(rawValue: try self.text(row[1])) else { throw AdvancedDedupError.invalidConfiguration }
                 let descriptor = RepresentationDescriptor(key: RepresentationKey(assetID: try self.text(row[0]), kind: kind),

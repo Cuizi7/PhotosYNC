@@ -256,6 +256,11 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         diagnostics(["phase": "photos-ready-ack", "event": String(expectedGeneration), "delivery": "reconciled", "historyAdmission": "open"])
     }
 
+    public func representationReadAdmission() async -> PhotosReaderAdmission {
+        guard let representationReader else { return .available }
+        return await representationReader.admission()
+    }
+
     public func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         _ = try await usableGeneration()
         let ticket = try state.beginRepresentationRead(descriptor)

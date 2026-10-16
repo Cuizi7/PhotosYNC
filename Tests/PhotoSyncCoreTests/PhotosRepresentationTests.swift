@@ -7,6 +7,41 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testAdmissionRetainsDrainingOwnerThenStallsAndLateDuplicateTerminalReleasesOnce() async throws {
+        let releasedSignal = expectation(description: "physical lease released exactly once")
+        let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "lease-released" { releasedSignal.fulfill() } })
+        let clock = RepresentationClock(), requester = ControlledRepresentationRequester()
+        let c = try configuration(timeout: 0.01), budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, monotonic: { clock.now }, indexDiagnostics: diagnostic)
+        let work = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started()
+        let busy = await reader.admission(); XCTAssertEqual(busy, .busy)
+        do { _ = try await work.value; XCTFail("logical timeout") } catch { XCTAssertEqual(error as? ReadExecutorError, .timedOut) }
+        let draining = await reader.admission(); XCTAssertEqual(draining, .draining)
+        clock.now = 59
+        for _ in 0..<100 { let state = await reader.admission(); XCTAssertEqual(state, .draining) }
+        clock.now = 60
+        let stalled = await reader.admission(); XCTAssertEqual(stalled, .stalled)
+        let occupied = await budget.snapshot(); XCTAssertEqual(occupied.images, 1)
+        requester.send(.cancelled); requester.send(.cancelled)
+        await fulfillment(of: [releasedSignal], timeout: 2)
+        let available = await reader.admission(); XCTAssertEqual(available, .available)
+        let released = await budget.snapshot(); XCTAssertEqual(released.images, 0)
+    }
+
+    func testAdmissionBlocksAfterTerminalUntilSuccessfulConsumerLeaseFinishes() async throws {
+        let requester = ControlledRepresentationRequester(), c = try configuration()
+        let budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c)
+        let work = Task { try await reader.read(descriptor(), isCurrent: { true }) }
+        await requester.started(); requester.send(.image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame))
+        let loaded = try await work.value
+        let active = await reader.physicalRequestCount; XCTAssertEqual(active, 0)
+        let held = await reader.admission(); XCTAssertEqual(held, .busy)
+        await loaded.lease.finishPhysicalWork()
+        let available = await reader.admission(); XCTAssertEqual(available, .available)
+    }
+
     func testLateRequestAndConsumerLeaseKeepOriginalIssuanceAfterReplacement() async throws {
         for heldLease in [false, true] {
             for changedDescriptor in [false, true] {
@@ -443,9 +478,11 @@ final class PhotosRepresentationTests: XCTestCase {
     }
 
     func testTimeoutAfterChunksKeepsPhysicalRequestUntilLateTerminal() async throws {
+        let releasedSignal = expectation(description: "physical lease released")
+        let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "lease-released" { releasedSignal.fulfill() } })
         let requester = ControlledRepresentationRequester()
         let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1_000_000)
-        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(timeout: 0.01))
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: try configuration(timeout: 0.01), indexDiagnostics: diagnostic)
         let task = Task { try await reader.read(descriptor(), isCurrent: { true }) }
         await requester.started()
         requester.send(.chunk(Data()))
@@ -454,10 +491,7 @@ final class PhotosRepresentationTests: XCTestCase {
         let occupied = await reader.physicalRequestCount
         XCTAssertEqual(occupied, 1)
         requester.send(.cancelled)
-        for _ in 0..<10_000 {
-            if await budget.snapshot().images == 0 { break }
-            await Task.yield()
-        }
+        await fulfillment(of: [releasedSignal], timeout: 2)
         let released = await budget.snapshot()
         XCTAssertEqual(released.images, 0)
     }
@@ -1190,4 +1224,12 @@ private final class RepresentationDiagnosticRows: @unchecked Sendable {
     private var rows: [[String: String]] = []
     func append(_ row: [String: String]) { lock.lock(); rows.append(row); lock.unlock() }
     var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return rows }
+}
+
+private final class RepresentationClock: @unchecked Sendable {
+    private let lock = NSLock(); private var value: TimeInterval = 0
+    var now: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
+    }
 }

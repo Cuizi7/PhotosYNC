@@ -39,7 +39,7 @@ struct AdvancedRuntimeGraph: Sendable {
         logger?.log(["phase": "sqlite-vector-query", "backend": configuration.backend,
             "effectiveMmapBytes": String(store.vectorQueryMmapBytes), "ordinaryCacheKiB": "16384"])
         coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-            configuration: configuration, indexDiagnostics: indexDiagnostics, diagnostics: { logger?.log($0) })
+            configuration: configuration, wallNow: now, indexDiagnostics: indexDiagnostics, diagnostics: { logger?.log($0) })
         service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator,
             fingerprinter: model, configuration: configuration, executor: executor, budget: budget)
         legacy = LegacySkipReevaluation(store: store,

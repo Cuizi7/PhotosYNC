@@ -37,6 +37,11 @@ public actor ImageWorkBudget {
         return ImageLease(budget: self, id: id, reservedBytes: requested)
     }
 
+    /// Matches acquire without reserving; callers must still handle a racing claim.
+    public func canAcquire(bytes requested: Int64) -> Bool {
+        requested > 0 && requested <= maxBytes && reservations.count < maxImages && requested <= maxBytes - bytes
+    }
+
     public func snapshot() -> Snapshot { Snapshot(images: reservations.count, bytes: bytes) }
 
     fileprivate func release(_ id: UUID) -> Bool {

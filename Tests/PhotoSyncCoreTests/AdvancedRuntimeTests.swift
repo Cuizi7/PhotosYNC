@@ -5,6 +5,29 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testPeriodicTickContinuesFiniteSlicesAndResumesAfterCapacityRelease() async throws {
+        let f = try await fixture(taskCount: 40)
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let first = await f.runtime.current()
+        XCTAssertEqual(first.snapshot.indexProgress?.readyRepresentations, 16)
+        let held = try await f.photos.holdBudget()
+        for _ in 0..<3 { await f.runtime.tick(); await f.runtime.waitForRound() }
+        let waiting = await f.runtime.current()
+        XCTAssertEqual(waiting.snapshot.indexProgress?.readyRepresentations, 16)
+        XCTAssertEqual(waiting.snapshot.indexProgress?.state, .waiting)
+        await f.runtime.pause(); await held.finishPhysicalWork()
+        await f.runtime.tick(); await f.runtime.waitForRound()
+        let paused = await f.runtime.current(); XCTAssertEqual(paused.snapshot.indexProgress?.readyRepresentations, 16)
+        await f.runtime.resume(); await f.runtime.waitForRound()
+        await f.runtime.tick(); await f.runtime.waitForRound()
+        let ready = await f.runtime.current()
+        XCTAssertEqual(ready.snapshot.indexProgress?.state, .ready)
+        XCTAssertEqual(ready.snapshot.indexProgress?.readyRepresentations, 40)
+        // Source-side ownership of the shared budget cannot turn a completed index into waiting.
+        await f.photos.setAdmission(.busy); await f.runtime.tick(); await f.runtime.waitForRound()
+        let stillReady = await f.runtime.current(); XCTAssertEqual(stillReady.snapshot.indexProgress?.state, .ready)
+    }
+
     func testPauseCancelsQueuedModelRecoveryWithoutConfigurationError() async throws {
         let f = try await fixture()
         await f.runtime.tick(force: true); await f.runtime.waitForRound()
@@ -192,7 +215,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         let loads: P8Counter, notifications: P8Counter, authorization: P8Authorization
         let model: P8Model
     }
-    private func fixture(authorized: Bool = true, gate: P8Gate? = nil, resourceDirectory: URL? = nil, modelUnavailable: Bool = false, now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }) async throws -> Fixture {
+    private func fixture(taskCount: Int = 0, authorized: Bool = true, gate: P8Gate? = nil, resourceDirectory: URL? = nil, modelUnavailable: Bool = false, now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }) async throws -> Fixture {
         let root = try temporaryDirectory(), source = root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         let executor = ReadExecutor()
@@ -209,9 +232,11 @@ final class AdvancedRuntimeTests: XCTestCase {
                     return try await AdvancedRuntimeGraph.load(store: store, executor: executor,
                         directory: directory, now: now, resourceDirectory: resourceDirectory)
                 }
+                let budget = ImageWorkBudget(limits: c.resources)
+                await photos.setWork(taskCount, budget: budget); await model.enableFingerprinting(taskCount > 0, version: c.fingerprint.version)
                 return AdvancedRuntimeGraph(store: store, photos: photos,
                     model: model, configuration: c, executor: executor,
-                    budget: ImageWorkBudget(limits: c.resources), directory: directory, now: now)
+                    budget: budget, directory: directory, now: now)
             }, now: now, authorized: { auth.value },
             notificationsEnabled: { true }, notification: { _, _ in notifications.increment() })
         try await runtime.prepareInjectedRuntime()
@@ -222,16 +247,35 @@ final class AdvancedRuntimeTests: XCTestCase {
 }
 
 private actor P8Model: ImageFingerprinting, ModelExecutionRecovering {
+    private var version: String?
+    func enableFingerprinting(_ value: Bool, version: String) { self.version = value ? version : nil }
     private var recoveryGate: P8Gate?
     func setRecoveryGate(_ gate: P8Gate) { recoveryGate = gate }
     func prepareExecution(forceRetry: Bool) async throws {
         if let gate = recoveryGate { recoveryGate = nil; await gate.hold(); try Task.checkCancellation() }
     }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
+        if let version { return try Fingerprint(version: version, values: [1] + Array(repeating: 0, count: 1023)) }
         XCTFail("Empty catalog must not infer"); throw AdvancedDedupError.invalidImage
     }
 }
 private actor P8Photos: PhotosIndexGateway {
+    private var taskCount = 0, budget: ImageWorkBudget?
+    private var admission: PhotosReaderAdmission = .available
+    func setAdmission(_ value: PhotosReaderAdmission) { admission = value }
+    func representationReadAdmission() async -> PhotosReaderAdmission {
+        guard admission == .available, let budget else { return admission }
+        return await budget.canAcquire(bytes: reservationBytes) ? .available : .busy
+    }
+    private var reservationBytes: Int64 = 0
+    func holdBudget() async throws -> ImageLease {
+        guard let budget else { throw PhotosRepresentationError.unavailable }
+        return try await budget.acquire(bytes: reservationBytes)
+    }
+    func setWork(_ count: Int, budget: ImageWorkBudget) async {
+        taskCount = count; self.budget = budget
+        reservationBytes = (try? p8Configuration().resources.maxDecodedBytes) ?? 1
+    }
     nonisolated let subscribers = P8Counter()
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 8)
     let context = LibraryContext(id: UUID(), epoch: 1)
@@ -270,9 +314,18 @@ private actor P8Photos: PhotosIndexGateway {
         catalogCount += 1
         let ready = catalogWaiters.filter { catalogCount > $0.0 }
         catalogWaiters.removeAll { catalogCount > $0.0 }; ready.forEach { $0.1.resume() }
-        return .init(context: context, generation: capturedGeneration, descriptors: [], nextOffset: multiplePages && offset == 0 ? 1 : nil)
+        return .init(context: context, generation: capturedGeneration, descriptors: (0..<taskCount).map {
+            .init(key: .init(assetID: String(format: "%03d", $0), kind: .original), context: context,
+                  revision: "r1", size: try! PixelSize(width: 8, height: 8), equivalentToOriginal: false, revisionIsReliable: true)
+        }, nextOffset: multiplePages && offset == 0 ? 1 : nil)
     }
-    func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation { throw PhotosRepresentationError.unavailable }
+    func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
+        guard let budget else { throw PhotosRepresentationError.unavailable }
+        let lease = try await budget.acquire(bytes: 256)
+        let image = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
+        return .init(image: image, orientation: .up, descriptor: descriptor, lease: lease, eligibility: .safeSingleFrame)
+    }
     func create(fileURL: URL, kind: MediaKind, expectedGeneration: Int, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
         createCount += 1; throw PhotosAdmissionDeferred()
     }

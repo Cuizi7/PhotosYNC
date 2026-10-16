@@ -44,6 +44,7 @@ protocol PhotosRepresentationRequesting: Sendable {
 
 public actor PhotosRepresentationReader {
     private let indexDiagnostics: IndexDiagnostics?
+    private let monotonic: @Sendable () -> TimeInterval
     private let requester: any PhotosRepresentationRequesting
     private let budget: ImageWorkBudget
     private let configuration: DedupConfiguration
@@ -53,14 +54,23 @@ public actor PhotosRepresentationReader {
     private var active: [UUID: RepresentationRequestState] = [:]
     public var physicalRequestCount: Int { active.count }
 
-    init(requester: any PhotosRepresentationRequesting, budget: ImageWorkBudget, configuration: DedupConfiguration, indexDiagnostics: IndexDiagnostics? = nil,
+    init(requester: any PhotosRepresentationRequesting, budget: ImageWorkBudget, configuration: DedupConfiguration, monotonic: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }, indexDiagnostics: IndexDiagnostics? = nil,
          resourceLimits: PhotosResourceLimits = PhotosResourceLimits(), storage: PhotosResourceStorage = PhotosResourceStorage(),
          decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage = {
              try EncodedImageDecoder.decode(url: $0, configuration: $1, decodedAllowance: $2)
          }) {
+        self.monotonic = monotonic
         self.indexDiagnostics = indexDiagnostics
         self.requester = requester; self.budget = budget; self.configuration = configuration
         self.resourceLimits = resourceLimits; self.storage = storage; self.decode = decode
+    }
+
+    public func admission() async -> PhotosReaderAdmission {
+        let capacity = await budget.canAcquire(bytes: configuration.resources.maxDecodedBytes)
+        // Recheck physical ownership after the budget actor suspension. Active can
+        // become empty before cleanup releases its reservation, so both must agree.
+        if let state = active.values.first { return state.admission(now: monotonic()) }
+        return capacity ? .available : .busy
     }
 
     public func read(_ descriptor: RepresentationDescriptor,
@@ -82,7 +92,7 @@ public actor PhotosRepresentationReader {
         catch { await lease.finishPhysicalWork(); throw PhotosRepresentationError.resourceStorageUnavailable(String(describing: error)) }
         let id = UUID()
         let state = RepresentationRequestState(descriptor: descriptor, lease: lease, resource: resource,
-            configuration: configuration, decode: decode, isCurrent: isCurrent, diagnostic: diagnostic)
+            configuration: configuration, decode: decode, isCurrent: isCurrent, monotonic: monotonic, diagnostic: diagnostic)
         // Retain state even if cancellation makes PhotoKit discard its callbacks.
         // Only trustworthy terminal completion removes the physical owner.
         active[id] = state
@@ -110,6 +120,8 @@ public actor PhotosRepresentationReader {
 }
 
 private final class RepresentationRequestState: @unchecked Sendable {
+    private let monotonic: @Sendable () -> TimeInterval
+    private var drainingSince: TimeInterval?
     private let diagnostic: IndexDiagnosticOperation?
     private let lock = NSLock()
     private let writerLock = NSLock()
@@ -129,10 +141,15 @@ private final class RepresentationRequestState: @unchecked Sendable {
     private var timeoutTask: Task<Void, Never>?
 
     init(descriptor: RepresentationDescriptor, lease: ImageLease, resource: OwnedPhotosResource,
-         configuration: DedupConfiguration, decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage, isCurrent: @escaping @Sendable () -> Bool, diagnostic: IndexDiagnosticOperation? = nil) {
-        self.diagnostic = diagnostic
+         configuration: DedupConfiguration, decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage, isCurrent: @escaping @Sendable () -> Bool, monotonic: @escaping @Sendable () -> TimeInterval, diagnostic: IndexDiagnosticOperation? = nil) {
+        self.monotonic = monotonic; self.diagnostic = diagnostic
         self.descriptor = descriptor; self.lease = lease; self.resource = resource
         self.configuration = configuration; self.decode = decode; self.isCurrent = isCurrent
+    }
+    func admission(now: TimeInterval) -> PhotosReaderAdmission {
+        lock.lock(); defer { lock.unlock() }
+        guard let drainingSince else { return .busy }
+        return now - drainingSince >= 60 ? .stalled : .draining
     }
     func install(_ continuation: CheckedContinuation<LoadedRepresentation, Error>, timeout: Duration) {
         lock.lock()
@@ -160,7 +177,7 @@ private final class RepresentationRequestState: @unchecked Sendable {
     func cancel(_ error: Error = CancellationError()) {
         lock.lock()
         guard !delivered, logicalError == nil else { lock.unlock(); return }
-        logicalError = error
+        logicalError = error; drainingSince = monotonic()
         let continuation = self.continuation; self.continuation = nil
         let timer = timeoutTask; timeoutTask = nil
         let cancel = takeCancellation(); lock.unlock()

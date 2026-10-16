@@ -6,6 +6,191 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testSliceStopsAtSixteenAttemptsAndContinuesOnNextCall() async throws {
+        let f = try fixture()
+        await f.photos.set((0..<40).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) })
+        try await f.coordinator.reconcile()
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 16)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 16)
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 32)
+        await f.coordinator.processDueWork(now: now)
+        try await assertNotNil(try await f.coordinator.readyToken())
+    }
+
+    func testFailureDeadlineUsesCapturedFailureWallTimeAfterReadAndModelDelay() async throws {
+        for (retryCount, delay) in [5.0, 15.0, 30.0, 60.0].enumerated() {
+            for readFailure in [false, true] {
+                let clock = DiagnosticClock(), rows = CoordinatorDiagnostics(), gate = CoordinatorGate(), postFailure = CoordinatorGate()
+                clock.now = 1000
+                let f = try fixture(wallNow: { Date(timeIntervalSince1970: clock.now) }, diagnostics: { rows.record($0) })
+                await f.photos.set([descriptor(f.photos.context)])
+                try await f.coordinator.reconcile()
+                try injectEngineSQL("UPDATE fingerprint_task SET retry_count=\(retryCount)", at: f.db)
+                if readFailure { await f.photos.gateNextRead(gate); await f.photos.setAfterRead(.invalidImage) }
+                else { await f.model.setGate(gate); await f.model.setAfterGate(.failure(.invalidImage)) }
+                await f.photos.gateSnapshot(2, using: postFailure)
+                let work = Task { await f.coordinator.processDueWork(now: Date(timeIntervalSince1970: 1000)) }
+                await gate.waitUntilEntered(); clock.now = 1040; await gate.release()
+                await postFailure.waitUntilEntered(); clock.now = 2000; await postFailure.release(); await work.value
+                let tasks = try await f.store.nextRepresentationTasks(now: Date(timeIntervalSince1970: 1040 + delay), limit: 10)
+                XCTAssertEqual(tasks.count, 1); XCTAssertEqual(tasks.first?.retryCount, retryCount + 1)
+                XCTAssertEqual(tasks.first?.nextRetryAt, Date(timeIntervalSince1970: 1040 + delay))
+                XCTAssertTrue(rows.rows.contains { $0["failureAt"] == "1040.0" && $0["deadline"] == String(1040 + delay) })
+                let tooEarly = try await f.store.nextRepresentationTasks(now: Date(timeIntervalSince1970: 1039 + delay), limit: 10)
+                XCTAssertTrue(tooEarly.isEmpty)
+            }
+        }
+    }
+
+    func testMonotonicAdmissionBudgetLetsOwnedWorkFinishThenRotatesPastFailures() async throws {
+        let clock = DiagnosticClock(), gate = CoordinatorGate()
+        let f = try fixture(monotonic: { clock.now })
+        await f.photos.set((0..<20).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) })
+        try await f.coordinator.reconcile(); await f.model.setGate(gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered(); clock.now = 1; await gate.release(); await work.value
+        await assertEqual(await f.photos.readCount, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 1)
+        await f.photos.setReadFailures(["001": .iCloudUnavailable("fake")])
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 17)
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(100))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 19)
+        let failures = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(100), limit: 10)
+        XCTAssertEqual(failures.first?.retryCount, 2, "One issuance must be attempted once per slice, even when failure deadline is before cutoff")
+    }
+
+    func testBusyLargeQueueAndTimeoutDrainLeaveSiblingIssuancesUntouched() async throws {
+        let log = CoordinatorDiagnostics(), f = try fixture(diagnostics: { log.record($0) })
+        await f.photos.setPaged((0..<2000).map { descriptor(f.photos.context, asset: String(format: "%04d", $0)) }, pageSize: 100)
+        try await f.coordinator.reconcile(); try installWriteAudit(at: f.db)
+        await f.photos.setAdmission(.busy)
+        for _ in 0..<100 { await f.coordinator.processDueWork(now: now) }
+        await assertEqual(await f.photos.readCount, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM p11_writes", at: f.db), 0)
+        XCTAssertEqual(log.rows.filter { $0["phase"] == "index-task" && $0["event"] == "attempt" }.count, 0)
+        await f.photos.setAdmission(.available); await f.photos.setReadError(.timedOut)
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE retry_count=1", at: f.db), 1)
+        await f.photos.setAdmission(.draining)
+        for _ in 0..<20 { await f.coordinator.processDueWork(now: now.addingTimeInterval(100)) }
+        await assertEqual(await f.photos.readCount, 1)
+        await f.photos.setAdmission(.stalled); await f.coordinator.processDueWork(now: now)
+        let progress = await f.coordinator.progress(); XCTAssertEqual(progress.state, .waiting)
+        XCTAssertTrue(progress.issue?.contains("系统") == true)
+        await f.coordinator.setPaused(true); await f.photos.setAdmission(.available); await f.photos.setReadError(nil)
+        await f.coordinator.processDueWork(now: now); await assertEqual(await f.photos.readCount, 1)
+        await f.coordinator.setPaused(false); await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 17)
+    }
+
+    func testNeutralGenerationAdvancesDoNotRestartRotationOrStarveHealthyHighKeys() async throws {
+        let f = try fixture()
+        let all = (0..<40).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) }
+        await f.photos.set(all)
+        await f.photos.setReadFailures(Dictionary(uniqueKeysWithValues: all.prefix(32).map { ($0.key.assetID, PhotosRepresentationError.unavailable) }))
+        try await f.coordinator.reconcile()
+        let cutoff = now.addingTimeInterval(100)
+        for slice in 0..<3 {
+            if slice > 0 {
+                // Context, descriptors, model and input are unchanged; only the live endpoint advances.
+                let neutral = await f.photos.changeFacts(all, changed: [])
+                await f.coordinator.libraryChanged(.incremental(neutral))
+            }
+            await f.coordinator.processDueWork(now: cutoff)
+            let prefix = (0..<min(40, (slice + 1) * 16)).map { String(format: "%03d", $0) }
+            let wrapped = slice == 2 ? (0..<8).map { String(format: "%03d", $0) } : []
+            await assertEqual(await f.photos.readAssetIDs, prefix + wrapped)
+        }
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id>='032' AND state='ready'", at: f.db), 8)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id<'032' AND retry_count>0", at: f.db), 32)
+    }
+
+    func testRotatingKeysetServesNewLowKeyAndDueRetriesAcrossWrap() async throws {
+        let clock = DiagnosticClock(); clock.now = 1000
+        let f = try fixture(wallNow: { Date(timeIntervalSince1970: clock.now) })
+        let initial = (100..<140).map { descriptor(f.photos.context, asset: String($0)) }
+        await f.photos.set(initial)
+        await f.photos.setReadFailures(Dictionary(uniqueKeysWithValues: initial.map { ($0.key.assetID, PhotosRepresentationError.unavailable) }))
+        try await f.coordinator.reconcile()
+        // Every failed deadline remains eligible against this frozen future cutoff.
+        let cutoff = now.addingTimeInterval(100)
+        await f.coordinator.processDueWork(now: cutoff)
+        await assertEqual(await f.photos.readAssetIDs, (100..<116).map(String.init))
+        clock.now = 500 // A wall-clock rollback does not reset the rotating slice or admit repeats.
+        let added = descriptor(f.photos.context, asset: "000-new")
+        let delta = await f.photos.changeFacts(initial + [added], changed: [added.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(delta))
+        await f.coordinator.processDueWork(now: cutoff)
+        await assertEqual(await f.photos.readAssetIDs, (100..<132).map(String.init))
+        await f.coordinator.processDueWork(now: cutoff)
+        await assertEqual(await f.photos.readAssetIDs, (100..<140).map(String.init) + ["000-new"] + (100..<107).map(String.init))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE retry_count>0", at: f.db), 40)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='000-new' AND state='ready'", at: f.db), 1)
+    }
+
+    func testCapacityErrorFromModelRemainsFailureWithModelBackoff() async throws {
+        for unavailable in [false, true] {
+            let f = try fixture()
+            await f.photos.set([descriptor(f.photos.context)])
+            if unavailable { await f.model.setUnavailable(true) }
+            else { await f.model.setCapacityFailure(true) }
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            let tasks = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(100), limit: 1)
+            XCTAssertEqual(tasks.first?.retryCount, 1)
+            XCTAssertEqual(tasks.first?.nextRetryAt, now.addingTimeInterval(unavailable ? 60 : 5))
+            let progress = await f.coordinator.progress()
+            XCTAssertEqual(progress.state, .waiting); XCTAssertEqual(progress.readErrorRepresentations, 0)
+            if unavailable { XCTAssertEqual(progress.issue, ModelExecutionUnavailable.summary) }
+        }
+    }
+
+    func testFrozenCutoffDoesNotAdmitTasksBecomingDueDuringOwnedWork() async throws {
+        let clock = DiagnosticClock(), gate = CoordinatorGate(), f = try fixture(wallNow: { Date(timeIntervalSince1970: clock.now) })
+        await f.photos.set([descriptor(f.photos.context, asset: "a"), descriptor(f.photos.context, asset: "b")])
+        try await f.coordinator.reconcile()
+        try injectEngineSQL("UPDATE fingerprint_task SET next_retry_at=1001 WHERE asset_id='b'", at: f.db)
+        await f.model.setGate(gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered(); clock.now = 2000; await gate.release(); await work.value
+        await assertEqual(await f.photos.readCount, 1)
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(1))
+        try await assertNotNil(try await f.coordinator.readyToken())
+    }
+
+    func testPauseAndContextChangeDuringAdmissionCannotStartStaleWork() async throws {
+        for contextChange in [false, true] {
+            let f = try fixture(), gate = CoordinatorGate()
+            await f.photos.set([descriptor(f.photos.context)]); try await f.coordinator.reconcile()
+            await f.photos.gateAdmission(2, using: gate)
+            let work = Task { await f.coordinator.processDueWork(now: now) }
+            await gate.waitUntilEntered()
+            if contextChange { await f.coordinator.libraryChanged(.contextInvalidated) }
+            else { await f.coordinator.setPaused(true) }
+            await gate.release(); await work.value
+            await assertEqual(await f.photos.readCount, 0)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE retry_count=0 AND next_retry_at IS NULL", at: f.db), 1)
+        }
+    }
+
+    func testRacingReadCapacityErrorsDoNotChangeDurableTaskOrVector() async throws {
+        for error in [ReadExecutorError.sourceBusy, .resourceExhausted, nil] {
+            let f = try fixture()
+            await f.photos.set([descriptor(f.photos.context, asset: "a"), descriptor(f.photos.context, asset: "b")])
+            try await f.coordinator.reconcile(); try installWriteAudit(at: f.db)
+            await f.photos.setReadError(error); await f.photos.setBudgetExhausted(error == nil)
+            await f.coordinator.processDueWork(now: now)
+            await assertEqual(await f.photos.readCount, 1)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM p11_writes", at: f.db), 0)
+            await f.photos.setReadError(nil); await f.photos.setBudgetExhausted(false)
+            await f.coordinator.processDueWork(now: now)
+            try await assertNotNil(try await f.coordinator.readyToken())
+        }
+    }
+
     func testSampledStaleSuccessFailureAndCancellationHaveTerminalOutcomes() async throws {
         for outcome in ["success", "failure", "cancelled"] {
             let rows = CoordinatorDiagnostics(), f = try fixture(diagnostics: { rows.record($0) }), gate = CoordinatorGate()
@@ -68,10 +253,10 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let log = CoordinatorDiagnostics(), f = try fixture(diagnostics: { log.record($0) })
         let descriptors = (0..<20).map { descriptor(f.photos.context, asset: "private-asset-\($0)") }
         await f.photos.setPaged(descriptors, pageSize: 10)
-        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        try await f.coordinator.reconcile(); await drain(f.coordinator, cutoff: now)
         await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: descriptors, nextOffset: nil,
             invalidateAllCachedRepresentations: true)])
-        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        try await f.coordinator.reconcile(); await drain(f.coordinator, cutoff: now)
         let rows = log.rows
         XCTAssertFalse(rows.contains { $0.values.contains { $0.contains("private-asset-") } })
         let invalidations = rows.filter { $0["phase"] == "index-invalidation" }
@@ -361,7 +546,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             _ = try await f.store.completeRepresentation(task, fingerprint: fingerprint)
         }
         await f.photos.setPaged(all, pageSize: 128)
-        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        try await f.coordinator.reconcile(); await drain(f.coordinator, cutoff: now)
         try installWriteAudit(at: f.db)
         try injectEngineSQL("CREATE TABLE untouched AS SELECT * FROM photos_representation WHERE asset_id='a139'", at: f.db)
         await f.photos.resetReads(); await f.model.reset()
@@ -369,7 +554,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let delta = await f.photos.changeFacts(all, changed: ids)
         await f.photos.invalidateDelta(ids)
         await f.coordinator.libraryChanged(.incremental(delta))
-        await f.coordinator.processDueWork(now: now)
+        await drain(f.coordinator, cutoff: now)
         try await assertNotNil(try await f.coordinator.readyToken())
         await assertEqual(await f.model.count, 258)
         await assertEqual(await f.photos.requestedLimits, [])
@@ -838,11 +1023,13 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
     }
 
     func testLastCloudRecoveryPreservesOtherGenericFailureAndDeadline() async throws {
-        let f = try fixture()
+        let clock = DiagnosticClock(); clock.now = 1000
+        let f = try fixture(wallNow: { Date(timeIntervalSince1970: clock.now) })
         await f.photos.set([descriptor(f.photos.context, asset: "a-generic"), descriptor(f.photos.context, asset: "z-cloud")])
         await f.photos.setReadFailures(["a-generic": .unavailable, "z-cloud": .iCloudUnavailable("offline")])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await f.photos.setReadFailures(["a-generic": .unavailable])
+        clock.now = 1005
         await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
         let progress = await f.coordinator.progress()
         XCTAssertEqual(progress.state, .waiting); XCTAssertEqual(progress.readyAssets, 1)
@@ -860,11 +1047,13 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
     }
 
     func testNewGenericFailureReplacesCloudClassificationForSameRepresentation() async throws {
-        let f = try fixture(), asset = "cloud"
+        let clock = DiagnosticClock(); clock.now = 1000
+        let f = try fixture(wallNow: { Date(timeIntervalSince1970: clock.now) }), asset = "cloud"
         await f.photos.set([descriptor(f.photos.context, asset: asset)])
         await f.photos.setReadFailures([asset: .iCloudUnavailable("offline")])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await f.photos.setReadFailures([asset: .unavailable])
+        clock.now = 1005
         await f.coordinator.processDueWork(now: now.addingTimeInterval(5))
         let reclassified = await f.coordinator.progress()
         XCTAssertEqual(reclassified.state, .waiting)
@@ -911,7 +1100,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         for size in [2, 40] {
             let f = try fixture()
             let original = (0..<size).map { descriptor(f.photos.context, asset: "a\($0)") }
-            await f.photos.set(original); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            await f.photos.set(original); try await f.coordinator.reconcile(); await drain(f.coordinator, cutoff: now)
             try installWriteAudit(at: f.db)
             try injectEngineSQL("CREATE TABLE untouched AS SELECT * FROM photos_representation WHERE asset_id <> 'a0';", at: f.db)
             await f.photos.resetReads(); await f.model.reset()
@@ -919,7 +1108,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             let delta = await f.photos.changeFacts([edit] + Array(original.dropFirst()), changed: ["a0"])
             await f.coordinator.libraryChanged(.incremental(delta))
             try await assertNil(try await f.coordinator.readyToken())
-            await f.coordinator.processDueWork(now: now)
+            await drain(f.coordinator, cutoff: now)
             let token = try await f.coordinator.readyToken()
             XCTAssertEqual(token?.photosGeneration, delta.toGeneration)
             await assertEqual(await f.photos.requestedLimits, [])
@@ -929,9 +1118,9 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             writes.append(try ["photos_representation", "fingerprint_task"].map { try engineSQLInteger("SELECT COUNT(*) FROM p11_writes WHERE table_name='\($0)'", at: f.db) })
             let added = descriptor(f.photos.context, asset: "new")
             let add = await f.photos.changeFacts([edit, added] + Array(original.dropFirst()), changed: ["new"])
-            await f.coordinator.libraryChanged(.incremental(add)); await f.coordinator.processDueWork(now: now)
+            await f.coordinator.libraryChanged(.incremental(add)); await drain(f.coordinator, cutoff: now)
             let remove = await f.photos.changeFacts(original, deleted: ["new"], changed: ["a0"])
-            await f.coordinator.libraryChanged(.incremental(remove)); await f.coordinator.processDueWork(now: now)
+            await f.coordinator.libraryChanged(.incremental(remove)); await drain(f.coordinator, cutoff: now)
             let publication = try await f.store.indexPublication(); XCTAssertEqual(publication?.representationCount, size)
             await assertEqual(await f.photos.requestedLimits, [])
         }
@@ -1023,6 +1212,14 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
+    private func drain(_ coordinator: PhotosIndexCoordinator, cutoff: Date) async {
+        for _ in 0..<32 {
+            await coordinator.processDueWork(now: cutoff)
+            if (try? await coordinator.readyToken()) != nil { return }
+        }
+        XCTFail("bounded test drain did not reach original ready oracle")
+    }
+
     private func installWriteAudit(at db: URL) throws {
         try injectEngineSQL("CREATE TABLE p11_writes (table_name TEXT);" + ["photos_representation", "fingerprint_task", "photos_index_exclusion"].flatMap { table in
             ["INSERT", "UPDATE", "DELETE"].map { operation in
@@ -1035,7 +1232,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let db: URL; let store: SyncStore; let photos: CoordinatorPhotos; let model: CoordinatorModel
         let configuration: DedupConfiguration; let coordinator: PhotosIndexCoordinator
     }
-    private func fixture(diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> Fixture {
+    private func fixture(wallNow: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }, monotonic: @escaping @Sendable () -> TimeInterval = { 0 }, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -1045,7 +1242,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let photos = CoordinatorPhotos(limits: configuration.resources), model = CoordinatorModel(version: configuration.fingerprint.version)
         return Fixture(db: db, store: store, photos: photos, model: model, configuration: configuration,
             coordinator: PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-                configuration: configuration, diagnostics: diagnostics))
+                configuration: configuration, wallNow: wallNow, monotonic: monotonic, diagnostics: diagnostics))
     }
     private func descriptor(_ context: LibraryContext, asset: String = "asset", kind: RepresentationKind = .original,
                             revision: String = "r1", equivalent: Bool = false) -> RepresentationDescriptor {
@@ -1079,7 +1276,8 @@ private actor CoordinatorModel: ImageFingerprinting {
     private let version: String
     private(set) var count = 0
     private var gate: CoordinatorGate?
-    private var unavailable = false
+    private var unavailable = false, capacityFailure = false
+    func setCapacityFailure(_ value: Bool) { capacityFailure = value }
     private var failure: PhotosRepresentationError?
     func setFailure(_ error: PhotosRepresentationError?) { failure = error }
     func setUnavailable(_ value: Bool) { unavailable = value }
@@ -1089,6 +1287,7 @@ private actor CoordinatorModel: ImageFingerprinting {
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
         if let failure { throw failure }
         if unavailable { throw ModelExecutionUnavailable(detail: "test index") }
+        if capacityFailure { throw ImageWorkBudgetError.exhausted }
         count += 1; if let gate { self.gate = nil; await gate.hold() }
         if let afterGate {
             switch afterGate { case .cancelled: throw CancellationError(); case .failure(let error): throw error }
@@ -1104,6 +1303,22 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     nonisolated let budget: ImageWorkBudget
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 128)
     private var pages: [RepresentationPage] = []
+    private var admission: PhotosReaderAdmission = .available
+    private var budgetExhausted = false
+    func setBudgetExhausted(_ value: Bool) { budgetExhausted = value }
+    private var readError: ReadExecutorError?
+    private var afterRead: PhotosRepresentationError?
+    func setAfterRead(_ error: PhotosRepresentationError?) { afterRead = error }
+    func setAdmission(_ value: PhotosReaderAdmission) { admission = value }
+    private var admissionCount = 0, admissionGateAt: Int?
+    private var admissionGate: CoordinatorGate?
+    func gateAdmission(_ number: Int, using gate: CoordinatorGate) { admissionCount = 0; admissionGateAt = number; admissionGate = gate }
+    func representationReadAdmission() async -> PhotosReaderAdmission {
+        admissionCount += 1
+        if admissionCount == admissionGateAt, let gate = admissionGate { admissionGate = nil; await gate.hold() }
+        return admission
+    }
+    func setReadError(_ error: ReadExecutorError?) { readError = error }
     private var readFailures: [String: PhotosRepresentationError] = [:]
     private var callbackFailure: NSError?
     private var callbackFailureKey: RepresentationKey?
@@ -1116,6 +1331,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     private var generation = 0, failedAsset: String?, conservative = false, resumeSuccess = true, changeOnAck = false
     private(set) var readCount = 0, resumeCount = 0, acknowledgementCount = 0
+    private(set) var readAssetIDs: [String] = []
     private(set) var readKinds: [RepresentationKind] = [], requestedLimits: [Int] = []
     private var resumeThrows = false
     private var readGate: CoordinatorGate?
@@ -1195,7 +1411,9 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
             invalidatedAssetIDs: deltaInvalidations.filter { ids.contains($0) }, inputUnchangedAssetIDs: deltaInputUnchanged.filter { ids.contains($0) })
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
-        readCount += 1; readKinds.append(descriptor.key.kind)
+        readCount += 1; readKinds.append(descriptor.key.kind); readAssetIDs.append(descriptor.key.assetID)
+        if budgetExhausted { throw ImageWorkBudgetError.exhausted }
+        if let readError { throw readError }
         if descriptor.key == callbackFailureKey, let callbackFailure {
             let c = try p8Configuration()
             let configuration = try DedupConfiguration(fingerprint: c.fingerprint, policyVersion: c.policyVersion,
@@ -1212,6 +1430,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
         let image = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
         if let gate = readGate { readGate = nil; await gate.hold() }
+        if let afterRead { await lease.finishPhysicalWork(); throw afterRead }
         return .init(image: image, orientation: .up, descriptor: descriptor, lease: lease,
             eligibility: conservative ? .conservative(.unverifiedContainer) : .safeSingleFrame)
     }

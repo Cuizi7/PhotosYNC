@@ -8,6 +8,11 @@ private struct RepresentationStageFailure: Error {
 /// Owns one bounded work loop and the durable-inventory → derived-index → Photos
 /// acknowledgement barrier. SQLite never waits for Photos or model work.
 public actor PhotosIndexCoordinator {
+    private let wallNow: @Sendable () -> Date
+    private let monotonic: @Sendable () -> TimeInterval
+    private var taskCursor: RepresentationKey?
+    private var readerTimeoutWaiting = false
+    private var readerAdmission: PhotosReaderAdmission = .available
     private let store: SyncStore
     private let photos: any PhotosIndexGateway
     private let fingerprinter: any ImageFingerprinting
@@ -32,8 +37,11 @@ public actor PhotosIndexCoordinator {
     private let diagnostics: @Sendable ([String: String]) -> Void
 
     public init(store: SyncStore, photos: any PhotosIndexGateway, fingerprinter: any ImageFingerprinting,
-                configuration: DedupConfiguration, indexDiagnostics: IndexDiagnostics? = nil,
+                configuration: DedupConfiguration,
+                wallNow: @escaping @Sendable () -> Date = { Date() },
+                monotonic: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }, indexDiagnostics: IndexDiagnostics? = nil,
                 diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        self.wallNow = wallNow; self.monotonic = monotonic
         self.store = store; self.photos = photos; self.fingerprinter = fingerprinter
         let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
         self.configuration = configuration; self.diagnostics = { context.emit($0) }
@@ -204,13 +212,18 @@ public actor PhotosIndexCoordinator {
         }
     }
 
+    /// `now` is frozen eligibility for this finite slice. Retry deadlines use
+    /// the wall clock at failure; admission limits use monotonic elapsed time.
     public func processDueWork(now: Date) async {
         guard !processing, !paused else { return }
         processing = true
         let diagnostic = indexDiagnostics.operation("work")
+        let sliceStarted = monotonic()
+        var sliceReason = "empty", attempted = 0
         var completed = 0, failed = 0, readErrors = 0
         defer {
             processing = false
+            indexDiagnostics.state("slice", value: sliceReason, fields: ["attempts": String(attempted)])
             diagnostic.finish(); indexDiagnostics.flushObservations()
             if completed > 0 || failed > 0 {
                 diagnostics(["phase": "index-work", "unit": "representationTasks", "completed": String(completed),
@@ -219,31 +232,43 @@ public actor PhotosIndexCoordinator {
             }
         }
         do {
+            readerAdmission = await photos.representationReadAdmission()
+            indexDiagnostics.state("reader-admission", value: readerAdmission.rawValue)
+            guard !paused else { sliceReason = "paused"; return }
+            guard readerAdmission == .available else { sliceReason = readerAdmission.rawValue; return }
+            readerTimeoutWaiting = false
             try await updateInventory()
-            guard !paused, !needsReconciliation, !reconciling else { return }
-            while !paused && !needsReconciliation && !reconciling {
-                try await updateInventory()
-                guard !paused, !needsReconciliation, !reconciling, pendingDelta == nil else { break }
+            guard !paused, !needsReconciliation, !reconciling, pendingDelta == nil else { return }
+            do {
                 // Serial consumer keeps physical image/model concurrency at one,
                 // below every configured limit. Polling itself never claims work.
                 let tasks = try await store.nextRepresentationTasks(now: now,
-                    limit: min(configuration.resources.catalogBatchSize, configuration.resources.maxInFlightTasks))
-                guard !tasks.isEmpty else { break }
+                    limit: 16, after: taskCursor)
+                guard !tasks.isEmpty else { try await publishIfComplete(); return }
                 let batchGeneration = reconciledGeneration
                 for task in tasks {
+                    guard monotonic() - sliceStarted < 1 else { sliceReason = "time-budget"; break }
                     guard !paused, !needsReconciliation, !reconciling, pendingDelta == nil, reconciledGeneration == batchGeneration else { break }
-                    let expected = reconciledGeneration
+                    let expected = reconciledGeneration, serial = changeSerial
+                    readerAdmission = await photos.representationReadAdmission()
+                    indexDiagnostics.state("reader-admission", value: readerAdmission.rawValue)
+                    guard !paused, !needsReconciliation, !reconciling, pendingDelta == nil,
+                          reconciledGeneration == expected, changeSerial == serial else { break }
+                    guard readerAdmission == .available else { sliceReason = readerAdmission.rawValue; break }
                     let snapshot = try await photos.candidateSnapshot()
                     // Snapshot acquisition suspends this actor. Admit no new
                     // physical work if pause or reconciliation changed meanwhile.
                     guard !paused, !needsReconciliation, !reconciling,
-                          reconciledGeneration == expected else { break }
+                          pendingDelta == nil, changeSerial == serial, reconciledGeneration == expected else { break }
+                    guard monotonic() - sliceStarted < 1 else { sliceReason = "time-budget"; break }
                     guard snapshot.generation == expected else {
                         if pendingDelta == nil { needsReconciliation = true }
                         acknowledgedGeneration = nil; break
                     }
                     // An unstructured owned Task does not inherit later caller
                     // cancellation. Pause cannot cancel already-started consumers.
+                    attempted += 1; taskCursor = task.descriptor.key
+                    sliceReason = attempted == 16 ? "attempt-budget" : "selected-work-complete"
                     diagnostic.record(["phase": "index-task", "event": "attempt", "retryCount": String(task.retryCount)], task: task)
                     let photos = photos, model = fingerprinter
                     let work = Task { () throws -> Fingerprint in
@@ -311,6 +336,16 @@ public actor PhotosIndexCoordinator {
                         let stageFailure = error as? RepresentationStageFailure
                         let underlying = stageFailure?.error ?? error
                         let stage = stageFailure?.stage ?? completionStage
+                        if stage == "photos-read", (underlying as? ReadExecutorError == .resourceExhausted ||
+                            underlying as? ReadExecutorError == .sourceBusy || underlying as? ImageWorkBudgetError == .exhausted) {
+                            readerAdmission = await photos.representationReadAdmission()
+                            if readerAdmission == .available { readerAdmission = .busy }
+                            indexDiagnostics.state("reader-admission", value: readerAdmission.rawValue)
+                            diagnostic.record(["phase": "index-task", "event": "deferred", "reason": "reader-capacity", "stage": stage], task: task)
+                            sliceReason = readerAdmission.rawValue
+                            return
+                        }
+                        let failureTime = wallNow()
                         let readFailure = stage == "photos-read" &&
                             (underlying as? PhotosRepresentationError)?.isIsolatableReadFailure == true
                         let latest = try? await photos.candidateSnapshot()
@@ -320,16 +355,16 @@ public actor PhotosIndexCoordinator {
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
                             let delay = underlying is ModelExecutionUnavailable ? 60 : delays[min(task.retryCount, delays.count - 1)]
-                            if try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay),
+                            if try await store.failRepresentation(task, nextRetryAt: failureTime.addingTimeInterval(delay),
                                 detail: String(describing: underlying), failureKind: readFailure ? .photosRead : nil) {
-                                diagnostic.record(["phase": "index-task", "event": "failure", "stage": stage, "failureAt": "unknown", "deadline": String(now.addingTimeInterval(delay).timeIntervalSince1970)], task: task)
+                                diagnostic.record(["phase": "index-task", "event": "failure", "stage": stage, "failureAt": String(failureTime.timeIntervalSince1970), "deadline": String(failureTime.addingTimeInterval(delay).timeIntervalSince1970)], task: task)
                                 failed += 1
                                 if readFailure { readErrors += 1 }
                                 diagnostics(["phase": "index-representation", "stage": stage,
                                     "result": readFailure ? "read-error" : "waiting",
                                     "representation": task.descriptor.key.kind.rawValue, "error": String(describing: underlying),
-                                    "retryCount": String(task.retryCount + 1),
-                                    "nextRetryAt": String(now.addingTimeInterval(delay).timeIntervalSince1970)])
+                                    "retryCount": String(task.retryCount + 1), "failureAt": String(failureTime.timeIntervalSince1970),
+                                    "nextRetryAt": String(failureTime.addingTimeInterval(delay).timeIntervalSince1970)])
                                 if underlying is ModelExecutionUnavailable { modelWaiting[waitKey] = task.descriptor }
                                 else { modelWaiting.removeValue(forKey: waitKey) }
                                 if case .iCloudUnavailable = underlying as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
@@ -337,6 +372,12 @@ public actor PhotosIndexCoordinator {
                             } else {
                                 diagnostic.record(["phase": "index-task", "event": "rejected", "reason": "stale-failure-issuance", "stage": stage], task: task)
                             }
+                        }
+                        if stage == "photos-read", underlying as? ReadExecutorError == .timedOut {
+                            readerAdmission = await photos.representationReadAdmission()
+                            readerTimeoutWaiting = true
+                            sliceReason = "logical-timeout"
+                            return
                         }
                     }
                 }
@@ -360,7 +401,13 @@ public actor PhotosIndexCoordinator {
             else if !modelWaiting.isEmpty { representationIssue = ModelExecutionUnavailable.summary }
             else if !cloudWaiting.isEmpty { representationIssue = "正在等待 iCloud 图像，连接恢复后自动继续" }
             else { representationIssue = stored.issue }
-            let aggregateIssue = issue ?? representationIssue
+            let capacityIssue: String?
+            if processing || ready || readerAdmission == .available ||
+                stored.readyRepresentations + stored.readErrorRepresentations >= stored.totalRepresentations { capacityIssue = nil }
+            else if readerAdmission == .stalled { capacityIssue = "正在等待系统结束图像读取，完成后自动继续。" }
+            else { capacityIssue = "正在等待图像读取资源，稍后自动继续。" }
+            let specificIssue = !modelWaiting.isEmpty || !cloudWaiting.isEmpty ? representationIssue : nil
+            let aggregateIssue = issue ?? specificIssue ?? (readerTimeoutWaiting ? capacityIssue : nil) ?? representationIssue ?? capacityIssue
             let state: IndexState = ready ? .ready : (paused ? .paused :
                 (aggregateIssue != nil || stored.state == .waiting ? .waiting : (stored.totalsKnown ? .updating : .preparing)))
             return IndexProgress(state: state, totalsKnown: stored.totalsKnown && !needsReconciliation,
