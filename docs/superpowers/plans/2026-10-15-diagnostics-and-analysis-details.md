@@ -85,12 +85,12 @@
 - [x] **Step 3: 最小原生交互复用。** 将SyncDetailsButton现有状态/任务原样迁入HoverDetailsButton，两个入口用同一交互；来源第二行用button承载，路径help仍是独立目标。SourceIssuesContent按spec§5渲染并有界ScrollView，路径/诊断可选择、不截断。所有调用方和ReviewFixtures改用真实明细，不能用计数补造虚构错误。
 - [x] **Step 4: 实现分析组及稳定入口。** SyncDetailsContent用既有analysis在顶部加入spec§6的状态/进度/原因/说明/脚注；三组分别标范围，300pt有界滚动。StatusMenu进度区将唯一SyncDetailsButton保持在analysis/sync条件分支之外的稳定结构中；调整LibraryAnalysisView/SyncProgressView的摘要与图形分工，避免复制交互或多个info，保留292pt内容宽、原生字号、原状态优先级和no-source可达入口。恢复ready时不重置presented。
 - [x] **Step 5: GREEN及任务review。** 重建并运行AppViewTests、SyncStatusPresentationTests、现有AppModelTests；覆盖0/1/30来源、明暗、原操作/disabled/键盘映射。新原生文件必须在实际App与测试都编译。一次SDD完整任务review同时检查规格与质量，通过后提交 `fix(ui): align source and library analysis details`。
-- [ ] **Step 6: 产出可审阅真实UI证据。** 扩展现有ReviewHost识别新详情按钮，不沿用失效硬编码坐标。`Tests/UIReview/run-ui-review.sh --derived-data "$PWD/work/022-focused" --output-dir "$PWD/work/022-ui-static"`取得主体；`--probe`用另一fresh目录取得本进程实际浮层。合成场景包括混合问题、20项滚动首尾、analysis known/unknown/waiting/paused和opened→ready，明暗各一套。用已有权限的自己窗口捕获，记录commit/diff、PID/windowID、尺寸/场景、原生popover发现/实际内容/结果；不激活、无全局输入。静态详情拼接或透明异常材质不能充当成功。环境不足时交协调线程具体失败证据，不擅自改权限。
+- [x] **Step 6: 产出可审阅真实UI证据。** 扩展现有ReviewHost识别新详情按钮，不沿用失效硬编码坐标。`Tests/UIReview/run-ui-review.sh --derived-data "$PWD/work/022-focused" --output-dir "$PWD/work/022-ui-static"`取得主体；`--probe`用另一fresh目录取得本进程实际浮层。合成场景包括混合问题、20项滚动首尾、analysis known/unknown/waiting/paused和opened→ready，明暗各一套。用已有权限的自己窗口捕获，记录commit/diff、PID/windowID、尺寸/场景、原生popover发现/实际内容/结果；不激活、无全局输入。静态详情拼接或透明异常材质不能充当成功。环境不足时交协调线程具体失败证据，不擅自改权限。
 - [x] **Step 6a: 协调批准的一次前台取图。** 常规非激活捕获已产生CG窗口仅1×2的具体证据后，协调线程明确授权spec§8的单次合成ReviewHost受控激活（≤30秒）。保留原frontmost、自己的PID/window/尺寸和明暗/滚动/动态原图；用户切走即停、不抢回，条件恢复原App，无全局输入或权限改动。仅测试宿主入口支持此模式，默认验收路径不激活；控制器核对一次性/恢复边界后执行，不需重复询问授权。
-- [ ] **Step 7: 交协调线程截图审阅。** 给原始PNG/图册/已披露局限；按收到的范围内修订更新截图和相关验证。记录结论为“协调代理审阅”，不得改写旧版本人工结论或称用户本人验收。由协调线程判断其本次委托的验收条件。
+- [x] **Step 7: 交协调线程截图审阅。** 给原始PNG/图册/已披露局限；按收到的范围内修订更新截图和相关验证。记录结论为“协调代理审阅”，不得改写旧版本人工结论或称用户本人验收。由协调线程判断其本次委托的验收条件。
 
 
-执行注：Step6a已于3df233d执行唯一受控会话，QA未成为前台（原前台loginwindow），零截图、不重试；Step6的真实屏幕材质与Step7协调视觉验收仍未通过，禁止merge/release。静态图及逻辑popup更新已有证据，不能替代。Task2独立代码review的SPEC/QUALITY已通过，无P0–P2发现；审阅不替代实际屏幕浮层验收。
+执行注：早期3df233d的受控会话因原前台为loginwindow而零截图，失败证据保留。用户明确告知已解锁后，按协调线程新授权取得14张真实原图，覆盖混合诊断、两色长列表首尾及同一浮层分析进度到ready转换；浅色材质另以获准的一次v3会话取得同popup的A/B原图。协调代理于2026-10-16直接审阅上述原图及独立ICC审计，通过本轮新增内容的原生UI验收；这是协调代理审阅，非用户亲自验收。v3原manifest因NSBitmapImageRep采样颜色空间解释保持unverified，补充审计按原PNG嵌入ICC、原四角及原8/255阈值通过，不覆盖原失败或冒称未到达的末尾断言通过。物理hover/focus/VoiceOver、真实MenuBarExtra及全显示器背景真实性未新增验证。详细边界见本轮validation记录。Task2独立代码review的SPEC/QUALITY已通过，无P0–P2发现。
 
 ### Task 3: 0.2.2发行配置与集成交付（scoped implementer + 主代理协调）
 
@@ -106,8 +106,8 @@
 
 - [x] **Step 1: 发行准备。** 再查远端main/tag/releases防版本冲突；若0.2.2已占用先向协调线程报告，不覆盖。按上述文件更新0.2.2 stable/build10，写两项修复/无视频扩展/无迁移/实机与签名限制。Python测试改动前读取python-development-guidelines。跑 `python3 -m unittest discover -s Tests/Tools -p test_release_validation.py`，确认新版本fixture及失败拒绝门槛；提交 `release: prepare PhotosYNC 0.2.2 stable`。
 - [x] **Step 2: 最终tester验收。** 专属tester执行 `python3 scripts/validate.py --output-dir "$PWD/work/022-integrated-validation" --derived-data "$PWD/work/022-integrated-derived" > "$PWD/work/022-integrated-validation.log" 2>&1`。读取完整validation.json、报告与日志，列XCTest数/跳过/失败、Tools、权重/model、scale四组、两个continuation、源码manifest前后一致。失败不得绕过；修复后重跑必要完整验收，路径唯一。
-- [ ] **Step 3: 最终集成deep_reviewer。** 审base `1291b53`→当前全部diff及spec/plan/验证/UI证据，重点接口/actor恢复边界、阶段错误不改变媒体规则、浮层生命周期、发布配置。高严重性无遗留、中严重性解决或有协调线程明确接受。只读review不重跑相同快照测试；新增修复按影响复核、最后行为变更完整验证。
-- [ ] **Step 4: PR。** 协调线程明确允许自动验收与代码review通过后创建披露真实popup关卡未过的draft PR；该关卡继续阻断merge/tag/release。push本轮分支；用临时body文件写清两项问题、行为、验证和限制，再 `gh pr create --repo Cuizi7/PhotosYNC --base main --head codex/source-diagnostics-022 --draft --body-file <file>`。创建后立即 `attach_artifact`。检查远端diff/checks/mergeability；base有变化则先评估集成和对应验证，不盲合并。
+- [x] **Step 3: 最终集成deep_reviewer。** 审base `1291b53`→当前全部diff及spec/plan/验证/UI证据，重点接口/actor恢复边界、阶段错误不改变媒体规则、浮层生命周期、发布配置。高严重性无遗留、中严重性解决或有协调线程明确接受。只读review不重跑相同快照测试；新增修复按影响复核、最后行为变更完整验证。
+- [x] **Step 4: PR。** 协调线程明确允许自动验收与代码review通过后创建披露真实popup关卡未过的draft PR；该关卡继续阻断merge/tag/release。push本轮分支；用临时body文件写清两项问题、行为、验证和限制，再 `gh pr create --repo Cuizi7/PhotosYNC --base main --head codex/source-diagnostics-022 --draft --body-file <file>`。创建后立即 `attach_artifact`。检查远端diff/checks/mergeability；base有变化则先评估集成和对应验证，不盲合并。
 - [ ] **Step 5: squash merge main。** 完成协调截图审阅和上述门槛后按已授权范围 `gh pr merge <PR> --squash`；fetch/pull主仓库仅fast-forward、先确认干净且无别人在改，不删除历史work/stash。记录真实main提交并比较合并tree与已审源树（文档和版本亦说明），复用同快照review不重复审批。
 - [ ] **Step 6: 从确切main打包。** 主仓库clean main执行 `scripts/package-release.sh`；它在精确git archive内重新全验收再Universal Release。确认LFS完整权重、app/Core双架构、0.2.2/stable/10、图标、嵌套签名、DMG verify、local SHA256SUMS、provenance source_commit/manifest/validation hashes全部吻合。目录已存在或锁冲突就停止，不覆盖、不清他人锁。
 - [ ] **Step 7: GitHub stable release。** 创建v0.2.2标签绑定main实commit，先确认远端无冲突。在独立work分发目录准备DMG/provenance/RELEASE-NOTES及只覆盖这三文件的下载SHA256SUMS；本地包完整校验表不改。用`gh release create v0.2.2 ... --verify-tag --latest --title 'PhotosYNC 0.2.2' --notes-file <notes>`上传四项既有惯例资产；无draft/prerelease。若上传结果未知先回读，避免重复。回读release/tag/assets，下载到独立临时目录验证哈希后报告。
@@ -117,4 +117,4 @@
 
 需求映射：Task1覆盖spec§3–4，Task2覆盖§5–6与截图，Task3覆盖§8发行。Review Focus五项各有具名测试。新增文件仅共享hover责任，Core新增类型留在既有文件；不拆分/重构其他模块。
 
-设计方向已由协调线程审阅通过；本计划将其指定的目录primary跟随剩余成员、未知目录项属性阶段两点落实为Task1测试与实现要求。Task2稳定入口也列为验收点；若实现发现必须改调度/存储或更大架构，暂停相关修改并报告具体差异，不改设计自授权。基线按协调要求优先核验复用；截至2026-10-16，Task1/2代码及各自独立审阅已完成；具体RED/GREEN和运行次数见台账。Task3发行配置与scoped review已完成；完整canonical于125ada6通过（627 XCTest含2项明确跳过/0失败、97 Tools、固定33例模型、四组规模、两项续体GREEN/预期RED，manifest前后一致）。此后的文档结果更新不冒称重新执行过测试；最终exact-main归档验收仍保留。最终deep代码review无P0–P2，P3自定义gateway阶段边界已由协调线程接受，真实结果补核仍由同一reviewer完成。真实浮层视觉关卡未通过，不merge/tag/release。
+设计方向已由协调线程审阅通过；本计划将其指定的目录primary跟随剩余成员、未知目录项属性阶段两点落实为Task1测试与实现要求。Task2稳定入口也列为验收点；若实现发现必须改调度/存储或更大架构，暂停相关修改并报告具体差异，不改设计自授权。基线按协调要求优先核验复用；截至2026-10-16，Task1/2代码及各自独立审阅已完成；具体RED/GREEN和运行次数见台账。Task3发行配置与scoped review已完成；完整canonical于125ada6通过（627 XCTest含2项明确跳过/0失败、97 Tools、固定33例模型、四组规模、两项续体GREEN/预期RED，manifest前后一致）。此后的文档结果更新不冒称重新执行过测试；最终exact-main归档验收仍保留。最终deep代码review及111项验证证据补核已完成，无P0–P2；P3自定义gateway阶段边界由协调线程接受。PR #3已创建并附带本轮验证记录。新增原生UI内容已由协调代理审阅通过，保留上述明确局限；同一deep reviewer仅补核最终文档和新增证据边界。产品/tests/Core未变，不重复分支整套suite；PR ready/squash、exact-main归档全验收/Universal打包、v0.2.2 stable/latest四资产发布及下载校验按已授权顺序执行，实际结果由main/package provenance及交付记录绑定。
