@@ -6,6 +6,69 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testDiagnosticHandlesAreRunLocalAndNeutralOvernightVolumeIsBounded() throws {
+        let log = CoordinatorDiagnostics(), clock = DiagnosticClock()
+        let diagnostic = IndexDiagnostics(sink: { log.record($0) }, monotonic: { clock.now })
+        let token = Data("PRIVATE-TOKEN-SENTINEL".utf8)
+        XCTAssertEqual(diagnostic.tokenHandle(token), diagnostic.tokenHandle(token))
+        let other = IndexDiagnostics(sink: { _ in })
+        XCTAssertNotEqual(diagnostic.tokenHandle(token), other.tokenHandle(token))
+        // 8 hours, 100 notifications/second, three neutral production phases.
+        for window in 0..<960 {
+            clock.now = Double(window * 30)
+            for _ in 0..<3000 {
+                diagnostic.observation(["phase": "photos-notification", "publication": "closed", "classification": "pending"])
+                diagnostic.observation(["phase": "photos-fetch-details", "incremental": "true"])
+                diagnostic.observation(["phase": "photos-change-classification", "contentScope": "known", "contentChanged": "0", "inserted": "0", "deleted": "0"])
+            }
+        }
+        diagnostic.flushObservations(force: true)
+        XCTAssertEqual(log.rows.count, 8640)
+        let suppressed = log.rows.reduce(0) { $0 + (Int($1["suppressed"] ?? "0") ?? 0) }
+        XCTAssertEqual(suppressed, 8_634_240)
+        let data = try JSONSerialization.data(withJSONObject: log.rows, options: [.sortedKeys])
+        XCTAssertLessThan(data.count, 2_000_000)
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("PRIVATE-TOKEN-SENTINEL"))
+        diagnostic.observation(["phase": "photos-change-classification", "contentScope": "unknown", "fallback": "gap"])
+        diagnostic.observation(["phase": "photos-change-classification", "contentScope": "known", "contentChanged": "1"])
+        XCTAssertEqual(log.rows.count, 8642, "Unknown and content transitions cannot be throttled as neutral")
+        diagnostic.state("reader", value: "busy")
+        for _ in 0..<1000 { diagnostic.state("reader", value: "busy"); diagnostic.flushObservations() }
+        XCTAssertEqual(log.rows.count, 8643, "Polling must not emit one summary per tick")
+        diagnostic.state("reader", value: "available")
+        XCTAssertEqual(log.rows.last?["suppressed"], "1000")
+    }
+
+    func testAnonymousDiagnosticsLinkTwoReconciliationsAndBoundDetail() async throws {
+        let log = CoordinatorDiagnostics(), f = try fixture(diagnostics: { log.record($0) })
+        let descriptors = (0..<20).map { descriptor(f.photos.context, asset: "private-asset-\($0)") }
+        await f.photos.setPaged(descriptors, pageSize: 10)
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: descriptors, nextOffset: nil,
+            invalidateAllCachedRepresentations: true)])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let rows = log.rows
+        XCTAssertFalse(rows.contains { $0.values.contains { $0.contains("private-asset-") } })
+        let invalidations = rows.filter { $0["phase"] == "index-invalidation" }
+        XCTAssertTrue(invalidations.contains { $0["readyToPending"] == "20" && $0["reason"] == "catalog-unknown" })
+        let details = rows.filter { $0["assetHandle"] != nil }
+        XCTAssertFalse(details.isEmpty)
+        XCTAssertLessThanOrEqual(Set(details.compactMap { $0["assetHandle"] }).count, 8)
+        let reconciles = Set(details.compactMap { $0["operation"] })
+        XCTAssertGreaterThanOrEqual(reconciles.count, 2)
+        XCTAssertTrue(rows.contains { $0["phase"] == "index-diagnostic-summary" && Int($0["suppressed"] ?? "0") ?? 0 > 0 })
+        XCTAssertEqual(rows.filter { $0["phase"] == "index-reconcile" }.count, 2)
+        let samples = rows.filter { $0["phase"] == "index-catalog-sample" }
+        for handle in Set(samples.compactMap { $0["assetHandle"] }) {
+            XCTAssertEqual(Set(samples.filter { $0["assetHandle"] == handle }.compactMap { $0["descriptorHandle"] }).count, 1)
+        }
+        if let destination = ProcessInfo.processInfo.environment["PHOTOSYNC_DIAGNOSTIC_EVIDENCE"] {
+            let lines = try rows.map { try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) + Data([10]) }
+            try lines.reduce(into: Data(), { $0.append($1) }).write(to: URL(fileURLWithPath: destination))
+        }
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 20)
+    }
+
     func testDecoderConservativeReadGapLetsHealthySiblingPublishWithoutVector() async throws {
         for reason in [RepresentationConservativeReason.decodedResourceLimit, .multiFrameOrCompound] {
             let log = CoordinatorDiagnostics(), f = try fixture(diagnostics: { log.record($0) })
@@ -1149,4 +1212,13 @@ private final class CoordinatorDiagnostics: @unchecked Sendable {
     private var values: [[String: String]] = []
     func record(_ row: [String: String]) { lock.lock(); values.append(row); lock.unlock() }
     var rows: [[String: String]] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
+private final class DiagnosticClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 0
+    var now: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
+    }
 }

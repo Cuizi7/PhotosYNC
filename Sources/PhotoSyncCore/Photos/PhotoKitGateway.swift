@@ -75,6 +75,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private let representationReader: PhotosRepresentationReader?
     private let catalogBatchSize: Int
     private let changeChannel: PhotosIndexChangeChannel
+    private let indexDiagnostics: IndexDiagnostics
     private let diagnostics: @Sendable ([String: String]) -> Void
 
     public override convenience init() {
@@ -82,21 +83,23 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library), observedLibrary: library)
     }
 
-    public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+    public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         let library = PHPhotoLibrary.shared()
+        let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
         let reader = PhotosRepresentationReader(requester: SystemPhotosRepresentationRequester(), budget: imageBudget,
-                                                configuration: configuration,
+                                                configuration: configuration, indexDiagnostics: context,
                                                 resourceLimits: PhotosResourceLimits(maxEncodedBytes: configuration.resources.maxEncodedBytes,
                                                     freeSpaceReserveBytes: configuration.resources.freeSpaceReserveBytes))
-        self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library, eventBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics), observedLibrary: library,
-                  representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize, diagnostics: diagnostics)
+        self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library, eventBatchSize: configuration.resources.catalogBatchSize, diagnostics: { context.observation($0) }, indexDiagnostics: context), observedLibrary: library,
+                  representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize, indexDiagnostics: context, diagnostics: diagnostics)
     }
 
     init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0,
-         diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in },
+         indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in },
          queueSubmissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil) {
         candidateIndex = PhotoKitCandidateIndex(submissionProbe: queueSubmissionProbe)
-        self.diagnostics = diagnostics
+        let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
+        self.indexDiagnostics = context; self.diagnostics = { context.observation($0) }
         self.representationReader = representationReader
         self.catalogBatchSize = catalogBatchSize
         changeChannel = PhotosIndexChangeChannel(capacity: max(1, catalogBatchSize))
@@ -106,9 +109,10 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     private init(lifecycle: any PhotoKitLifecycle, observedLibrary: PHPhotoLibrary,
-                 representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+                 representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         candidateIndex = PhotoKitCandidateIndex()
-        self.diagnostics = diagnostics
+        let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
+        self.indexDiagnostics = context; self.diagnostics = { context.observation($0) }
         self.representationReader = representationReader
         self.catalogBatchSize = catalogBatchSize
         changeChannel = PhotosIndexChangeChannel(capacity: max(1, catalogBatchSize))
@@ -288,6 +292,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         // No state lock is held during PhotoKit history or SQLite journal work.
         let ticket = state.beginHistoryCoverage()
         defer { state.finishChangeDetails() }
+        let diagnostic = indexDiagnostics.operation("history")
+        diagnostic.record(["phase": "photos-history-range", "source": "history", "fromRange": indexDiagnostics.tokenHandle(previous.archivedChangeToken), "throughRange": indexDiagnostics.tokenHandle(proposed.archivedChangeToken), "fromGeneration": previous.photosGeneration.map(String.init) ?? "unknown", "throughGeneration": proposed.photosGeneration.map(String.init) ?? "unknown", "tokenEquality": "unknown"])
+        defer { diagnostic.finish() }
         guard state.hasStore, previous.context == proposed.context,
               proposed.context == ticket.context, let upperGeneration = proposed.photosGeneration,
               upperGeneration >= 0, upperGeneration <= ticket.generation,
@@ -301,6 +308,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 if event == .fullReconcileRequired || event == .contextInvalidated { unknown = true }
             }, onContentChange: { [state, catalogBatchSize] ids in
                 if !state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) { persisted = false }
+                diagnostic.record(["phase": "photos-history-obligation", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers", "assets": String(ids.count)])
+                for id in ids { diagnostic.record(["phase": "photos-history-sample", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers"], assetID: id) }
             })
         } catch {
             state.invalidateAllRepresentations()
@@ -455,7 +464,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 guard let self else { return false }
                 return self.state.markIndexed(generation: generation)
             },
-            onChange: { [state, changeChannel, catalogBatchSize] event in
+            onChange: { [state, changeChannel, catalogBatchSize, indexDiagnostics] event in
                 switch event {
                 case .incremental(let delta):
                     if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.invalidateAllRepresentations() }
@@ -463,13 +472,23 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                     if delta.changedAssetIDs.count + delta.deletedAssetIDs.count > max(1, catalogBatchSize / 2), state.hasStore {
                         changeChannel.send(.fullReconcileRequired)
                     } else { changeChannel.send(event) }
+                    if !delta.changedAssetIDs.isEmpty || !delta.deletedAssetIDs.isEmpty {
+                        let diagnostic = indexDiagnostics.operation("live")
+                        diagnostic.record(["phase": "photos-live-scope", "source": "live", "category": "inventory", "changed": String(delta.changedAssetIDs.count), "deleted": String(delta.deletedAssetIDs.count), "fromGeneration": String(delta.fromGeneration), "throughGeneration": String(delta.toGeneration)])
+                        for id in delta.changedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "inventory-changed", "content": "unknown", "event": String(delta.toGeneration)], assetID: id) }
+                        for id in delta.deletedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "deleted", "event": String(delta.toGeneration)], assetID: id) }
+                        diagnostic.finish()
+                    }
                 case .contextInvalidated: state.invalidateAllRepresentations(); changeChannel.send(event)
                 case .fullReconcileRequired: state.invalidateAllRepresentations(); changeChannel.send(event)
                 }
             },
             onContentChange: { [state, catalogBatchSize] ids in _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) },
             didFinishDetails: { [state] in state.finishChangeDetails() },
-            diagnostics: diagnostics
+            diagnostics: { [indexDiagnostics] fields in
+                var fields = fields; fields["source"] = "live"
+                indexDiagnostics.observation(fields)
+            }
         )
     }
 
@@ -542,8 +561,9 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     private var representationGeneration: Int?
     private let eventBatchSize: Int
     private let diagnostics: @Sendable ([String: String]) -> Void
-    init(photoLibrary: PHPhotoLibrary, eventBatchSize: Int = 1, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
-        self.photoLibrary = photoLibrary; self.eventBatchSize = eventBatchSize; self.diagnostics = diagnostics
+    private let indexDiagnostics: IndexDiagnostics?
+    init(photoLibrary: PHPhotoLibrary, eventBatchSize: Int = 1, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }, indexDiagnostics: IndexDiagnostics? = nil) {
+        self.photoLibrary = photoLibrary; self.eventBatchSize = eventBatchSize; self.diagnostics = diagnostics; self.indexDiagnostics = indexDiagnostics
     }
 
     func currentAccess() -> PhotoKitAccess {
@@ -696,9 +716,15 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool {
         guard let token = try NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: token) else { return false }
         let result = try photoLibrary.fetchPersistentChanges(since: token)
+        let diagnostic = indexDiagnostics?.operation("history-replay")
+        defer { diagnostic?.finish() }
+        var updated = 0, deleted = 0, inserted = 0
+        defer { indexDiagnostics?.emit(["phase": "photos-history-categories", "source": "history", "updated": String(updated), "deleted": String(deleted), "inserted": String(inserted), "updatedContent": "unknown", "reason": "conservative-history-identifiers"]) }
         for change in result {
             let details = try change.changeDetails(for: .asset)
-            for ids in [details.updatedLocalIdentifiers, details.deletedLocalIdentifiers, details.insertedLocalIdentifiers] {
+            updated += details.updatedLocalIdentifiers.count; deleted += details.deletedLocalIdentifiers.count; inserted += details.insertedLocalIdentifiers.count
+            for (category, ids) in [("updated", details.updatedLocalIdentifiers), ("deleted", details.deletedLocalIdentifiers), ("inserted", details.insertedLocalIdentifiers)] {
+                for id in ids { diagnostic?.record(["phase": "photos-history-sample", "source": "history", "category": category, "content": "unknown", "reason": "conservative-history-identifiers"], assetID: id) }
                 let ordered = ids.sorted()
                 for offset in stride(from: 0, to: ordered.count, by: max(1, eventBatchSize)) {
                     onContentChange(Array(ordered[offset..<min(ordered.count, offset + max(1, eventBatchSize))]))

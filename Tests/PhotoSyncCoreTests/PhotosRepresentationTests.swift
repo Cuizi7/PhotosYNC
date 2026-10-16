@@ -7,6 +7,30 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testAnonymousReaderLifecycleJoinsTaskIssuanceAndReleasesOnlyOnce() async throws {
+        let rows = RepresentationDiagnosticRows(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
+        let requester = ControlledRepresentationRequester(), c = try configuration()
+        let budget = ImageWorkBudget(limits: c.resources)
+        let descriptor = RepresentationDescriptor(key: .init(assetID: "PRIVATE-ID-SENTINEL", kind: .original),
+            context: .init(id: UUID(), epoch: 1), revision: "PRIVATE-EXIF-PATH-SENTINEL", size: nil, equivalentToOriginal: false, revisionIsReliable: true)
+        let task = RepresentationTask(descriptor: descriptor, retryCount: 0, nextRetryAt: nil,
+            fingerprintVersion: c.fingerprint.version, indexGeneration: 1, issuanceRevision: "PRIVATE-ISSUANCE-SENTINEL")
+        diagnostic.operation("work").record(["phase": "index-task", "event": "attempt"], task: task)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, indexDiagnostics: diagnostic)
+        let read = Task { try await reader.read(descriptor, isCurrent: { true }) }
+        await requester.started()
+        requester.send(.failure(NSError(domain: NSCocoaErrorDomain, code: -1)))
+        do { _ = try await read.value; XCTFail("terminal failure expected") } catch {}
+        requester.send(.failure(NSError(domain: NSCocoaErrorDomain, code: -1)))
+        diagnostic.flushObservations()
+        let events = rows.values.filter { $0["phase"] == "photos-reader" }
+        XCTAssertEqual(events.compactMap { $0["event"] }, ["admission", "request", "terminal", "drain", "lease-released"])
+        XCTAssertEqual(Set(events.compactMap { $0["issuanceHandle"] }), Set(rows.values.filter { $0["phase"] == "index-task" }.compactMap { $0["issuanceHandle"] }))
+        let physical = await budget.snapshot(); XCTAssertEqual(physical.images, 0)
+        let output = String(decoding: try JSONSerialization.data(withJSONObject: rows.values), as: UTF8.self)
+        XCTAssertFalse(output.contains("PRIVATE-"))
+    }
+
     func testEncodedStreamUsesIdenticalSourceTensorAndUnappliedOrientation() async throws {
         let configuration = try p8Configuration()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1114,4 +1138,11 @@ private struct ValidationFailingRepresentationRequester: PhotosRepresentationReq
 private final class CyclicRepresentationCallbackError: NSError, @unchecked Sendable {
     override var userInfo: [String: Any] { [NSUnderlyingErrorKey: self] }
     override var description: String { "synthetic cyclic callback" }
+}
+
+private final class RepresentationDiagnosticRows: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [[String: String]] = []
+    func append(_ row: [String: String]) { lock.lock(); rows.append(row); lock.unlock() }
+    var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return rows }
 }

@@ -1421,14 +1421,15 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     public func applyIndexDeltaBatch(_ batch: PhotosIndexDeltaBatch, page: RepresentationPage,
-                                     fingerprintVersion: String, checkpoint: LibraryResumeCheckpoint?) async throws -> Int64 {
+                                     fingerprintVersion: String, checkpoint: LibraryResumeCheckpoint?,
+                                     diagnostic: IndexDiagnosticOperation? = nil) async throws -> Int64 {
         guard batch.valid else { throw PhotoKitGatewayError.libraryChanged }
         let delta = batch.request, firstBatch = batch.first, lastBatch = batch.last
         let identity = try JSONSerialization.data(withJSONObject: [batch.interval.context.id.uuidString,
             String(batch.interval.context.epoch), String(delta.fromGeneration), String(delta.toGeneration),
             batch.interval.changedAssetIDs, batch.interval.deletedAssetIDs])
         let digest = SHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
-        return try await perform {
+        let result: (generation: Int64, invalidated: Int) = try await perform {
             try self.transaction {
                 guard delta.isValid, let state = try self.indexStateRow(),
                       try self.libraryContext(state) == delta.context, try self.int64(state[7]) == (firstBatch ? 1 : 0),
@@ -1454,7 +1455,7 @@ public final class SyncStore: @unchecked Sendable {
                 let generation = try self.int64(state[2]) + (firstBatch ? 1 : 0)
                 try self.execute("UPDATE dedup_index_state SET generation = ?, photos_generation = ?, published_generation = NULL, reconciliation_complete = 0 WHERE id = 1",
                                  [.int64(generation), .int64(Int64(delta.toGeneration))])
-                try self.invalidateRepresentationsSync(assetIDs: page.invalidatedAssetIDs, state: state, generation: generation)
+                let invalidated = try self.invalidateRepresentationsSync(assetIDs: page.invalidatedAssetIDs, state: state, generation: generation)
                 _ = try self.upsertRepresentationsSync(page.descriptors, state: state, generation: generation, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
                 let affected = changed.union(delta.deletedAssetIDs)
                 let seen = Set(page.descriptors.map(\.key))
@@ -1464,9 +1465,12 @@ public final class SyncStore: @unchecked Sendable {
                 if lastBatch { try self.finishInventory(checkpoint: retainedCheckpoint, context: delta.context) }
                 else { try self.execute("UPDATE dedup_index_state SET reconcile_cursor = ? WHERE id=1", [.text("delta:\(digest):\(batch.offset + batch.count)")]) }
                 self.publishedIndexToken = nil
-                return generation
+                return (generation, invalidated)
             }
         }
+        diagnostic?.record(["phase": "index-invalidation", "source": "live", "reason": "content-obligation", "readyToPending": String(result.invalidated), "generation": String(result.generation), "fromGeneration": String(delta.fromGeneration), "throughGeneration": String(delta.toGeneration)])
+        diagnostic?.finish()
+        return result.generation
     }
 
     private func validateCheckpoint(_ checkpoint: LibraryResumeCheckpoint?, context: LibraryContext, photosGeneration: Int,
@@ -1541,23 +1545,28 @@ public final class SyncStore: @unchecked Sendable {
 
     /// Page invalidation is authoritative even when a reliable metadata revision
     /// matches. Invalidate before upsert; an all-invalid page also covers earlier pages.
-    public func invalidateRepresentations(assetIDs: [String]?, generation: Int64) async throws {
+    @discardableResult
+    public func invalidateRepresentations(assetIDs: [String]?, generation: Int64) async throws -> Int {
         try await perform {
             try self.transaction {
                 guard let state = try self.indexStateRow(), try self.int64(state[2]) == generation,
                       try self.int64(state[7]) == 0 else { throw SyncStoreError.invalidTransition("Stale reconciliation invalidation.") }
-                try self.invalidateRepresentationsSync(assetIDs: assetIDs, state: state, generation: generation)
+                return try self.invalidateRepresentationsSync(assetIDs: assetIDs, state: state, generation: generation)
             }
         }
     }
 
-    private func invalidateRepresentationsSync(assetIDs: [String]?, state: [Value], generation: Int64) throws {
+    @discardableResult
+    private func invalidateRepresentationsSync(assetIDs: [String]?, state: [Value], generation: Int64) throws -> Int {
+        var readyToPending = 0
         let context = try self.libraryContext(state)
         let base: [Binding] = [.text(context.id.uuidString), .int64(context.epoch)]
         let ids: [String?] = assetIDs.map { $0.map(Optional.some) } ?? [nil]
         for asset in ids {
             let filter = "context_id = ? AND context_epoch = ?" + (asset == nil ? "" : " AND asset_id = ?")
             let bindings = base + (asset.map { [Binding.text($0)] } ?? [])
+            let ready = try self.one("SELECT COUNT(*) FROM photos_representation WHERE " + filter + " AND state = 'ready'", bindings)!
+            readyToPending += Int(try self.int64(ready[0]))
             let nextState = asset == nil ? "CASE WHEN state = 'failed' THEN 'failed' ELSE 'pending' END" : "'pending'"
             try self.execute("UPDATE photos_representation SET state = " + nextState + ", seen_generation = ? WHERE " + filter, [.int64(generation)] + bindings)
             if asset == nil {
@@ -1573,6 +1582,7 @@ public final class SyncStore: @unchecked Sendable {
                 FROM photos_representation WHERE
                 """ + " " + filter + " AND tombstoned = 0", bindings)
         }
+        return readyToPending
     }
 
 

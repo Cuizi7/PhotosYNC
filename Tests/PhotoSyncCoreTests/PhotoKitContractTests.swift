@@ -107,6 +107,25 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(lifecycle.loadCount, 2)
     }
 
+    func testSharedAnonymousContextLinksHistoryLiveAndConservativeInvalidation() async throws {
+        let rows = HistoryPendingTrace(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
+        let f = try continuityFixture(indexDiagnostics: diagnostic)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        f.lifecycle.persistentToken = 2
+        try await f.coordinator.reconcile()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [.init(identifier: "page0", candidates: [candidate(key: "page0")])])
+        f.gateway.recordLibraryChangeForTesting()
+        _ = try await f.gateway.candidateSnapshot()
+        let history = rows.rows.filter { $0["phase"] == "photos-history-sample" }
+        let live = rows.rows.filter { $0["phase"] == "photos-live-sample" }
+        XCTAssertEqual(Set(history.compactMap { $0["assetHandle"] }), Set(live.compactMap { $0["assetHandle"] }))
+        XCTAssertFalse(history.isEmpty); XCTAssertTrue(history.allSatisfy { $0["category"] == "unknown" && $0["reason"] == "conservative-history-identifiers" })
+        XCTAssertEqual(Set(rows.rows.compactMap { $0["run"] }), [diagnostic.run])
+        XCTAssertTrue(rows.rows.contains { $0["phase"] == "index-invalidation" && $0["readyToPending"] == "1" })
+        XCTAssertFalse(rows.rows.contains { $0["asset"] != nil || $0["token"] != nil })
+    }
+
     func testHistoryCoverageClosesExistingSnapshotFenceWithoutChangingRawGeneration() async throws {
         let f = try continuityFixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
@@ -683,7 +702,7 @@ final class PhotoKitContractTests: XCTestCase {
         guard case .incremental = await events.next() else { return XCTFail("successful retry acknowledges delivery") }
     }
 
-    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil,
+    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil, indexDiagnostics: IndexDiagnostics? = nil,
                                    diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> (root: URL, db: URL, store: SyncStore,
         context: LibraryContext, lifecycle: FakePhotoKitLifecycle, gateway: PhotoKitGateway, configuration: DedupConfiguration,
         fingerprint: Fingerprint, coordinator: PhotosIndexCoordinator) {
@@ -706,10 +725,10 @@ final class PhotoKitContractTests: XCTestCase {
         let lifecycle = FakePhotoKitLifecycle(); lifecycle.candidates = (0..<4).map { candidate(key: "page\($0)") }
         let reader = readProbe.map { PhotosRepresentationReader(requester: $0,
             budget: ImageWorkBudget(limits: configuration.resources),
-            configuration: configuration) }
-        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, diagnostics: diagnostics)
+            configuration: configuration, indexDiagnostics: indexDiagnostics) }
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics)
         return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
-            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, diagnostics: diagnostics))
+            PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics))
     }
 
     func testRealGatewayCoordinatorMergesClassifiedEventsDuringEveryCatalogPage() async throws {

@@ -43,6 +43,7 @@ protocol PhotosRepresentationRequesting: Sendable {
 }
 
 public actor PhotosRepresentationReader {
+    private let indexDiagnostics: IndexDiagnostics?
     private let requester: any PhotosRepresentationRequesting
     private let budget: ImageWorkBudget
     private let configuration: DedupConfiguration
@@ -52,11 +53,12 @@ public actor PhotosRepresentationReader {
     private var active: [UUID: RepresentationRequestState] = [:]
     public var physicalRequestCount: Int { active.count }
 
-    init(requester: any PhotosRepresentationRequesting, budget: ImageWorkBudget, configuration: DedupConfiguration,
+    init(requester: any PhotosRepresentationRequesting, budget: ImageWorkBudget, configuration: DedupConfiguration, indexDiagnostics: IndexDiagnostics? = nil,
          resourceLimits: PhotosResourceLimits = PhotosResourceLimits(), storage: PhotosResourceStorage = PhotosResourceStorage(),
          decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage = {
              try EncodedImageDecoder.decode(url: $0, configuration: $1, decodedAllowance: $2)
          }) {
+        self.indexDiagnostics = indexDiagnostics
         self.requester = requester; self.budget = budget; self.configuration = configuration
         self.resourceLimits = resourceLimits; self.storage = storage; self.decode = decode
     }
@@ -65,7 +67,10 @@ public actor PhotosRepresentationReader {
                      isCurrent: @escaping @Sendable () -> Bool) async throws -> LoadedRepresentation {
         try Task.checkCancellation()
         guard active.isEmpty else { throw ReadExecutorError.resourceExhausted }
+        let diagnostic = indexDiagnostics?.operation("request")
+        diagnostic?.record(["phase": "photos-reader", "event": "admission"], descriptor: descriptor)
         let lease = try await budget.acquire(bytes: configuration.resources.maxDecodedBytes)
+        lease.setIndexDiagnostic(diagnostic, descriptor: descriptor)
         guard active.isEmpty else { await lease.finishPhysicalWork(); throw ReadExecutorError.resourceExhausted }
         guard !Task.isCancelled, isCurrent() else {
             await lease.finishPhysicalWork()
@@ -77,7 +82,7 @@ public actor PhotosRepresentationReader {
         catch { await lease.finishPhysicalWork(); throw PhotosRepresentationError.resourceStorageUnavailable(String(describing: error)) }
         let id = UUID()
         let state = RepresentationRequestState(descriptor: descriptor, lease: lease, resource: resource,
-            configuration: configuration, decode: decode, isCurrent: isCurrent)
+            configuration: configuration, decode: decode, isCurrent: isCurrent, diagnostic: diagnostic)
         // Retain state even if cancellation makes PhotoKit discard its callbacks.
         // Only trustworthy terminal completion removes the physical owner.
         active[id] = state
@@ -105,6 +110,7 @@ public actor PhotosRepresentationReader {
 }
 
 private final class RepresentationRequestState: @unchecked Sendable {
+    private let diagnostic: IndexDiagnosticOperation?
     private let lock = NSLock()
     private let writerLock = NSLock()
     private let descriptor: RepresentationDescriptor
@@ -123,7 +129,8 @@ private final class RepresentationRequestState: @unchecked Sendable {
     private var timeoutTask: Task<Void, Never>?
 
     init(descriptor: RepresentationDescriptor, lease: ImageLease, resource: OwnedPhotosResource,
-         configuration: DedupConfiguration, decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage, isCurrent: @escaping @Sendable () -> Bool) {
+         configuration: DedupConfiguration, decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage, isCurrent: @escaping @Sendable () -> Bool, diagnostic: IndexDiagnosticOperation? = nil) {
+        self.diagnostic = diagnostic
         self.descriptor = descriptor; self.lease = lease; self.resource = resource
         self.configuration = configuration; self.decode = decode; self.isCurrent = isCurrent
     }
@@ -136,7 +143,11 @@ private final class RepresentationRequestState: @unchecked Sendable {
         }
         lock.unlock()
     }
-    func beginRequest() -> Bool { lock.lock(); defer { lock.unlock() }; return logicalError == nil }
+    func beginRequest() -> Bool {
+        lock.lock(); let begins = logicalError == nil; lock.unlock()
+        if begins { diagnostic?.record(["phase": "photos-reader", "event": "request"], descriptor: descriptor) }
+        return begins
+    }
     func installCancellation(_ cancellation: @escaping @Sendable () -> Void) {
         lock.lock(); cancelRequest = cancellation
         let cancel = takeCancellation(); lock.unlock()
@@ -153,6 +164,7 @@ private final class RepresentationRequestState: @unchecked Sendable {
         let continuation = self.continuation; self.continuation = nil
         let timer = timeoutTask; timeoutTask = nil
         let cancel = takeCancellation(); lock.unlock()
+        diagnostic?.record(["phase": "photos-reader", "event": error as? ReadExecutorError == .timedOut ? "timeout" : "cancel", "physical": "retained"], descriptor: descriptor)
         timer?.cancel(); continuation?.resume(throwing: error)
         // A framework cancel can reenter its terminal handler; keep this logical
         // handler independent of the writer and callback drain.
@@ -187,6 +199,7 @@ private final class RepresentationRequestState: @unchecked Sendable {
         do { try resource.closeStream() } catch let closeError { if error == nil { error = closeError } }
         lock.lock(); let finalError = error ?? logicalError; lock.unlock()
         writerLock.unlock()
+        diagnostic?.record(["phase": "photos-reader", "event": "terminal", "result": finalError == nil ? "complete" : "failure"], descriptor: descriptor)
         // Physical ownership includes close, real decode and every lazy pixel
         // consumer. Decoding never runs on the actor or framework callback queue.
         DispatchQueue.global(qos: .utility).async { [self] in
@@ -213,8 +226,11 @@ private final class RepresentationRequestState: @unchecked Sendable {
     }
     func completePhysical(_ result: Result<LoadedRepresentation, Error>) async {
         let publication = takePublication(result)
+        diagnostic?.record(["phase": "photos-reader", "event": "drain"], descriptor: descriptor)
         switch publication {
-        case .success(let value, let continuation): continuation.resume(returning: value)
+        case .success(let value, let continuation):
+            diagnostic?.record(["phase": "photos-reader", "event": "lease-returned", "physical": "consumer-owned"], descriptor: descriptor)
+            continuation.resume(returning: value)
         case .failure(let error, let continuation):
             await lease.finishPhysicalWork()
             continuation?.resume(throwing: error)

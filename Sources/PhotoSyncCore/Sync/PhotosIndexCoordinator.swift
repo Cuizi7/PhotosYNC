@@ -28,13 +28,16 @@ public actor PhotosIndexCoordinator {
     // classification only while the same descriptor remains a current failed fact.
     private var modelWaiting: [String: RepresentationDescriptor] = [:]
     private var cloudWaiting: [String: RepresentationDescriptor] = [:]
+    private let indexDiagnostics: IndexDiagnostics
     private let diagnostics: @Sendable ([String: String]) -> Void
 
     public init(store: SyncStore, photos: any PhotosIndexGateway, fingerprinter: any ImageFingerprinting,
-                configuration: DedupConfiguration,
+                configuration: DedupConfiguration, indexDiagnostics: IndexDiagnostics? = nil,
                 diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         self.store = store; self.photos = photos; self.fingerprinter = fingerprinter
-        self.configuration = configuration; self.diagnostics = diagnostics
+        let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
+        self.configuration = configuration; self.diagnostics = { context.emit($0) }
+        self.indexDiagnostics = context
         photos.attachIndexStore(store)
     }
 
@@ -44,14 +47,17 @@ public actor PhotosIndexCoordinator {
         guard !paused else { throw CancellationError() }
         guard !reconciling else { throw PhotoKitGatewayError.libraryChanged }
         reconciling = true; acknowledgedGeneration = nil; pendingDelta = nil; pendingReinsertedIDs.removeAll()
+        let diagnostic = indexDiagnostics.operation("reconcile")
         let startedAt = ProcessInfo.processInfo.systemUptime
         var counts = IndexMutationCounts()
         var complete = false
-        var retainedReady = 0, unverified = 0
+        var retainedReady = 0, unverified = 0, readyToPending = 0
         defer {
             reconciling = false
+            diagnostic.finish(); indexDiagnostics.flushObservations()
             diagnostics(["phase": "index-reconcile", "unit": "representationRows", "batch": complete ? "completed" : "aborted",
                 "added": String(counts.added), "changed": String(counts.changed), "deleted": String(counts.deleted),
+                "readyToPending": String(readyToPending), "operation": diagnostic.id,
                 "retainedReady": String(retainedReady), "unverified": String(unverified),
                 "timingMS.catalogReconciliation": String((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)])
         }
@@ -78,6 +84,7 @@ public actor PhotosIndexCoordinator {
             if let checkpoint {
                 if let previousCheckpoint {
                     let covered = try await photos.coverPersistentHistory(from: previousCheckpoint, through: checkpoint)
+                    diagnostic.record(["phase": "index-history-range", "source": "history", "category": "coverage", "fromRange": indexDiagnostics.tokenHandle(previousCheckpoint.archivedChangeToken), "throughRange": indexDiagnostics.tokenHandle(checkpoint.archivedChangeToken), "fromGeneration": previousCheckpoint.photosGeneration.map(String.init) ?? "unknown", "throughGeneration": checkpoint.photosGeneration.map(String.init) ?? "unknown", "result": covered ? "covered" : "unknown"])
                     if !covered { forceCacheInvalidation = true }
                 } else { forceCacheInvalidation = true }
             } else if previousCheckpoint != nil { forceCacheInvalidation = true }
@@ -108,12 +115,17 @@ public actor PhotosIndexCoordinator {
                 }
                 let current = generation!
                 if (forceCacheInvalidation || page.invalidateAllCachedRepresentations) && !allInvalidated {
-                    try await store.invalidateRepresentations(assetIDs: nil, generation: current)
+                    let changed = try await store.invalidateRepresentations(assetIDs: nil, generation: current)
+                    readyToPending += changed
+                    diagnostic.record(["phase": "index-invalidation", "source": "catalog", "reason": forceCacheInvalidation ? "continuity-unknown" : "catalog-unknown", "readyToPending": String(changed), "generation": String(current)])
                     try await photos.catalogInvalidationTransferred(session: session)
                     allInvalidated = true
                 } else if !allInvalidated && !page.invalidatedAssetIDs.isEmpty {
-                    try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: current)
+                    let changed = try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: current)
+                    readyToPending += changed
+                    diagnostic.record(["phase": "index-invalidation", "source": "catalog", "reason": "content-obligation", "readyToPending": String(changed), "assets": String(page.invalidatedAssetIDs.count), "generation": String(current)])
                 }
+                for descriptor in page.descriptors { diagnostic.record(["phase": "index-catalog-sample", "source": "catalog", "generation": String(current)], descriptor: descriptor) }
                 let mutations = try await store.upsertRepresentations(page.descriptors, generation: current, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
                 counts.added += mutations.added; counts.changed += mutations.changed
                 seenKeys.formUnion(page.descriptors.map(\.key))
@@ -144,7 +156,9 @@ public actor PhotosIndexCoordinator {
                               Set(facts.map { $0.key.assetID }) == Set(batch.changedAssetIDs),
                               Set(page.invalidatedAssetIDs).isSubset(of: Set(batch.changedAssetIDs)) else { throw PhotoKitGatewayError.libraryChanged }
                         if !allInvalidated && !page.invalidatedAssetIDs.isEmpty {
-                            try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: generation!)
+                            let changed = try await store.invalidateRepresentations(assetIDs: page.invalidatedAssetIDs, generation: generation!)
+                            readyToPending += changed
+                            diagnostic.record(["phase": "index-invalidation", "source": "live-catalog", "reason": "content-obligation", "readyToPending": String(changed), "generation": String(generation!)])
                         }
                         let mutations = try await store.upsertRepresentations(page.descriptors, generation: generation!, inputUnchangedAssetIDs: Set(page.inputUnchangedAssetIDs).subtracting(page.invalidatedAssetIDs))
                         counts.added += mutations.added; counts.changed += mutations.changed
@@ -193,9 +207,11 @@ public actor PhotosIndexCoordinator {
     public func processDueWork(now: Date) async {
         guard !processing, !paused else { return }
         processing = true
+        let diagnostic = indexDiagnostics.operation("work")
         var completed = 0, failed = 0, readErrors = 0
         defer {
             processing = false
+            diagnostic.finish(); indexDiagnostics.flushObservations()
             if completed > 0 || failed > 0 {
                 diagnostics(["phase": "index-work", "unit": "representationTasks", "completed": String(completed),
                              "failed": String(failed), "readErrors": String(readErrors), "waiting": String(failed - readErrors),
@@ -228,16 +244,17 @@ public actor PhotosIndexCoordinator {
                     }
                     // An unstructured owned Task does not inherit later caller
                     // cancellation. Pause cannot cancel already-started consumers.
-                    let photos = photos, model = fingerprinter, diagnostics = diagnostics
+                    diagnostic.record(["phase": "index-task", "event": "attempt", "retryCount": String(task.retryCount)], task: task)
+                    let photos = photos, model = fingerprinter
                     let work = Task { () throws -> Fingerprint in
-                        var fields = ["phase": "index-representation-timing", "asset": task.descriptor.key.assetID,
+                        var fields = ["phase": "index-representation-timing",
                                       "representation": task.descriptor.key.kind.rawValue]
                         let readStarted = ProcessInfo.processInfo.systemUptime
                         defer {
                             if fields["timingMS.representationReadWait"] == nil {
                                 fields["timingMS.representationReadWait"] = String((ProcessInfo.processInfo.systemUptime - readStarted) * 1000)
                             }
-                            diagnostics(fields)
+                            diagnostic.record(fields, task: task)
                         }
                         var loaded: LoadedRepresentation?
                         do { loaded = try await photos.readRepresentation(task.descriptor) }
@@ -280,8 +297,9 @@ public actor PhotosIndexCoordinator {
                         }
                         completionStage = "sqlite-completion"
                         if try await store.completeRepresentation(task, fingerprint: fingerprint) {
+                            diagnostic.record(["phase": "index-task", "event": "accepted"], task: task)
                             completed += 1; cloudWaiting.removeValue(forKey: waitKey); modelWaiting.removeValue(forKey: waitKey)
-                        }
+                        } else { diagnostic.record(["phase": "index-task", "event": "rejected", "reason": "stale-issuance"], task: task) }
                     } catch is CancellationError {
                         // Eligibility revoked before a new model phase is deferred work,
                         // not a damaged image. The owned task has returned and released
@@ -301,10 +319,11 @@ public actor PhotosIndexCoordinator {
                             let delay = underlying is ModelExecutionUnavailable ? 60 : delays[min(task.retryCount, delays.count - 1)]
                             if try await store.failRepresentation(task, nextRetryAt: now.addingTimeInterval(delay),
                                 detail: String(describing: underlying), failureKind: readFailure ? .photosRead : nil) {
+                                diagnostic.record(["phase": "index-task", "event": "failure", "stage": stage, "failureAt": "unknown", "deadline": String(now.addingTimeInterval(delay).timeIntervalSince1970)], task: task)
                                 failed += 1
                                 if readFailure { readErrors += 1 }
                                 diagnostics(["phase": "index-representation", "stage": stage,
-                                    "result": readFailure ? "read-error" : "waiting", "asset": task.descriptor.key.assetID,
+                                    "result": readFailure ? "read-error" : "waiting",
                                     "representation": task.descriptor.key.kind.rawValue, "error": String(describing: underlying),
                                     "retryCount": String(task.retryCount + 1),
                                     "nextRetryAt": String(now.addingTimeInterval(delay).timeIntervalSince1970)])
@@ -429,7 +448,8 @@ public actor PhotosIndexCoordinator {
                     invalidatedAssetIDs: Set(page.invalidatedAssetIDs).union(reinserted.intersection(batch.changedAssetIDs)).sorted(),
                     invalidateAllCachedRepresentations: page.invalidateAllCachedRepresentations, inputUnchangedAssetIDs: page.inputUnchangedAssetIDs)
                 _ = try await store.applyIndexDeltaBatch(slice, page: effectivePage,
-                    fingerprintVersion: configuration.fingerprint.version, checkpoint: index == offsets.count - 1 ? checkpoint : nil)
+                    fingerprintVersion: configuration.fingerprint.version, checkpoint: index == offsets.count - 1 ? checkpoint : nil,
+                    diagnostic: indexDiagnostics.operation("live-delta"))
             }
             guard !paused, serial == changeSerial else { throw PhotoKitGatewayError.libraryChanged }
             let snapshot = try await photos.candidateSnapshot()

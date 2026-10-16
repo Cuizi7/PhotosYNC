@@ -34,12 +34,12 @@ struct AdvancedRuntimeGraph: Sendable {
 
     init(store: SyncStore, photos: any PhotosIndexGateway, model: any ImageFingerprinting,
          configuration: DedupConfiguration, executor: ReadExecutor, budget: ImageWorkBudget,
-         directory: @escaping SyncEngine.DirectoryFactory, now: @escaping @Sendable () -> Date, logger: RunLogger? = nil) {
+         directory: @escaping SyncEngine.DirectoryFactory, now: @escaping @Sendable () -> Date, logger: RunLogger? = nil, indexDiagnostics: IndexDiagnostics? = nil) {
         self.configuration = configuration; self.photos = photos; self.model = model; self.budget = budget
         logger?.log(["phase": "sqlite-vector-query", "backend": configuration.backend,
             "effectiveMmapBytes": String(store.vectorQueryMmapBytes), "ordinaryCacheKiB": "16384"])
         coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
-            configuration: configuration, diagnostics: { logger?.log($0) })
+            configuration: configuration, indexDiagnostics: indexDiagnostics, diagnostics: { logger?.log($0) })
         service = AdvancedDedupService(store: store, photos: photos, coordinator: coordinator,
             fingerprinter: model, configuration: configuration, executor: executor, budget: budget)
         legacy = LegacySkipReevaluation(store: store,
@@ -64,10 +64,11 @@ struct AdvancedRuntimeGraph: Sendable {
             try Task.checkCancellation()
             try await model.prepareExecution()
             try Task.checkCancellation()
+            let indexDiagnostics = IndexDiagnostics(sink: { logger?.log($0) })
             let budget = ImageWorkBudget(limits: configuration.resources)
-            let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget, diagnostics: { logger?.log($0) })
+            let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget, indexDiagnostics: indexDiagnostics, diagnostics: { logger?.log($0) })
             return AdvancedRuntimeGraph(store: store, photos: photos, model: model,
-                configuration: configuration, executor: executor, budget: budget, directory: directory, now: now, logger: logger)
+                configuration: configuration, executor: executor, budget: budget, directory: directory, now: now, logger: logger, indexDiagnostics: indexDiagnostics)
         }
     }
 
