@@ -2,15 +2,13 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.5 stable
+## 0.2.6 stable
 
-0.2.5 (build 13) preserves completed fingerprints while Photos observation remains continuous. Full inventory checks use classified live changes without replaying generic history updates over confirmed unchanged content. True edits and genuine observation gaps still require revalidation; permission transitions revoke stale inventory confirmations even when no read is in progress.
+0.2.6 (build 14) keeps logical Photos-read deadlines, cancellation and reader-admission queries responsive when the synchronous request-start call blocks. Startup runs on a utility queue under the existing single-owner limit. Physical ownership can transfer or release only after both request startup has returned and terminal processing has settled, including callbacks delivered synchronously before startup returns.
 
-Requests already covered by a successful full inventory no longer trigger a second whole-library pass. Subscription cancellation no longer takes the delivery lock from Swift's task cancellation callback. The model, 0.98 threshold, image acquisition and resizing, schema v9, source-root recovery and successful-import history remain unchanged.
+A permanently blocked system startup still retains its bounded worker and resource lease. This patch does not establish a fix for the observed Photos timeouts, long physical-drain waits or source-video metadata failures. The new execution context has synthetic regression coverage but no new real PhotoKit acceptance. See the [0.2.6 release notes](docs/release/0.2.6.md).
 
-Active sessions retain the last safely recovered durable history checkpoint. Startup or a real gap can conservatively revalidate changes since it, and work already made unverified by an older version still needs validation. iCloud retrieval and a system request that never completes can still delay progress. See the [0.2.5 release notes](docs/release/0.2.5.md) and [Photos continuity contract](docs/research/advanced-dedup/photokit-contract.md).
-
-Routine release validation now defaults to one large mixed-history scale sample; changes affecting indexing, queries, models or resource behavior retain the full profile. This release uses `scripts/package-release.sh --scale-profile full` on exact main. Provenance binds the archived source, complete tests and artifact checks. Historical [0.2.4 notes](docs/release/0.2.4.md) and earlier evidence remain; no new real Photos/production or macOS 13/Intel hardware acceptance is claimed.
+Schema v9, the model, threshold, media selection, source immutability, successful-import history and the 0.2.5 continuity rules are retained. This release uses `scripts/package-release.sh --scale-profile full` on exact main; provenance binds the archived source, complete tests and artifact checks. No new GUI, real Photos/production or macOS 13/Intel hardware acceptance is claimed.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -34,18 +32,19 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Release configuration: **0.2.5 stable (build 13)**, targeting
-`outputs/releases/0.2.5/`; see [release notes](docs/release/0.2.5.md)
+Release configuration: **0.2.6 stable (build 14)**, targeting
+`outputs/releases/0.2.6/`; see [release notes](docs/release/0.2.6.md)
 and the [changelog](CHANGELOG.md).
 The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
+[0.2.5 stable build 13](docs/release/0.2.5.md),
 [0.2.4 stable build 12](docs/release/0.2.4.md),
 [0.2.3 stable build 11](docs/release/0.2.3.md),
 [0.2.2 stable build 10](docs/release/0.2.2.md),
 [0.2.1 stable build 9](docs/release/0.2.1.md),
 [0.2.0 stable build 8](docs/release/0.2.0.md) and
-[0.2.0 beta build 7](docs/release/0.2.0-beta.md) notes and artifacts are retained.
+[0.2.0 beta build 7](docs/release/0.2.0-beta.md) notes and local artifacts are retained. GitHub Releases 0.2.0–0.2.4 are withdrawn from public distribution because of serious bugs; their tags and source history are retained.
 The package entry point requires Apple Silicon and Intel code, the compiled
 layered icon and an ICNS fallback for older macOS. The previous 0.1.0 stable
 build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
