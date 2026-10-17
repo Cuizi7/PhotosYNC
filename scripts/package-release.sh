@@ -7,6 +7,17 @@ fail() {
   exit "${2:-1}"
 }
 
+scale_profile=release
+case $# in
+  0) ;;
+  2)
+    [[ "$1" == '--scale-profile' && ( "$2" == 'release' || "$2" == 'full' ) ]] || \
+      fail 'Usage: scripts/package-release.sh [--scale-profile release|full]' 64
+    scale_profile="$2"
+    ;;
+  *) fail 'Usage: scripts/package-release.sh [--scale-profile release|full]' 64 ;;
+esac
+
 cd "${0:A:h:h}"
 release_name=0.2.4
 release_root="$PWD/outputs/releases"
@@ -63,6 +74,7 @@ env -u RQDATAC2_CONF python3 "$source_dir/scripts/advanced-dedup/release.py" \
 cd "$source_dir"
 
 env -u RQDATAC2_CONF python3 scripts/validate.py \
+  --scale-profile "$scale_profile" \
   --output-dir "$validation_dir" \
   --derived-data "$validation_derived_data" > "$build_dir/validate.log" 2>&1
 
@@ -70,12 +82,13 @@ validation_json="$validation_dir/validation.json"
 [[ -f "$validation_json" && ! -L "$validation_json" ]] || \
   fail "Validation completed without a regular success marker: $validation_json" 70
 
-validation_summary=$(env -u RQDATAC2_CONF python3 -c '
-import json
+validation_summary=$(env -u RQDATAC2_CONF PYTHONDONTWRITEBYTECODE=1 python3 -c '
 import sys
+from pathlib import Path
+from scripts.validate import read_json, validate_scale_evidence
 
-with open(sys.argv[1], encoding="utf-8") as source:
-    evidence = json.load(source)
+evidence = read_json(Path(sys.argv[1]))
+validate_scale_evidence(evidence, output_dir=Path(sys.argv[1]).parent, expected_profile=sys.argv[2])
 try:
     test_count = evidence["xctest"]["test_count"]
     tool_test_count = evidence["tool_tests"]["test_count"]
@@ -95,13 +108,14 @@ if continuation.get("status") != "passed" or continuation.get("regression") != "
     raise SystemExit("validation evidence does not prove the continuation regression")
 if set(continuations) != {"stamp", "advanced-preparation"} or any(item.get("status") != "passed" for item in continuations.values()):
     raise SystemExit("validation evidence lacks both continuation scenarios")
-if set(advanced.get("scale", {})) != {"100000", "150000", "200000", "200000-history-100000"}:
-    raise SystemExit("validation evidence lacks current graph scale samples")
 if any(not advanced.get(key) for key in ("resources_sha256", "model_regression_sha256", "runtime_load_sha256")):
     raise SystemExit("validation evidence lacks advanced model/runtime/resource gates")
-print(f"{test_count}\t{tool_test_count}\t{manifest}")
-' "$validation_json")
-IFS=$'\t' read -r validation_test_count validation_tool_test_count validation_manifest_hash <<< "$validation_summary"
+scale = evidence["scale_validation"]
+print("\t".join((str(test_count), str(tool_test_count), manifest, scale["profile"],
+                 ",".join(scale["required_samples"]), ",".join(scale["executed_samples"]))))
+' "$validation_json" "$scale_profile")
+IFS=$'\t' read -r validation_test_count validation_tool_test_count validation_manifest_hash \
+  validation_scale_profile validation_scale_required validation_scale_executed <<< "$validation_summary"
 
 archive_source_manifest() {
   env -u RQDATAC2_CONF PYTHONDONTWRITEBYTECODE=1 python3 -c '
@@ -171,6 +185,9 @@ continuation_result_hash=$(shasum -a 256 "$release_dir/validation/continuation-r
   print "validation_report_sha256=$validation_report_hash"
   print "validation_xctest_count=$validation_test_count"
   print "validation_tool_test_count=$validation_tool_test_count"
+  print "validation_scale_profile=$validation_scale_profile"
+  print "validation_scale_required_samples=$validation_scale_required"
+  print "validation_scale_executed_samples=$validation_scale_executed"
   print "validation_source_manifest_sha256=$validation_manifest_hash"
   print "release_source_manifest_sha256=$(archive_source_manifest)"
   print 'validation_continuation_result=validation/continuation-race/result.json'

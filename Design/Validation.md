@@ -186,6 +186,18 @@ Ordinary beta changes do not require repeating all historical real-Photos tests.
 
 Current execution results must be taken from the final package's provenance and validation evidence. This section defines the gate; it does not predeclare a future build successful. The original beta3 archive at 1f0047d remains historical and is not retroactively relabeled as having run the new gate.
 
+### Scale profiles — 2026-10-16
+
+The current default for both `scripts/validate.py` and `scripts/package-release.sh` is `--scale-profile release`: exactly one optimized actual-graph sample with 200,000 representations and 100,000 success-history vectors. It retains the existing 2,000 ms preparation/readiness and 4 GiB peak-RSS budgets, per-table read/write observations, restart checks, large-media samples and 60-second idle/resume measurement. Complete functional XCTest, Tools, actual-model/runtime/resource checks, both continuation regressions and all distribution checks remain required.
+
+Select `--scale-profile full` explicitly for index/candidate-query/cache/SQLite changes, preprocessing/model performance or resource behavior changes, scale-harness or threshold changes, and performance investigations. Both entry points accept the same flag. Full runs exactly 100,000/150,000/200,000 representations without success history, then 200,000 representations + 100,000 history. Those first three samples cover 0%/50%/100% edited representations; the default maximum mixed sample is not equivalent evidence for the zero/half-edited distributions or a scaling curve. This is a documented author/reviewer selection responsibility, with no automatic change classifier.
+
+Validation JSON and its human report identify profile, required samples and executed samples; package provenance repeats these fields. Each profile requires its exact current-run set and valid matching reports. Missing/failed/malformed, duplicate keys/samples/phases, unexpected reports, mismatched identity/hash/profile or an unknown profile cannot pass. Historical releases keep their original four-sample evidence; they are not relabeled. Full CLI orchestration can be verified synthetically without claiming a new four-scale performance measurement.
+
+The complete XCTest suite also emits `scale-2.json` for its two-row functional measurement-harness smoke. This separately checked evidence is retained, is not an optimized profile sample, and does not allow arbitrary extra scale reports.
+
+During development, run affected checks; final packaging runs canonical validation once in its exact source archive. Independent QA verifies that snapshot's reports, hashes and provenance. A read-only review does not invalidate those results or require repeating the complete suite. This does not authorize skipping required gates or caching success across changed commits.
+
 ## 0.2 advanced dedup integration gate (2026-10-05)
 
 The current scope, resource/LFS identities, approved 512 MiB conservative-overlimit policy and evidence are in [0.2 validation](../docs/release/0.2.0-advanced-dedup-validation.md). The canonical entry point now requires the local approved fixture validator, actual-model 33-case content/action regression, a nonempty injected actual runtime graph, complete XCTest/Tools, and both continuation scenarios with GREEN and intended RED. It preserves source-manifest identity and records current compilation cache identity separately from the portable source model package. Missing resources, license, model bytes, reports or passing cases block acceptance.

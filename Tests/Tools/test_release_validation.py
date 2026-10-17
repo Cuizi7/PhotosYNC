@@ -53,9 +53,11 @@ class ReleaseFixture:
         environment.update(overrides)
         return environment
 
-    def run_validator(self, output_dir: Path, derived_data: Path, **environment: str) -> subprocess.CompletedProcess[str]:
+    def run_validator(self, output_dir: Path, derived_data: Path, *, scale_profile: str | None = None,
+                      **environment: str) -> subprocess.CompletedProcess[str]:
+        arguments = [] if scale_profile is None else ["--scale-profile", scale_profile]
         return subprocess.run(
-            [sys.executable, "scripts/validate.py", "--output-dir", str(output_dir), "--derived-data", str(derived_data)],
+            [sys.executable, "scripts/validate.py", "--output-dir", str(output_dir), "--derived-data", str(derived_data), *arguments],
             cwd=self.root,
             env=self.environment(**environment),
             text=True,
@@ -63,9 +65,10 @@ class ReleaseFixture:
             check=False,
         )
 
-    def run_packager(self, **environment: str) -> subprocess.CompletedProcess[str]:
+    def run_packager(self, *, scale_profile: str | None = None, **environment: str) -> subprocess.CompletedProcess[str]:
+        arguments = [] if scale_profile is None else ["--scale-profile", scale_profile]
         return subprocess.run(
-            ["zsh", "scripts/package-release.sh"],
+            ["zsh", "scripts/package-release.sh", *arguments],
             cwd=self.root,
             env=self.environment(**environment),
             text=True,
@@ -77,6 +80,54 @@ class ReleaseFixture:
         if not self.events.exists():
             return []
         return self.events.read_text().splitlines()
+
+    def corrupt_validator_evidence_after_success(self) -> None:
+        # Corrupt the producer/consumer boundary, without replacing either real
+        # gate. Only the fixture's Python launcher edits the finished evidence.
+        self._write_tool("python3", f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import hashlib, json, os, subprocess, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            result = subprocess.run([sys.executable, *args])
+            if result.returncode == 0 and args[0] == 'scripts/validate.py':
+                root = Path(args[args.index('--output-dir') + 1])
+                path = root / 'validation.json'
+                data = json.loads(path.read_text())
+                mode = os.environ['FAKE_EVIDENCE_CORRUPTION']
+                sample = '200000-history-100000'
+                contract = data.setdefault('scale_validation', {
+                    'profile': 'release', 'required_samples': [sample], 'executed_samples': [sample]})
+                if mode == 'missing-profile': data.pop('scale_validation')
+                elif mode == 'wrong-profile': contract['profile'] = 'full'
+                elif mode == 'duplicate-required': contract['required_samples'] *= 2
+                elif mode == 'duplicate-executed': contract['executed_samples'] *= 2
+                elif mode == 'missing-executed': contract['executed_samples'] = []
+                elif mode == 'extra-executed': contract['executed_samples'].append('100000')
+                elif mode == 'missing-result': data['advanced_dedup']['scale'].pop(sample)
+                elif mode == 'extra-result': data['advanced_dedup']['scale']['unexpected'] = {}
+                elif mode == 'duplicate-phase': data['phases'].append(next(p for p in data['phases'] if p['name'] == 'scale-' + sample))
+                elif mode == 'wrong-hash': data['advanced_dedup']['scale'][sample]['result_sha256'] = '0' * 64
+                elif mode == 'extra-file': (root / 'scale-unexpected.json').write_text('{}')
+                elif mode == 'wrong-smoke':
+                    smoke = root / 'scale-2.json'
+                    payload = json.loads(smoke.read_text()); payload['representations'] = 100000
+                    smoke.write_text(json.dumps(payload))
+                elif mode in ('failed-sample', 'wrong-identity', 'duplicate-sample-key', 'wrong-report-path'):
+                    entry = data['advanced_dedup']['scale'][sample]
+                    report = root / entry['result']
+                    payload = json.loads(report.read_text())
+                    if mode == 'failed-sample': payload['budget_pass'] = False
+                    if mode == 'wrong-identity': payload['representations'] = 100000
+                    report.write_text(json.dumps(payload))
+                    if mode == 'duplicate-sample-key':
+                        report.write_text(report.read_text().replace('{', '{"budget_pass":false,', 1))
+                    entry['result_sha256'] = hashlib.sha256(report.read_bytes()).hexdigest()
+                    if mode == 'wrong-report-path': entry['result'] = '../scale-' + sample + '.json'
+                path.write_text(json.dumps(data))
+                if mode == 'duplicate-summary-key':
+                    path.write_text(path.read_text().replace('{', '{"status":"failed",', 1))
+            sys.exit(result.returncode)
+            '''))
 
     def release_path(self) -> Path:
         return self.root / "outputs" / "releases" / "0.2.4"
@@ -179,12 +230,70 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertEqual(evidence["xctest"]["test_count"], 7)
         self.assertEqual(evidence["tool_tests"]["test_count"], 1)
         self.assertEqual(evidence["continuation_race"]["status"], "passed")
+        sample = "200000-history-100000"
+        self.assertEqual(evidence["scale_validation"], {
+            "profile": "release", "required_samples": [sample], "executed_samples": [sample],
+        })
+        self.assertEqual(list(evidence["advanced_dedup"]["scale"]), [sample])
+        self.assertEqual({p.name for p in output_dir.glob("scale-*.json")}, {"scale-2.json", f"scale-{sample}.json"})
+        report = (output_dir / "validation-report.md").read_text()
+        self.assertIn("Scale profile: release", report)
+        self.assertIn(f"Required scale samples: {sample}", report)
+        self.assertIn(f"Executed scale samples: {sample}", report)
         self.assertTrue((output_dir / "validation-report.md").is_file())
         self.assertNotIn("must-not-reach-child-tools", "\n".join(self.fixture.event_lines()))
         self.assertEqual(
             [line.split(":", 1)[0] for line in self.fixture.event_lines()],
-            ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcrun", "xcrun", "xcrun", "continuation", "continuation"],
+            ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcodebuild", "xcrun", "continuation", "continuation"],
         )
+
+    def test_validator_full_profile_executes_all_four_samples(self) -> None:
+        output_dir = Path(self.temporary_directory.name) / "full"
+        result = self.fixture.run_validator(output_dir, output_dir.with_name("full-derived"), scale_profile="full")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evidence = json.loads((output_dir / "validation.json").read_text())
+        samples = ["100000", "150000", "200000", "200000-history-100000"]
+        self.assertEqual(evidence["scale_validation"], {
+            "profile": "full", "required_samples": samples, "executed_samples": samples,
+        })
+        self.assertEqual(set(evidence["advanced_dedup"]["scale"]), set(samples))
+        self.assertEqual({p.name for p in output_dir.glob("scale-*.json")}, {"scale-2.json", *[f"scale-{s}.json" for s in samples]})
+        self.assertEqual([p["name"] for p in evidence["phases"] if p["name"].startswith("scale-")],
+                         ["scale-build", *[f"scale-{s}" for s in samples]])
+
+    def test_entry_points_reject_unknown_scale_profile_before_running_tools(self) -> None:
+        output_dir = Path(self.temporary_directory.name) / "unknown"
+        result = self.fixture.run_validator(output_dir, output_dir.with_name("unknown-derived"), scale_profile="fast")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output_dir.exists())
+        result = self.fixture.run_packager(scale_profile="fast")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.fixture.event_lines(), [])
+        self.assertFalse(self.fixture.release_path().exists())
+
+    def test_validator_rejects_missing_malformed_duplicate_and_extra_scale_reports(self) -> None:
+        for mode in ('missing', 'malformed', 'duplicate-key', 'extra', 'nonobject'):
+            with self.subTest(mode=mode):
+                output = Path(self.temporary_directory.name) / mode
+                result = self.fixture.run_validator(output, output.with_name(mode + '-derived'), FAKE_SCALE_REPORT_MODE=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((output / 'validation.json').exists())
+
+    def test_packager_rejects_tampered_scale_contract_and_report_evidence(self) -> None:
+        modes = ('missing-profile', 'wrong-profile', 'duplicate-required', 'duplicate-executed',
+                 'missing-executed', 'extra-executed', 'missing-result', 'extra-result',
+                 'duplicate-phase', 'wrong-hash', 'extra-file', 'failed-sample', 'wrong-identity',
+                 'duplicate-sample-key', 'wrong-report-path', 'duplicate-summary-key', 'wrong-smoke')
+        for mode in modes:
+            temporary = tempfile.TemporaryDirectory()
+            with self.subTest(mode=mode), temporary:
+                fixture = ReleaseFixture(temporary)
+                fixture.corrupt_validator_evidence_after_success()
+                result = fixture.run_packager(FAKE_EVIDENCE_CORRUPTION=mode)
+                self.assertNotEqual(result.returncode, 0, mode)
+                self.assertNotIn('xcodebuild:release', fixture.event_lines())
+                self.assertFalse(fixture.release_path().exists())
+                self.assert_no_transient_release_paths(fixture)
 
     def test_validator_rejects_false_or_missing_index_change_readiness(self) -> None:
         for mode in ("false", "missing"):
@@ -195,7 +304,7 @@ class ReleaseValidationTests(unittest.TestCase):
                     Path(self.temporary_directory.name) / f"derived-readiness-{mode}",
                     FAKE_SCALE_READINESS=mode,
                 )
-                scale = json.loads((output_dir / "scale-100000.json").read_text())
+                scale = json.loads((output_dir / "scale-200000-history-100000.json").read_text())
                 self.assertIs(scale["budget_pass"], True)
                 self.assertLessEqual(scale["hot_preparation_ms"]["p95"], 2000)
                 self.assertLessEqual(scale["source_incremental_ms"]["p95"], 2000)
@@ -243,10 +352,12 @@ class ReleaseValidationTests(unittest.TestCase):
                         FAKE_PREPARATION_SCOPE=scope,
                         FAKE_PREPARATION_OVERRIDES=json.dumps(overrides),
                     )
-                    report = "scale-100000.json" if scope == "scale" else "runtime-load.json"
+                    report = "scale-200000-history-100000.json" if scope == "scale" else "runtime-load.json"
                     self.assertIs(json.loads((output_dir / report).read_text())["budget_pass"], True)
                     self.assertNotEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("preparation", result.stderr.lower())
+                    # Strict JSON rejects NaN/Infinity before field-level budget
+                    # validation; both must fail cleanly without a success marker.
+                    self.assertNotIn("Traceback", result.stderr)
                     self.assertFalse((output_dir / "validation.json").exists())
                     self.assertFalse((output_dir / "validation-report.md").exists())
 
@@ -361,6 +472,9 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertIn("release=0.2.4", provenance)
         self.assertIn("build_number=12", provenance)
         self.assertIn("signing=ad-hoc; notarized=no", provenance)
+        self.assertIn("validation_scale_profile=release", provenance)
+        self.assertIn("validation_scale_required_samples=200000-history-100000", provenance)
+        self.assertIn("validation_scale_executed_samples=200000-history-100000", provenance)
         self.assertTrue((release / "SHA256SUMS").is_file())
         self.assertIn(
             "./validation/continuation-race/probe evidence with spaces.txt",
@@ -371,6 +485,20 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertLess(events.index("continuation:absent"), next(index for index, line in enumerate(events) if line == "xcodebuild:release"))
         self.assertTrue(any(line == "hdiutil:verify" for line in events))
         self.assert_no_transient_release_paths(self.fixture)
+
+    def test_packager_full_profile_is_preserved_in_report_and_provenance(self) -> None:
+        result = self.fixture.run_packager(scale_profile="full")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        release = self.fixture.release_path()
+        samples = ["100000", "150000", "200000", "200000-history-100000"]
+        evidence = json.loads((release / "validation/validation.json").read_text())
+        self.assertEqual(evidence["scale_validation"], {
+            "profile": "full", "required_samples": samples, "executed_samples": samples,
+        })
+        provenance = (release / "PhotosYNC.provenance").read_text().splitlines()
+        self.assertIn("validation_scale_profile=full", provenance)
+        self.assertIn("validation_scale_required_samples=" + ",".join(samples), provenance)
+        self.assertIn("validation_scale_executed_samples=" + ",".join(samples), provenance)
 
     def test_packager_never_publishes_after_validation_or_distribution_failure(self) -> None:
         cases = {
@@ -600,12 +728,29 @@ if [ -n "${PHOTOSYNC_SCALE_REPRESENTATIONS:-}" ]; then
   esac
   printf '{"representations":%s,"success_history_vectors":%s,"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"large_source_samples":[{},{}],"index_change_sample_count_per_operation":5,"query_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":0},"unchanged_full_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":3},"idle_60s":{"elapsed_seconds":60,"after":{"footprint_bytes":1,"rss_bytes":1},"resume_query_ms":1}%s%s}' "$PHOTOSYNC_SCALE_REPRESENTATIONS" "${PHOTOSYNC_SCALE_HISTORY:-0}" "$readiness" "$delta" > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
   patch_preparation_report scale "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json"
+  if [ -n "${FAKE_SCALE_REPORT_MODE:-}" ]; then
+    python3 - "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-$sample.json" <<'BAD_SCALE'
+import os,sys
+from pathlib import Path
+path=Path(sys.argv[1]); mode=os.environ['FAKE_SCALE_REPORT_MODE']
+if mode == 'missing': path.unlink()
+elif mode == 'malformed': path.write_text('{')
+elif mode == 'duplicate-key': path.write_text(path.read_text().replace('{', '{"budget_pass":false,', 1))
+elif mode == 'extra': (path.parent / 'scale-unexpected.json').write_text('{}')
+elif mode == 'nonobject': path.write_text('[]')
+BAD_SCALE
+  fi
   printf "Test Suite 'Selected tests' passed at fixture.\\n"
   printf 'Executed 1 test, with 0 failures\\n'
   exit 0
 fi
 case "${FAKE_XCTEST_MODE:-success}" in
   success)
+    # The real complete suite writes this functional two-row harness smoke. It
+    # must survive packaging without being counted as a performance sample.
+    cat > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-2.json" <<'SMOKE'
+{"representations":2,"success_history_vectors":0,"performance_contract":"background-preparation-v2","preparation_p95_budget_ms":2000,"budget_pass":true,"hot_preparation_ms":{"p95":100},"source_incremental_ms":{"p95":500},"rss_peak_bytes":1000000,"delta_path_verified":true,"index_change_ready_within_2s":true,"index_change_sample_count_per_operation":5,"query_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":0},"unchanged_full_io":{"rows.photos_representation":0,"rows.fingerprint_task":0,"rows.photos_index_exclusion":0,"rows.dedup_index_state":3}}
+SMOKE
     printf '{"case_count":33,"duplicate_count":14,"skip_count":11}' > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-regression.json"
     python3 - "$PHOTOSYNC_ACCEPTANCE_OUTPUT/model-execution.json" <<'P12'
 import json,platform,sys
