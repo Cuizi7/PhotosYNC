@@ -402,6 +402,7 @@ private actor P8Photos: PhotosIndexGateway {
     private var admission: PhotosReaderAdmission = .available
     private var admissionGate: P8Gate?
     private var catalogFailure = false, catalogInvalidation = false
+    private var modificationDate = Date(timeIntervalSinceReferenceDate: 100)
     func gateNextAdmission(_ gate: P8Gate) { admissionGate = gate }
     func advanceGeneration() { generation += 1 }
     func failNextCatalog() { catalogFailure = true }
@@ -473,10 +474,11 @@ private actor P8Photos: PhotosIndexGateway {
         catalogWaiters.removeAll { catalogCount > $0.0 }; ready.forEach { $0.1.resume() }
         if catalogFailure { catalogFailure = false; throw PhotoKitGatewayError.libraryUnavailable }
         let invalidated = catalogInvalidation ? (0..<taskCount).map { String(format: "%03d", $0) } : []
+        if catalogInvalidation { modificationDate = modificationDate.addingTimeInterval(1) }
         catalogInvalidation = false
         return .init(context: context, generation: capturedGeneration, descriptors: (0..<taskCount).map {
             .init(key: .init(assetID: String(format: "%03d", $0), kind: .original), context: context,
-                  revision: "r1", size: try! PixelSize(width: 8, height: 8), equivalentToOriginal: false, revisionIsReliable: true)
+                  revision: "r1", size: try! PixelSize(width: 8, height: 8), equivalentToOriginal: false, revisionIsReliable: true, modificationDate: modificationDate)
         }, nextOffset: multiplePages && offset == 0 ? 1 : nil, invalidatedAssetIDs: invalidated)
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {

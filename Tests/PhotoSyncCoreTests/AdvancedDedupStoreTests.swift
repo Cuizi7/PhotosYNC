@@ -6,6 +6,294 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testCompletedRemovalThenSameSuccessfulDateReturnReusesOnlyAfterMembershipFinish() async throws {
+        for changedLocator in [false, true] {
+            let (root, db, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let context = LibraryContext(id: UUID(), epoch: 1), item = try datedDescriptor(context)
+            var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+            try await store.upsertRepresentations([item], generation: generation)
+            let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+            try await assertTrue(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+            _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [item.key])
+            generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+            _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=1 AND successful_modification_date=100 AND vector IS NOT NULL", at: db), 1)
+
+            generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
+            let returned = try datedDescriptor(context, revision: changedLocator ? "new-locator" : "A", width: changedLocator ? 1280 : 640)
+            try await store.upsertRepresentations([returned], generation: generation)
+            try await assertTrue(try await store.nextRepresentationTasks(now: Date(), limit: 1).isEmpty)
+            let incomplete = try await store.indexProgress(); XCTAssertEqual(incomplete.readyRepresentations, 0)
+            _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [returned.key])
+            let complete = try await store.indexProgress(); XCTAssertEqual(complete.readyRepresentations, 1)
+            try await assertTrue(try await store.nextRepresentationTasks(now: Date(), limit: 1).isEmpty)
+            try await assertFalse(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0 AND state='ready' AND successful_modification_date=100 AND successful_vector_version='v1'", at: db), 1)
+            try await assertFalse(try await store.indexPublication() == nil)
+        }
+    }
+
+    func testCompletedRemovalReturnWithChangedMissingDateOrContractRetainsSuccessButNeedsWork() async throws {
+        for change in ["date", "missing-date", "contract"] {
+            let (root, db, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let context = LibraryContext(id: UUID(), epoch: 1), item = try datedDescriptor(context)
+            var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+            try await store.upsertRepresentations([item], generation: generation)
+            let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+            try await assertTrue(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+            _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [item.key])
+            generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+            _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
+            generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: change == "contract" ? "v2" : "v1")
+            let returned = try datedDescriptor(context, date: change == "missing-date" ? nil : Date(timeIntervalSinceReferenceDate: change == "date" ? 200 : 100))
+            try await store.upsertRepresentations([returned], generation: generation)
+            _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [returned.key])
+            let progress = try await store.indexProgress(); XCTAssertEqual(progress.readyRepresentations, 0)
+            let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+            XCTAssertEqual(task.descriptor, returned); XCTAssertEqual(task.indexGeneration, generation)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0 AND state='pending' AND successful_modification_date=100 AND successful_vector_version='v1' AND vector IS NOT NULL", at: db), 1)
+            try await assertFalse(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+            try await assertNil(try await store.indexPublication())
+        }
+    }
+
+    func testMissingRevisionPreservesRetryDeadlineButRevokesOldIssuance() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), item = descriptor(context, reliable: false)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: .distantPast, limit: 1).first)
+        let deadline = Date(timeIntervalSince1970: 2000)
+        try await assertTrue(try await store.failRepresentation(old, nextRetryAt: deadline, detail: "retry"))
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        try await assertFalse(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+        let early = try await store.nextRepresentationTasks(now: deadline.addingTimeInterval(-1), limit: 1)
+        XCTAssertTrue(early.isEmpty)
+        let retry = try await unwrap(try await store.nextRepresentationTasks(now: deadline, limit: 1).first)
+        XCTAssertEqual(retry.retryCount, 1); XCTAssertEqual(retry.nextRetryAt, deadline)
+        XCTAssertEqual(retry.indexGeneration, generation)
+    }
+
+    private func datedDescriptor(_ context: LibraryContext, asset: String = "asset", revision: String = "A",
+                                 date: Date? = Date(timeIntervalSinceReferenceDate: 100), width: Int = 640,
+                                 kind: RepresentationKind = .original) throws -> RepresentationDescriptor {
+        RepresentationDescriptor(key: .init(assetID: asset, kind: kind), context: context, revision: revision,
+            size: try PixelSize(width: width, height: 480), equivalentToOriginal: false, revisionIsReliable: true,
+            modificationDate: date)
+    }
+
+    func testSameSuccessfulDateReusesAcrossRevisionDimensionsAndReopenWithoutDigest() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let item = try datedDescriptor(context)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+        let reopened = try SyncStore(url: db)
+        generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        let changed = try datedDescriptor(context, revision: "resource-changed", width: 1280)
+        try await reopened.upsertRepresentations([changed], generation: generation)
+        let tasks = try await reopened.nextRepresentationTasks(now: Date(), limit: 1)
+        XCTAssertTrue(tasks.isEmpty, "same successful date and contract needs no read or inference")
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND successful_modification_date=100 AND successful_vector_version='v1' AND input_vector_version IS NULL", at: db), 1)
+        try await assertFalse(try await reopened.completeRepresentation(old, fingerprint: fingerprint("v1")))
+    }
+
+    func testChangedDateRetainsSuccessfulFactsAcrossFailureAndAcceptsDigestHitAtomically() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), input = try preparedDigest(red: 32)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: generation)
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.completeRepresentation(old, result: digestResult(input))
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([try datedDescriptor(context, date: Date(timeIntervalSinceReferenceDate: 200))], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(task.descriptor)) as? [String: Any])
+        XCTAssertEqual(encoded["modificationDate"] as? Double, Date(timeIntervalSinceReferenceDate: 200).timeIntervalSinceReferenceDate)
+        let cached = try await unwrap(try await store.reusableFingerprint(task, input: input))
+        try await assertNil(try await store.completeRepresentation(old, result: digestResult(input)))
+        let deadline = Date(timeIntervalSince1970: 9999999999)
+        try await assertTrue(try await store.failRepresentation(task, nextRetryAt: deadline, detail: "read failed", failureKind: .photosRead))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='failed' AND length(vector)=4096 AND observed_modification_date=200 AND successful_modification_date=100 AND successful_vector_version='v1' AND input_vector_version='v1'", at: db), 1)
+        try await assertNil(try await store.reusableFingerprint(task, input: input))
+        try await assertNil(try await store.completeRepresentation(task, result: FingerprintResult(fingerprint: cached, inputDigest: input, reusedCachedVector: true)))
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([try datedDescriptor(context, date: Date(timeIntervalSinceReferenceDate: 200))], generation: generation)
+        try await assertTrue(try await store.nextRepresentationTasks(now: deadline.addingTimeInterval(-1), limit: 1).isEmpty)
+        let retry = try await unwrap(try await store.nextRepresentationTasks(now: deadline, limit: 1).first)
+        XCTAssertEqual(retry.retryCount, 1)
+        let reused = try await unwrap(try await store.reusableFingerprint(retry, input: input))
+        try injectEngineSQL("CREATE TRIGGER reject_date_completion BEFORE DELETE ON fingerprint_task BEGIN SELECT RAISE(FAIL, 'synthetic rollback'); END", at: db)
+        await XCTAssertThrowsErrorAsync(try await store.completeRepresentation(retry, result: FingerprintResult(fingerprint: reused, inputDigest: input, reusedCachedVector: true)))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='failed' AND observed_modification_date=200 AND successful_modification_date=100 AND length(vector)=4096", at: db), 1)
+        try injectEngineSQL("DROP TRIGGER reject_date_completion", at: db)
+        _ = try await store.completeRepresentation(retry, result: FingerprintResult(fingerprint: reused, inputDigest: input, reusedCachedVector: true))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND observed_modification_date=200 AND successful_modification_date=200 AND successful_vector_version='v1'", at: db), 1)
+    }
+
+    func testMissingDateVerifiesOnlyThatItemAndVersionChangeCannotBorrowOldSuccess() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let known = try datedDescriptor(context, asset: "known"), missing = try datedDescriptor(context, asset: "missing", date: nil)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([known, missing], generation: generation)
+        for task in try await store.nextRepresentationTasks(now: Date(), limit: 2) {
+            _ = try await store.completeRepresentation(task, fingerprint: fingerprint("v1"))
+        }
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([known, missing], generation: generation)
+        let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 2)
+        XCTAssertEqual(tasks.map { $0.descriptor.key.assetID }, ["missing"])
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v2")
+        try await store.upsertRepresentations([known], generation: generation)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='known' AND state='pending' AND fingerprint_version='v2' AND successful_vector_version='v1' AND successful_modification_date=100", at: db), 1)
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 4, fingerprintVersion: "v2")
+        try await store.upsertRepresentations([known], generation: generation)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='known' AND state='pending'", at: db), 1)
+    }
+
+    func testLegacyDateColumnsUpgradeAndBootstrapNeverInventDigestPair() async throws {
+        for priorVersion in [9, 10] {
+            let (root, db, store) = try fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let context = LibraryContext(id: UUID(), epoch: 1), item = try datedDescriptor(context)
+            var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+            try await store.upsertRepresentations([item], generation: generation)
+            let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+            _ = try await store.completeRepresentation(task, result: digestResult(preparedDigest(red: 32)))
+            for column in ["observed_modification_date", "successful_modification_date", "successful_vector_version"] {
+                if try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('photos_representation') WHERE name='\(column)'", at: db) > 0 {
+                    try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN \(column)", at: db)
+                }
+            }
+            if priorVersion == 9 { try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN input_vector_version", at: db) }
+            try injectEngineSQL("PRAGMA user_version=\(priorVersion)", at: db)
+            let reopened = try SyncStore(url: db)
+            generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+            try await reopened.upsertRepresentations([item], generation: generation)
+            try await assertTrue(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).isEmpty)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND successful_modification_date=100 AND successful_vector_version='v1'", at: db), 1)
+            if priorVersion == 9 {
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE input_vector_version IS NULL", at: db), 1)
+            }
+        }
+    }
+
+    func testPriorV10KnownDigestPairReusesAfterDateChangeWithoutInventingSuccessfulDate() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), input = try preparedDigest(red: 32)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.completeRepresentation(task, result: digestResult(input))
+        try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN observed_modification_date; ALTER TABLE photos_representation DROP COLUMN successful_modification_date; ALTER TABLE photos_representation DROP COLUMN successful_vector_version", at: db)
+        let reopened = try SyncStore(url: db)
+        generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        try await reopened.upsertRepresentations([try datedDescriptor(context, revision: "edited", date: Date(timeIntervalSinceReferenceDate: 200))], generation: generation)
+        let pending = try await unwrap(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).first)
+        let cached = try await unwrap(try await reopened.reusableFingerprint(pending, input: input))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE successful_modification_date IS NULL AND successful_vector_version IS NULL AND input_vector_version='v1'", at: db), 1)
+        _ = try await reopened.completeRepresentation(pending, result: FingerprintResult(fingerprint: cached, inputDigest: input, reusedCachedVector: true))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND successful_modification_date=200 AND successful_vector_version='v1'", at: db), 1)
+    }
+
+    func testSameGenerationChangedDateRejectsStaleCompletionWithIdenticalRevision() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: generation)
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await store.upsertRepresentations([try datedDescriptor(context, date: Date(timeIntervalSinceReferenceDate: 200))], generation: generation)
+        try await assertFalse(try await store.completeRepresentation(old, fingerprint: fingerprint("v1")))
+        try await assertFalse(try await store.failRepresentation(old, nextRetryAt: .distantFuture, detail: "late", failureKind: .photosRead))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='pending' AND successful_modification_date IS NULL", at: db), 1)
+        let current = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertTrue(try await store.completeRepresentation(current, fingerprint: fingerprint("v1")))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND successful_modification_date=200", at: db), 1)
+    }
+
+    func testReusableVectorBindingRejectsChangedVersionMissingDigestAndStaleIssuance() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), item = descriptor(context)
+        let input = try preparedDigest(red: 32)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.completeRepresentation(old, result: digestResult(input))
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        let current = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        let reusable = try await store.reusableFingerprint(current, input: input)
+        XCTAssertNotNil(reusable)
+        try await assertNil(try await store.reusableFingerprint(old, input: input))
+        // A successful diagnostic-free adapter replaces the vector, but cannot
+        // leave the old digest claiming to describe that new vector.
+        _ = try await store.completeRepresentation(current, result: digestResult(nil))
+        try await store.upsertRepresentations([item], generation: generation)
+        let missing = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertNil(try await store.reusableFingerprint(missing, input: input))
+        _ = try await store.completeRepresentation(missing, result: digestResult(input))
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v2")
+        try await store.upsertRepresentations([item], generation: generation)
+        let changedVersion = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertNil(try await store.reusableFingerprint(changedVersion, input: input))
+        try await assertNil(try await store.completeRepresentation(changedVersion,
+            result: FingerprintResult(fingerprint: try fingerprint("v2"), inputDigest: input, reusedCachedVector: true)))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task", at: db), 1)
+    }
+
+    func testCachedVectorMustStillBeBoundAtAcceptanceAfterReadFailure() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), item = descriptor(context)
+        let input = try preparedDigest(red: 32)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        var task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.completeRepresentation(task, result: digestResult(input))
+        try await store.upsertRepresentations([item], generation: generation)
+        task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        let cached = try await unwrap(try await store.reusableFingerprint(task, input: input))
+        try await assertTrue(try await store.failRepresentation(task, nextRetryAt: .distantPast, detail: "broken", failureKind: .photosRead))
+        try await assertNil(try await store.reusableFingerprint(task, input: input))
+        try await assertNil(try await store.completeRepresentation(task,
+            result: FingerprintResult(fingerprint: cached, inputDigest: input, reusedCachedVector: true)))
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='failed' AND length(vector)=4096 AND input_vector_version='v1' AND successful_vector_version='v1'", at: db), 1)
+    }
+
+    func testV9VectorBindingMigrationPreservesReadyButDoesNotInventPairing() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), item = descriptor(context)
+        let input = try preparedDigest(red: 32)
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([item], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.completeRepresentation(task, result: digestResult(input))
+        try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN input_vector_version; PRAGMA user_version=9", at: db)
+        let upgraded = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND length(vector)=4096 AND input_vector_version IS NULL", at: db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task", at: db), 0)
+        try assertBaseline(input, at: db)
+        try await upgraded.upsertRepresentations([item], generation: generation)
+        let pending = try await unwrap(try await upgraded.nextRepresentationTasks(now: Date(), limit: 1).first)
+        try await assertNil(try await upgraded.reusableFingerprint(pending, input: input))
+    }
+
     func testPreparedInputBaselinesCompareAfterMetadataAndInputChangesAndReopen() async throws {
         let (root, db, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -32,7 +320,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await assertEqual(try await store.completeRepresentation(task, result: digestResult(originalInput)), .sameInput)
 
         generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
-        _ = try await store.invalidateRepresentations(assetIDs: [item.key.assetID], generation: generation)
+        try await store.upsertRepresentations([item], generation: generation)
         try assertBaseline(originalInput, at: db)
         task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await assertEqual(try await store.completeRepresentation(task, result: digestResult(editedInput)), .differentInput)
@@ -46,11 +334,11 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await assertEqual(try await store.completeRepresentation(task, result: digestResult(changedPipeline, version: "v2")), .incomparable)
         let reopened = try SyncStore(url: db)
         generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 5, fingerprintVersion: "v2")
-        _ = try await reopened.invalidateRepresentations(assetIDs: nil, generation: generation)
+        try await reopened.upsertRepresentations([item], generation: generation)
         task = try await unwrap(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await assertEqual(try await reopened.completeRepresentation(task, result: digestResult(changedPipeline, version: "v2")), .sameInput)
         try assertBaseline(changedPipeline, at: db)
-        _ = try await reopened.invalidateRepresentations(assetIDs: nil, generation: generation)
+        try await reopened.upsertRepresentations([item], generation: generation)
         task = try await unwrap(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await assertTrue(try await reopened.completeRepresentation(task, fingerprint: fingerprint("v2")))
         try assertBaseline(changedPipeline, at: db)
@@ -67,7 +355,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await assertEqual(try await store.completeRepresentation(old, result: digestResult(input)), .missingBaseline)
         generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
-        _ = try await store.invalidateRepresentations(assetIDs: [item.key.assetID], generation: generation)
+        try await store.upsertRepresentations([item], generation: generation)
         try await assertNil(try await store.completeRepresentation(old, result: digestResult(edit)))
         try assertBaseline(input, at: db)
         let retry = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
@@ -77,7 +365,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try await assertEqual(try await store.completeRepresentation(retry, result: digestResult(nil)), .missingInput)
         try assertBaseline(input, at: db)
         generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
-        _ = try await store.invalidateRepresentations(assetIDs: [item.key.assetID], generation: generation)
+        try await store.upsertRepresentations([item], generation: generation)
         let replaced = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await store.upsertRepresentations([descriptor(context, revision: "replacement")], generation: generation)
         try await assertNil(try await store.completeRepresentation(replaced, result: digestResult(edit)))
@@ -117,12 +405,12 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 try await assertEqual(try await store.completeRepresentation(task,
                     result: digestResult(task.descriptor.key.kind == .original ? input : edit)), .missingBaseline)
             }
-            _ = try await store.invalidateRepresentations(assetIDs: nil, generation: generation)
+            try await store.upsertRepresentations([original, current], generation: generation)
             for task in try await store.nextRepresentationTasks(now: Date(), limit: 2) {
                 try await assertEqual(try await store.completeRepresentation(task,
                     result: digestResult(task.descriptor.key.kind == .original ? input : edit)), .sameInput)
             }
-            _ = try await store.invalidateRepresentations(assetIDs: nil, generation: generation)
+            try await store.upsertRepresentations([original, current], generation: generation)
             previousContextTask = try await store.nextRepresentationTasks(now: Date(), limit: 2).first { $0.descriptor.key.kind == .original }
         }
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE input_digest IS NOT NULL", at: db), 6)
@@ -178,7 +466,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("PRAGMA user_version=8", at: db)
         let upgraded = try SyncStore(url: db)
         withExtendedLifetime(upgraded) {}
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('photos_representation') WHERE name IN ('input_digest','input_digest_contract')", at: db), 2)
         XCTAssertEqual(try facts(at: db), historyBefore)
         for table in tables {
@@ -247,7 +535,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         let before = try facts(at: db)
         try injectEngineSQL("CREATE TABLE preserved_vectors AS SELECT * FROM file_fingerprint; PRAGMA user_version=7", at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         XCTAssertEqual(try facts(at: db), before)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM preserved_vectors EXCEPT SELECT * FROM file_fingerprint)", at: db), 0)
         try await assertNil(try await reopened.indexReadiness())
@@ -275,7 +563,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("CREATE TABLE preserved_source AS SELECT file_id,size,modified_ns,purpose,width,height,hex(vector) AS bytes,attempt_id FROM file_fingerprint WHERE fingerprint_version='\(oldVersion)'", at: db)
         try injectEngineSQL("PRAGMA user_version=7", at: db)
         let upgraded = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         try await assertNil(try await upgraded.indexReadiness())
         try await upgraded.rebindEquivalentSourceFingerprints(to: config.fingerprint)
         XCTAssertEqual(try facts(at: db), before)
@@ -891,7 +1179,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE attempt_id = ''", at: db), 2)
             }
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 2)
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 9)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 10)
         }
     }
 
@@ -1052,7 +1340,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try makeV3(at: db)
         let before = try facts(at: db)
         let store = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         XCTAssertEqual(try facts(at: db), before)
         let generation = try await store.beginIndexReconciliation(context: LibraryContext(id: UUID(), epoch: 1), photosGeneration: 4, fingerprintVersion: "new-model")
         try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
@@ -1071,9 +1359,9 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 3)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE name = 'dedup_index_state'", at: db), 0)
         XCTAssertEqual(try facts(at: db), before)
-        try injectEngineSQL("PRAGMA user_version = 10", at: db)
+        try injectEngineSQL("PRAGMA user_version = 11", at: db)
         XCTAssertThrowsError(try SyncStore(url: db))
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
     }
 
     func testStaleTaskCannotPublish() async throws {
@@ -1115,8 +1403,8 @@ final class AdvancedDedupStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let context = LibraryContext(id: UUID(), epoch: 1)
         let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 9, fingerprintVersion: "v1")
-        try await store.upsertRepresentations([descriptor(context)], generation: generation)
-        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([descriptor(context)]).map(\.key)))
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: generation)
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([try datedDescriptor(context)]).map(\.key)))
         try await assertNil(try await store.indexPublication())
         let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 1)
         try await assertTrue(try await store.completeRepresentation(try XCTUnwrap(tasks.first), fingerprint: fingerprint("v1")))
@@ -1130,8 +1418,8 @@ final class AdvancedDedupStoreTests: XCTestCase {
         let next = try await store.beginIndexReconciliation(context: context, photosGeneration: 10, fingerprintVersion: "v1")
         try await assertFalse(try await reopened.markIndexPublished(token: publication.token))
         try await assertFalse(try await reopened.indexIsReady(token: publication.token))
-        try await store.upsertRepresentations([descriptor(context)], generation: next)
-        try await store.finishIndexReconciliation(generation: next, seenKeys: Set(([descriptor(context)]).map(\.key)))
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: next)
+        try await store.finishIndexReconciliation(generation: next, seenKeys: Set(([try datedDescriptor(context)]).map(\.key)))
         try await assertTrue(try await store.nextRepresentationTasks(now: Date(), limit: 10).isEmpty)
         try await assertEqual(try await store.indexPublication()?.representationCount, 1)
     }
@@ -1317,13 +1605,13 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(selected.fingerprint.version, changed.fingerprint.version)
         let context = LibraryContext(id: UUID(), epoch: 1)
         var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: selected.fingerprint.version)
-        try await store.upsertRepresentations([descriptor(context)], generation: generation)
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: generation)
         let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
         try await assertTrue(try await store.completeRepresentation(task, fingerprint: fingerprint(selected.fingerprint.version)))
-        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([descriptor(context)]).map(\.key)))
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([try datedDescriptor(context)]).map(\.key)))
         generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: changed.fingerprint.version)
-        try await store.upsertRepresentations([descriptor(context)], generation: generation)
-        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([descriptor(context)]).map(\.key)))
+        try await store.upsertRepresentations([try datedDescriptor(context)], generation: generation)
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([try datedDescriptor(context)]).map(\.key)))
         try await assertTrue(try await store.nextRepresentationTasks(now: Date(), limit: 10).isEmpty)
         try await assertEqual(try await store.indexPublication()?.representationCount, 1)
         XCTAssertEqual(try facts(at: db), before)
@@ -1391,27 +1679,61 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: db), 1)
     }
 
-    func testSoftReadGapSurvivesReopenAndNeutralRetargetButNotUnknownContinuity() async throws {
+    func testSoftReadGapSurvivesReopenAndSameDateRetargetButNotChangedDate() async throws {
         let (root, db, store) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let context = LibraryContext(id: UUID(), epoch: 1)
-        _ = try await seedReadGap(store, context: context)
+        let failed = try datedDescriptor(context, asset: "failed"), healthy = try datedDescriptor(context, asset: "healthy")
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([failed, healthy], generation: generation)
+        let tasks = try await store.nextRepresentationTasks(now: Date(), limit: 2)
+        let old = try XCTUnwrap(tasks.first { $0.descriptor.key == failed.key })
+        _ = try await store.completeRepresentation(try XCTUnwrap(tasks.first { $0.descriptor.key == healthy.key }), fingerprint: fingerprint("v1"))
+        _ = try await store.failRepresentation(old, nextRetryAt: Date(timeIntervalSince1970: 20), detail: "synthetic", failureKind: .photosRead)
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: [failed.key, healthy.key])
         let reopened = try SyncStore(url: db)
-        let original = try await unwrap(try await reopened.indexPublication())
-        XCTAssertEqual(original.representationCount, 1)
-        let generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
-        let changed = descriptor(context, asset: "failed", revision: "metadata-only"), healthy = descriptor(context, asset: "healthy")
-        try await reopened.upsertRepresentations([changed, healthy], generation: generation, inputUnchangedAssetIDs: ["failed"])
+        generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v1")
+        let changed = try datedDescriptor(context, asset: "failed", revision: "metadata-only", width: 1280)
+        try await reopened.upsertRepresentations([changed, healthy], generation: generation)
         try await reopened.finishIndexReconciliation(generation: generation, seenKeys: [changed.key, healthy.key])
-        _ = try await unwrap(try await reopened.indexPublication())
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind='photos_read' AND next_retry_at=20 AND issuance_revision='A' AND revision='metadata-only'", at: db), 1)
-        let unknown = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
-        try await reopened.invalidateRepresentations(assetIDs: nil, generation: unknown)
-        try await reopened.upsertRepresentations([changed, healthy], generation: unknown)
-        try await reopened.finishIndexReconciliation(generation: unknown, seenKeys: [changed.key, healthy.key])
+        let publication = try await unwrap(try await reopened.indexPublication())
+        XCTAssertEqual(publication.representationCount, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind='photos_read' AND next_retry_at=20 AND retry_count=1 AND revision='metadata-only'", at: db), 1)
+        try await assertFalse(try await reopened.completeRepresentation(old, fingerprint: fingerprint("v1")))
+        generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 3, fingerprintVersion: "v1")
+        let edited = try datedDescriptor(context, asset: "failed", revision: "metadata-only", date: Date(timeIntervalSinceReferenceDate: 200), width: 1280)
+        try await reopened.upsertRepresentations([edited, healthy], generation: generation)
+        try await reopened.finishIndexReconciliation(generation: generation, seenKeys: [edited.key, healthy.key])
         try await assertNil(try await reopened.indexPublication())
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind='photos_read'", at: db), 0)
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id='failed' AND next_retry_at=20", at: db), 1)
+    }
+
+    func testLegacyUnmatchedReadFailureRetainsVectorAndExcludesItFromQueries() async throws {
+        let (root, db, store) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        let item = try datedDescriptor(context)
+        try await store.upsertRepresentations([item], generation: generation)
+        let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.completeRepresentation(task, fingerprint: fingerprint("v1"))
+        try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN observed_modification_date; ALTER TABLE photos_representation DROP COLUMN successful_modification_date; ALTER TABLE photos_representation DROP COLUMN successful_vector_version; ALTER TABLE photos_representation DROP COLUMN input_vector_version; PRAGMA user_version=9", at: db)
+        let reopened = try SyncStore(url: db)
+        generation = try await reopened.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v2")
+        let changed = try datedDescriptor(context, revision: "new-resource")
+        try await reopened.upsertRepresentations([changed], generation: generation)
+        let pending = try await unwrap(try await reopened.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await reopened.failRepresentation(pending, nextRetryAt: .distantPast, detail: "unavailable", failureKind: .photosRead)
+        try await reopened.finishIndexReconciliation(generation: generation, seenKeys: [item.key])
+        let publication = try await unwrap(try await reopened.indexPublication())
+        XCTAssertEqual(publication.representationCount, 0)
+        try await assertTrue(try await reopened.markIndexPublished(token: publication.token))
+        let source = try await reopened.registerSource(url: root)
+        let incoming = try await prepared(reopened, source, root, "incoming.jpg", version: "v2")
+        let token = try await unwrap(try await reopened.indexPublication()).token
+        let candidates = try await reopened.vectorCandidates(for: incoming.fileID, query: incoming.fingerprint, token: token, threshold: 0.98, diagnosticLimit: 10)
+        XCTAssertEqual(candidates?.matches.count, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='failed' AND length(vector)=4096 AND successful_vector_version IS NULL", at: db), 1)
     }
 
     func testSoftReadClassificationCannotAuthorizeMismatchedOrOrphanTasks() async throws {
@@ -1422,7 +1744,6 @@ final class AdvancedDedupStoreTests: XCTestCase {
             "UPDATE fingerprint_task SET last_error=NULL",
             "UPDATE photos_representation SET tombstoned=1 WHERE asset_id='failed'",
             "UPDATE photos_representation SET seen_generation=999999 WHERE asset_id='failed'",
-            "UPDATE photos_representation SET vector=zeroblob(4096) WHERE asset_id='failed'",
             "DELETE FROM photos_representation WHERE asset_id='failed'",
             "DELETE FROM fingerprint_task",
             "UPDATE dedup_index_state SET reconciliation_complete=0"]
@@ -1478,7 +1799,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 try await assertNil(try await reopened.indexPublication())
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: db), 1)
             }
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 9)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 10)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('fingerprint_task') WHERE name='failure_kind'", at: db), fail ? 0 : 1)
             XCTAssertEqual(try facts(at: db), before)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM vectors_before EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
@@ -1519,7 +1840,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
             PRAGMA user_version=5;
             """, at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_vectors EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_tasks EXCEPT SELECT asset_id,revision,generation,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: db), 0)
         let publication = try await reopened.indexPublication(); XCTAssertNil(publication)
@@ -1598,7 +1919,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         }
         try injectEngineSQL("UPDATE photos_representation SET seen_generation=\(first) WHERE asset_id='a'; UPDATE fingerprint_task SET generation=\(first) WHERE asset_id='a';", at: db)
         let delta = PhotosIndexDelta(context: context, fromGeneration: 1, toGeneration: 2, changedAssetIDs: ["a"], deletedAssetIDs: [])
-        let valid = RepresentationPage(context: context, generation: 2, descriptors: [a], nextOffset: nil, invalidatedAssetIDs: ["a"])
+        let valid = RepresentationPage(context: context, generation: 2, descriptors: [try datedDescriptor(context, asset: "a", date: Date(timeIntervalSinceReferenceDate: 200))], nextOffset: nil, invalidatedAssetIDs: ["a"])
         for page in [RepresentationPage(context: context, generation: 2, descriptors: [], nextOffset: nil),
                      RepresentationPage(context: context, generation: 2, descriptors: [a], nextOffset: 1),
                      RepresentationPage(context: context, generation: 3, descriptors: [a], nextOffset: nil)] {
@@ -1653,11 +1974,11 @@ final class AdvancedDedupStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let context = LibraryContext(id: UUID(), epoch: 1)
         let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
-        try await store.upsertRepresentations([descriptor(context, asset: "a")], generation: generation)
+        try await store.upsertRepresentations([try datedDescriptor(context, asset: "a")], generation: generation)
         let task = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
         let vector = try Fingerprint(version: "v1", values: [1] + Array(repeating: 0, count: 1023))
         try await assertTrue(try await store.completeRepresentation(task, fingerprint: vector))
-        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([descriptor(context, asset: "a")]).map(\.key)))
+        try await store.finishIndexReconciliation(generation: generation, seenKeys: Set(([try datedDescriptor(context, asset: "a")]).map(\.key)))
         let indexSQL = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='photos_representation_readiness'"
         XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
         let hex = vector.littleEndianFloat32.map { String(format: "%02x", $0) }.joined()
@@ -1672,14 +1993,14 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("UPDATE photos_representation SET tombstoned=0; PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS photos_representation_readiness", at: db)
         let upgraded = try SyncStore(url: db)
         XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         let after = try await upgraded.indexReadiness(); XCTAssertNil(after)
         let publication = try await upgraded.indexPublication()
         XCTAssertEqual(try photosVector(at: db), vector)
         XCTAssertNil(publication)
         let refreshed = try await upgraded.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
-        try await upgraded.upsertRepresentations([descriptor(context, asset: "a")], generation: refreshed)
-        try await upgraded.finishIndexReconciliation(generation: refreshed, seenKeys: [descriptor(context, asset: "a").key])
+        try await upgraded.upsertRepresentations([try datedDescriptor(context, asset: "a")], generation: refreshed)
+        try await upgraded.finishIndexReconciliation(generation: refreshed, seenKeys: [try datedDescriptor(context, asset: "a").key])
         let restored = try await upgraded.indexReadiness(); XCTAssertEqual(restored?.entryCount, 1)
     }
 
@@ -1701,7 +2022,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         // Reproduce the previous unreleased integration-v4 shape without its reverse index.
         try injectEngineSQL("PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS dedup_dependency_candidate;", at: db)
         let migrated = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 9)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 10)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
         try await assertEqual(try await migrated.state(of: dependent.fileID), .skipped)
         try assertReverseDependencyLookup(at: db)

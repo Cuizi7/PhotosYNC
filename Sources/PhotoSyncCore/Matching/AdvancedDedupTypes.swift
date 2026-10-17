@@ -9,7 +9,7 @@ public enum AdvancedDedupError: Error, Equatable {
     case invalidModelOutput
 }
 
-/// Diagnostic evidence for one successful prepared model input; never an asset identity.
+/// Exact prepared-model-input evidence; never an asset identity.
 public struct ModelInputDigest: Equatable, Sendable {
     public let bytes: Data
     public let contract: String
@@ -46,10 +46,12 @@ public struct FingerprintResult: Sendable {
     public let fingerprint: Fingerprint
     public let inputDigest: ModelInputDigest?
     public let timings: FingerprintTimings
+    public let reusedCachedVector: Bool
 
     public init(fingerprint: Fingerprint, inputDigest: ModelInputDigest? = nil,
-                timings: FingerprintTimings = .init()) {
+                timings: FingerprintTimings = .init(), reusedCachedVector: Bool = false) {
         self.fingerprint = fingerprint; self.inputDigest = inputDigest; self.timings = timings
+        self.reusedCachedVector = reusedCachedVector
     }
 }
 
@@ -375,8 +377,10 @@ public struct RepresentationDescriptor: Codable, Equatable, Sendable {
     public let size: PixelSize?
     public let equivalentToOriginal: Bool
     public let revisionIsReliable: Bool
+    public let modificationDate: Date?
     public init(key: RepresentationKey, context: LibraryContext, revision: String, size: PixelSize?,
-                equivalentToOriginal: Bool, revisionIsReliable: Bool) {
+                equivalentToOriginal: Bool, revisionIsReliable: Bool, modificationDate: Date? = nil) {
+        self.modificationDate = modificationDate.flatMap { $0.timeIntervalSinceReferenceDate.isFinite ? $0 : nil }
         self.key = key; self.context = context; self.revision = revision; self.size = size
         self.equivalentToOriginal = equivalentToOriginal; self.revisionIsReliable = revisionIsReliable
     }

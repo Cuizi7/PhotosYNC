@@ -51,7 +51,7 @@ build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
 
 Before first launch after upgrading, quit PhotosYNC normally and back up the complete
 `~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
-files. The app transactionally migrates supported schemas v3–v8 to v9; older apps reject the upgraded database on reopening.
+files. The app transactionally migrates supported schemas v3–v9 to v10; older apps reject the upgraded database on reopening.
 Direct downgrade is not supported. Restoring an old database after new imports can
 lose success evidence and cause duplicate additions; see the release notes for the
 backup and downgrade boundary. Packaging does not back up or migrate production data.
@@ -68,9 +68,11 @@ PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source 
 
 ## Model input diagnostics
 
-For gallery recomputation, SHA-256 describes the exact prepared 320 × 320 Float32 model input. The independent successful baseline is stored per context, epoch, asset and original/current representation. Accepted tasks report `same_input`, `different_input`, `missing_baseline` or `incomparable`; older or diagnostic-free test implementations additionally report `missing_input`. Schema v9 adds two nullable columns without creating new tasks, discarding vectors or altering the index policy. Older schema-v8 apps reject an upgraded database; direct downgrade remains unsupported.
+For gallery recomputation, SHA-256 describes the exact prepared 320 × 320 Float32 model input. The independent successful baseline is stored per context, epoch, asset and original/current representation. Accepted tasks report `same_input`, `different_input`, `missing_baseline` or `incomparable`; older or diagnostic-free test implementations additionally report `missing_input`. Schema v10 stores nullable observed and successful modification dates, the successful vector version, and a version binding between a successful input digest and its vector. Observed dates are separate from accepted successful facts; success dates, vectors, digests and contracts commit atomically only after current-task checks. Older ready vectors remain usable after unchanged metadata reconciliation; migration does not invent successful dates or digest/vector bindings or queue new work. Apps supporting schema v9 or older reject the upgraded database; direct downgrade remains unsupported.
 
 Same input proves equality only at this model-input boundary. Different input may reflect resource selection, decoding, orientation, color or image changes; neither outcome alone proves a PhotoKit pixel edit. History updated identities remain unknown content evidence. Logs use bounded anonymous causal samples plus complete comparison counts and monotonic elapsed-wall timing aggregates; they contain no input hashes. Nested timings are inclusive and cannot be added to form a CPU profile or labelled as iCloud download time. See the [approved diagnostics scope](docs/superpowers/specs/2026-10-16-input-digest-diagnostics.md) and [measurement/validation notes](docs/release/2026-10-16-input-diagnostics-validation.md).
+
+Photos history tokens accelerate change discovery; their expiry, loss or corrupt checkpoint does not discard the same-device object namespace or successful results. Within that namespace, the same asset ID and original/current representation with the same valid successful modification date and analysis contract directly reuse the accepted vector without reading pixels, preparing input or predicting. Resource descriptors, revisions and content events do not override that date match. A changed or missing date requires individual input validation; an equal prepared-input digest reliably paired with the successful vector and compatible contracts bypasses prediction, while different input requires prediction for that item. Failed updates retain successful dates, vectors, digests and contracts, with noncurrent results excluded from decisions. Temporary history failures retain the cache and back off for 5/15/30/60 seconds; recovery never clears or rebuilds all analysis. Publication remains closed until a complete authorized inventory is acknowledged. See [incremental Photos recovery](docs/specs/2026-10-17-photos-incremental-recovery.md).
 
 ## Storage, logs, and recovery
 

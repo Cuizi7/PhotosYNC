@@ -37,18 +37,21 @@ public struct PhotosIndexDelta: Equatable, Sendable {
 }
 
 /// One bounded page from a fixed Photos generation, including excluded version
-/// slots. Before upserting, invalidate matching cached facts for the listed IDs
-/// (or all cached representations when flagged), even if metadata revisions match.
+/// slots. Notification scopes require inspection of the listed IDs; successful dates
+/// own per-item analysis reuse. An unknown whole scope requires metadata verification of each
+/// row, not discarded successful inference.
 public struct RepresentationPage: Equatable, Sendable {
     public let context: LibraryContext
     public let generation: Int
     public let descriptors: [RepresentationDescriptor]
     public let nextOffset: Int?
     public let exclusions: [RepresentationCatalogExclusion]
-    /// Assets whose cached content must be invalidated even when descriptor revisions
-    /// match. Delta pages restrict these IDs to the delta's changed IDs; merely being
-    /// in changedAssetIDs does not itself establish same-revision content validity.
+    /// Legacy name for notification content scope, used for bounded discovery and
+    /// diagnostics only. It never overrides a matching successful date/contract.
+    /// Delta pages restrict these IDs to the delta's changed IDs.
     public let invalidatedAssetIDs: [String]
+    /// Legacy name for unknown inventory continuity. Requires complete metadata
+    /// reconciliation, never bulk analysis invalidation.
     public let invalidateAllCachedRepresentations: Bool
     public let inputUnchangedAssetIDs: [String]
     public init(context: LibraryContext, generation: Int, descriptors: [RepresentationDescriptor], nextOffset: Int?, exclusions: [RepresentationCatalogExclusion] = [],
@@ -114,8 +117,9 @@ public enum PhotosReaderAdmission: String, Equatable, Sendable {
     case available, busy, draining, stalled
 }
 
-/// One full inventory's content-continuity decision. The optional observer fence
-/// belongs to a single gateway lifetime and must never be persisted.
+/// One full inventory's history-continuity decision. False preservation requires
+/// independent per-row metadata verification, never unconditional inference loss.
+/// The observer fence belongs to one gateway lifetime and must not be persisted.
 public struct PhotosInventoryContinuity: Sendable {
     public let checkpoint: LibraryResumeCheckpoint?
     public let preservesCachedRepresentations: Bool
@@ -133,6 +137,9 @@ public struct PhotosInventoryContinuity: Sendable {
 }
 
 public protocol PhotosIndexGateway: PhotosGateway {
+    /// Restore the same-device persistent PhotoKit object domain independently of
+    /// a history token. This is not a claim about a system library UUID.
+    func restoreInventoryContext(_ context: LibraryContext) async throws
     /// Synchronously revoke active observer continuity when the runtime observes
     /// a permission gap, including while no Photos request is being issued.
     func invalidateObservationContinuity()
@@ -145,7 +152,8 @@ public protocol PhotosIndexGateway: PhotosGateway {
     func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession
     func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage
     func catalogCoverage(session: PhotosCatalogSession) async throws -> Int
-    /// Called only after prior unknown obligations were durably marked non-queryable.
+    /// Called after the durable reconciliation publication barrier is established.
+    /// Cached rows are verified individually before that barrier can be reopened.
     func catalogInvalidationTransferred(session: PhotosCatalogSession) async throws
     /// Full-session merge facts may retain an older transferred verification obligation;
     /// a new unknown event still invalidates the session. Normal deltas stay strict.
@@ -167,8 +175,8 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// Every changed ID must be accounted for; keys are unique, nextOffset is nil,
     /// and descriptors + exclusions fit catalogBatchSize. Deletions come exclusively
     /// from delta.deletedAssetIDs, not omitted/unknown/unavailable fetch results.
-    /// Supply invalidatedAssetIDs whenever matching revisions cannot prove content
-    /// unchanged. Unknown scope, incomplete/oversized results, pagination, or context/
+    /// Supply invalidatedAssetIDs as diagnostic/discovery scope; successful dates own
+    /// analysis freshness. Unknown scope, incomplete/oversized results, pagination, or context/
     /// generation drift must throw for caller-owned full reconciliation; do not turn
     /// uncertainty into exclusion/deletion or set invalidateAllCachedRepresentations
     /// as a usable incremental result. This fetch neither advances a persistent-history
@@ -186,8 +194,8 @@ public protocol PhotosIndexGateway: PhotosGateway {
     func representationReadAdmission() async -> PhotosReaderAdmission
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation
     /// Recovery primitives: capture a proposal before the complete recovery
-    /// inventory, then durably retain all affected IDs since the prior token.
-    /// False means unknown coverage, never empty history. Neither operation
+    /// inventory. Replay IDs identify possible updates, not confirmed pixel changes.
+    /// The full inventory verifies them; false means unknown coverage, never empty history. Neither operation
     /// acknowledges readiness or advances the store on its own.
     /// Active full/delta inventories retain the last recovered checkpoint; only
     /// prepareInventoryReconciliation decides when new recovery is necessary.
@@ -301,6 +309,7 @@ public struct LibraryResumeCheckpoint: Codable, Equatable, Sendable {
 }
 
 public extension PhotosIndexGateway {
+    func restoreInventoryContext(_ context: LibraryContext) async throws {}
     func invalidateObservationContinuity() {}
     func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
         let checkpoint = try await contextCheckpoint()
@@ -309,7 +318,7 @@ public extension PhotosIndexGateway {
             covered = try await coverPersistentHistory(from: previousCheckpoint, through: checkpoint)
         } else {
             // Resource-free adapters without checkpoints retain their existing
-            // page-based contract; the coordinator still invalidates its first pass.
+            // page-based contract; per-item dates still own analysis reuse.
             covered = checkpoint == nil && previousCheckpoint == nil
         }
         return .init(checkpoint: checkpoint, preservesCachedRepresentations: covered)

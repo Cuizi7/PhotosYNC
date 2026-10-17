@@ -190,7 +190,7 @@ private func p10SQLiteSearch(query: Fingerprint, entries: [VectorEntry], configu
     let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: query.version)
     try await store.upsertRepresentations(entries.map {
         RepresentationDescriptor(key: .init(assetID: $0.key, kind: .original), context: context, revision: "fixed-replay",
-            size: $0.size, equivalentToOriginal: false, revisionIsReliable: true)
+            size: $0.size, equivalentToOriginal: false, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: 100))
     }, generation: generation)
     let tasks = try await store.nextRepresentationTasks(now: Date(), limit: max(1, entries.count))
     for task in tasks {
@@ -200,7 +200,7 @@ private func p10SQLiteSearch(query: Fingerprint, entries: [VectorEntry], configu
     }
     try await store.finishIndexReconciliation(generation: generation, seenKeys: Set((entries.map {
         RepresentationDescriptor(key: .init(assetID: $0.key, kind: .original), context: context, revision: "fixed-replay",
-            size: $0.size, equivalentToOriginal: false, revisionIsReliable: true)
+            size: $0.size, equivalentToOriginal: false, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: 100))
     }).map(\.key)))
     let value = try await store.indexPublication(), publication = try XCTUnwrap(value)
     let published = try await store.markIndexPublished(token: publication.token); XCTAssertTrue(published)
@@ -352,7 +352,7 @@ private actor P9FixturePhotos: PhotosIndexGateway {
         let all = (0..<16).flatMap { n in [RepresentationKind.original, .current].map { kind in
             RepresentationDescriptor(key: .init(assetID: "synthetic-\(n)", kind: kind), context: context,
                 revision: n == 0 ? "r\(generation)" : "r1", size: try! PixelSize(width: 256, height: 256),
-                equivalentToOriginal: true, revisionIsReliable: true)
+                equivalentToOriginal: true, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: n == 0 ? Double(generation) : 1))
         } }
         let end = min(offset + limit, all.count)
         return .init(context: context, generation: generation, descriptors: Array(all[offset..<end]), nextOffset: end < all.count ? end : nil)
@@ -715,6 +715,51 @@ extension AdvancedDedupRegressionTests {
         try p11StopRowAudit(db)
     }
 
+    func testScaleFixtureAdditionsUseFreshIDsAcrossCatalogDeltaAndRemoval() async throws {
+        let configuration = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
+        let photos = P9ScalePhotos(count: 1, image: try p9Image(style: 1), budget: ImageWorkBudget(limits: configuration.resources))
+        var addedIDs = Set<String>()
+        for round in 0..<5 {
+            let addition = await photos.addOne()
+            XCTAssertEqual(addition.fromGeneration, 1 + round * 2)
+            XCTAssertEqual(addition.toGeneration, 2 + round * 2)
+            XCTAssertTrue(addition.deletedAssetIDs.isEmpty)
+            XCTAssertEqual(addition.changedAssetIDs.count, 1)
+            let id = try XCTUnwrap(addition.changedAssetIDs.first)
+            XCTAssertNotEqual(id, "asset-0")
+            XCTAssertTrue(addedIDs.insert(id).inserted, "Each synthetic addition must be a new asset, not a restored member")
+
+            let catalog = try await photos.representationCatalog(offset: 0, limit: 10, expectedGeneration: addition.toGeneration)
+            let delta = try await photos.representationDelta(addition)
+            XCTAssertEqual(catalog.context, addition.context)
+            XCTAssertEqual(delta.context, addition.context)
+            XCTAssertEqual(catalog.generation, addition.toGeneration)
+            XCTAssertEqual(delta.generation, addition.toGeneration)
+            XCTAssertEqual(catalog.descriptors.map(\.key.assetID), ["asset-0", id])
+            XCTAssertEqual(delta.descriptors.map(\.key.assetID), [id])
+            let catalogMember = try XCTUnwrap(catalog.descriptors.last)
+            let deltaMember = try XCTUnwrap(delta.descriptors.first)
+            XCTAssertEqual(catalogMember.key, deltaMember.key)
+            XCTAssertEqual(catalogMember.key.kind, .original)
+            XCTAssertEqual(catalogMember.revision, "r1")
+            XCTAssertEqual(deltaMember.revision, "r1")
+            XCTAssertEqual(catalogMember.modificationDate, Date(timeIntervalSinceReferenceDate: 1))
+            XCTAssertEqual(deltaMember.modificationDate, Date(timeIntervalSinceReferenceDate: 1))
+
+            let removal = await photos.removeAdded()
+            XCTAssertEqual(removal.context, addition.context)
+            XCTAssertEqual(removal.fromGeneration, addition.toGeneration)
+            XCTAssertEqual(removal.toGeneration, addition.toGeneration + 1)
+            XCTAssertTrue(removal.changedAssetIDs.isEmpty)
+            XCTAssertEqual(removal.deletedAssetIDs, [id])
+            let removedCatalog = try await photos.representationCatalog(offset: 0, limit: 10, expectedGeneration: removal.toGeneration)
+            let removedDelta = try await photos.representationDelta(removal)
+            XCTAssertEqual(removedCatalog.descriptors.map(\.key.assetID), ["asset-0"])
+            XCTAssertTrue(removedDelta.descriptors.isEmpty)
+        }
+        XCTAssertEqual(addedIDs.count, 5)
+    }
+
     func testScaleFixtureHistoryProofRejectsForeignUnknownAndFutureIntervals() async throws {
         let configuration = try DedupConfiguration.loadValidated(resourceDirectory: DedupConfiguration.bundledResourceDirectory())
         let photos = P9ScalePhotos(count: 1, image: try p9Image(style: 1), budget: ImageWorkBudget(limits: configuration.resources))
@@ -796,6 +841,7 @@ private actor P9ScalePhotos: PhotosIndexGateway {
     let context = LibraryContext(id: UUID(), epoch: 1), count: Int, image: CGImage, budget: ImageWorkBudget
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 128)
     var generation = 1, originalRevision = 1, reads = 0, hasAdded = false, acknowledgementFails = false
+    var additionSequence = 0, addedAssetID = "added-asset-0"
     var catalogRequests = 0
     init(count: Int, image: CGImage, budget: ImageWorkBudget) { self.count = count; self.image = image; self.budget = budget }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { channel.stream() }
@@ -806,8 +852,11 @@ private actor P9ScalePhotos: PhotosIndexGateway {
         channel.send(.incremental(delta)); return delta
     }
     @discardableResult func changeOne() -> PhotosIndexDelta { originalRevision += 1; return change(changed: ["asset-0"]) }
-    @discardableResult func addOne() -> PhotosIndexDelta { hasAdded = true; return change(changed: ["added-asset"]) }
-    @discardableResult func removeAdded() -> PhotosIndexDelta { hasAdded = false; return change(deleted: ["added-asset"]) }
+    @discardableResult func addOne() -> PhotosIndexDelta {
+        additionSequence += 1; addedAssetID = "added-asset-\(additionSequence)"
+        hasAdded = true; return change(changed: [addedAssetID])
+    }
+    @discardableResult func removeAdded() -> PhotosIndexDelta { hasAdded = false; return change(deleted: [addedAssetID]) }
     func setAcknowledgementFailure(_ fails: Bool) { acknowledgementFails = fails }
     func acknowledgeReconciliation(expectedGeneration: Int) async throws {
         guard !acknowledgementFails, expectedGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
@@ -831,9 +880,9 @@ private actor P9ScalePhotos: PhotosIndexGateway {
         let total = count + (hasAdded ? 1 : 0)
         let end = min(offset + limit, total)
         let descriptors = (offset..<end).map { n in
-            RepresentationDescriptor(key: .init(assetID: n == count ? "added-asset" : "asset-\(n % 100000)", kind: n < 100000 || n == count ? .original : .current), context: context,
+            RepresentationDescriptor(key: .init(assetID: n == count ? addedAssetID : "asset-\(n % 100000)", kind: n < 100000 || n == count ? .original : .current), context: context,
                 revision: n == 0 ? "r\(originalRevision)" : "r1", size: try! PixelSize(width: 256, height: 256),
-                equivalentToOriginal: false, revisionIsReliable: true)
+                equivalentToOriginal: false, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: n == 0 ? Double(originalRevision) : 1))
         }
         return .init(context: context, generation: generation, descriptors: descriptors, nextOffset: end < total ? end : nil)
     }
@@ -841,12 +890,12 @@ private actor P9ScalePhotos: PhotosIndexGateway {
         guard delta.context == context, delta.toGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
         var descriptors: [RepresentationDescriptor] = []
         for id in delta.changedAssetIDs {
-            guard id == "asset-0" || (id == "added-asset" && hasAdded) else { throw PhotoKitGatewayError.libraryChanged }
+            guard id == "asset-0" || (id == addedAssetID && hasAdded) else { throw PhotoKitGatewayError.libraryChanged }
             let kinds: [RepresentationKind] = id == "asset-0" && count > 100000 ? [.original, .current] : [.original]
             for kind in kinds {
                 descriptors.append(.init(key: .init(assetID: id, kind: kind), context: context,
                     revision: id == "asset-0" && kind == .original ? "r\(originalRevision)" : "r1",
-                    size: try PixelSize(width: 256, height: 256), equivalentToOriginal: false, revisionIsReliable: true))
+                    size: try PixelSize(width: 256, height: 256), equivalentToOriginal: false, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: id == "asset-0" && kind == .original ? Double(originalRevision) : 1)))
             }
         }
         return .init(context: context, generation: generation, descriptors: descriptors, nextOffset: nil)

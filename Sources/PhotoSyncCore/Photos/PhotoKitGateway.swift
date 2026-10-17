@@ -100,6 +100,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private let changeChannel: PhotosIndexChangeChannel
     private let indexDiagnostics: IndexDiagnostics
     private let diagnostics: @Sendable ([String: String]) -> Void
+    private let historyRetry: PhotosHistoryRetry
 
     public override convenience init() {
         let library = PHPhotoLibrary.shared()
@@ -119,7 +120,9 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0,
          indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in },
-         queueSubmissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil) {
+         queueSubmissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil,
+         historyNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        historyRetry = PhotosHistoryRetry(now: historyNow)
         candidateIndex = PhotoKitCandidateIndex(submissionProbe: queueSubmissionProbe)
         let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
         self.indexDiagnostics = context; self.diagnostics = { context.observation($0) }
@@ -133,6 +136,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     private init(lifecycle: any PhotoKitLifecycle, observedLibrary: PHPhotoLibrary,
                  representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        historyRetry = PhotosHistoryRetry(now: { ProcessInfo.processInfo.systemUptime })
         candidateIndex = PhotoKitCandidateIndex()
         let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
         self.indexDiagnostics = context; self.diagnostics = { context.observation($0) }
@@ -211,12 +215,13 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     public func invalidateObservationContinuity() {
-        state.invalidateAllRepresentations()
+        state.requireInventoryReconciliation()
         diagnostics(["phase": "photos-observer-continuity", "event": "revoked", "reason": "runtime-permission-transition"])
     }
 
     public func attachIndexStore(_ store: SyncStore) { state.attach(store) }
     public func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
+        try historyRetry.check()
         // Drain the ordered classifier before deciding whether the observer session
         // is intact. An inventory wakeup alone is not a content-continuity gap.
         let snapshot = try await candidateSnapshot()
@@ -243,6 +248,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                   { [changeChannel] in changeChannel.reconciled() }) else {
             throw PhotoKitGatewayError.libraryChanged
         }
+        historyRetry.succeeded()
         diagnostics(["phase": "photos-inventory-ack", "event": String(expectedGeneration),
                      "delivery": "reconciled", "historyAdmission": "unchanged", "observerContinuity": "established"])
     }
@@ -349,21 +355,24 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     public func contextCheckpoint() async throws -> LibraryResumeCheckpoint? {
+        try historyRetry.check()
         let start = ProcessInfo.processInfo.systemUptime
         defer { indexDiagnostics.recordTiming(stage: "photos_checkpoint_wall", seconds: ProcessInfo.processInfo.systemUptime - start) }
         do {
             let generation = try await usableGeneration()
             guard let token = try lifecycle.archivedChangeToken() else {
-                state.invalidateHistoryAdmission(); state.invalidateAllRepresentations(); return nil
+                state.invalidateHistoryAdmission(); state.requireInventoryReconciliation(); return nil
             }
             try verifyUsable(generation: generation)
             return LibraryResumeCheckpoint(context: state.snapshot().context, archivedChangeToken: token, photosGeneration: generation)
         } catch {
-            state.invalidateHistoryAdmission(); state.invalidateAllRepresentations(); throw error
+            state.invalidateHistoryAdmission(); state.requireInventoryReconciliation()
+            historyRetry.failed(); throw error
         }
     }
 
     public func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool {
+        try historyRetry.check()
         // This closes existing snapshot/submit fences as well as future admission.
         // No state lock is held during PhotoKit history or SQLite journal work.
         let ticket = state.beginHistoryCoverage()
@@ -375,31 +384,34 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
               proposed.context == ticket.context, let upperGeneration = proposed.photosGeneration,
               upperGeneration >= 0, upperGeneration <= ticket.generation,
               lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
-            state.invalidateAllRepresentations(); return false
+            state.requireInventoryReconciliation(); return false
         }
-        var persisted = true, unknown = false
+        var unknown = false
         let complete: Bool
         do {
             complete = try measured("photos_history_replay_wall") { try lifecycle.replayPersistentChanges(previous.archivedChangeToken, onChange: { event in
                 if event == .fullReconcileRequired || event == .contextInvalidated { unknown = true }
-            }, onContentChange: { [state, catalogBatchSize, indexDiagnostics] ids in
+            }, onContentChange: { [state, indexDiagnostics] ids in
                 let start = ProcessInfo.processInfo.systemUptime
-                if !state.recordContentChanges(ids, capacity: max(1, catalogBatchSize)) { persisted = false }
-                indexDiagnostics.recordTiming(stage: "photos_history_content_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
+                // History identifies possible updates, not changed model inputs.
+                // The mandatory metadata inventory checks every asset's date.
+                state.invalidateActiveReads(Set(ids))
+                indexDiagnostics.recordTiming(stage: "photos_history_scope_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
                 for id in ids { indexDiagnostics.recordCause(context: ticket.context, assetID: id, source: "history", generation: ticket.generation,
                     facts: ["category": "unknown", "content": "unknown", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
                 diagnostic.record(["phase": "photos-history-obligation", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers", "assets": String(ids.count)])
                 for id in ids { diagnostic.record(["phase": "photos-history-sample", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers"], assetID: id) }
             }) }
         } catch {
-            state.invalidateAllRepresentations()
+            state.requireInventoryReconciliation()
             diagnostics(["phase": "photos-history-coverage", "result": "unknown", "reason": "history-unavailable"])
-            return false
+            if Self.isUnusableHistoryCursor(error) { historyRetry.succeeded(); return false }
+            historyRetry.failed(); throw error
         }
         let coverage = state.historyCoverageFacts(ticket)
-        guard complete, persisted, !unknown, coverage.valid,
+        guard complete, !unknown, coverage.valid,
               lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else {
-            state.invalidateAllRepresentations()
+            state.requireInventoryReconciliation()
             diagnostics(["phase": "photos-history-coverage", "result": "unknown"])
             return false
         }
@@ -411,12 +423,19 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
             throw PhotoKitGatewayError.libraryChanged
         }
         diagnostics(["phase": "photos-history-coverage", "result": "covered"])
+        historyRetry.succeeded()
         return true
     }
 
+    public func restoreInventoryContext(_ context: LibraryContext) async throws {
+        let generation = try await usableGeneration()
+        guard state.adoptContext(context, generation: generation) != nil else { throw PhotoKitGatewayError.libraryChanged }
+    }
+
     public func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool {
+        try historyRetry.check()
         do {
-            _ = try await usableGeneration()
+            try await restoreInventoryContext(checkpoint.context)
             let generation = state.recordChange(expectingDetails: true)
             state.setReplayContext(checkpoint.context)
             let diagnostic = indexDiagnostics.operation("history-resume")
@@ -427,23 +446,37 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 diagnostic.finish()
             }
             guard try lifecycle.replayPersistentChanges(checkpoint.archivedChangeToken, onChange: { [state] event in
-                if event == .fullReconcileRequired || event == .contextInvalidated { state.invalidateAllRepresentations() }
-            }, onContentChange: { [state, catalogBatchSize, indexDiagnostics] ids in
+                if event == .fullReconcileRequired || event == .contextInvalidated { state.requireInventoryReconciliation() }
+            }, onContentChange: { [state, indexDiagnostics] ids in
                 let start = ProcessInfo.processInfo.systemUptime
-                _ = state.recordContentChanges(ids, capacity: max(1, catalogBatchSize))
-                indexDiagnostics.recordTiming(stage: "photos_history_content_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
+                // History identifies possible updates, not changed model inputs.
+                // The mandatory metadata inventory checks every asset's date.
+                state.invalidateActiveReads(Set(ids))
+                indexDiagnostics.recordTiming(stage: "photos_history_scope_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
                 for id in ids { indexDiagnostics.recordCause(context: checkpoint.context, assetID: id, source: "history", generation: generation,
                     facts: ["category": "unknown", "content": "unknown", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
-            }), let adoptedGeneration = state.adoptContext(checkpoint.context, generation: generation) else {
-                state.invalidateContext(); changeChannel.send(.contextInvalidated); return false
+            }), let adoptedGeneration = state.adoptContext(checkpoint.context, generation: generation, completingReplay: true) else {
+                state.requireInventoryReconciliation(); changeChannel.send(.fullReconcileRequired); return false
             }
             try verifyUsable(generation: adoptedGeneration)
             changeChannel.send(.fullReconcileRequired)
+            historyRetry.succeeded()
             return true
         } catch {
-            state.invalidateContext(); changeChannel.send(.contextInvalidated)
-            return false
+            state.requireInventoryReconciliation(); changeChannel.send(.fullReconcileRequired)
+            if Self.isUnusableHistoryCursor(error) { historyRetry.succeeded(); return false }
+            historyRetry.failed(); throw error
         }
+    }
+
+    private static func isUnusableHistoryCursor(_ error: Error) -> Bool {
+        let error = error as NSError
+        if error.domain == PHPhotosErrorDomain {
+            return error.code == PHPhotosError.persistentChangeTokenExpired.rawValue ||
+                error.code == PHPhotosError.persistentChangeDetailsUnavailable.rawValue
+        }
+        return error.domain == NSCocoaErrorDomain &&
+            [NSCoderReadCorruptError, NSCoderValueNotFoundError, NSCoderInvalidValueError].contains(error.code)
     }
 
     public func loadCandidates() async throws -> [MatchCandidate] {
@@ -559,7 +592,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 switch event {
                 case .incremental(let delta):
                     let persistStart = ProcessInfo.processInfo.systemUptime
-                    if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.invalidateAllRepresentations() }
+                    if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.requireInventoryReconciliation() }
                     indexDiagnostics.recordTiming(stage: "photos_live_catalog_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - persistStart)
                     // A large complete scope is durable; stream buffers hold only a wakeup.
                     if delta.changedAssetIDs.count + delta.deletedAssetIDs.count > max(1, catalogBatchSize / 2), state.hasStore {
@@ -577,8 +610,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                         for id in delta.changedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "inventory-changed", "content": "unknown", "event": String(delta.toGeneration)], assetID: id) }
                         for id in delta.deletedAssetIDs { diagnostic.record(["phase": "photos-live-sample", "source": "live", "category": "deleted", "event": String(delta.toGeneration)], assetID: id) }
                     }
-                case .contextInvalidated: state.invalidateAllRepresentations(); changeChannel.send(event)
-                case .fullReconcileRequired: state.invalidateAllRepresentations(); changeChannel.send(event)
+                case .contextInvalidated: state.requireInventoryReconciliation(); changeChannel.send(event)
+                case .fullReconcileRequired: state.requireInventoryReconciliation(); changeChannel.send(event)
                 }
             },
             onContentChange: { [state, catalogBatchSize, indexDiagnostics] ids in
@@ -603,16 +636,16 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private func usableGeneration() async throws -> Int {
         var access = lifecycle.currentAccess()
         if access == .notDetermined { access = await lifecycle.requestReadWriteAuthorization() }
-        guard access == .authorized else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.authorizationRequired }
-        guard lifecycle.isAvailable() else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.libraryUnavailable }
+        guard access == .authorized else { state.requireInventoryReconciliation(); throw PhotoKitGatewayError.authorizationRequired }
+        guard lifecycle.isAvailable() else { state.requireInventoryReconciliation(); throw PhotoKitGatewayError.libraryUnavailable }
         let snapshot = state.snapshot()
         guard snapshot.available else { throw PhotoKitGatewayError.libraryUnavailable }
         return snapshot.generation
     }
 
     private func verifyUsable(generation: Int) throws {
-        guard lifecycle.currentAccess() == .authorized else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.authorizationRequired }
-        guard lifecycle.isAvailable() else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.libraryUnavailable }
+        guard lifecycle.currentAccess() == .authorized else { state.requireInventoryReconciliation(); throw PhotoKitGatewayError.authorizationRequired }
+        guard lifecycle.isAvailable() else { state.requireInventoryReconciliation(); throw PhotoKitGatewayError.libraryUnavailable }
         let snapshot = state.snapshot()
         guard snapshot.available else { throw PhotoKitGatewayError.libraryUnavailable }
         guard snapshot.generation == generation else { throw PhotoKitGatewayError.libraryChanged }
@@ -1051,7 +1084,7 @@ private final class PhotoKitState: @unchecked Sendable {
     func continuousInventory(previousCheckpoint: LibraryResumeCheckpoint?, expectedGeneration: Int) throws -> PhotosInventoryContinuity? {
         lock.lock(); defer { lock.unlock() }
         guard available, generation == expectedGeneration, pendingChangeDetails == 0 else { throw PhotoKitGatewayError.libraryChanged }
-        guard observerContinuous, !allRepresentationsInvalid, store != nil,
+        guard observerContinuous, !inventoryUnverified, store != nil,
               previousCheckpoint == observerCheckpoint else { return nil }
         return .init(checkpoint: previousCheckpoint, preservesCachedRepresentations: true, observerFence: observerFence)
     }
@@ -1074,7 +1107,7 @@ private final class PhotoKitState: @unchecked Sendable {
     }
     func historyCoverageFacts(_ ticket: HistoryCoverageTicket) -> (valid: Bool, retryReason: String?) {
         lock.lock(); defer { lock.unlock() }
-        guard available, context == ticket.context, store != nil, !allRepresentationsInvalid else { return (false, nil) }
+        guard available, context == ticket.context, store != nil, !inventoryUnverified else { return (false, nil) }
         if generation != ticket.generation { return (true, "upper-generation-stale") }
         if pendingChangeDetails != 1 { return (true, "observer-details-pending") }
         if admissionRevision != ticket.admissionRevision { return (true, "coverage-superseded") }
@@ -1134,7 +1167,7 @@ private final class PhotoKitState: @unchecked Sendable {
             return true
         } catch { return false }
     }
-    private var allRepresentationsInvalid = false
+    private var inventoryUnverified = false
     private var pendingChangeDetails = 0
 
     private var reads: [UUID: (assetID: String, valid: Bool)] = [:]
@@ -1166,7 +1199,7 @@ private final class PhotoKitState: @unchecked Sendable {
         if store == nil {
             for id in ids {
                 if contentChangedIDs.count >= capacity && !contentChangedIDs.contains(id) {
-                    revokeObserverContinuityLocked(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll(); break
+                    revokeObserverContinuityLocked(); inventoryUnverified = true; unknownGeneration = generation; contentChangedIDs.removeAll(); break
                 }
                 contentChangedIDs.insert(id)
             }
@@ -1176,10 +1209,12 @@ private final class PhotoKitState: @unchecked Sendable {
             try store?.recordPhotosChanges(context: context, runID: runID, generation: generation,
                 changed: ids, deleted: [], content: Set(ids), batchSize: capacity)
             return store != nil
-        } catch { invalidateAllRepresentations(); return false }
+        } catch { requireInventoryReconciliation(); return false }
     }
-    func invalidateAllRepresentations() {
-        lock.lock(); revokeObserverContinuityLocked(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll()
+    // Revoke discovery/admission continuity only. This never changes stored
+    // representation readiness or successful analysis facts.
+    func requireInventoryReconciliation() {
+        lock.lock(); revokeObserverContinuityLocked(); inventoryUnverified = true; unknownGeneration = generation; contentChangedIDs.removeAll()
         for (ticket, read) in reads { reads[ticket] = (read.assetID, false) }
         lock.unlock()
     }
@@ -1190,7 +1225,7 @@ private final class PhotoKitState: @unchecked Sendable {
         lock.lock()
         let usable = available && generation == expected && pendingChangeDetails == 0
         let store = store, context = context, fallback = contentChangedIDs.intersection(pageAssetIDs).sorted()
-        let all = allRepresentationsInvalid
+        let all = inventoryUnverified
         lock.unlock()
         guard usable else { throw PhotoKitGatewayError.libraryChanged }
         return (try store?.photosContentChanges(context: context, assetIDs: pageAssetIDs) ?? fallback, all,
@@ -1212,7 +1247,7 @@ private final class PhotoKitState: @unchecked Sendable {
         if let continuity {
             observerCheckpoint = continuity.checkpoint; observerContinuous = true
         }
-        contentChangedIDs.removeAll(); allRepresentationsInvalid = false
+        contentChangedIDs.removeAll(); inventoryUnverified = false
         if admitHistory { historyAdmissionBlocked = false }
         acknowledge()
         return true
@@ -1224,20 +1259,18 @@ private final class PhotoKitState: @unchecked Sendable {
         lock.unlock()
     }
     func snapshot() -> (available: Bool, generation: Int, context: LibraryContext) { lock.lock(); defer { lock.unlock() }; return (available, generation, context) }
-    func adoptContext(_ context: LibraryContext, generation expected: Int) -> Int? {
+    func adoptContext(_ context: LibraryContext, generation expected: Int, completingReplay: Bool = false) -> Int? {
         lock.lock(); defer { lock.unlock() }
-        guard available, generation == expected else { return nil }
+        // A resume owns one pending replay marker; any observer marker beyond
+        // it is still an unfinished classification and prevents adoption.
+        let expectedDetails = completingReplay ? 1 : 0
+        guard available, generation == expected, pendingChangeDetails == expectedDetails,
+              !completingReplay || replayContext == context else { return nil }
         self.context = context
         // Replay runs outside the lock. Snapshots acquired during that work
         // belong to the provisional context and must not survive adoption.
         generation += 1; indexedGeneration = nil
         return generation
-    }
-    func invalidateContext() {
-        lock.lock(); defer { lock.unlock() }
-        revokeObserverContinuityLocked()
-        context = LibraryContext(id: UUID(), epoch: 0); generation += 1; indexedGeneration = nil
-        allRepresentationsInvalid = true; contentChangedIDs.removeAll()
     }
     func validity(generation expected: Int) -> any PhotosCandidateValidity {
         lock.lock(); let revision = admissionRevision; lock.unlock()
@@ -1306,4 +1339,24 @@ private final class PhotoKitMutationGuard: @unchecked Sendable {
         catch { lock.lock(); self.error = error; lock.unlock(); return false }
     }
     var failure: Error? { lock.lock(); defer { lock.unlock() }; return error }
+}
+
+/// No Photos/SQLite work under this lock. Bounds retries even when runtime ticks
+/// arrive frequently; permanent token loss takes the metadata path immediately.
+private final class PhotosHistoryRetry: @unchecked Sendable {
+    private let lock = NSLock()
+    private let now: @Sendable () -> TimeInterval
+    private var failures = 0
+    private var nextAttempt: TimeInterval = 0
+    init(now: @escaping @Sendable () -> TimeInterval) { self.now = now }
+    func check() throws {
+        lock.lock(); defer { lock.unlock() }
+        guard now() >= nextAttempt else { throw PhotoKitGatewayError.libraryChanged }
+    }
+    func failed() {
+        lock.lock(); defer { lock.unlock() }
+        failures = min(failures + 1, 4)
+        nextAttempt = now() + [5.0, 15, 30, 60][failures - 1]
+    }
+    func succeeded() { lock.lock(); failures = 0; nextAttempt = 0; lock.unlock() }
 }

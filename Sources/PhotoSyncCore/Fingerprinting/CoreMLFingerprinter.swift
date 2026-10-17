@@ -6,6 +6,9 @@ import Foundation
 import ImageIO
 
 public protocol ImageFingerprinting: Sendable {
+    func fingerprintReusingInput(image: CGImage, orientation: CGImagePropertyOrientation,
+                               reuse: @escaping @Sendable (ModelInputDigest) async throws -> Fingerprint?,
+                               onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint
     func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult
     func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation,
@@ -13,6 +16,12 @@ public protocol ImageFingerprinting: Sendable {
 }
 
 public extension ImageFingerprinting {
+    func fingerprintReusingInput(image: CGImage, orientation: CGImagePropertyOrientation,
+                               reuse: @escaping @Sendable (ModelInputDigest) async throws -> Fingerprint?,
+                               onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult {
+        try await fingerprintWithDiagnostics(image: image, orientation: orientation, onTiming: onTiming)
+    }
+
     func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> FingerprintResult {
         FingerprintResult(fingerprint: try await fingerprint(image: image, orientation: orientation))
     }
@@ -67,8 +76,11 @@ enum PreparedTensorDigest {
         // This is deliberately independent of the mutable representation descriptor. v1 binds
         // resource selection/ImageIO orientation, sRGB RGBA8 premultiplication, high interpolation,
         // EXIF transforms, Float32 normalization, model config, serialization and system runtime.
-        let contract = "model-input-sha256-v1|nchw-f32-le|imageio-selection-v1|cg-srgb-rgba8-premultiplied-high-exif-v1|\(configuration.version)|\(runtimeIdentity)"
-        return try ModelInputDigest(bytes: Data(hash.finalize()), contract: contract)
+        return try ModelInputDigest(bytes: Data(hash.finalize()), contract: contract(configuration: configuration, runtimeIdentity: runtimeIdentity))
+    }
+
+    static func contract(configuration: FingerprintConfiguration, runtimeIdentity: String = Self.runtimeIdentity) -> String {
+        "model-input-sha256-v1|nchw-f32-le|imageio-selection-v1|cg-srgb-rgba8-premultiplied-high-exif-v1|\(configuration.version)|\(runtimeIdentity)"
     }
 }
 
@@ -200,6 +212,12 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
     /// synchronous; it runs outside ownership locks, and does not receive image or digest data.
     public func fingerprintWithDiagnostics(image: CGImage, orientation: CGImagePropertyOrientation,
                                            onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult {
+        try await fingerprintReusingInput(image: image, orientation: orientation, reuse: { _ in nil }, onTiming: onTiming)
+    }
+
+    public func fingerprintReusingInput(image: CGImage, orientation: CGImagePropertyOrientation,
+                               reuse: @escaping @Sendable (ModelInputDigest) async throws -> Fingerprint?,
+                               onTiming: @escaping @Sendable (FingerprintTimingStage, Double) -> Void) async throws -> FingerprintResult {
         try Task.checkCancellation()
         guard eligibility.isEligible else { throw CancellationError() }
         let prepared = try Self.measured(.preprocessing, onTiming: onTiming) {
@@ -207,6 +225,13 @@ public actor CoreMLFingerprinter: ImageFingerprinting, ModelExecutionRecovering 
         }
         let digest = try Self.measured(.digest, onTiming: onTiming) {
             try PreparedTensorDigest.compute(prepared.value, configuration: configuration)
+        }
+        if let cached = try await reuse(digest.value) {
+            try Task.checkCancellation()
+            guard eligibility.isEligible else { throw CancellationError() }
+            guard cached.version == configuration.version else { throw AdvancedDedupError.modelMismatch }
+            return FingerprintResult(fingerprint: cached, inputDigest: digest.value,
+                timings: .init(preprocessingSeconds: prepared.seconds, digestSeconds: digest.seconds), reusedCachedVector: true)
         }
         let prediction = try await predictPrepared(prepared.value, onTiming: onTiming)
         return FingerprintResult(fingerprint: prediction.fingerprint, inputDigest: digest.value,

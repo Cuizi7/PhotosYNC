@@ -7,6 +7,16 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testDescriptorCarriesExactModificationDateAndRejectsNonfiniteDate() throws {
+        let date = Date(timeIntervalSince1970: 123.125)
+        for value in [date, nil, Date(timeIntervalSince1970: .infinity), Date(timeIntervalSince1970: .nan)] {
+            let asset = PhotoKitRepresentationAsset(identifier: "date", modificationDate: value, playbackStyle: .image, resources: [])
+            let descriptor = asset.descriptor(kind: .original, context: .init(id: UUID(), epoch: 1))
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(descriptor)) as? [String: Any])
+            XCTAssertEqual(json["modificationDate"] as? Double, value?.timeIntervalSince1970.isFinite == true ? value?.timeIntervalSinceReferenceDate : nil)
+        }
+    }
+
     func testLogicalTimeoutAndAdmissionRemainResponsiveDuringSynchronousRequestStart() async throws {
         let timeout = expectation(description: "deadline handler fired")
         let returned = expectation(description: "logical timeout returned with startup held")
@@ -483,7 +493,7 @@ final class PhotosRepresentationTests: XCTestCase {
         XCTAssertEqual(clean, fixtureIndexChange(changed: ["e"]))
     }
 
-    func testResumeRequiresPublicHistoryAndReplaysExplicitChanges() async throws {
+    func testPublicHistoryFailureRetainsThePersistentObjectNamespace() async throws {
         let lifecycle = RepresentationLifecycle()
         lifecycle.replayChanges = [fixtureIndexChange(changed: ["same-revision"]), fixtureIndexChange(deleted: ["deleted"])]
         let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 128)
@@ -501,7 +511,7 @@ final class PhotosRepresentationTests: XCTestCase {
         let failed = try await gateway.resumeContext(checkpoint)
         XCTAssertFalse(failed)
         let fresh = try await gateway.contextCheckpoint()
-        XCTAssertNotEqual(fresh?.context, oldContext)
+        XCTAssertEqual(fresh?.context, oldContext)
     }
 
     func testSourceCancellationKeepsSharedBudgetAndDecodeSlotOccupied() async throws {
@@ -738,7 +748,7 @@ final class PhotosRepresentationTests: XCTestCase {
         }
     }
 
-    func testUnconsumedReplayEventsStillInvalidateMatchingCatalogRevision() async throws {
+    func testUnconsumedHistoryIDsDoNotOverrideReliableCatalogMetadata() async throws {
         let lifecycle = RepresentationLifecycle()
         let facts = PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(timeIntervalSince1970: 1), playbackStyle: .image,
             resources: [PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "a", size: nil)])
@@ -753,18 +763,18 @@ final class PhotosRepresentationTests: XCTestCase {
         let page = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: snapshot.generation)
         XCTAssertEqual(page.descriptors[0].revision, old.revision)
         XCTAssertTrue(page.descriptors[0].revisionIsReliable)
-        XCTAssertEqual(page.invalidatedAssetIDs, ["a"], "catalog safety cannot depend on draining AsyncStream")
+        XCTAssertEqual(page.invalidatedAssetIDs, [], "history IDs require catalog verification, not unconditional input invalidation")
         XCTAssertFalse(page.invalidateAllCachedRepresentations)
         try await gateway.acknowledgeReconciliation(expectedGeneration: snapshot.generation)
         let acknowledged = try await gateway.representationCatalog(offset: 0, limit: 128, expectedGeneration: snapshot.generation)
         XCTAssertEqual(acknowledged.invalidatedAssetIDs, [])
     }
 
-    func testBoundedInvalidationOverflowIsStickyInPagesUntilCurrentAcknowledgement() async throws {
+    func testUnknownReplayScopeIsStickyInPagesUntilCurrentAcknowledgement() async throws {
         let lifecycle = RepresentationLifecycle()
         lifecycle.assets = [PhotoKitRepresentationAsset(identifier: "a", modificationDate: Date(), playbackStyle: .image,
             resources: [PhotoKitRepresentationResource(type: .photo, uti: "public.jpeg", filename: "a", size: nil)])]
-        lifecycle.replayChanges = [fixtureIndexChange(changed: ["a", "b"]), fixtureIndexChange(changed: ["a"])]
+        lifecycle.replayChanges = [.fullReconcileRequired, fixtureIndexChange(changed: ["a", "b"]), fixtureIndexChange(changed: ["a"]) ]
         let gateway = PhotoKitGateway(lifecycle: lifecycle, catalogBatchSize: 1)
         let context = LibraryContext(id: UUID(), epoch: 0)
         let before = try await gateway.candidateSnapshot()

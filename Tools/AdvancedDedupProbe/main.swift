@@ -719,7 +719,7 @@ private func productSQLiteCandidates(query: Fingerprint, entries: [VectorEntry],
     let context = LibraryContext(id: UUID(), epoch: 1)
     let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: query.version)
     let descriptors = entries.map { RepresentationDescriptor(key: .init(assetID: $0.key, kind: .original), context: context,
-        revision: "validation", size: $0.size, equivalentToOriginal: false, revisionIsReliable: true) }
+        revision: "validation", size: $0.size, equivalentToOriginal: false, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: 100)) }
     _ = try await store.upsertRepresentations(descriptors, generation: generation)
     let tasks = try await store.nextRepresentationTasks(now: Date(), limit: max(1, entries.count))
     for task in tasks { guard try await store.completeRepresentation(task, fingerprint: entries.first { $0.key == task.descriptor.key.assetID }!.fingerprint) else { throw AdvancedDedupError.invalidConfiguration } }

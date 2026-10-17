@@ -6,6 +6,134 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testCompletedEmptyInventoryThenSameSuccessfulDateReturnDoesNoImageWork() async throws {
+        let f = try fixture(), d = descriptor(f.photos.context)
+        await f.photos.set([d]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.set([]); try await f.coordinator.reconcile()
+        let removed = await f.coordinator.progress(); XCTAssertEqual(removed.totalRepresentations, 0)
+        try await assertNotNil(try await f.coordinator.readyToken())
+        await f.photos.resetReads(); await f.model.reset()
+        await f.photos.set([d]); try await f.coordinator.reconcile()
+        let returned = await f.coordinator.progress(); XCTAssertEqual(returned.readyRepresentations, 1)
+        let tasks = try await f.store.nextRepresentationTasks(now: now, limit: 1); XCTAssertTrue(tasks.isEmpty)
+        await f.coordinator.processDueWork(now: now)
+        try await assertNotNil(try await f.coordinator.readyToken())
+        await assertEqual(await f.photos.readCount, 0); await assertEqual(await f.model.count, 0)
+    }
+
+    func testCancellationDuringPreReadSnapshotStartsNoOwnedWorkAndFreshCallerCanResume() async throws {
+        let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+        try await f.coordinator.reconcile()
+        try injectEngineSQL("CREATE TABLE before_cancel AS SELECT * FROM fingerprint_task", at: f.db)
+        let gate = CoordinatorGate(); await f.photos.gateSnapshot(1, using: gate)
+        let work = Task { await f.coordinator.processDueWork(now: now) }
+        await gate.waitUntilEntered(); work.cancel(); await gate.release(); await work.value
+        await assertEqual(await f.photos.readCount, 0); await assertEqual(await f.model.count, 0)
+        let progress = await f.coordinator.progress(); XCTAssertEqual(progress.readyRepresentations, 0)
+        let pending = try await f.store.nextRepresentationTasks(now: now, limit: 1); XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_cancel EXCEPT SELECT * FROM fingerprint_task)", at: f.db), 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM fingerprint_task EXCEPT SELECT * FROM before_cancel)", at: f.db), 0)
+        let resources = await f.photos.budget.snapshot(); XCTAssertEqual(resources.images, 0); XCTAssertEqual(resources.bytes, 0)
+        await f.coordinator.processDueWork(now: now)
+        await assertEqual(await f.photos.readCount, 1); await assertEqual(await f.model.count, 1)
+        try await assertNotNil(try await f.coordinator.readyToken())
+    }
+
+    func testSameDateContentEventsNeverDemoteSuccessOrRestartFailedRetry() async throws {
+        for succeeded in [true, false] {
+            let f = try fixture()
+            let d = descriptor(f.photos.context, date: Date(timeIntervalSinceReferenceDate: 100.25))
+            await f.photos.set([d])
+            if !succeeded { await f.photos.fail("asset") }
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            try injectEngineSQL("CREATE TABLE before_retry AS SELECT retry_count,next_retry_at,last_error FROM fingerprint_task; CREATE TRIGGER forbid_event_demotion BEFORE UPDATE OF state ON photos_representation WHEN OLD.state='ready' AND NEW.state='pending' BEGIN SELECT RAISE(FAIL, 'same-date event demoted success'); END;", at: f.db)
+            await f.model.reset(); await f.photos.resetReads()
+            await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [d], nextOffset: nil, invalidatedAssetIDs: ["asset"])])
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_retry EXCEPT SELECT retry_count,next_retry_at,last_error FROM fingerprint_task)", at: f.db), 0)
+            await assertEqual(await f.photos.readCount, 0)
+            await assertEqual(await f.model.count, 0)
+            let token = try await f.coordinator.readyToken()
+            XCTAssertEqual(token != nil, succeeded)
+        }
+    }
+
+    func testCancellationOrPauseAtPublicationAwaitsCannotPublishOrConfirmAndResumeReusesDates() async throws {
+        for pause in [false, true] {
+            // 4: final inventory snapshot; 5: before publication persistence;
+            // 6: after gateway acknowledgment; nil: acknowledgment itself awaits.
+            for snapshotNumber in [4, 5, 6, nil] as [Int?] {
+                let f = try fixture(), gate = CoordinatorGate()
+                await f.photos.set([descriptor(f.photos.context)])
+                try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+                await f.photos.resetReads(); await f.model.reset()
+                let acknowledgments = await f.photos.acknowledgementCount
+                let receipt = await f.coordinator.libraryChanged(.fullReconcileRequired)
+                if let snapshotNumber { await f.photos.gateSnapshot(snapshotNumber, using: gate) }
+                else { await f.photos.gateNextAcknowledgment(gate) }
+                let pass = Task { try await f.coordinator.reconcile() }
+                await gate.waitUntilEntered()
+                if pause { await f.coordinator.setPaused(true) } else { pass.cancel() }
+                await gate.release()
+                do { try await pass.value; XCTFail("interrupted publication cannot finish") }
+                catch { XCTAssertTrue(error is CancellationError) }
+                let covered = await f.coordinator.reconciliationCovers(change: receipt)
+                XCTAssertFalse(covered)
+                try await assertNil(try await f.coordinator.readyToken())
+                // A call already issued before interruption may finish, but an
+                // interrupted pre-publication snapshot must not issue an ack.
+                let expectedAcknowledgments = acknowledgments + (snapshotNumber == 6 || snapshotNumber == nil ? 1 : 0)
+                await assertEqual(await f.photos.acknowledgementCount, expectedAcknowledgments)
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_index_state WHERE published_generation IS NULL", at: f.db), 1)
+                XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL AND successful_modification_date=100", at: f.db), 1)
+                await f.coordinator.setPaused(false)
+                try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+                try await assertNotNil(try await f.coordinator.readyToken())
+                let resumed = await f.coordinator.reconciliationCovers(change: receipt)
+                XCTAssertTrue(resumed)
+                await assertEqual(await f.photos.readCount, 0); await assertEqual(await f.model.count, 0)
+            }
+        }
+    }
+
+    func testMergedDeleteReinsertKeepsSameDateSuccessWithoutImageWork() async throws {
+        let f = try fixture(), d = descriptor(f.photos.context)
+        await f.photos.set([d]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        await f.photos.resetReads(); await f.model.reset()
+        let removed = await f.photos.changeFacts([], deleted: [d.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(removed))
+        let restored = await f.photos.changeFacts([d], changed: [d.key.assetID])
+        await f.coordinator.libraryChanged(.incremental(restored)); await f.coordinator.processDueWork(now: now)
+        try await assertNotNil(try await f.coordinator.readyToken())
+        await assertEqual(await f.photos.readCount, 0); await assertEqual(await f.model.count, 0)
+    }
+
+    func testMetadataRevisionChangeReusesSuccessfulModelInputBeforePrediction() async throws {
+        let f = try fixture(), calls = CoordinatorPhysicalCount()
+        let model = CoreMLFingerprinter(configuration: f.configuration.fingerprint, predict: { _ in
+            calls.increment(); return [1] + Array(repeating: 0, count: 1023)
+        })
+        let coordinator = PhotosIndexCoordinator(store: f.store, photos: f.photos, fingerprinter: model,
+            configuration: f.configuration)
+        await f.photos.set([descriptor(f.photos.context, revision: "first")])
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        XCTAssertEqual(calls.value, 1)
+        await f.photos.set([descriptor(f.photos.context, revision: "new-metadata-same-pixels", date: Date(timeIntervalSinceReferenceDate: 200))])
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        XCTAssertEqual(calls.value, 1, "A matching accepted model input must bypass physical prediction")
+        await assertEqual(await f.photos.readCount, 2)
+        try await assertNotNil(try await coordinator.readyToken())
+        await f.photos.setImageRed(1)
+        await f.photos.set([descriptor(f.photos.context, revision: "new-pixels", date: Date(timeIntervalSinceReferenceDate: 300))])
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        XCTAssertEqual(calls.value, 2, "A changed model input must still be predicted")
+        await f.photos.setImageRed(0.5)
+        await f.photos.setPages([.init(context: f.photos.context, generation: 4,
+            descriptors: [descriptor(f.photos.context, revision: "new-pixels", date: Date(timeIntervalSinceReferenceDate: 400))], nextOffset: nil, invalidatedAssetIDs: ["asset"])])
+        try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
+        XCTAssertEqual(calls.value, 3, "A changed date verifies actual input even when the read revision is equal")
+    }
+
     func testSuccessfulInventoryConfirmsRequestWhileVectorsRemainPending() async throws {
         let f = try fixture()
         await f.photos.set([descriptor(f.photos.context)])
@@ -39,11 +167,11 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let f = try fixture(indexDiagnostics: diagnostics), d = descriptor(f.photos.context)
         await f.photos.set([d]); try await f.coordinator.reconcile()
         await f.coordinator.processDueWork(now: now)
-        let content = await f.photos.changeFacts([d], changed: ["asset"])
+        let content = await f.photos.changeFacts([descriptor(f.photos.context, date: Date(timeIntervalSinceReferenceDate: 200))], changed: ["asset"])
         diagnostics.recordCause(context: f.photos.context, assetID: "asset", source: "live", generation: content.toGeneration,
             facts: ["assetContentChanged": "true", "visibleInputFields": "none", "metadataFields": "none"])
         await f.coordinator.libraryChanged(.incremental(content))
-        let neutral = await f.photos.changeFacts([d], changed: ["asset"])
+        let neutral = await f.photos.changeFacts([descriptor(f.photos.context, date: Date(timeIntervalSinceReferenceDate: 200))], changed: ["asset"])
         diagnostics.recordCause(context: f.photos.context, assetID: "asset", source: "live", generation: neutral.toGeneration,
             facts: ["assetContentChanged": "false", "visibleInputFields": "none", "metadataFields": "isFavorite"], inputObligation: false)
         await f.photos.invalidateDelta(["asset"])
@@ -63,7 +191,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.coordinator.processDueWork(now: now)
         diagnostics.recordCause(context: f.photos.context, assetID: "asset", source: "live", generation: 1,
             facts: ["assetContentChanged": "true", "visibleInputFields": "none", "metadataFields": "none"])
-        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [d], nextOffset: nil,
+        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [descriptor(f.photos.context, date: Date(timeIntervalSinceReferenceDate: 200))], nextOffset: nil,
             invalidateAllCachedRepresentations: true)])
         await f.coordinator.libraryChanged(.fullReconcileRequired)
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
@@ -114,7 +242,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         diagnostic.recordCause(context: f.photos.context, assetID: "asset", source: "history", generation: 2,
             facts: ["category": "updated", "content": "unknown"])
         await f.photos.setPages([.init(context: f.photos.context, generation: 2,
-            descriptors: [descriptor(f.photos.context, revision: "metadata-only")], nextOffset: nil, invalidatedAssetIDs: ["asset"])])
+            descriptors: [descriptor(f.photos.context, revision: "metadata-only", date: Date(timeIntervalSinceReferenceDate: 200))], nextOffset: nil, invalidatedAssetIDs: ["asset"])])
         await coordinator.libraryChanged(.fullReconcileRequired)
         try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
         let same = try XCTUnwrap(rows.rows.last { $0["event"] == "accepted" })
@@ -123,7 +251,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let catalog = rows.rows.last { $0["phase"] == "index-catalog-sample" && $0["causeHandle"] == same["causeHandle"] }
         XCTAssertNotNil(catalog)
         await f.photos.setImageRed(1)
-        await f.photos.set([descriptor(f.photos.context, revision: "edited-input")])
+        await f.photos.set([descriptor(f.photos.context, revision: "edited-input", date: Date(timeIntervalSinceReferenceDate: 300))])
         await coordinator.libraryChanged(.fullReconcileRequired)
         try await coordinator.reconcile(); await coordinator.processDueWork(now: now)
         XCTAssertEqual(rows.rows.last { $0["event"] == "accepted" }?["comparison"], "different_input")
@@ -143,7 +271,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try await next.reconcile(); await next.processDueWork(now: now)
         XCTAssertEqual(rows.rows.last { $0["event"] == "accepted" }?["comparison"], "incomparable")
         await assertEqual(await f.photos.readCount, 4)
-        XCTAssertEqual(count.value, 4, "Diagnostics must not infer twice")
+        XCTAssertEqual(count.value, 3, "Identical prepared input reuses its accepted vector")
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND length(input_digest)=32 AND length(input_digest_contract)>0", at: f.db), 1)
         let summaries = rows.rows.filter { $0["phase"] == "index-diagnostic-summary" }
         for outcome in ["missing_baseline", "same_input", "different_input", "incomparable"] {
@@ -371,8 +499,8 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         XCTAssertFalse(stream.contains { $0["phase"] == "index-invalidation" || $0["phase"] == "index-diagnostic-summary" })
         let finalTasks = try await f.store.nextRepresentationTasks(now: now.addingTimeInterval(100), limit: 2)
         let retained = try XCTUnwrap(finalTasks.first)
-        XCTAssertEqual(retained.issuanceRevision, original.issuanceRevision)
-        XCTAssertEqual(retained.indexGeneration, original.indexGeneration)
+        XCTAssertEqual(retained.issuanceRevision, all[0].revision)
+        XCTAssertEqual(retained.indexGeneration, original.indexGeneration + 127)
         XCTAssertEqual(retained.retryCount, original.retryCount); XCTAssertEqual(retained.nextRetryAt, original.nextRetryAt)
         await assertEqual(await f.photos.readCount, 2); await assertEqual(await f.model.count, 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db), 1)
@@ -395,7 +523,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             await f.photos.preserveDeltaInputs(kind == "inserted-with-proof" ? ["new"] : kind == "changed-shape-with-proof" ? ["healthy"] : [])
             if kind == "changed-shape-with-proof" {
                 healthy = .init(key: healthy.key, context: healthy.context, revision: healthy.revision,
-                    size: try PixelSize(width: 16, height: 8), equivalentToOriginal: false, revisionIsReliable: true)
+                    size: try PixelSize(width: 16, height: 8), equivalentToOriginal: false, revisionIsReliable: true, modificationDate: Date(timeIntervalSinceReferenceDate: 200))
             }
             let all = kind == "inserted-with-proof" ? [healthy, added] : [healthy]
             let changed = kind == "deleted" ? [] : [kind == "inserted-with-proof" ? "new" : "healthy"]
@@ -403,7 +531,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             await f.coordinator.libraryChanged(.incremental(delta)); await f.coordinator.processDueWork(now: now)
             let events = Array(rows.rows.dropFirst(start)).filter { $0["phase"] == "index-invalidation" && $0["source"] == "live" }
             XCTAssertEqual(events.count, 1, kind)
-            XCTAssertEqual(events.first?["readyToPending"], kind == "content" ? "1" : "0", kind)
+            XCTAssertEqual(events.first?["readyToPending"], "0", kind)
             XCTAssertNotNil(events.first?["operation"], kind)
             controls.append(contentsOf: events)
         }
@@ -426,7 +554,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.coordinator.libraryChanged(.fullReconcileRequired)
         let start = rows.rows.count
         await f.coordinator.processDueWork(now: now)
-        XCTAssertTrue(rows.rows.dropFirst(start).contains { $0["phase"] == "index-invalidation" && $0["reason"] == "catalog-unknown" && $0["readyToPending"] == "2" }, "unknown invalidation also updates the retained tombstoned row")
+        XCTAssertTrue(rows.rows.dropFirst(start).contains { $0["phase"] == "index-metadata-verification" }, "unknown continuity requests metadata verification without mutating tombstoned facts")
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE tombstoned=0 AND state='ready'", at: f.db), 1)
     }
 
@@ -452,7 +580,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE asset_id<'032' AND retry_count>0", at: f.db), 32)
     }
 
-    func testMetadataOnlyNonemptyDeltasPreserveRotationIssuanceAndFailureBackoff() async throws {
+    func testSameDateLocatorDeltasRetargetIssuancePreservingRotationAndFailureBackoff() async throws {
         let f = try fixture()
         var all = (0..<40).map { descriptor(f.photos.context, asset: String(format: "%03d", $0)) }
         let ids = all.map { $0.key.assetID }
@@ -483,8 +611,8 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
                 let original = try XCTUnwrap(initial[asset])
                 XCTAssertEqual(task.descriptor.revision, revision)
                 XCTAssertEqual(task.descriptor.context, original.descriptor.context)
-                XCTAssertEqual(task.issuanceRevision, original.issuanceRevision, "Metadata continuity cannot reissue the task")
-                XCTAssertEqual(task.indexGeneration, original.indexGeneration)
+                XCTAssertEqual(task.issuanceRevision, revision, "The current locator owns the retargeted issuance")
+                XCTAssertEqual(task.indexGeneration, original.indexGeneration + Int64(slice))
                 let ordinal = try XCTUnwrap(Int(asset))
                 let retries = slice == 2 && ordinal < 8 ? 2 : (ordinal < min(32, (slice + 1) * 16) ? 1 : 0)
                 XCTAssertEqual(task.retryCount, retries, "Neutral metadata must preserve prior failures")
@@ -590,7 +718,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             if outcome == "failure" { await f.model.setAfterGate(.failure(.invalidImage)) }
             if outcome == "cancelled" { await f.model.setAfterGate(.cancelled) }
             else {
-                await f.photos.set([descriptor(f.photos.context, revision: "new")])
+                await f.photos.set([descriptor(f.photos.context, revision: "new", date: Date(timeIntervalSinceReferenceDate: 200))])
                 await f.coordinator.libraryChanged(.fullReconcileRequired)
             }
             await f.coordinator.setPaused(true)
@@ -642,13 +770,13 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let descriptors = (0..<20).map { descriptor(f.photos.context, asset: "private-asset-\($0)") }
         await f.photos.setPaged(descriptors, pageSize: 10)
         try await f.coordinator.reconcile(); await drain(f.coordinator, cutoff: now)
-        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: descriptors, nextOffset: nil,
-            invalidateAllCachedRepresentations: true)])
+        await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: descriptors.map { descriptor(f.photos.context, asset: $0.key.assetID, date: Date(timeIntervalSinceReferenceDate: 200)) }, nextOffset: nil,
+            invalidatedAssetIDs: descriptors.map { $0.key.assetID })])
         try await f.coordinator.reconcile(); await drain(f.coordinator, cutoff: now)
         let rows = log.rows
         XCTAssertFalse(rows.contains { $0.values.contains { $0.contains("private-asset-") } })
         let invalidations = rows.filter { $0["phase"] == "index-invalidation" }
-        XCTAssertTrue(invalidations.contains { $0["readyToPending"] == "20" && $0["reason"] == "catalog-unknown" })
+        XCTAssertTrue(invalidations.isEmpty, "Content events cannot force analysis invalidation; changed dates schedule per item")
         let details = rows.filter { $0["assetHandle"] != nil }
         XCTAssertFalse(details.isEmpty)
         XCTAssertLessThanOrEqual(Set(details.compactMap { $0["assetHandle"] }).count, 8)
@@ -662,7 +790,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         XCTAssertEqual(rows.filter { $0["phase"] == "index-reconcile" }.count, 2)
         let samples = rows.filter { $0["phase"] == "index-catalog-sample" }
         for handle in Set(samples.compactMap { $0["assetHandle"] }) {
-            XCTAssertEqual(Set(samples.filter { $0["assetHandle"] == handle }.compactMap { $0["descriptorHandle"] }).count, 1)
+            XCTAssertEqual(Set(samples.filter { $0["assetHandle"] == handle }.compactMap { $0["descriptorHandle"] }).count, 2, "An actual date change has a new descriptor identity")
         }
         if let destination = ProcessInfo.processInfo.environment["PHOTOSYNC_DIAGNOSTIC_EVIDENCE"] {
             let lines = try rows.map { try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) + Data([10]) }
@@ -857,7 +985,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
 
     private let now = Date(timeIntervalSince1970: 1_000)
 
-    func testMetadataOnlyRevisionChangePreservesInFlightIssuanceAndInference() async throws {
+    func testSameDateLocatorRetargetRejectsOldInFlightIssuanceWithoutLosingWork() async throws {
         let f = try fixture(), gate = CoordinatorGate()
         let a = descriptor(f.photos.context)
         await f.photos.set([a]); try await f.coordinator.reconcile(); await f.model.setGate(gate)
@@ -867,8 +995,10 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.preserveDeltaInputs([a.key.assetID])
         await f.coordinator.libraryChanged(.incremental(delta))
         await gate.release(); await work.value
+        try await assertNil(try await f.coordinator.readyToken())
+        await f.coordinator.processDueWork(now: now)
         try await assertNotNil(try await f.coordinator.readyToken())
-        await assertEqual(await f.model.count, 1)
+        await assertEqual(await f.model.count, 2)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE revision='metadata-only' AND state='ready'", at: f.db), 1)
     }
 
@@ -884,7 +1014,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             """, at: f.db)
         try installWriteAudit(at: f.db)
         await f.model.reset(); await f.photos.resetReads()
-        let delta = await f.photos.changeFacts([descriptor(f.photos.context, asset: "a0", revision: "edit"), other], changed: ["a0"])
+        let delta = await f.photos.changeFacts([descriptor(f.photos.context, asset: "a0", revision: "edit", date: Date(timeIntervalSinceReferenceDate: 200)), other], changed: ["a0"])
         await f.coordinator.libraryChanged(.incremental(delta)); await f.coordinator.processDueWork(now: now)
         try await assertNotNil(try await f.coordinator.readyToken())
         await assertEqual(await f.model.count, 1)
@@ -906,7 +1036,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await assertEqual(await f.photos.readCount, 0)
     }
 
-    func testUnknownContentReconciliationRetainsBytesButBlocksReadiness() async throws {
+    func testUnknownContinuityRetainsBytesAndRepublishesVerifiedMetadata() async throws {
         let f = try fixture()
         let original = descriptor(f.photos.context)
         await f.photos.set([original]); try await f.coordinator.reconcile()
@@ -915,9 +1045,9 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [original],
             nextOffset: nil, invalidateAllCachedRepresentations: true)])
         try await f.coordinator.reconcile()
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE vector IS NOT NULL AND state <> 'ready'", at: f.db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE vector IS NOT NULL AND state = 'ready'", at: f.db), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM retained_vectors v JOIN photos_representation r USING(asset_id,kind) WHERE r.vector=v.vector", at: f.db), 1)
-        try await assertNil(try await f.coordinator.readyToken())
+        try await assertNotNil(try await f.coordinator.readyToken())
     }
 
     func test129ChangedAssetsUseBoundedDeltaBatchesWithoutTouchingUnrelatedRows() async throws {
@@ -939,7 +1069,8 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         try injectEngineSQL("CREATE TABLE untouched AS SELECT * FROM photos_representation WHERE asset_id='a139'", at: f.db)
         await f.photos.resetReads(); await f.model.reset()
         let ids = (0..<129).map { "a\($0)" }
-        let delta = await f.photos.changeFacts(all, changed: ids)
+        let edited = all.map { d in ids.contains(d.key.assetID) ? descriptor(f.photos.context, asset: d.key.assetID, kind: d.key.kind, date: Date(timeIntervalSinceReferenceDate: 200)) : d }
+        let delta = await f.photos.changeFacts(edited, changed: ids)
         await f.photos.invalidateDelta(ids)
         await f.coordinator.libraryChanged(.incremental(delta))
         await drain(f.coordinator, cutoff: now)
@@ -993,7 +1124,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.set([original, current]); try await f.coordinator.reconcile()
         await f.coordinator.processDueWork(now: now)
         await f.photos.resetReads(); await f.model.reset()
-        await f.photos.set([original, descriptor(f.photos.context, kind: .current, revision: "edit2")])
+        await f.photos.set([original, descriptor(f.photos.context, kind: .current, revision: "edit2", date: Date(timeIntervalSinceReferenceDate: 200))])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await assertEqual(await f.photos.readKinds, [.current])
         await assertEqual(await f.model.count, 1)
@@ -1001,7 +1132,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
 
     func testRevertCoalescesEquivalentRepresentations() async throws {
         let f = try fixture()
-        await f.photos.set([descriptor(f.photos.context), descriptor(f.photos.context, kind: .current, revision: "edit")])
+        await f.photos.set([descriptor(f.photos.context), descriptor(f.photos.context, kind: .current, revision: "edit", date: Date(timeIntervalSinceReferenceDate: 200))])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await f.photos.set([descriptor(f.photos.context), descriptor(f.photos.context, kind: .current, equivalent: true)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
@@ -1042,17 +1173,18 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await assertEqual(await f.photos.requestedLimits, [f.configuration.resources.catalogBatchSize, f.configuration.resources.catalogBatchSize])
     }
 
-    func testSameRevisionExplicitPageInvalidationRecomputes() async throws {
+    func testSameDateExplicitPageContentNotificationDoesNoImageWork() async throws {
         let f = try fixture(); let d = descriptor(f.photos.context)
         await f.photos.set([d]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await f.model.reset(); await f.photos.resetReads()
         await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [d], nextOffset: nil, invalidatedAssetIDs: [d.key.assetID])])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
-        await assertEqual(await f.model.count, 1)
+        await assertEqual(await f.model.count, 0)
+        await assertEqual(await f.photos.readCount, 0)
         try await assertNotNil(try await f.coordinator.readyToken())
     }
 
-    func testAllInvalidationOnLaterPageInvalidatesEarlierCachedPage() async throws {
+    func testUnknownContinuityOnLaterPageRetainsMetadataVerifiedCachedPages() async throws {
         let f = try fixture(); let a = descriptor(f.photos.context, asset: "a"), b = descriptor(f.photos.context, asset: "b")
         await f.photos.set([a, b]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await f.model.reset()
@@ -1061,7 +1193,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             .init(context: f.photos.context, generation: 2, descriptors: [b], nextOffset: nil, invalidateAllCachedRepresentations: true)
         ])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
-        await assertEqual(await f.model.count, 2)
+        await assertEqual(await f.model.count, 0)
     }
 
     func testConservativeReadNeverBecomesReadyOrExcluded() async throws {
@@ -1141,14 +1273,14 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await assertEqual(await f.photos.checkpointBeforeSnapshot, true)
     }
 
-    func testFailedResumeDoesNotReuseOldContextFacts() async throws {
+    func testFailedResumeReusesMetadataVerifiedSameDeviceFacts() async throws {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         let reopened = try SyncStore(url: f.db); await f.photos.setResumeSuccess(false); await f.model.reset()
         let resumed = PhotosIndexCoordinator(store: reopened, photos: f.photos, fingerprinter: f.model,
             configuration: f.configuration)
         try await resumed.reconcile(); await resumed.processDueWork(now: now)
-        await assertEqual(await f.model.count, 1)
+        await assertEqual(await f.model.count, 0)
     }
 
     func testChangeDuringAcknowledgementBlocksReady() async throws {
@@ -1163,7 +1295,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         try await assertNotNil(try await f.coordinator.readyToken())
-        await f.photos.set([descriptor(f.photos.context, revision: "new")])
+        await f.photos.set([descriptor(f.photos.context, revision: "new", date: Date(timeIntervalSinceReferenceDate: 200))])
         try await assertNil(try await f.coordinator.readyToken())
     }
 
@@ -1268,7 +1400,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let oldTasks = try await f.store.nextRepresentationTasks(now: now, limit: 1)
         let old = try XCTUnwrap(oldTasks.first)
         let second = try await f.store.beginIndexReconciliation(context: f.photos.context, photosGeneration: 1, fingerprintVersion: f.configuration.fingerprint.version)
-        try await f.store.invalidateRepresentations(assetIDs: [d.key.assetID], generation: second)
+        try await f.store.upsertRepresentations([descriptor(f.photos.context, date: Date(timeIntervalSinceReferenceDate: 200))], generation: second)
         try await f.store.upsertRepresentations([d], generation: second); try await f.store.finishIndexReconciliation(generation: second, seenKeys: Set(([d]).map(\.key)))
         try await f.store.failRepresentation(old, nextRetryAt: now.addingTimeInterval(100), detail: "late failure")
         let accepted = try await f.store.completeRepresentation(old, fingerprint: Fingerprint(version: old.fingerprintVersion, values: [1] + Array(repeating: 0, count: 1023)))
@@ -1284,7 +1416,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let work = Task { await f.coordinator.processDueWork(now: now) }
         await gate.waitUntilEntered()
         let facts = try await f.store.indexPublication(); XCTAssertNotNil(facts)
-        await f.photos.set([descriptor(f.photos.context, revision: "changed")])
+        await f.photos.set([descriptor(f.photos.context, revision: "changed", date: Date(timeIntervalSinceReferenceDate: 200))])
         await gate.release(); await work.value
         try await assertNil(try await f.coordinator.readyToken())
         await assertEqual(await f.photos.acknowledgementCount, 0)
@@ -1357,7 +1489,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let checkpoint = try await f.store.libraryResumeCheckpoint(); XCTAssertNil(checkpoint)
     }
 
-    func testThrownResumeCannotLoseRequiredFullInvalidationOnRetry() async throws {
+    func testThrownResumePreservesMetadataVerifiedCacheOnRetry() async throws {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         let reopened = try SyncStore(url: f.db); await f.photos.throwNextResume(); await f.model.reset()
@@ -1365,13 +1497,13 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             configuration: f.configuration)
         do { try await resumed.reconcile(); XCTFail("Expected interrupted replay") } catch {}
         try await resumed.reconcile(); await resumed.processDueWork(now: now)
-        await assertEqual(await f.model.count, 1)
+        await assertEqual(await f.model.count, 0)
     }
 
     func testGenerationMismatchTriggersReconciliationWithoutStreamConsumption() async throws {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
-        await f.model.reset(); await f.photos.set([descriptor(f.photos.context, revision: "changed")])
+        await f.model.reset(); await f.photos.set([descriptor(f.photos.context, revision: "changed", date: Date(timeIntervalSinceReferenceDate: 200))])
         try await assertNil(try await f.coordinator.readyToken())
         await f.coordinator.processDueWork(now: now)
         await assertEqual(await f.model.count, 1)
@@ -1466,9 +1598,9 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             XCTAssertEqual(failed.issue, "正在等待 iCloud 图像，连接恢复后自动继续", change)
             switch change {
             case "removal": await f.photos.set([generic])
-            case "revision": await f.photos.set([descriptor(f.photos.context, asset: "cloud", revision: "r2"), generic])
+            case "revision": await f.photos.set([descriptor(f.photos.context, asset: "cloud", revision: "r2", date: Date(timeIntervalSinceReferenceDate: 200)), generic])
             case "invalidation":
-                await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [cloud, generic],
+                await f.photos.setPages([.init(context: f.photos.context, generation: 2, descriptors: [descriptor(f.photos.context, asset: "cloud", date: Date(timeIntervalSinceReferenceDate: 200)), generic],
                     nextOffset: nil, invalidatedAssetIDs: ["cloud"])])
             case "coalescing": await f.photos.set([cloud, descriptor(f.photos.context, asset: "cloud"), generic])
             default:
@@ -1492,7 +1624,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
             try installWriteAudit(at: f.db)
             try injectEngineSQL("CREATE TABLE untouched AS SELECT * FROM photos_representation WHERE asset_id <> 'a0';", at: f.db)
             await f.photos.resetReads(); await f.model.reset()
-            let edit = descriptor(f.photos.context, asset: "a0", revision: "r2")
+            let edit = descriptor(f.photos.context, asset: "a0", revision: "r2", date: Date(timeIntervalSinceReferenceDate: 200))
             let delta = await f.photos.changeFacts([edit] + Array(original.dropFirst()), changed: ["a0"])
             await f.coordinator.libraryChanged(.incremental(delta))
             try await assertNil(try await f.coordinator.readyToken())
@@ -1520,7 +1652,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         let original = descriptor(f.photos.context)
         await f.photos.set([original]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
         await f.photos.resetReads(); await f.model.reset()
-        let edited = descriptor(f.photos.context, kind: .current, revision: "edit")
+        let edited = descriptor(f.photos.context, kind: .current, revision: "edit", date: Date(timeIntervalSinceReferenceDate: 200))
         let edit = await f.photos.changeFacts([original, edited], changed: [id])
         await f.coordinator.libraryChanged(.incremental(edit)); await f.coordinator.processDueWork(now: now)
         await assertEqual(await f.photos.readKinds, [.current])
@@ -1576,7 +1708,7 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
         await f.photos.set([a, b]); try await f.coordinator.reconcile(); await f.model.setGate(gate)
         let work = Task { await f.coordinator.processDueWork(now: now) }
         await gate.waitUntilEntered()
-        let delta = await f.photos.changeFacts([a, descriptor(f.photos.context, asset: "b", revision: "new")], changed: ["b"])
+        let delta = await f.photos.changeFacts([a, descriptor(f.photos.context, asset: "b", revision: "new", date: Date(timeIntervalSinceReferenceDate: 200))], changed: ["b"])
         await f.coordinator.libraryChanged(.incremental(delta))
         await gate.release(); await work.value
         await f.coordinator.processDueWork(now: now)
@@ -1633,9 +1765,9 @@ final class PhotosIndexCoordinatorTests: XCTestCase {
                 configuration: configuration, wallNow: wallNow, monotonic: monotonic, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics))
     }
     private func descriptor(_ context: LibraryContext, asset: String = "asset", kind: RepresentationKind = .original,
-                            revision: String = "r1", equivalent: Bool = false) -> RepresentationDescriptor {
+                            revision: String = "r1", equivalent: Bool = false, date: Date? = Date(timeIntervalSinceReferenceDate: 100)) -> RepresentationDescriptor {
         .init(key: .init(assetID: asset, kind: kind), context: context, revision: revision,
-              size: try! PixelSize(width: 8, height: 8), equivalentToOriginal: equivalent, revisionIsReliable: true)
+              size: try! PixelSize(width: 8, height: 8), equivalentToOriginal: equivalent, revisionIsReliable: true, modificationDate: date)
     }
     private func assertEqual<T: Equatable>(_ value: @autoclosure () async -> T, _ expected: T, file: StaticString = #filePath, line: UInt = #line) async {
         let result = await value(); XCTAssertEqual(result, expected, file: file, line: line)
@@ -1753,6 +1885,8 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     func throwNextResume() { resumeThrows = true }
     func setResumeSuccess(_ value: Bool) { resumeSuccess = value }
     func changeOnAcknowledgement(_ value: Bool) { changeOnAck = value }
+    private var acknowledgementGate: CoordinatorGate?
+    func gateNextAcknowledgment(_ gate: CoordinatorGate) { acknowledgementGate = gate }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { channel.stream() }
     func gateSnapshot(_ number: Int, using gate: CoordinatorGate) { snapshotCount = 0; snapshotGateAt = number; snapshotGate = gate }
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
@@ -1829,6 +1963,7 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     }
     func acknowledgeReconciliation(expectedGeneration: Int) async throws {
         acknowledgementCount += 1
+        if let gate = acknowledgementGate { acknowledgementGate = nil; await gate.hold() }
         if changeOnAck { generation += 1 }
         guard expectedGeneration == generation else { throw PhotoKitGatewayError.libraryChanged }
         channel.reconciled()

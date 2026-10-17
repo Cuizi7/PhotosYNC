@@ -102,4 +102,10 @@ CREATE INDEX photos_content_change_asset ON photos_content_change(context_id, co
 -- v9 preserves existing facts and publication; prior rows have no input baseline.
 ALTER TABLE photos_representation ADD COLUMN input_digest BLOB CHECK(input_digest IS NULL OR (typeof(input_digest) = 'blob' AND length(input_digest) = 32));
 ALTER TABLE photos_representation ADD COLUMN input_digest_contract TEXT CHECK(input_digest_contract IS NULL OR length(input_digest_contract) > 0);
-PRAGMA user_version = 9;
+-- v10 binds only future digest-bearing accepted vectors; old readiness stays intact.
+ALTER TABLE photos_representation ADD COLUMN input_vector_version TEXT CHECK(input_vector_version IS NULL OR length(input_vector_version) > 0);
+-- Date values use Date.timeIntervalSinceReferenceDate for exact native precision.
+ALTER TABLE photos_representation ADD COLUMN observed_modification_date REAL;
+ALTER TABLE photos_representation ADD COLUMN successful_modification_date REAL;
+ALTER TABLE photos_representation ADD COLUMN successful_vector_version TEXT CHECK(successful_vector_version IS NULL OR length(successful_vector_version) > 0);
+PRAGMA user_version = 10;

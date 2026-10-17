@@ -369,7 +369,8 @@ struct PhotoKitRepresentationAsset: Sendable {
         let revision = ([identifier, kind.rawValue, modificationDate.map { String($0.timeIntervalSinceReferenceDate.bitPattern) } ?? "unknown"] + facts).joined(separator: "|")
         return RepresentationDescriptor(key: RepresentationKey(assetID: identifier, kind: kind), context: context,
                                         revision: SHA256.hash(data: Data(revision.utf8)).map { String(format: "%02x", $0) }.joined(), size: resource?.size, equivalentToOriginal: kind == .original || !edited,
-                                        revisionIsReliable: modificationDate != nil && resource != nil)
+                                        revisionIsReliable: modificationDate?.timeIntervalSinceReferenceDate.isFinite == true && resource != nil,
+                                        modificationDate: modificationDate)
     }
 
     init(asset: PHAsset) {
