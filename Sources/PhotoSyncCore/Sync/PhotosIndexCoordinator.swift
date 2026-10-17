@@ -88,16 +88,14 @@ public actor PhotosIndexCoordinator {
                 }
             }
             let previousCheckpoint = try await store.libraryResumeCheckpoint()
-            // Capture the proposed upper token before replay. Metadata pages alone
-            // cannot prove that an already cached vector was unchanged through it.
-            let checkpoint = try await measured("checkpoint", diagnostic) { try await photos.contextCheckpoint() }
-            if let checkpoint {
-                if let previousCheckpoint {
-                    let covered = try await measured("history", diagnostic) { try await photos.coverPersistentHistory(from: previousCheckpoint, through: checkpoint) }
-                    diagnostic.record(["phase": "index-history-range", "source": "history", "category": "coverage", "fromRange": indexDiagnostics.tokenHandle(previousCheckpoint.archivedChangeToken), "throughRange": indexDiagnostics.tokenHandle(checkpoint.archivedChangeToken), "fromGeneration": previousCheckpoint.photosGeneration.map(String.init) ?? "unknown", "throughGeneration": checkpoint.photosGeneration.map(String.init) ?? "unknown", "result": covered ? "covered" : "unknown"])
-                    if !covered { forceCacheInvalidation = true }
-                } else { forceCacheInvalidation = true }
-            } else if previousCheckpoint != nil { forceCacheInvalidation = true }
+            // The gateway distinguishes inventory work from a genuine content
+            // continuity gap. An active observer session pins its safe durable token;
+            // generic persistent IDs must not overwrite classified live evidence.
+            let continuity = try await measured("history-preparation", diagnostic) {
+                try await photos.prepareInventoryReconciliation(previousCheckpoint: previousCheckpoint)
+            }
+            let checkpoint = continuity.checkpoint
+            if !continuity.preservesCachedRepresentations { forceCacheInvalidation = true }
             let snapshot = try await measured("candidate-snapshot", diagnostic) { try await photos.candidateSnapshot() }
             let session = try await photos.beginCatalogSession(expectedGeneration: snapshot.generation)
             var offset = 0
@@ -217,7 +215,7 @@ public actor PhotosIndexCoordinator {
                     excludedAssetIDs: excludedAssets.subtracting(eligibleAssets))
             }) else { throw PhotoKitGatewayError.libraryChanged }
             counts.deleted += finish.deleted
-            try await photos.acknowledgeInventory(expectedGeneration: endpoint)
+            try await photos.acknowledgeInventory(expectedGeneration: endpoint, continuity: continuity)
             complete = true
             let storedProgress = try await store.indexProgress()
             retainedReady = storedProgress.readyRepresentations

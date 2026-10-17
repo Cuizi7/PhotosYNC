@@ -273,6 +273,7 @@ actor SyncRuntime {
         if let previous = lastKnownAuthorization, previous != granted {
             // Permission transitions can hide Photos changes. Resume must reconcile
             // immediately even when the ordinary 30-minute deadline is still future.
+            advancedGraph?.photos.invalidateObservationContinuity()
             changePending = true
             nextProgressAt = nil
         }

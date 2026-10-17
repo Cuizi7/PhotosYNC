@@ -26,6 +26,10 @@ extension AdvancedRuntimeTests {
             await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
             await f.runtime.holdCoverageReply(using: reply)
             await admission.release(); await reply.waitUntilEntered()
+            // Retain the owned task before releasing its gate. waitForRound alone
+            // can see no registered handles during the old tail's await tick.
+            let ownedWork = await f.runtime.capturedAdvancedWorkForRace()
+            XCTAssertNotNil(ownedWork)
             // If old confirmation loses the new request, due-work cannot mask it
             // with an internal full pass while the physical reader is unavailable.
             await f.photos.setAdmission(.draining)
@@ -37,7 +41,7 @@ extension AdvancedRuntimeTests {
                 f.authorization.value = false; await f.runtime.tick()
                 f.authorization.value = true; await f.runtime.tick()
             }
-            await reply.release(); await f.runtime.waitForRound()
+            await reply.release(); await ownedWork?.value; await f.runtime.waitForRound()
             let after = await f.photos.catalogCount
             XCTAssertEqual(after - before, 2, "coverage_reply_preserves_new_\(action)")
         }

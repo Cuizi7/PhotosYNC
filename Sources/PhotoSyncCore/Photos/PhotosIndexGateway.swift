@@ -114,7 +114,34 @@ public enum PhotosReaderAdmission: String, Equatable, Sendable {
     case available, busy, draining, stalled
 }
 
+/// One full inventory's content-continuity decision. The optional observer fence
+/// belongs to a single gateway lifetime and must never be persisted.
+public struct PhotosInventoryContinuity: Sendable {
+    public let checkpoint: LibraryResumeCheckpoint?
+    public let preservesCachedRepresentations: Bool
+    let observerFence: UUID?
+    public init(checkpoint: LibraryResumeCheckpoint?, preservesCachedRepresentations: Bool) {
+        self.checkpoint = checkpoint
+        self.preservesCachedRepresentations = preservesCachedRepresentations
+        self.observerFence = nil
+    }
+    init(checkpoint: LibraryResumeCheckpoint?, preservesCachedRepresentations: Bool, observerFence: UUID) {
+        self.checkpoint = checkpoint
+        self.preservesCachedRepresentations = preservesCachedRepresentations
+        self.observerFence = observerFence
+    }
+}
+
 public protocol PhotosIndexGateway: PhotosGateway {
+    /// Synchronously revoke active observer continuity when the runtime observes
+    /// a permission gap, including while no Photos request is being issued.
+    func invalidateObservationContinuity()
+    /// Continuous observer sessions retain the last recovered durable token.
+    /// Startup and actual coverage gaps use conservative persistent recovery.
+    func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity
+    /// Establish continuous observation only after this decision's complete inventory
+    /// has been committed, and only if its gateway fence is still current.
+    func acknowledgeInventory(expectedGeneration: Int, continuity: PhotosInventoryContinuity) async throws
     func beginCatalogSession(expectedGeneration: Int) async throws -> PhotosCatalogSession
     func representationCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> RepresentationPage
     func catalogCoverage(session: PhotosCatalogSession) async throws -> Int
@@ -158,18 +185,12 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// not claim, cancel or release work; draining/stalled retain physical ownership.
     func representationReadAdmission() async -> PhotosReaderAdmission
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation
-    /// Capture BEFORE the complete catalog acquisition; nil means no resumable
-    /// checkpoint is available. The caller persists a nonnil value only alongside
-    /// successful inventory facts of its captured context. A full inventory may cover
-    /// a later observer endpoint; its saved token remains the earlier pre-read token.
-    /// Cached-vector reuse additionally requires complete coverPersistentHistory from
-    /// the old durable token through this proposal; metadata equality is insufficient.
-    /// Incremental inventory retains the previous durable token until another full pass.
-    /// Replay is continuity evidence, never a stable physical-library identity or
-    /// an index-ready flag. Fetching facts alone must not acknowledge reconciliation.
-    /// Replay complete persistent history from the durable prior token after capturing
-    /// `through`, durably retaining all affected IDs before allowing cached-vector reuse.
-    /// False is unknown coverage, never an empty history. Context must not be reset.
+    /// Recovery primitives: capture a proposal before the complete recovery
+    /// inventory, then durably retain all affected IDs since the prior token.
+    /// False means unknown coverage, never empty history. Neither operation
+    /// acknowledges readiness or advances the store on its own.
+    /// Active full/delta inventories retain the last recovered checkpoint; only
+    /// prepareInventoryReconciliation decides when new recovery is necessary.
     func coverPersistentHistory(from previous: LibraryResumeCheckpoint, through proposed: LibraryResumeCheckpoint) async throws -> Bool
     func contextCheckpoint() async throws -> LibraryResumeCheckpoint?
     func resumeContext(_ checkpoint: LibraryResumeCheckpoint) async throws -> Bool
@@ -240,7 +261,11 @@ final class PhotosIndexChangeChannel: @unchecked Sendable {
             continuations[id] = continuation
             if dirty { continuation.yield(.fullReconcileRequired) }
             lock.unlock()
-            continuation.onTermination = { [weak self] _ in self?.remove(id) }
+            continuation.onTermination = { [weak self] _ in
+                // Cancellation may hold Swift's task-status lock while yield waits
+                // for it. Never acquire our delivery lock from that callback.
+                DispatchQueue.global(qos: .utility).async { [weak self] in self?.remove(id) }
+            }
         }
     }
     func send(_ event: PhotosIndexChange) {
@@ -276,6 +301,23 @@ public struct LibraryResumeCheckpoint: Codable, Equatable, Sendable {
 }
 
 public extension PhotosIndexGateway {
+    func invalidateObservationContinuity() {}
+    func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
+        let checkpoint = try await contextCheckpoint()
+        let covered: Bool
+        if let previousCheckpoint, let checkpoint {
+            covered = try await coverPersistentHistory(from: previousCheckpoint, through: checkpoint)
+        } else {
+            // Resource-free adapters without checkpoints retain their existing
+            // page-based contract; the coordinator still invalidates its first pass.
+            covered = checkpoint == nil && previousCheckpoint == nil
+        }
+        return .init(checkpoint: checkpoint, preservesCachedRepresentations: covered)
+    }
+    func acknowledgeInventory(expectedGeneration: Int, continuity: PhotosInventoryContinuity) async throws {
+        try await acknowledgeInventory(expectedGeneration: expectedGeneration)
+    }
+
     /// Convenience only for resource-free fakes. Real adapters must report their
     /// actual reader/shared-budget capacity, including cleanup and held leases.
     func representationReadAdmission() async -> PhotosReaderAdmission { .available }

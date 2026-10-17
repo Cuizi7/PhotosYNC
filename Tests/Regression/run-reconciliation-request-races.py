@@ -45,7 +45,8 @@ def main() -> None:
     private var coverageReplyProbe: ReconciliationRaceGate?
     private var eventReceiptProbe: ReconciliationRaceGate?
     func holdCoverageReply(using gate: ReconciliationRaceGate) { coverageReplyProbe = gate }
-    func holdEventReceipt(using gate: ReconciliationRaceGate) { eventReceiptProbe = gate }""")
+    func holdEventReceipt(using gate: ReconciliationRaceGate) { eventReceiptProbe = gate }
+    func capturedAdvancedWorkForRace() -> Task<Void, Never>? { advancedWork }""")
     anchor = "        let receipt = await advancedGraph?.coordinator.libraryChanged(event)"
     patched = replace_once(patched, anchor, anchor + "\n        if let gate = eventReceiptProbe { eventReceiptProbe = nil; await gate.hold() }")
     anchor = "        let covered = await graph.coordinator.reconciliationCovers(change: receipt)"

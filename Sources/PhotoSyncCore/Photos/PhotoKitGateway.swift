@@ -210,7 +210,43 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         return page
     }
 
+    public func invalidateObservationContinuity() {
+        state.invalidateAllRepresentations()
+        diagnostics(["phase": "photos-observer-continuity", "event": "revoked", "reason": "runtime-permission-transition"])
+    }
+
     public func attachIndexStore(_ store: SyncStore) { state.attach(store) }
+    public func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
+        // Drain the ordered classifier before deciding whether the observer session
+        // is intact. An inventory wakeup alone is not a content-continuity gap.
+        let snapshot = try await candidateSnapshot()
+        if let continuous = try state.continuousInventory(previousCheckpoint: previousCheckpoint,
+                                                          expectedGeneration: snapshot.generation) {
+            diagnostics(["phase": "photos-inventory-continuity", "mode": "observer", "checkpoint": "retained"])
+            return continuous
+        }
+        let checkpoint = try await contextCheckpoint()
+        let covered: Bool
+        if let previousCheckpoint, let checkpoint {
+            covered = try await coverPersistentHistory(from: previousCheckpoint, through: checkpoint)
+        } else { covered = false }
+        let decision = try state.recoveryInventory(checkpoint: checkpoint, covered: covered)
+        diagnostics(["phase": "photos-inventory-continuity", "mode": "recovery",
+                     "cacheContinuity": covered ? "covered" : "unknown"])
+        return decision
+    }
+
+    public func acknowledgeInventory(expectedGeneration: Int, continuity: PhotosInventoryContinuity) async throws {
+        let generation = try await usableGeneration()
+        guard generation == expectedGeneration, continuity.observerFence != nil,
+              state.acknowledgeReconciliation(generation: expectedGeneration, continuity: continuity,
+                  { [changeChannel] in changeChannel.reconciled() }) else {
+            throw PhotoKitGatewayError.libraryChanged
+        }
+        diagnostics(["phase": "photos-inventory-ack", "event": String(expectedGeneration),
+                     "delivery": "reconciled", "historyAdmission": "unchanged", "observerContinuity": "established"])
+    }
+
     public func acknowledgeInventory(expectedGeneration: Int) async throws {
         let generation = try await usableGeneration()
         guard generation == expectedGeneration,
@@ -567,16 +603,16 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     private func usableGeneration() async throws -> Int {
         var access = lifecycle.currentAccess()
         if access == .notDetermined { access = await lifecycle.requestReadWriteAuthorization() }
-        guard access == .authorized else { throw PhotoKitGatewayError.authorizationRequired }
-        guard lifecycle.isAvailable() else { throw PhotoKitGatewayError.libraryUnavailable }
+        guard access == .authorized else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.authorizationRequired }
+        guard lifecycle.isAvailable() else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.libraryUnavailable }
         let snapshot = state.snapshot()
         guard snapshot.available else { throw PhotoKitGatewayError.libraryUnavailable }
         return snapshot.generation
     }
 
     private func verifyUsable(generation: Int) throws {
-        guard lifecycle.currentAccess() == .authorized else { throw PhotoKitGatewayError.authorizationRequired }
-        guard lifecycle.isAvailable() else { throw PhotoKitGatewayError.libraryUnavailable }
+        guard lifecycle.currentAccess() == .authorized else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.authorizationRequired }
+        guard lifecycle.isAvailable() else { state.invalidateAllRepresentations(); throw PhotoKitGatewayError.libraryUnavailable }
         let snapshot = state.snapshot()
         guard snapshot.available else { throw PhotoKitGatewayError.libraryUnavailable }
         guard snapshot.generation == generation else { throw PhotoKitGatewayError.libraryChanged }
@@ -1001,13 +1037,39 @@ private final class PhotoKitState: @unchecked Sendable {
     struct HistoryCoverageTicket { let context: LibraryContext; let generation: Int; let admissionRevision: UInt64 }
     private var admissionRevision: UInt64 = 0
     private var historyAdmissionBlocked = false
+    private var observerFence = UUID()
+    private var observerContinuous = false
+    private var observerCheckpoint: LibraryResumeCheckpoint?
+
+    private func revokeObserverContinuityLocked() {
+        observerFence = UUID(); observerContinuous = false; observerCheckpoint = nil
+        admissionRevision &+= 1
+        // Filename-only gateways have no inventory acknowledgement cycle. Their
+        // candidate index remains valid after a classified membership change.
+        if store != nil { historyAdmissionBlocked = true }
+    }
+    func continuousInventory(previousCheckpoint: LibraryResumeCheckpoint?, expectedGeneration: Int) throws -> PhotosInventoryContinuity? {
+        lock.lock(); defer { lock.unlock() }
+        guard available, generation == expectedGeneration, pendingChangeDetails == 0 else { throw PhotoKitGatewayError.libraryChanged }
+        guard observerContinuous, !allRepresentationsInvalid, store != nil,
+              previousCheckpoint == observerCheckpoint else { return nil }
+        return .init(checkpoint: previousCheckpoint, preservesCachedRepresentations: true, observerFence: observerFence)
+    }
+    func recoveryInventory(checkpoint: LibraryResumeCheckpoint?, covered: Bool) throws -> PhotosInventoryContinuity {
+        lock.lock(); defer { lock.unlock() }
+        guard available, pendingChangeDetails == 0,
+              checkpoint == nil || checkpoint?.context == context else { throw PhotoKitGatewayError.libraryChanged }
+        return .init(checkpoint: checkpoint, preservesCachedRepresentations: covered, observerFence: observerFence)
+    }
+
     func invalidateHistoryAdmission() {
-        lock.lock(); admissionRevision &+= 1; historyAdmissionBlocked = true; indexedGeneration = nil; lock.unlock()
+        lock.lock(); revokeObserverContinuityLocked(); historyAdmissionBlocked = true; indexedGeneration = nil; lock.unlock()
     }
     func beginHistoryCoverage() -> HistoryCoverageTicket {
         lock.lock(); defer { lock.unlock() }
-        admissionRevision &+= 1; historyAdmissionBlocked = true
-        pendingChangeDetails += 1; indexedGeneration = nil
+        revokeObserverContinuityLocked()
+        historyAdmissionBlocked = true; indexedGeneration = nil
+        pendingChangeDetails += 1
         return .init(context: context, generation: generation, admissionRevision: admissionRevision)
     }
     func historyCoverageFacts(_ ticket: HistoryCoverageTicket) -> (valid: Bool, retryReason: String?) {
@@ -1018,28 +1080,28 @@ private final class PhotoKitState: @unchecked Sendable {
         if admissionRevision != ticket.admissionRevision { return (true, "coverage-superseded") }
         return (true, nil)
     }
-    private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext, invalidationTransferred: Bool)?
+    private var catalogSession: (session: PhotosCatalogSession, context: LibraryContext, invalidationTransferred: Bool, observerFence: UUID)?
     func beginCatalogSession(expectedGeneration: Int) throws -> PhotosCatalogSession {
         lock.lock(); defer { lock.unlock() }
         guard available, generation == expectedGeneration, pendingChangeDetails == 0 else { throw PhotoKitGatewayError.libraryChanged }
         let session = PhotosCatalogSession(baselineGeneration: expectedGeneration)
-        catalogSession = (session, context, false)
+        catalogSession = (session, context, false, observerFence)
         return session
     }
     func validateCatalogSession(_ session: PhotosCatalogSession) throws {
         lock.lock(); defer { lock.unlock() }
-        guard available, catalogSession?.session == session, catalogSession?.context == context,
+        guard available, catalogSession?.session == session, catalogSession?.context == context, catalogSession?.observerFence == observerFence,
               unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
     }
     func markCatalogInvalidationTransferred(_ session: PhotosCatalogSession) throws {
         lock.lock(); defer { lock.unlock() }
-        guard available, catalogSession?.session == session, catalogSession?.context == context,
+        guard available, catalogSession?.session == session, catalogSession?.context == context, catalogSession?.observerFence == observerFence,
               unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
         catalogSession?.invalidationTransferred = true
     }
     func hasTransferredCatalogInvalidation(_ session: PhotosCatalogSession) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard available, catalogSession?.session == session, catalogSession?.context == context,
+        guard available, catalogSession?.session == session, catalogSession?.context == context, catalogSession?.observerFence == observerFence,
               pendingChangeDetails == 0, unknownGeneration <= session.baselineGeneration else { throw PhotoKitGatewayError.libraryChanged }
         return catalogSession?.invalidationTransferred == true
     }
@@ -1104,7 +1166,7 @@ private final class PhotoKitState: @unchecked Sendable {
         if store == nil {
             for id in ids {
                 if contentChangedIDs.count >= capacity && !contentChangedIDs.contains(id) {
-                    allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll(); break
+                    revokeObserverContinuityLocked(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll(); break
                 }
                 contentChangedIDs.insert(id)
             }
@@ -1117,7 +1179,7 @@ private final class PhotoKitState: @unchecked Sendable {
         } catch { invalidateAllRepresentations(); return false }
     }
     func invalidateAllRepresentations() {
-        lock.lock(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll()
+        lock.lock(); revokeObserverContinuityLocked(); allRepresentationsInvalid = true; unknownGeneration = generation; contentChangedIDs.removeAll()
         for (ticket, read) in reads { reads[ticket] = (read.assetID, false) }
         lock.unlock()
     }
@@ -1134,21 +1196,33 @@ private final class PhotoKitState: @unchecked Sendable {
         return (try store?.photosContentChanges(context: context, assetIDs: pageAssetIDs) ?? fallback, all,
                 all && !permittingUnverifiedInputEvidence ? [] : try store?.photosInputUnchanged(context: context, assetIDs: pageAssetIDs) ?? [])
     }
-    func acknowledgeReconciliation(generation expected: Int, admitHistory: Bool = false, _ acknowledge: () -> Void) -> Bool {
+    func acknowledgeReconciliation(generation expected: Int, admitHistory: Bool = false, continuity: PhotosInventoryContinuity? = nil, _ acknowledge: () -> Void) -> Bool {
         lock.lock()
-        guard available, generation == expected, pendingChangeDetails == 0 else { lock.unlock(); return false }
+        guard available, generation == expected, pendingChangeDetails == 0,
+              continuity == nil || continuity?.observerFence == observerFence,
+              !admitHistory || store == nil || observerContinuous else { lock.unlock(); return false }
         let store = store, context = context
         lock.unlock()
         do { try store?.acknowledgePhotosChanges(context: context, runID: runID, throughGeneration: expected) }
         catch { return false }
         lock.lock(); defer { lock.unlock() }
-        guard available, generation == expected, pendingChangeDetails == 0 else { return false }
+        guard available, generation == expected, pendingChangeDetails == 0,
+              continuity == nil || continuity?.observerFence == observerFence,
+              !admitHistory || store == nil || observerContinuous else { return false }
+        if let continuity {
+            observerCheckpoint = continuity.checkpoint; observerContinuous = true
+        }
         contentChangedIDs.removeAll(); allRepresentationsInvalid = false
         if admitHistory { historyAdmissionBlocked = false }
         acknowledge()
         return true
     }
-    func setReplayContext(_ value: LibraryContext?) { lock.lock(); replayContext = value; lock.unlock() }
+    func setReplayContext(_ value: LibraryContext?) {
+        lock.lock()
+        if value != nil { revokeObserverContinuityLocked() }
+        replayContext = value
+        lock.unlock()
+    }
     func snapshot() -> (available: Bool, generation: Int, context: LibraryContext) { lock.lock(); defer { lock.unlock() }; return (available, generation, context) }
     func adoptContext(_ context: LibraryContext, generation expected: Int) -> Int? {
         lock.lock(); defer { lock.unlock() }
@@ -1161,6 +1235,7 @@ private final class PhotoKitState: @unchecked Sendable {
     }
     func invalidateContext() {
         lock.lock(); defer { lock.unlock() }
+        revokeObserverContinuityLocked()
         context = LibraryContext(id: UUID(), epoch: 0); generation += 1; indexedGeneration = nil
         allRepresentationsInvalid = true; contentChangedIDs.removeAll()
     }
@@ -1175,7 +1250,11 @@ private final class PhotoKitState: @unchecked Sendable {
         if expectingDetails { pendingChangeDetails += 1 }
         return generation
     }
-    func recordUnavailable() { lock.lock(); available = false; generation += 1; indexedGeneration = nil; lock.unlock() }
+    func recordUnavailable() {
+        lock.lock(); defer { lock.unlock() }
+        revokeObserverContinuityLocked(); available = false; generation += 1; indexedGeneration = nil
+        for (ticket, read) in reads { reads[ticket] = (read.assetID, false) }
+    }
     func markIndexed(generation expected: Int) -> Bool { lock.lock(); defer { lock.unlock() }; guard available, generation == expected else { return false }; indexedGeneration = expected; return true }
     enum Admission { case ready, libraryChanged, blockedAfterCheckpointFailure, blockedAfterUnknownOutcome }
     func admission(generation expected: Int) -> Admission {
