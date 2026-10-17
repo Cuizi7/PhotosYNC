@@ -105,18 +105,26 @@ public actor PhotosRepresentationReader {
             try await withCheckedThrowingContinuation { continuation in
                 state.install(continuation, timeout: .seconds(configuration.resources.requestTimeoutSeconds))
                 let finish: @Sendable (Result<LoadedRepresentation, Error>) -> Void = { [self, state] result in
-                    Task { await self.completed(id); await state.completePhysical(result) }
+                    state.afterRequestReturns {
+                        Task { await self.completed(id); await state.completePhysical(result) }
+                    }
                 }
-                guard state.beginRequest() else { state.receive(.cancelled, finish: finish); return }
-                do {
-                    let cancel = try requester.request(descriptor) { [state] event in state.receive(event, finish: finish) }
-                    state.installCancellation(cancel)
-                } catch {
-                    // No framework work started: a thrown validation error is not
-                    // evidence authorizing isolation as a damaged image.
-                    let requestError: Error = (error as? PhotosRepresentationError)?.isIsolatableReadFailure == true
-                        ? PhotosRepresentationError.requestFailed(String(describing: error)) : error
-                    state.receive(.failure(requestError), finish: finish)
+                // Catalog validation and request startup are synchronous framework work.
+                // Keep them off this actor so logical cancellation/deadlines and advisory
+                // queries remain responsive. The existing active owner bounds this worker.
+                DispatchQueue.global(qos: .utility).async { [requester] in
+                    defer { state.requestReturned() }
+                    guard state.beginRequest() else { state.receive(.cancelled, finish: finish); return }
+                    do {
+                        let cancel = try requester.request(descriptor) { [state] event in state.receive(event, finish: finish) }
+                        state.installCancellation(cancel)
+                    } catch {
+                        // No framework work started: a thrown validation error is not
+                        // evidence authorizing isolation as a damaged image.
+                        let requestError: Error = (error as? PhotosRepresentationError)?.isIsolatableReadFailure == true
+                            ? PhotosRepresentationError.requestFailed(String(describing: error)) : error
+                        state.receive(.failure(requestError), finish: finish)
+                    }
                 }
             }
         } onCancel: { state.cancel() }
@@ -144,6 +152,8 @@ private final class RepresentationRequestState: @unchecked Sendable {
     private var cancelRequest: (@Sendable () -> Void)?
     private var cancelSent = false
     private var timeoutTask: Task<Void, Never>?
+    private var requestHasReturned = false
+    private var pendingPhysicalCompletion: (@Sendable () -> Void)?
 
     init(descriptor: RepresentationDescriptor, lease: ImageLease, resource: OwnedPhotosResource,
          configuration: DedupConfiguration, decode: @escaping @Sendable (URL, DedupConfiguration, Int64) throws -> SourceImage, isCurrent: @escaping @Sendable () -> Bool, monotonic: @escaping @Sendable () -> TimeInterval, diagnostic: IndexDiagnosticOperation? = nil) {
@@ -169,6 +179,27 @@ private final class RepresentationRequestState: @unchecked Sendable {
         lock.lock(); let begins = logicalError == nil; lock.unlock()
         if begins { diagnostic?.record(["phase": "photos-reader", "event": "request"], descriptor: descriptor) }
         return begins
+    }
+    // A requester may deliver its terminal callback synchronously and then block before
+    // returning the cancel handle. Both startup and terminal processing must finish before
+    // physical ownership can transfer or release. Never run completion while holding lock.
+    func afterRequestReturns(_ completion: @escaping @Sendable () -> Void) {
+        lock.lock()
+        guard requestHasReturned else {
+            pendingPhysicalCompletion = completion
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        completion()
+    }
+    func requestReturned() {
+        lock.lock()
+        requestHasReturned = true
+        let completion = pendingPhysicalCompletion
+        pendingPhysicalCompletion = nil
+        lock.unlock()
+        completion?()
     }
     func installCancellation(_ cancellation: @escaping @Sendable () -> Void) {
         lock.lock(); cancelRequest = cancellation

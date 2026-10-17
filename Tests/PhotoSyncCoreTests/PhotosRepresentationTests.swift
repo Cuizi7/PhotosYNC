@@ -7,6 +7,96 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testLogicalTimeoutAndAdmissionRemainResponsiveDuringSynchronousRequestStart() async throws {
+        let timeout = expectation(description: "deadline handler fired")
+        let returned = expectation(description: "logical timeout returned with startup held")
+        let queried = expectation(description: "admission and competing read completed with startup held")
+        let release = DispatchSemaphore(value: 0), requester = ControlledRepresentationRequester()
+        requester.beforeReturn = { _ = release.wait(timeout: .now() + 5) }
+        defer { release.signal() }
+        let c = try configuration(timeout: 0.02), budget = ImageWorkBudget(limits: c.resources)
+        let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "timeout" { timeout.fulfill() } })
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, indexDiagnostics: diagnostic)
+        let work = Task {
+            do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("expected logical timeout") }
+            catch { XCTAssertEqual(error as? ReadExecutorError, .timedOut) }
+            returned.fulfill()
+        }
+        await requester.started()
+        await fulfillment(of: [timeout], timeout: 2)
+        let query = Task {
+            let admission = await reader.admission(), owners = await reader.physicalRequestCount
+            XCTAssertEqual(admission, .draining); XCTAssertEqual(owners, 1)
+            do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("startup still owns physical slot") }
+            catch { XCTAssertEqual(error as? ReadExecutorError, .resourceExhausted) }
+            queried.fulfill()
+        }
+        // The gate establishes the interleaving; this bound only checks responsiveness.
+        await fulfillment(of: [returned, queried], timeout: 0.3)
+        let held = await budget.snapshot(); XCTAssertEqual(held.images, 1)
+        release.signal(); await work.value; await query.value
+        await requester.cancellationRequested(); XCTAssertEqual(requester.cancellationCount, 1)
+        requester.send(.cancelled); requester.send(.cancelled)
+        await waitForDrain(reader, budget: budget)
+    }
+
+    func testLogicalCancellationReturnsWhileSynchronousStartHasNoCancellationHandle() async throws {
+        let returned = expectation(description: "cancelled caller returned before startup")
+        let queried = expectation(description: "cancelled startup admission remains responsive")
+        let release = DispatchSemaphore(value: 0), requester = ControlledRepresentationRequester()
+        requester.beforeReturn = { _ = release.wait(timeout: .now() + 5) }
+        defer { release.signal() }
+        let c = try configuration(), budget = ImageWorkBudget(limits: c.resources)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c)
+        let work = Task {
+            do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("expected cancellation") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            returned.fulfill()
+        }
+        await requester.started(); work.cancel()
+        let query = Task {
+            let admission = await reader.admission(); XCTAssertEqual(admission, .draining)
+            queried.fulfill()
+        }
+        await fulfillment(of: [returned, queried], timeout: 0.3)
+        XCTAssertEqual(requester.cancellationCount, 0, "the framework handle has not returned")
+        let held = await budget.snapshot(); XCTAssertEqual(held.images, 1)
+        release.signal(); await work.value; await query.value
+        await requester.cancellationRequested(); XCTAssertEqual(requester.cancellationCount, 1)
+        requester.send(.cancelled); await waitForDrain(reader, budget: budget)
+    }
+
+    func testSynchronousTerminalCannotReleaseOwnerBeforeRequestStartReturns() async throws {
+        let terminal = expectation(description: "terminal delivered synchronously inside request")
+        let returned = expectation(description: "logical cancellation returned while startup still held")
+        let queried = expectation(description: "owner remains held after synchronous terminal")
+        let release = DispatchSemaphore(value: 0), requester = ControlledRepresentationRequester()
+        requester.immediateEvent = .cancelled
+        requester.beforeReturn = { _ = release.wait(timeout: .now() + 5) }
+        defer { release.signal() }
+        let c = try configuration(), budget = ImageWorkBudget(limits: c.resources)
+        let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "terminal" { terminal.fulfill() } })
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: c, indexDiagnostics: diagnostic)
+        let work = Task {
+            do { _ = try await reader.read(descriptor(), isCurrent: { true }); XCTFail("expected cancellation") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            returned.fulfill()
+        }
+        await fulfillment(of: [terminal], timeout: 2)
+        work.cancel()
+        await fulfillment(of: [returned], timeout: 0.3)
+        let query = Task {
+            let owners = await reader.physicalRequestCount
+            XCTAssertEqual(owners, 1, "synchronous terminal does not end a still-blocked startup")
+            queried.fulfill()
+        }
+        await fulfillment(of: [queried], timeout: 0.3)
+        let held = await budget.snapshot(); XCTAssertEqual(held.images, 1)
+        release.signal(); await work.value; await query.value
+        await waitForDrain(reader, budget: budget)
+        XCTAssertEqual(requester.cancellationCount, 0, "a terminal stream needs no late cancellation")
+    }
+
     func testAdmissionRetainsDrainingOwnerThenStallsAndLateDuplicateTerminalReleasesOnce() async throws {
         let releasedSignal = expectation(description: "physical lease released exactly once")
         let diagnostic = IndexDiagnostics(sink: { if $0["event"] == "lease-released" { releasedSignal.fulfill() } })
