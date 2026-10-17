@@ -2,19 +2,21 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.6 stable
+## 0.2.7 stable
 
-0.2.6 (build 14) keeps logical Photos-read deadlines, cancellation and reader-admission queries responsive when the synchronous request-start call blocks. Startup runs on a utility queue under the existing single-owner limit. Physical ownership can transfer or release only after both request startup has returned and terminal processing has settled, including callbacks delivered synchronously before startup returns.
+0.2.7 (build 15) reuses successful Photos analysis incrementally. Within the same persisted device-local asset namespace, asset ID, original/current representation and analysis contract, the same valid successful modification date reuses the vector without reading pixels, preparing input or predicting. A changed date validates only that item; an equal compatible model-input digest reliably paired with its successful vector bypasses prediction.
 
-A permanently blocked system startup still retains its bounded worker and resource lease. This patch does not establish a fix for the observed Photos timeouts, long physical-drain waits or source-video metadata failures. The new execution context has synthetic regression coverage but no new real PhotoKit acceptance. See the [0.2.6 release notes](docs/release/0.2.6.md).
+Expired or unavailable history tokens and damaged checkpoints fall back to metadata reconciliation while preserving successful analysis. A whole-library metadata enumeration can still occur; it does not clear or rebuild all analysis. Failed updates retain successful facts and retry individually. Confirmed removal followed by the same ID/date/contract returning can reuse the retained vector after complete membership reconciliation. Cancellation during pre-read admission cannot start new owned work.
 
-Schema v9, the model, threshold, media selection, source immutability, successful-import history and the 0.2.5 continuity rules are retained. This release uses `scripts/package-release.sh --scale-profile full` on exact main; provenance binds the archived source, complete tests and artifact checks. No new GUI, real Photos/production or macOS 13/Intel hardware acceptance is claimed.
+Schema v10 migrates supported older databases transactionally and keeps vectors, tasks and successful-import history. Missing dates, missing compatible results or a changed analysis contract still need individual work; first analysis of new assets remains incremental. See the [0.2.7 release notes](docs/release/0.2.7.md) and [incremental recovery contract](docs/specs/2026-10-17-photos-incremental-recovery.md).
+
+This release uses `scripts/package-release.sh --scale-profile full` on exact main; provenance binds archived source, complete tests and artifact checks. No new real Photos, GUI, macOS 13/14 or Intel hardware acceptance is claimed. Model, 0.98 threshold, source immutability and additive Photos writes retain their existing rules.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
-Photos catalog reconciliation retains existing fingerprint bytes and pending work. Known changes affect their own assets; unverified entries remain excluded from decisions until content continuity is established. Stable catalog sessions and a bounded same-database change journal separate inventory progress from publication. Schema v8 preserves prior vectors and import history while withdrawing old publication for the new encoded-resource input contract. Individual Photos read failures remain isolated from healthy siblings; see the [continuity implementation and validation](docs/release/2026-10-07-photos-index-continuity-validation.md) and [read-error isolation validation](docs/release/2026-10-08-photos-read-error-isolation-validation.md). Candidate scores use system SQLite + Accelerate exact Float32 queries.
+Photos catalog reconciliation retains existing fingerprint bytes and pending work. Known changes affect their own assets; unverified entries remain excluded from decisions until content continuity is established. Stable catalog sessions and a bounded same-database change journal separate inventory progress from publication. The earlier schema v8 upgrade preserved prior vectors and import history while withdrawing old publication for the encoded-resource input contract. Individual Photos read failures remain isolated from healthy siblings; see the [continuity implementation and validation](docs/release/2026-10-07-photos-index-continuity-validation.md) and [read-error isolation validation](docs/release/2026-10-08-photos-read-error-isolation-validation.md). Candidate scores use system SQLite + Accelerate exact Float32 queries.
 
-Photos now streams its precisely selected original or edited-current encoded resource into an owned temporary file. Source and Photos use the same bounded ImageIO decoder and final 320 × 320 preprocessing. Each encoded file is limited to 512 MiB with a 128 MiB free-space reserve; file ownership lasts through actual pixel consumption. The input-version upgrade rebuilds old Photos preview fingerprints and transactionally rebinds only proven-equivalent Source fingerprints, preserving successful and unknown imports. See [implementation and validation](docs/release/2026-10-11-original-resource-integration-validation.md) for the real paired-sample results and remaining current/iCloud/platform boundaries.
+Photos now streams its precisely selected original or edited-current encoded resource into an owned temporary file. Source and Photos use the same bounded ImageIO decoder and final 320 × 320 preprocessing. Each encoded file is limited to 512 MiB with a 128 MiB free-space reserve; file ownership lasts through actual pixel consumption. Input-contract changes keep prior vectors and schedule affected representations individually; only proven-equivalent Source fingerprints can be transactionally rebound, preserving successful and unknown imports. See [implementation and validation](docs/release/2026-10-11-original-resource-integration-validation.md) for the real paired-sample results and remaining current/iCloud/platform boundaries.
 
 Fixed model weights use Git LFS; install Git LFS with repository-local filters (`git lfs install --local --skip-repo`) and hydrate the exact checkout before building. The package entry point verifies and hydrates archived pointers from local objects only, and fails on absent/corrupt resources. It does not download a model at App runtime.
 
@@ -32,12 +34,13 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Release configuration: **0.2.6 stable (build 14)**, targeting
-`outputs/releases/0.2.6/`; see [release notes](docs/release/0.2.6.md)
+Release configuration: **0.2.7 stable (build 15)**, targeting
+`outputs/releases/0.2.7/`; see [release notes](docs/release/0.2.7.md)
 and the [changelog](CHANGELOG.md).
 The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
+[0.2.6 stable build 14](docs/release/0.2.6.md),
 [0.2.5 stable build 13](docs/release/0.2.5.md),
 [0.2.4 stable build 12](docs/release/0.2.4.md),
 [0.2.3 stable build 11](docs/release/0.2.3.md),
