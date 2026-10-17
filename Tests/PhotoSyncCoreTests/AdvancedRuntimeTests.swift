@@ -5,6 +5,97 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testFullRequestCoveredInsideBusyWorkDoesNotRepeatCatalog() async throws {
+        for event in [PhotosIndexChange.fullReconcileRequired, .contextInvalidated] {
+            let f = try await fixture(), gate = P8Gate()
+            await f.runtime.tick(force: true); await f.runtime.waitForRound()
+            let before = await f.photos.catalogCount
+            await f.photos.gateNextAdmission(gate)
+            await f.runtime.tick(); await gate.waitUntilEntered()
+            await f.photos.advanceGeneration()
+            await f.runtime.libraryChanged(event)
+            await gate.release(); await f.runtime.waitForRound()
+            let after = await f.photos.catalogCount
+            XCTAssertEqual(after - before, 1, "Successful internal inventory already covered this request")
+            let state = await f.runtime.current()
+            XCTAssertEqual(state.snapshot.indexProgress?.state, .ready)
+        }
+    }
+
+    func testNewFullRequestDuringFinalSnapshotIsNotConfirmedByOldPass() async throws {
+        let f = try await fixture(), admission = P8Gate(), snapshot = P8Gate()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let before = await f.photos.catalogCount
+        await f.photos.gateNextAdmission(admission)
+        await f.runtime.tick(); await admission.waitUntilEntered()
+        await f.photos.gateSnapshot(4, using: snapshot)
+        await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
+        await admission.release(); await snapshot.waitUntilEntered()
+        await f.photos.setAdmission(.draining)
+        await f.runtime.libraryChanged(.fullReconcileRequired)
+        await snapshot.release(); await f.runtime.waitForRound()
+        let after = await f.photos.catalogCount
+        XCTAssertEqual(after - before, 2, "A later full request must force work even when image reads cannot proceed")
+    }
+
+    func testFullRequestAfterReconcileStartedStillGetsFreshCatalog() async throws {
+        let f = try await fixture(), admission = P8Gate(), catalog = P8Gate()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let before = await f.photos.catalogCount
+        await f.photos.gateNextAdmission(admission); await f.photos.setCatalogGate(catalog)
+        await f.runtime.tick(); await admission.waitUntilEntered()
+        await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
+        await admission.release(); await catalog.waitUntilEntered()
+        // A later request is distinct even when the fake generation is unchanged.
+        await f.runtime.libraryChanged(.fullReconcileRequired)
+        await catalog.release(); await f.runtime.waitForRound()
+        let after = await f.photos.catalogCount
+        XCTAssertEqual(after - before, 2)
+        await f.runtime.libraryChanged(.fullReconcileRequired); await f.runtime.waitForRound()
+        let latest = await f.photos.catalogCount
+        XCTAssertEqual(latest - after, 1, "A request received after successful completion is still new")
+    }
+
+    func testFailedInternalCatalogDoesNotConsumeFullRequest() async throws {
+        let f = try await fixture(), gate = P8Gate()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let before = await f.photos.catalogCount
+        await f.photos.gateNextAdmission(gate); await f.photos.failNextCatalog()
+        await f.runtime.tick(); await gate.waitUntilEntered()
+        await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
+        await gate.release(); await f.runtime.waitForRound()
+        let after = await f.photos.catalogCount
+        XCTAssertEqual(after - before, 2, "Failed inventory must leave the request for a successful retry")
+        let state = await f.runtime.current()
+        XCTAssertEqual(state.snapshot.indexProgress?.state, .ready)
+    }
+
+    func testFullRequestReconcilesWhilePhysicalReaderIsUnavailable() async throws {
+        let f = try await fixture()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let before = await f.photos.catalogCount
+        await f.photos.setAdmission(.draining)
+        await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
+        await f.runtime.waitForRound()
+        let after = await f.photos.catalogCount
+        XCTAssertEqual(after - before, 1, "Catalog confirmation cannot wait for physical image capacity")
+    }
+
+    func testCoveredFullRequestStillRecomputesSameRevisionExplicitEdit() async throws {
+        let f = try await fixture(taskCount: 1), gate = P8Gate()
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let before = await f.photos.catalogCount, predictions = await f.model.fingerprintCount
+        await f.photos.gateNextAdmission(gate); await f.photos.invalidateNextCatalog()
+        await f.runtime.tick(); await gate.waitUntilEntered()
+        await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
+        await gate.release(); await f.runtime.waitForRound()
+        let after = await f.photos.catalogCount, newPredictions = await f.model.fingerprintCount
+        XCTAssertEqual(after - before, 1)
+        XCTAssertEqual(newPredictions - predictions, 1, "Same-revision content obligations still reissue real coordinator work")
+        let state = await f.runtime.current()
+        XCTAssertEqual(state.snapshot.indexProgress?.readyRepresentations, 1)
+    }
+
     func testIndexReadinessDoesNotBypassUnavailableSourceRecoveryDeadline() async throws {
         let clock = P12Clock()
         let f = try await fixture(taskCount: 40, now: { clock.value })
@@ -293,6 +384,7 @@ final class AdvancedRuntimeTests: XCTestCase {
 }
 
 private actor P8Model: ImageFingerprinting, ModelExecutionRecovering {
+    private(set) var fingerprintCount = 0
     private var version: String?
     func enableFingerprinting(_ value: Bool, version: String) { self.version = value ? version : nil }
     private var recoveryGate: P8Gate?
@@ -301,15 +393,22 @@ private actor P8Model: ImageFingerprinting, ModelExecutionRecovering {
         if let gate = recoveryGate { recoveryGate = nil; await gate.hold(); try Task.checkCancellation() }
     }
     func fingerprint(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> Fingerprint {
-        if let version { return try Fingerprint(version: version, values: [1] + Array(repeating: 0, count: 1023)) }
+        if let version { fingerprintCount += 1; return try Fingerprint(version: version, values: [1] + Array(repeating: 0, count: 1023)) }
         XCTFail("Empty catalog must not infer"); throw AdvancedDedupError.invalidImage
     }
 }
 private actor P8Photos: PhotosIndexGateway {
     private var taskCount = 0, budget: ImageWorkBudget?
     private var admission: PhotosReaderAdmission = .available
+    private var admissionGate: P8Gate?
+    private var catalogFailure = false, catalogInvalidation = false
+    func gateNextAdmission(_ gate: P8Gate) { admissionGate = gate }
+    func advanceGeneration() { generation += 1 }
+    func failNextCatalog() { catalogFailure = true }
+    func invalidateNextCatalog() { catalogInvalidation = true }
     func setAdmission(_ value: PhotosReaderAdmission) { admission = value }
     func representationReadAdmission() async -> PhotosReaderAdmission {
+        if let gate = admissionGate { admissionGate = nil; await gate.hold() }
         guard admission == .available, let budget else { return admission }
         return await budget.canAcquire(bytes: reservationBytes) ? .available : .busy
     }
@@ -351,7 +450,19 @@ private actor P8Photos: PhotosIndexGateway {
         if catalogCount > count { return }
         await withCheckedContinuation { catalogWaiters.append((count, $0)) }
     }
-    func candidateSnapshot() async throws -> PhotosCandidateSnapshot { .init(generation: generation, candidates: []) }
+    private var snapshotCount = 0, snapshotGateAt: Int?
+    private var snapshotGate: P8Gate?
+    func gateSnapshot(_ number: Int, using gate: P8Gate) {
+        snapshotCount = 0; snapshotGateAt = number; snapshotGate = gate
+    }
+    func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        snapshotCount += 1
+        let captured = generation
+        if snapshotCount == snapshotGateAt, let gate = snapshotGate {
+            snapshotGateAt = nil; snapshotGate = nil; await gate.hold()
+        }
+        return .init(generation: captured, candidates: [])
+    }
     func representationCatalog(offset: Int, limit: Int, expectedGeneration: Int) async throws -> RepresentationPage {
         activeCatalogs += 1; maximumCatalogs = max(maximumCatalogs, activeCatalogs)
         defer { activeCatalogs -= 1 }
@@ -360,10 +471,13 @@ private actor P8Photos: PhotosIndexGateway {
         catalogCount += 1
         let ready = catalogWaiters.filter { catalogCount > $0.0 }
         catalogWaiters.removeAll { catalogCount > $0.0 }; ready.forEach { $0.1.resume() }
+        if catalogFailure { catalogFailure = false; throw PhotoKitGatewayError.libraryUnavailable }
+        let invalidated = catalogInvalidation ? (0..<taskCount).map { String(format: "%03d", $0) } : []
+        catalogInvalidation = false
         return .init(context: context, generation: capturedGeneration, descriptors: (0..<taskCount).map {
             .init(key: .init(assetID: String(format: "%03d", $0), kind: .original), context: context,
                   revision: "r1", size: try! PixelSize(width: 8, height: 8), equivalentToOriginal: false, revisionIsReliable: true)
-        }, nextOffset: multiplePages && offset == 0 ? 1 : nil)
+        }, nextOffset: multiplePages && offset == 0 ? 1 : nil, invalidatedAssetIDs: invalidated)
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         guard let budget else { throw PhotosRepresentationError.unavailable }

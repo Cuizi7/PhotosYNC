@@ -164,6 +164,7 @@ final class PhotoKitContractTests: XCTestCase {
         let f = try continuityFixture(indexDiagnostics: diagnostics)
         defer { try? FileManager.default.removeItem(at: f.root) }
         try await f.coordinator.reconcile()
+        try await enterExplicitHistoryRecovery(gateway: f.gateway, store: f.store)
         f.lifecycle.persistentToken = 2
         try await f.coordinator.reconcile()
         f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
@@ -234,11 +235,218 @@ final class PhotoKitContractTests: XCTestCase {
         }
     }
 
+    func testContinuousNeutralHistoryDoesNotInvalidateCompletedFingerprints() async throws {
+        let reads = ContractReadProbe()
+        let f = try continuityFixture(readProbe: reads, catalogBatchSize: 4)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let initialReplayCount = f.lifecycle.replayedTokens.count
+        let initialCheckpoint = try await f.store.libraryResumeCheckpoint()
+        f.lifecycle.replayContentChangeIDs = (0..<4).map { "page\($0)" }
+        for token: UInt8 in 2...5 {
+            f.lifecycle.persistentToken = token
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                (0..<4).map { .init(identifier: "page\($0)", candidates: [candidate(key: "page\($0)")],
+                    inputUnchanged: true, assetContentChanged: false, visibleInputFields: [], metadataFields: ["location"]) })
+            f.gateway.recordLibraryChangeForTesting()
+            _ = try await f.gateway.candidateSnapshot()
+            // Periodic/large-batch full inventory must not reinterpret the already
+            // classified live update as a fresh, unknown content edit.
+            try await f.coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 4)
+        }
+        await f.coordinator.processDueWork(now: Date())
+        XCTAssertEqual(f.lifecycle.replayedTokens.count, initialReplayCount)
+        let saved = try await f.store.libraryResumeCheckpoint()
+        XCTAssertEqual(saved, initialCheckpoint, "active inventory must retain its last safely recovered durable cursor")
+        XCTAssertEqual(reads.count, 0)
+        let ready = try await f.coordinator.readyToken()
+        XCTAssertNotNil(ready)
+    }
+
+    func testOverflowedNeutralDeliveryDoesNotRevokeContentContinuity() async throws {
+        let f = try continuityFixture(catalogBatchSize: 4)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let replayCount = f.lifecycle.replayedTokens.count
+        let stream = f.gateway.changes() // Deliberately leave this subscriber idle.
+        for _ in 0..<12 {
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                [.init(identifier: "page0", candidates: [candidate(key: "page0")], inputUnchanged: true)])
+            f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+        }
+        var iterator = stream.makeAsyncIterator()
+        let wakeup = await iterator.next()
+        XCTAssertEqual(wakeup, .fullReconcileRequired)
+        try await f.coordinator.reconcile()
+        let progress = try await f.store.indexProgress()
+        XCTAssertEqual(progress.readyRepresentations, 4)
+        XCTAssertEqual(f.lifecycle.replayedTokens.count, replayCount)
+        let ready = try await f.coordinator.readyToken(); XCTAssertNotNil(ready)
+    }
+
+    func testPartialBuildConvergesAcrossNeutralNotificationsAndFullInventories() async throws {
+        let reads = ContractReadProbe(), f = try continuityFixture(readProbe: reads)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+            (0..<4).map { .init(identifier: "page\($0)", candidates: [candidate(key: "page\($0)")],
+                assetContentChanged: true, visibleInputFields: [], metadataFields: []) })
+        f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+        try await f.coordinator.reconcile()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 0)
+        let replayCount = f.lifecycle.replayedTokens.count
+        for completed in 1...4 {
+            let tasks = try await f.store.nextRepresentationTasks(now: Date(), limit: 1)
+            let task = try XCTUnwrap(tasks.first)
+            let accepted = try await f.store.completeRepresentation(task, fingerprint: f.fingerprint)
+            XCTAssertTrue(accepted)
+            f.lifecycle.persistentToken = UInt8(completed + 1)
+            f.lifecycle.replayContentChangeIDs = [task.descriptor.key.assetID]
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                [.init(identifier: task.descriptor.key.assetID, candidates: [candidate(key: task.descriptor.key.assetID)],
+                    inputUnchanged: true, assetContentChanged: false, visibleInputFields: [], metadataFields: ["location"])])
+            f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+            try await f.coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), completed)
+        }
+        let ready = try await f.coordinator.readyToken()
+        XCTAssertNotNil(ready)
+        XCTAssertEqual(f.lifecycle.replayedTokens.count, replayCount)
+        XCTAssertEqual(reads.count, 0)
+    }
+
+    func testContinuousSessionStillInvalidatesSameRevisionTrueEdit() async throws {
+        let f = try continuityFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let replayCount = f.lifecycle.replayedTokens.count
+        for contentChanged in [false, true, false] {
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                [.init(identifier: "page0", candidates: [candidate(key: "page0")], inputUnchanged: !contentChanged,
+                    assetContentChanged: contentChanged, visibleInputFields: [], metadataFields: [])])
+            f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+        }
+        try await f.coordinator.reconcile()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND revision='r1'", at: f.db), 1)
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 3)
+        XCTAssertEqual(f.lifecycle.replayedTokens.count, replayCount)
+        let ready = try await f.coordinator.readyToken(); XCTAssertNil(ready)
+    }
+
+    func testObservationGapsRecoverOnceThenPreserveNeutralProgress() async throws {
+        for gap in ["unknown", "permission", "unavailable"] {
+            let f = try continuityFixture()
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            try await f.coordinator.reconcile()
+            let replays = f.lifecycle.replayedTokens.count
+            f.lifecycle.persistentToken = 2
+            switch gap {
+            case "permission":
+                f.lifecycle.access = .denied
+                await assertThrows({ try await f.gateway.candidateSnapshot() })
+                f.lifecycle.access = .authorized
+            case "unavailable":
+                f.lifecycle.available = false
+                await assertThrows({ try await f.gateway.candidateSnapshot() })
+                f.lifecycle.available = true
+            default:
+                f.lifecycle.nextChange = .reload
+                f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+            }
+            try await f.coordinator.reconcile()
+            XCTAssertGreaterThan(f.lifecycle.replayedTokens.count, replays, gap)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 0, gap)
+            let recovered = try await f.store.libraryResumeCheckpoint()
+            XCTAssertEqual(recovered?.archivedChangeToken, Data([2]), gap)
+            for task in try await f.store.nextRepresentationTasks(now: Date(), limit: 128) {
+                let accepted = try await f.store.completeRepresentation(task, fingerprint: f.fingerprint)
+                XCTAssertTrue(accepted, gap)
+            }
+            let recoveredReplays = f.lifecycle.replayedTokens.count
+            f.lifecycle.persistentToken = 3
+            f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets:
+                [.init(identifier: "page0", candidates: [candidate(key: "page0")], inputUnchanged: true)])
+            f.gateway.recordLibraryChangeForTesting(); _ = try await f.gateway.candidateSnapshot()
+            try await f.coordinator.reconcile()
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 4, gap)
+            XCTAssertEqual(f.lifecycle.replayedTokens.count, recoveredReplays, gap)
+            let saved = try await f.store.libraryResumeCheckpoint(); XCTAssertEqual(saved, recovered, gap)
+            let ready = try await f.coordinator.readyToken(); XCTAssertNotNil(ready, gap)
+        }
+    }
+
+    func testRuntimePermissionGapDuringPartialBuildRequiresHistoryRecovery() async throws {
+        let f = try continuityFixture(failedAsset: "page0")
+        let source = f.root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        _ = try await f.store.registerSource(url: source)
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.gateway, model: ContractNoReadModel(),
+                configuration: f.configuration, executor: executor, budget: ImageWorkBudget(limits: f.configuration.resources),
+                directory: directory, now: now)
+        }, now: { Date(timeIntervalSince1970: 1000) }, authorized: { f.lifecycle.access == .authorized })
+        addTeardownBlock { await runtime.stop(); await runtime.waitForRound(); try? FileManager.default.removeItem(at: f.root) }
+        try await runtime.prepareInjectedRuntime()
+        await runtime.tick(force: true); await runtime.waitForRound()
+        let before = try await f.store.indexProgress()
+        XCTAssertEqual(before.readyRepresentations, 3)
+        let replays = f.lifecycle.replayedTokens.count
+        f.lifecycle.access = .denied
+        await runtime.tick() // No gateway read while denied: the runtime owns this observation.
+        f.lifecycle.persistentToken = 2
+        f.lifecycle.replayContentChangeIDs = ["page1"] // Same r1, edit only recoverable through history.
+        f.lifecycle.access = .authorized
+        await runtime.tick(); await runtime.waitForRound()
+        XCTAssertGreaterThan(f.lifecycle.replayedTokens.count, replays)
+        let tasks = try await f.store.nextRepresentationTasks(now: Date.distantFuture, limit: 128)
+        XCTAssertTrue(tasks.contains { $0.descriptor.key.assetID == "page1" && $0.descriptor.revision == "r1" })
+        let after = try await f.store.indexProgress()
+        XCTAssertEqual(after.readyRepresentations, 0)
+    }
+
+    func testChannelCancellationCanOverlapDeliveryWithoutDeadlock() async {
+        let done = expectation(description: "all concurrent cancellations and deliveries finish")
+        Task.detached {
+            for _ in 0..<200 {
+                let channel = PhotosIndexChangeChannel(capacity: 1)
+                let stream = channel.stream()
+                let consumer = Task { for await _ in stream { if Task.isCancelled { break } } }
+                let producer = Task.detached { for _ in 0..<20 { channel.send(.fullReconcileRequired) } }
+                consumer.cancel()
+                await producer.value; await consumer.value
+            }
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 10)
+    }
+
+    func testStaleInventoryContinuityCannotAcknowledgeAfterPermissionGap() async throws {
+        let f = try continuityFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let before = try await f.gateway.candidateSnapshot()
+        let checkpoint = try await f.store.libraryResumeCheckpoint()
+        let continuity = try await f.gateway.prepareInventoryReconciliation(previousCheckpoint: checkpoint)
+        XCTAssertTrue(continuity.preservesCachedRepresentations)
+        f.lifecycle.access = .denied
+        await assertThrows({ try await f.gateway.candidateSnapshot() })
+        f.lifecycle.access = .authorized
+        let current = try await f.gateway.candidateSnapshot()
+        XCTAssertEqual(current.generation, before.generation, "the observer fence must protect gaps without a generation increment")
+        await assertThrows({ try await f.gateway.acknowledgeInventory(expectedGeneration: current.generation, continuity: continuity) })
+        XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("pre-gap admission revived") }))
+        await assertThrows({ try await f.gateway.acknowledgeReconciliation(expectedGeneration: current.generation) })
+        try await f.coordinator.reconcile()
+        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 0)
+    }
+
     func testSharedAnonymousContextLinksHistoryLiveAndConservativeInvalidation() async throws {
         let rows = HistoryPendingTrace(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
         let f = try continuityFixture(indexDiagnostics: diagnostic)
         defer { try? FileManager.default.removeItem(at: f.root) }
         try await f.coordinator.reconcile()
+        try await enterExplicitHistoryRecovery(gateway: f.gateway, store: f.store)
         f.lifecycle.persistentToken = 2
         try await f.coordinator.reconcile()
         f.lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [.init(identifier: "page0", candidates: [candidate(key: "page0")])])
@@ -264,17 +472,21 @@ final class PhotoKitContractTests: XCTestCase {
         let before = try await f.gateway.candidateSnapshot()
         let entered = expectation(description: "history paused"), release = DispatchSemaphore(value: 0)
         f.lifecycle.afterReplay = { entered.fulfill(); release.wait() }
-        let work = Task { try await f.coordinator.reconcile() }
+        let previousValue = try await f.store.libraryResumeCheckpoint(), proposedValue = try await f.gateway.contextCheckpoint()
+        let previous = try XCTUnwrap(previousValue), proposed = try XCTUnwrap(proposedValue)
+        let work = Task { _ = try await f.gateway.coverPersistentHistory(from: previous, through: proposed) }
         await fulfillment(of: [entered], timeout: 2)
         XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("old admission entered during history") }))
         release.signal(); try await work.value
+        f.lifecycle.afterReplay = nil
+        try await f.coordinator.reconcile()
         let after = try await f.gateway.candidateSnapshot()
         XCTAssertEqual(after.generation, before.generation)
         XCTAssertFalse(try before.candidateValidity.commitIfCurrent({ XCTFail("old admission revived after history") }))
         XCTAssertTrue(try after.candidateValidity.commitIfCurrent({}))
     }
 
-    func testNoChangeHistoryReplayWritesNoRepresentationOrTaskRows() async throws {
+    func testNoChangeActiveInventorySkipsHistoryAndWritesNoRepresentationOrTaskRows() async throws {
         let f = try continuityFixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
         try await f.coordinator.reconcile()
@@ -285,7 +497,7 @@ final class PhotoKitContractTests: XCTestCase {
         }.joined(), at: f.db)
         let replayCount = f.lifecycle.replayedTokens.count
         try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: Date())
-        XCTAssertEqual(f.lifecycle.replayedTokens.count, replayCount + 1)
+        XCTAssertEqual(f.lifecycle.replayedTokens.count, replayCount)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM history_writes", at: f.db), 0)
         let ready = try await f.coordinator.readyToken(); XCTAssertNotNil(ready)
     }
@@ -330,7 +542,10 @@ final class PhotoKitContractTests: XCTestCase {
         f.gateway.recordLibraryChangeForTesting()
         await fulfillment(of: [detailEntered], timeout: 3)
 
-        let work = Task { try await f.coordinator.reconcile() }
+        let previousValue = try await f.store.libraryResumeCheckpoint()
+        let proposedValue = try await f.gateway.contextCheckpoint()
+        let previous = try XCTUnwrap(previousValue), proposed = try XCTUnwrap(proposedValue)
+        let work = Task { _ = try await f.gateway.coverPersistentHistory(from: previous, through: proposed) }
         await fulfillment(of: [coverageGuardEvaluated], timeout: 3)
         XCTAssertFalse(try beforeEvent.candidateValidity.commitIfCurrent({ XCTFail("pending history must close old admission") }))
         await assertThrows({ try await f.gateway.create(fileURL: f.root.appendingPathComponent("unused-synthetic.jpg"), kind: .image,
@@ -342,7 +557,7 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(f.lifecycle.access, .authorized)
         XCTAssertTrue(f.lifecycle.available)
         XCTAssertTrue(f.lifecycle.completeReplay, "persistent-history replay completed")
-        XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change WHERE asset_id='page3'", at: f.db), 1,
+        XCTAssertEqual(try f.store.photosContentChanges(context: f.context, assetIDs: ["page3"]), ["page3"],
             "history affected-ID persistence succeeded before the pending-detail guard")
         XCTAssertFalse(trace.rows.contains { $0["phase"] == "photos-change-classification" },
             "pending classification must not be published as inputUnchanged")
@@ -357,6 +572,8 @@ final class PhotoKitContractTests: XCTestCase {
             reconciliationDeferred = true
         }
 
+        _ = try await f.gateway.candidateSnapshot()
+        await f.coordinator.libraryChanged(.fullReconcileRequired)
         let historyRows = trace.rows.filter { $0["phase"] == "photos-history-coverage" }
         let readyVectors = try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND vector IS NOT NULL", at: f.db)
         let retainedVectors = try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE vector IS NOT NULL", at: f.db)
@@ -483,6 +700,7 @@ final class PhotoKitContractTests: XCTestCase {
             let f = try continuityFixture()
             defer { try? FileManager.default.removeItem(at: f.root) }
             try await f.coordinator.reconcile()
+            try await enterExplicitHistoryRecovery(gateway: f.gateway, store: f.store)
             f.lifecycle.persistentToken = 2
             if failureMode == 1 {
                 try injectEngineSQL("CREATE TRIGGER reject_history BEFORE INSERT ON photos_content_change BEGIN SELECT RAISE(ABORT,'history write failure'); END;", at: f.db)
@@ -510,7 +728,9 @@ final class PhotoKitContractTests: XCTestCase {
             else { f.lifecycle.persistentToken = 2 }
             // No observer callback for page0: equal metadata must not hide its edit.
             try await f.coordinator.reconcile()
-            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND vector IS NOT NULL", at: f.db), 1)
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE asset_id='page0' AND state='pending' AND vector IS NOT NULL", at: f.db), startupGap ? 1 : 0)
+            let activeCheckpoint = try await f.store.libraryResumeCheckpoint()
+            XCTAssertEqual(activeCheckpoint?.archivedChangeToken, Data([startupGap ? 2 : 1]))
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_content_change", at: f.db), 0)
             let ready = try await f.coordinator.readyToken(); XCTAssertNil(ready)
             let reopened = try SyncStore(url: f.db), lifecycle = FakePhotoKitLifecycle()
@@ -549,6 +769,7 @@ final class PhotoKitContractTests: XCTestCase {
                 await f.coordinator.libraryChanged(.incremental(.init(context: f.context,
                     fromGeneration: before.generation, toGeneration: after.generation, changedAssetIDs: ["page1"], deletedAssetIDs: [])))
                 await f.coordinator.processDueWork(now: Date())
+                try await f.coordinator.reconcile() // active full must not jump past the still-undelivered edit
             }
             let saved = try await f.store.libraryResumeCheckpoint()
             let checkpoint = try XCTUnwrap(saved)
@@ -833,7 +1054,14 @@ final class PhotoKitContractTests: XCTestCase {
         guard case .incremental = await events.next() else { return XCTFail("successful retry acknowledges delivery") }
     }
 
-    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil, indexDiagnostics: IndexDiagnostics? = nil,
+    private func enterExplicitHistoryRecovery(gateway: PhotoKitGateway, store: SyncStore) async throws {
+        let previousValue = try await store.libraryResumeCheckpoint(), proposedValue = try await gateway.contextCheckpoint()
+        let previous = try XCTUnwrap(previousValue), proposed = try XCTUnwrap(proposedValue)
+        let covered = try await gateway.coverPersistentHistory(from: previous, through: proposed)
+        XCTAssertTrue(covered)
+    }
+
+    private func continuityFixture(failedAsset: String? = nil, readProbe: ContractReadProbe? = nil, catalogBatchSize: Int = 128, indexDiagnostics: IndexDiagnostics? = nil,
                                    diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) throws -> (root: URL, db: URL, store: SyncStore,
         context: LibraryContext, lifecycle: FakePhotoKitLifecycle, gateway: PhotoKitGateway, configuration: DedupConfiguration,
         fingerprint: Fingerprint, coordinator: PhotosIndexCoordinator) {
@@ -841,7 +1069,11 @@ final class PhotoKitContractTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let db = root.appendingPathComponent("test.sqlite"), store = try SyncStore(url: db)
         let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: Data(contentsOf: repository.appendingPathComponent("docs/research/advanced-dedup/integration-profile.json")))
+        let data = try Data(contentsOf: repository.appendingPathComponent("docs/research/advanced-dedup/integration-profile.json"))
+        var profile = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var resources = try XCTUnwrap(profile["resources"] as? [String: Any])
+        resources["catalogBatchSize"] = catalogBatchSize; profile["resources"] = resources
+        let configuration = try JSONDecoder().decode(DedupConfiguration.self, from: JSONSerialization.data(withJSONObject: profile))
         let context = LibraryContext(id: UUID(), epoch: 1)
         let fingerprint = try Fingerprint(version: configuration.fingerprint.version, values: [1] + Array(repeating: 0, count: 1023))
         let checkpoint = try JSONEncoder().encode(LibraryResumeCheckpoint(context: context, archivedChangeToken: Data([1]), photosGeneration: 0)).map { String(format: "%02x", $0) }.joined()
@@ -857,7 +1089,7 @@ final class PhotoKitContractTests: XCTestCase {
         let reader = readProbe.map { PhotosRepresentationReader(requester: $0,
             budget: ImageWorkBudget(limits: configuration.resources),
             configuration: configuration, indexDiagnostics: indexDiagnostics) }
-        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: 128, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics)
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, representationReader: reader, catalogBatchSize: catalogBatchSize, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics)
         return (root, db, store, context, lifecycle, gateway, configuration, fingerprint,
             PhotosIndexCoordinator(store: store, photos: gateway, fingerprinter: ContractNoReadModel(), configuration: configuration, indexDiagnostics: indexDiagnostics, diagnostics: diagnostics))
     }
