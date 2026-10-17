@@ -2,15 +2,15 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.4 stable
+## 0.2.5 stable
 
-0.2.4 (build 12) holds new work for an unavailable source root until actual root enumeration proves recovery. Other sources and Photos indexing continue. Independent child/file errors and already dispatched Photos results retain their existing recovery and persistence rules.
+0.2.5 (build 13) preserves completed fingerprints while Photos observation remains continuous. Full inventory checks use classified live changes without replaying generic history updates over confirmed unchanged content. True edits and genuine observation gaps still require revalidation; permission transitions revoke stale inventory confirmations even when no read is in progress.
 
-Gallery recomputation now compares the exact prepared model input with its last successful baseline and reports same, different, missing or incompatible input contracts. Schema v9 adds nullable diagnostic baselines while retaining existing vectors, tasks, index/checkpoint state and import history. Old rows gain baselines only through normally scheduled successful computation; upgrading does not trigger a full-library reread or rebuild. Older apps reject schema v9. Bounded anonymous causal evidence and elapsed-wall stage summaries include failure/cancellation without altering the model, 0.98 threshold, resource selection, readiness or scheduling policy. Same input does not prove full-resolution original-pixel identity; different input alone does not establish a PhotoKit pixel edit.
+Requests already covered by a successful full inventory no longer trigger a second whole-library pass. Subscription cancellation no longer takes the delivery lock from Swift's task cancellation callback. The model, 0.98 threshold, image acquisition and resizing, schema v9, source-root recovery and successful-import history remain unchanged.
 
-The retry/fair-slice/physical-reader protections from 0.2.3 remain. This release does not fix repeated conservative history invalidation or repeated reconciliation scheduling, and a system request that never completes still has no guaranteed automatic recovery. See the [0.2.4 release notes](docs/release/0.2.4.md), [input-diagnostic measurement notes](docs/release/2026-10-16-input-diagnostics-validation.md), and [source-root contract](docs/superpowers/specs/2026-10-16-source-root-availability.md).
+Active sessions retain the last safely recovered durable history checkpoint. Startup or a real gap can conservatively revalidate changes since it, and work already made unverified by an older version still needs validation. iCloud retrieval and a system request that never completes can still delay progress. See the [0.2.5 release notes](docs/release/0.2.5.md) and [Photos continuity contract](docs/research/advanced-dedup/photokit-contract.md).
 
-A release requires independent review and exact-main archive validation through the normal packager. Provenance binds the actual source, complete tests and artifact checks; older logs do not establish a newly built package. Historical [0.2.3 notes](docs/release/0.2.3.md), [0.2.2 notes](docs/release/0.2.2.md) and their evidence remain. No new real Photos/production or macOS 13/Intel hardware evidence is claimed.
+Routine release validation now defaults to one large mixed-history scale sample; changes affecting indexing, queries, models or resource behavior retain the full profile. This release uses `scripts/package-release.sh --scale-profile full` on exact main. Provenance binds the archived source, complete tests and artifact checks. Historical [0.2.4 notes](docs/release/0.2.4.md) and earlier evidence remain; no new real Photos/production or macOS 13/Intel hardware acceptance is claimed.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -34,12 +34,13 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Release configuration: **0.2.4 stable (build 12)**, targeting
-`outputs/releases/0.2.4/`; see [release notes](docs/release/0.2.4.md)
+Release configuration: **0.2.5 stable (build 13)**, targeting
+`outputs/releases/0.2.5/`; see [release notes](docs/release/0.2.5.md)
 and the [changelog](CHANGELOG.md).
 The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
+[0.2.4 stable build 12](docs/release/0.2.4.md),
 [0.2.3 stable build 11](docs/release/0.2.3.md),
 [0.2.2 stable build 10](docs/release/0.2.2.md),
 [0.2.1 stable build 9](docs/release/0.2.1.md),
