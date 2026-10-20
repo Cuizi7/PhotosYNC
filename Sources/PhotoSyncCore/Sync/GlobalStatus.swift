@@ -28,9 +28,9 @@ public enum GlobalStatus: String, CaseIterable, Sendable {
     public var description: String {
         switch self {
         case .unconfigured: return "未配置来源"
-        case .error: return "需要处理错误"
+        case .error: return "同步异常"
         case .paused: return "已暂停"
-        case .waiting: return "等待恢复"
+        case .waiting: return "等待中"
         case .running: return "正在同步"
         case .completed: return "已完成"
         }

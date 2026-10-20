@@ -2,6 +2,49 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testOnlyEnabledUnmountedRootDimsWaitingIcon() {
+        let source = RegisteredSource(id: UUID(), url: URL(fileURLWithPath: "/Volumes/Example/Photos"), enabled: true)
+        var snapshot = EngineSnapshot()
+        let summary = "所在磁盘或网络共享 /Volumes/Example 未挂载；挂载后会自动继续同步。"
+        snapshot.waitingSources[source.id] = SourceIssue(summary: summary, detail: "synthetic")
+        snapshot.sourceIssueDetails[source.id] = [SourceIssueDetail(id: "root", kind: .sourceAvailability,
+            path: source.url.path, summary: summary, stage: nil, detail: "synthetic")]
+        func dims(_ status: GlobalStatus = .waiting, sources: [RegisteredSource]? = nil) -> Bool {
+            SyncStatusPresentation(snapshot: snapshot).dimsStatusIcon(status: status, sources: sources ?? [source])
+        }
+        XCTAssertTrue(dims())
+        for status in GlobalStatus.allCases where status != .waiting {
+            XCTAssertFalse(dims(status), "A mount issue must not hide \(status)")
+        }
+        let disabled = RegisteredSource(id: source.id, url: source.url, enabled: false)
+        XCTAssertFalse(dims(sources: [disabled]))
+        XCTAssertFalse(dims(sources: []))
+        snapshot.sourceIssueDetails[source.id]?[0].path += "/nested"
+        XCTAssertFalse(dims(), "A nested directory diagnosis is not an unmounted source root")
+        snapshot.sourceIssueDetails[source.id]?[0].path = source.url.path
+        snapshot.sourceIssueDetails[source.id]?[0].kind = .file
+        XCTAssertFalse(dims())
+        snapshot.sourceIssueDetails[source.id] = []
+        XCTAssertFalse(dims(), "Recovery awaiting a traversal is not a current unmounted diagnosis")
+    }
+
+    func testOrdinaryWaitingAndOtherDirectoryFailuresStayOpaque() {
+        let source = RegisteredSource(id: UUID(), url: URL(fileURLWithPath: "/Volumes/Example/Photos"), enabled: true)
+        for summary in ["来源目录无法访问，请检查访问权限。", "来源目录所在的网络共享连接已中断。", "来源目录不可用。"] {
+            var snapshot = EngineSnapshot()
+            snapshot.waitingSources[source.id] = SourceIssue(summary: summary, detail: "synthetic")
+            snapshot.sourceIssueDetails[source.id] = [SourceIssueDetail(id: "root", kind: .sourceAvailability,
+                path: source.url.path, summary: summary, stage: nil, detail: "synthetic")]
+            XCTAssertFalse(SyncStatusPresentation(snapshot: snapshot).dimsStatusIcon(status: .waiting, sources: [source]))
+        }
+        var snapshot = EngineSnapshot()
+        snapshot.deferredSources = [source.id]
+        snapshot.summary = SyncStatusSummary(pending: 1, importing: 1, retryPending: 1)
+        snapshot.indexProgress = IndexProgress(state: .waiting, totalsKnown: false, totalAssets: 0,
+            readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
+        XCTAssertFalse(SyncStatusPresentation(snapshot: snapshot).dimsStatusIcon(status: .waiting, sources: [source]))
+    }
+
     func testAnalysisAssetProgressIgnoresRepresentationAndSourceCounts() {
         var snapshot = EngineSnapshot()
         snapshot.summary = SyncStatusSummary(imported: 800, skipped: 100, pending: 9)
@@ -178,7 +221,7 @@ final class SyncStatusPresentationTests: XCTestCase {
 
         XCTAssertEqual(blocked, .error)
         XCTAssertEqual(unauthorized, .error)
-        XCTAssertEqual(view.statusDescription(for: blocked, enabledSourceIDs: [id]), "需要处理错误")
+        XCTAssertEqual(view.statusDescription(for: blocked, enabledSourceIDs: [id]), "同步异常")
     }
 
     func testPausedWorkDescribesPendingStop() {
@@ -261,8 +304,8 @@ final class SyncStatusPresentationTests: XCTestCase {
         let cases: [(name: String, summary: SyncStatusSummary, description: String)] = [
             ("importing", SyncStatusSummary(importing: 1), "等待核对"),
             ("retry only", SyncStatusSummary(retryPending: 1), "等待重试"),
-            ("new pending", SyncStatusSummary(pending: 1), "等待处理"),
-            ("mixed pending", SyncStatusSummary(pending: 1, retryPending: 1), "等待处理")
+            ("new pending", SyncStatusSummary(pending: 1), "等待中"),
+            ("mixed pending", SyncStatusSummary(pending: 1, retryPending: 1), "等待中")
         ]
 
         for item in cases {
@@ -291,7 +334,7 @@ final class SyncStatusPresentationTests: XCTestCase {
             let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
 
             XCTAssertEqual(status, .error, item.name)
-            XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "部分文件需要处理", item.name)
+            XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "同步异常", item.name)
         }
     }
 
@@ -305,7 +348,7 @@ final class SyncStatusPresentationTests: XCTestCase {
         let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
 
         XCTAssertEqual(status, .error)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "部分文件需要处理")
+        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "同步异常")
     }
 
     func testCompletedRoundWithoutOutstandingWorkIsCompleted() {
@@ -348,7 +391,7 @@ extension SyncStatusPresentationTests {
             for (authorized, blocked) in [(false, false), (true, true)] {
                 let error = p.globalStatus(enabledSourceIDs: [id], authorized: authorized, hasBlockingError: blocked)
                 XCTAssertEqual(error, .error)
-                XCTAssertEqual(p.statusDescription(for: error, enabledSourceIDs: [id]), "需要处理错误")
+                XCTAssertEqual(p.statusDescription(for: error, enabledSourceIDs: [id]), "同步异常")
             }
             let unconfigured = p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false)
             XCTAssertEqual(unconfigured, .unconfigured)

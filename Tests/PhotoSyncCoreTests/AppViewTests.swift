@@ -156,8 +156,11 @@ final class AppViewTests: XCTestCase {
                 let info = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first)
                 let frame = host.convert(info.bounds, from: info)
                 let countSize = NSHostingView(rootView: StatusMenuSingleLine(text: "已处理 150 / 已发现 200")).fittingSize
+                let count = try XCTUnwrap(self.recognizedText(in: host).first { $0.text.contains("已处理") })
                 XCTAssertEqual(frame.minX, 14 + countSize.width + 7, accuracy: 2)
-                XCTAssertEqual(frame.midY, 47, accuracy: 2)
+                // Adjacency is relative to the count row, independent of the headline icon's
+                // intrinsic height/baseline. Moving the button to another row must still fail.
+                XCTAssertEqual(frame.midY, count.frame.midY, accuracy: 4)
             }
         }
     }
@@ -791,7 +794,7 @@ extension AppViewTests {
         model.state.snapshot.blockingSummary = "Photos 提交结果尚未确认。"
         model.state.snapshot.blockingError = "synthetic unknown result"
         model.state.snapshot.recoveryHint = .uncertainSubmission(message: "synthetic unknown result")
-        XCTAssertEqual(model.statusDescription, "需要处理错误")
+        XCTAssertEqual(model.statusDescription, "同步异常")
         model.state.snapshot.summaryError = "synthetic stale summary"
         XCTAssertEqual(try XCTUnwrap(SyncProgressMetrics(summary: model.state.snapshot.summary)).processed, 200)
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {

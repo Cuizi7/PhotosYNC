@@ -17,7 +17,8 @@ struct PhotoSyncApp: App {
         MenuBarExtra {
             StatusMenu(model: model)
         } label: {
-            Image(systemName: model.status.symbol).accessibilityLabel(model.statusDescription)
+            Image(nsImage: RibbonStatusIcon.image(status: model.status, dimmed: model.statusIconIsDimmed))
+                .accessibilityLabel(model.statusDescription)
         }.menuBarExtraStyle(.window)
 #if GUI_QA
         WindowGroup("PhotosYNC GUI QA") {

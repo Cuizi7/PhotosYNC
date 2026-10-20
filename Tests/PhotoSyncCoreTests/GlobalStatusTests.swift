@@ -3,6 +3,11 @@ import AppKit
 @testable import PhotoSyncCore
 
 final class GlobalStatusTests: XCTestCase {
+    func testWaitingAndFailureHaveDistinctHeadings() {
+        XCTAssertEqual(GlobalStatus.waiting.description, "等待中")
+        XCTAssertEqual(GlobalStatus.error.description, "同步异常")
+    }
+
     func testWaitingIsVisibleWhileAnotherSourceRuns() {
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: false, waiting: true, running: true), .waiting)
     }

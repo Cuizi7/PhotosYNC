@@ -8,6 +8,21 @@ import PhotoSyncCore
 struct SyncStatusPresentation {
     let snapshot: EngineSnapshot
 
+    /// A drawing-only modifier, after normal status priority has been resolved. The current
+    /// engine exposes mount absence in its root diagnostic text, not a separate reason code.
+    /// Use that existing diagnosis without probing paths on the UI thread. Other directory
+    /// errors, ordinary queued work and a recovery marker without a root diagnosis stay opaque.
+    func dimsStatusIcon(status: GlobalStatus, sources: [RegisteredSource]) -> Bool {
+        guard status == .waiting else { return false }
+        return sources.contains { source in
+            source.enabled && snapshot.waitingSources[source.id]?.isSourceAvailability == true &&
+                (snapshot.sourceIssueDetails[source.id] ?? []).contains { issue in
+                    issue.kind == .sourceAvailability && issue.path == source.url.path &&
+                        issue.summary.contains("未挂载")
+                }
+        }
+    }
+
     /// Maps only enabled sources to the global icon state, so a stale snapshot for a disabled
     /// source cannot hide work that is still progressing elsewhere.
     func globalStatus(
@@ -41,9 +56,7 @@ struct SyncStatusPresentation {
            let analysis, [.running, .waiting].contains(status) { return analysis.title }
         switch status {
         case .error:
-            return hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs)
-                ? "部分文件需要处理"
-                : status.description
+            return status.description
         case .paused:
             return snapshot.activeWork ? "正在暂停，等待当前操作返回" : status.description
         case .waiting:
@@ -53,7 +66,7 @@ struct SyncStatusPresentation {
             let pending = summary?.pending ?? 0
             let retryPending = summary?.retryPending ?? 0
             if pending > 0 || retryPending > 0 {
-                return pending == 0 ? "等待重试" : "等待处理"
+                return pending == 0 ? "等待重试" : status.description
             }
             return "等待扫描"
         default:

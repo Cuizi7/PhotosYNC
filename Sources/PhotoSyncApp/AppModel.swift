@@ -160,6 +160,9 @@ final class AppModel: ObservableObject {
             hasBlockingError: hasBlockingStatusError
         )
     }
+    var statusIconIsDimmed: Bool {
+        SyncStatusPresentation(snapshot: state.snapshot).dimsStatusIcon(status: status, sources: state.sources)
+    }
     private var enabledSourceIDs: Set<UUID> {
         Set(state.sources.filter(\.enabled).map(\.id))
     }

@@ -125,7 +125,9 @@ struct SourceSettings: View {
 
     private var settingsStatus: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(model.statusDescription, systemImage: model.status.symbol)
+            Label { Text(model.statusDescription) } icon: {
+                RibbonStatusIcon(status: model.status, dimmed: model.statusIconIsDimmed)
+            }
                 .font(.headline)
                 .accessibilityIdentifier("photosync-settings-status")
             if model.isGUIQA {
@@ -141,7 +143,9 @@ struct SourceSettings: View {
                 Text("界面验证模式：所有同步、授权和登录启动操作均已禁用。")
                 Picker("预览状态", selection: $model.demoStatus) {
                     ForEach(GlobalStatus.allCases, id: \.self) { status in
-                        Label(status.description, systemImage: status.symbol).tag(status)
+                        Label { Text(status.description) } icon: {
+                            RibbonStatusIcon(status: status)
+                        }.tag(status)
                     }
                 }
             }

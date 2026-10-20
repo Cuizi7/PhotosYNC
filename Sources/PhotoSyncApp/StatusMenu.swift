@@ -37,7 +37,9 @@ struct StatusMenu: View {
     private var statusContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label(model.statusDescription, systemImage: model.status.symbol)
+                Label { Text(model.statusDescription) } icon: {
+                    RibbonStatusIcon(status: model.status, dimmed: model.statusIconIsDimmed)
+                }
                     .font(.headline).accessibilityLabel(model.statusDescription)
                     .accessibilityIdentifier("photosync-status")
                 Spacer()

@@ -2,15 +2,15 @@
 
 PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
 
-## 0.2.8 stable
+## 0.2.9 stable
 
-0.2.8 (build 16) separates source-folder availability from file problems in the menu, Settings and diagnostic details. An unavailable root now shows a warning and a direct unavailable status; a partial subfolder failure has its own status. Only file read/parse and file import/submission diagnostics contribute to the problem count.
+0.2.9 (build 17) replaces the generic status symbols with the app icon's folded S and a large lower-right ribbon tab. Six native vector marks distinguish complete, syncing, paused, waiting, error and unconfigured states. Light and dark appearances use the same monochrome template; waiting is labelled “等待中” and errors “同步异常”, with specific waiting explanations retained.
 
-When recovery traversal is actually running, the source row says it is scanning the folder. When traversal remains incomplete during a pause or deferred/idle period, it says the folder scan is incomplete and will continue later. Submission work and another source's activity do not count as this folder scanning. Existing root/file checks and recovery gates remain in place.
+A currently diagnosed unmounted root in an enabled source displays a gray full S without the status tab. Ordinary waits and other directory/file problems retain their status marks; blocking errors and user pause retain priority. The previous [0.2.8 release](docs/release/0.2.8.md) separated source availability from file problems and remains the runtime behavior baseline.
 
-Schema v10, incremental Photos analysis, model, 0.98 threshold, source immutability and additive Photos writes retain their existing rules. See the [0.2.8 release notes](docs/release/0.2.8.md) and [runtime state contract](docs/specs/2026-09-18-runtime-state-and-recovery.md). The previous [0.2.7 release](docs/release/0.2.7.md) introduced successful-date analysis reuse.
+Schema v10, incremental Photos analysis, model, 0.98 threshold, source immutability and additive Photos writes retain their existing rules. See the [0.2.9 release notes](docs/release/0.2.9.md) and [runtime state contract](docs/specs/2026-09-18-runtime-state-and-recovery.md).
 
-This UI and wording release uses `scripts/package-release.sh --scale-profile release` on exact main. Provenance binds the archived source to complete tests, one 200k-representation/100k-success-history scale sample and artifact checks. Development verification includes offscreen UI tests; no new real Photos, physical GUI interaction, macOS 13/14 or Intel hardware acceptance is claimed.
+This UI and wording release uses `scripts/package-release.sh --scale-profile release` on exact main. Provenance binds the archived source to complete tests, one 200k-representation/100k-success-history scale sample and artifact checks. Native offscreen verification compares all seven icon silhouettes against the approved design and checks 1×/2× light/dark rendering. No new real Photos, system menu selection, physical GUI interaction, macOS 13/14 or Intel hardware acceptance is claimed.
 
 The 0.2 series uses SSCD Large FP16 with Float32 input/output and a native gallery-analysis panel. On Apple Silicon, Core ML requests CPU + Neural Engine first, then CPU + GPU as the sole fallback. Intel requests CPU + GPU. Every newly loaded instance must pass four fixed numerical checks before producing photo fingerprints. Both configurations can use CPU internally; the application does not select a CPU-only fallback. Unavailable execution waits for recovery, with automatic retries at least 60 seconds apart and an explicit manual scan/resume exception.
 
@@ -34,12 +34,13 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh
 ```
 
-Release configuration: **0.2.8 stable (build 16)**, targeting
-`outputs/releases/0.2.8/`; see [release notes](docs/release/0.2.8.md)
+Release configuration: **0.2.9 stable (build 17)**, targeting
+`outputs/releases/0.2.9/`; see [release notes](docs/release/0.2.9.md)
 and the [changelog](CHANGELOG.md).
 The stable package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
+[0.2.8 stable build 16](docs/release/0.2.8.md),
 [0.2.7 stable build 15](docs/release/0.2.7.md),
 [0.2.6 stable build 14](docs/release/0.2.6.md),
 [0.2.5 stable build 13](docs/release/0.2.5.md),

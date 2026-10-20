@@ -3,6 +3,28 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testUnmountedMenuBarDrawingKeepsBlockingErrorsVisible() async throws {
+        let fixture = try await makeAppModelFixture()
+        let model = fixture.model
+        let source = try XCTUnwrap(model.state.sources.first)
+        let message = "所在磁盘或网络共享 /Volumes/Example 未挂载；挂载后会自动继续同步。"
+        model.state.snapshot.waitingSources[source.id] = SourceIssue(summary: message, detail: "synthetic")
+        model.state.snapshot.sourceIssueDetails[source.id] = [SourceIssueDetail(id: "root", kind: .sourceAvailability,
+            path: source.url.path, summary: message, stage: nil, detail: "synthetic")]
+        XCTAssertEqual(model.status, .waiting)
+        XCTAssertTrue(model.statusIconIsDimmed)
+        model.state.authorized = false
+        XCTAssertEqual(model.status, .error)
+        XCTAssertFalse(model.statusIconIsDimmed)
+        XCTAssertEqual(model.statusDescription, "同步异常")
+        model.state.authorized = true
+        model.state.snapshot.sourceIssueDetails = [:]
+        XCTAssertFalse(model.statusIconIsDimmed, "A recovered root must immediately return to the normal waiting mark")
+        model.state.sources = []
+        XCTAssertEqual(model.status, .unconfigured)
+        XCTAssertFalse(model.statusIconIsDimmed)
+    }
+
     // Catches a regression where the menu action stops forwarding a scan to the injected runtime.
     func testScanImportsAnEnabledSourceThroughInjectedRuntime() async throws {
         let fixture = try await makeAppModelFixture()
