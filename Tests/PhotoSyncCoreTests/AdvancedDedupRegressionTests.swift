@@ -261,6 +261,12 @@ extension AdvancedDedupRegressionTests {
         try await runtime.prepareInjectedRuntime()
         let started = ProcessInfo.processInfo.systemUptime
         await runtime.tick(force: true); await runtime.waitForRound()
+        // Native inference may use the one-second slice before all 32 fixture rows finish.
+        // Follow the normal timer path; waiting for one round does not drain future slices.
+        for _ in 0..<32 {
+            if try await store.state(of: legacyID) == .imported { break }
+            await runtime.tick(); await runtime.waitForRound()
+        }
         let initialMS = (ProcessInfo.processInfo.systemUptime - started) * 1000
         let state = try await store.state(of: legacyID), creates = await photos.creates
         XCTAssertEqual(state, .imported, "runtime must reopen old skip and submit through normal guarded engine")
