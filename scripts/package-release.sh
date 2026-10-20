@@ -19,7 +19,7 @@ case $# in
 esac
 
 cd "${0:A:h:h}"
-release_name=0.2.7
+release_name=0.2.8
 release_root="$PWD/outputs/releases"
 final_release_dir="$release_root/$release_name"
 
@@ -64,7 +64,10 @@ mkdir -p "$source_dir"
 print "Build evidence: $build_dir"
 
 # Keep archive creation offline and pointer-only even when Git applies LFS filters.
-GIT_LFS_SKIP_SMUDGE=1 git archive "$source_commit" | tar -x -C "$source_dir"
+# bsdtar can finish before Git writes the trailing padding. Keep both exit statuses
+# authoritative without a successful extraction causing an upstream SIGPIPE.
+GIT_LFS_SKIP_SMUDGE=1 git archive --output="$build_dir/source.tar" "$source_commit"
+tar -xf "$build_dir/source.tar" -C "$source_dir"
 # The controlled archive contains pointers. Hydrate only this immutable commit's local LFS
 # object and verify the complete approved package before any build or validation.
 env -u RQDATAC2_CONF python3 "$source_dir/scripts/advanced-dedup/release.py" \
@@ -151,8 +154,8 @@ codesign --force --sign - --timestamp=none "$app_path/Contents/Frameworks/PhotoS
 codesign --force --sign - --timestamp=none "$app_path"
 codesign --verify --deep --strict --all-architectures "$app_path"
 [[ -s "$app_path/Contents/Resources/Assets.car" && -s "$app_path/Contents/Resources/PhotosYNC.icns" ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.2.7' ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '15' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.2.8' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '16' ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :PhotoSyncReleaseChannel' "$app_path/Contents/Info.plist")" == 'stable' ]]
 for architecture in arm64 x86_64; do
   lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch "$architecture"
@@ -161,7 +164,7 @@ done
 scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg"
 hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg"
 
-cp docs/release/0.2.7.md "$release_dir/RELEASE-NOTES.md"
+cp docs/release/0.2.8.md "$release_dir/RELEASE-NOTES.md"
 cp CHANGELOG.md "$release_dir/CHANGELOG.md"
 ditto "$validation_dir" "$release_dir/validation"
 cp "$build_dir/validate.log" "$release_dir/validate.log"
@@ -174,7 +177,7 @@ continuation_result_hash=$(shasum -a 256 "$release_dir/validation/continuation-r
 {
   print "release=$release_name"
   print "source_commit=$source_commit"
-  print 'build_number=15'
+  print 'build_number=16'
   print 'signing=ad-hoc; notarized=no'
   print 'architectures=arm64 x86_64'
   print 'minimum_macos=13.0'
