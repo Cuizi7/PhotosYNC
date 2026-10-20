@@ -89,7 +89,8 @@ struct StatusMenu: View {
                 if model.enabledWaiting[source.id] != nil || !issues.isEmpty || model.state.snapshot.advancedWaitingReasons[source.id] != nil || model.state.snapshot.sourcePhases[source.id] != nil {
                     SourceRowLabel(url: source.url,
                         status: model.enabledWaiting[source.id]?.summary ?? model.state.snapshot.advancedWaitingReasons[source.id] ?? model.state.snapshot.sourcePhases[source.id] ?? "已启用",
-                        issues: issues, recoveryPending: model.recoveryPending(for: source.id))
+                        issues: issues, recoveryPending: model.recoveryPending(for: source.id),
+                        isScanningDirectory: model.isScanningDirectory(for: source.id))
                 }
             }
             if let warning = model.notificationWarning {

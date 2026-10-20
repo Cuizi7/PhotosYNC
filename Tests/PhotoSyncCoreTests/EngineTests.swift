@@ -266,7 +266,7 @@ final class EngineTests: XCTestCase {
         let neutral = await engine.snapshot()
         XCTAssertNil(neutral.sourceIssueDetails[id])
         XCTAssertEqual(neutral.waitingSources[id]?.kind, .sourceAvailability)
-        XCTAssertEqual(neutral.waitingSources[id]?.summary, "等待确认来源恢复")
+        XCTAssertEqual(neutral.waitingSources[id]?.summary, "目录扫描尚未完成，稍后继续")
         XCTAssertFalse(neutral.waitingSources[id]?.detail.contains(a.path) == true)
         XCTAssertEqual(notices.events.filter(\.recovered).count, 0)
         await reader.deferDirectory(nil)
@@ -305,7 +305,7 @@ final class EngineTests: XCTestCase {
         XCTAssertTrue(held)
         let beforePause = await engine.snapshot()
         XCTAssertNil(beforePause.sourceIssueDetails[id])
-        XCTAssertEqual(beforePause.waitingSources[id]?.summary, "等待确认来源恢复")
+        XCTAssertEqual(beforePause.waitingSources[id]?.summary, "目录扫描尚未完成，稍后继续")
         await engine.setPaused(true); await gate.release(); await scan.value
         let paused = await engine.snapshot()
         XCTAssertEqual(paused.waitingSources[id]?.kind, .sourceAvailability)

@@ -183,6 +183,11 @@ final class AppModel: ObservableObject {
             !(state.snapshot.sourceIssueDetails[sourceID] ?? []).contains { $0.kind == .sourceAvailability }
     }
 
+    /// A submission or work on another source is not evidence that this directory is scanning.
+    func isScanningDirectory(for sourceID: UUID) -> Bool {
+        !state.snapshot.isPaused && state.snapshot.sourcePhases[sourceID] == "扫描目录与元数据"
+    }
+
     func fileIssueCount(for sourceID: UUID) -> Int {
         state.snapshot.sourceFileIssueCounts[sourceID] ?? 0
     }

@@ -248,7 +248,8 @@ struct SourceSettings: View {
             SourceRowLabel(url: source.url,
                 status: source.enabled ? (model.enabledWaiting[source.id]?.summary ?? "已启用") : "已停用 · 记录保留",
                 issues: source.enabled ? (model.state.snapshot.sourceIssueDetails[source.id] ?? []) : [],
-                recoveryPending: source.enabled && model.recoveryPending(for: source.id))
+                recoveryPending: source.enabled && model.recoveryPending(for: source.id),
+                isScanningDirectory: source.enabled && model.isScanningDirectory(for: source.id))
             HStack(spacing: 6) {
                 Button(source.enabled ? "停用" : "启用") {
                     if source.enabled { model.disable(source.id) }

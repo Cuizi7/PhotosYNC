@@ -97,7 +97,7 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         }
     case .recoveryPending:
         if let first {
-            state.snapshot.waitingSources[first] = SourceIssue(summary: "等待确认来源恢复", detail: "合成目录恢复标记", kind: .sourceAvailability)
+            state.snapshot.waitingSources[first] = SourceIssue(summary: "目录扫描尚未完成，稍后继续", detail: "合成目录恢复标记", kind: .sourceAvailability)
         }
     case .summaryLoading: state.snapshot.summary = nil
     case .summaryStale: state.snapshot.summaryError = "合成统计读取失败，保留上次统计"

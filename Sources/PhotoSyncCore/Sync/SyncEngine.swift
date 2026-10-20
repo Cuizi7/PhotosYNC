@@ -1298,7 +1298,7 @@ public actor SyncEngine {
             result.primary = SourceIssue(summary: first.summary, detail: first.detail, kind: first.kind)
         } else {
             // Keep the source-availability marker until the existing exhaustive traversal gate.
-            result.primary = SourceIssue(summary: "等待确认来源恢复", detail: "正在等待完整目录遍历，以确认来源已恢复。", kind: tracked.primary.kind)
+            result.primary = SourceIssue(summary: "目录扫描尚未完成，稍后继续", detail: "完整目录扫描尚未结束，后续扫描会继续检查。", kind: tracked.primary.kind)
         }
         return result
     }

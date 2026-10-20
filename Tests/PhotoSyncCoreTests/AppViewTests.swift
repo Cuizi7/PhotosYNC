@@ -380,19 +380,53 @@ final class AppViewTests: XCTestCase {
         }
     }
 
-    func testSourceRowShowsOneProblemSummary() throws {
+    func testSourceRowSeparatesDirectoryAvailabilityFromFileProblemCount() throws {
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             let size = try measure(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源/旅行"),
                 status: "原来的人话", issues: reviewIssues()).frame(width: 292),
                 width: 292, appearance: appearance, minimumHeight: 0) { host in
                 let texts = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
-                XCTAssertEqual(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源"), status: "原来的人话", issues: reviewIssues()).statusText, "发现 5 项问题")
-                XCTAssertTrue(texts.contains("发现") && texts.contains("5") && texts.contains("项问题"), texts)
+                XCTAssertEqual(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源"), status: "原来的人话", issues: reviewIssues()).statusText, "部分子目录不可用 · 发现 3 项问题")
+                XCTAssertTrue(texts.contains("发现") && texts.contains("3") && texts.contains("项问题"), texts)
+                XCTAssertTrue(texts.contains("部分子目录不可用"), texts)
                 XCTAssertFalse(texts.contains("读取失败"), texts)
                 XCTAssertFalse(texts.contains("原来的人话"), texts)
             }
-            XCTAssertLessThanOrEqual(size.height, 42)
+            XCTAssertLessThanOrEqual(size.height, 58)
         }
+    }
+
+    func testUnavailableRootShowsStatusInMenuAndSettingsWithoutProblemCount() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .offline, root: root)
+        let source = model.state.sources[0]
+        let issues = try XCTUnwrap(model.state.snapshot.sourceIssueDetails[source.id])
+        XCTAssertEqual(SourceRowLabel(url: source.url, status: "等待恢复", issues: issues).statusText,
+            "来源目录不可用，等待恢复")
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            for view in [AnyView(StatusMenu(model: model)), AnyView(SourceSettings(model: model))] {
+                _ = try measure(view, width: 560, appearance: appearance, minimumHeight: 0) { host in
+                    let text = try self.allScrolledText(in: host)
+                    XCTAssertTrue(text.contains("来源目录不可用"), text)
+                    XCTAssertFalse(text.contains("项问题"), text)
+                }
+            }
+            _ = try measure(SourceIssuesContent(sourceURL: source.url, issues: issues, recoveryPending: false),
+                width: 360, appearance: appearance, minimumHeight: 0) { host in
+                let text = try self.allScrolledText(in: host)
+                XCTAssertTrue(text.contains("来源目录不可用"), text)
+                XCTAssertFalse(text.contains("项问题"), text)
+            }
+        }
+    }
+
+    func testAvailableDirectoryCountsOnlyFileAndSubmissionProblems() {
+        let issues = reviewIssues().filter { $0.kind != .sourceAvailability }
+        let url = URL(fileURLWithPath: "/示例来源")
+        XCTAssertEqual(SourceRowLabel(url: url, status: "已启用", issues: issues).statusText, "发现 3 项问题")
+        XCTAssertEqual(SourceRowLabel(url: url, status: "已启用", issues: issues, recoveryPending: true).statusText,
+            "目录扫描尚未完成，稍后继续 · 发现 3 项问题")
     }
 
     func testSourceDetailsGroupCompletePathsAndCauses() throws {
@@ -412,7 +446,7 @@ final class AppViewTests: XCTestCase {
             }
             XCTAssertEqual(issues.filter { $0.path == "/示例来源/same.jpg" }.count, 2)
             XCTAssertTrue(texts.contains("same.jpg"), texts)
-            XCTAssertTrue(texts.contains("5") && texts.contains("项问题"), texts)
+            XCTAssertTrue(texts.contains("3") && texts.contains("项问题"), texts)
             for detail in ["NSPOSIXErrorDomain", "NSCocoaErrorDomain", "读取时长"] {
                 XCTAssertTrue(texts.contains(detail), texts)
             }
@@ -427,11 +461,43 @@ final class AppViewTests: XCTestCase {
         }
     }
 
+    func testDirectoryRescanCopyFollowsActualSourcePhase() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .recoveryPending, root: root)
+        let id = model.state.sources[0].id
+        let cases: [(phase: String?, paused: Bool, expected: String)] = [
+            (nil, false, "目录扫描尚未完成"),
+            ("扫描目录与元数据", false, "正在扫描目录"),
+            ("新增到照片", false, "目录扫描尚未完成"),
+            ("扫描目录与元数据", true, "目录扫描尚未完成")]
+        for item in cases {
+            model.state.snapshot.sourcePhases[id] = item.phase
+            model.state.snapshot.isPaused = item.paused
+            XCTAssertEqual(model.isScanningDirectory(for: id), item.expected == "正在扫描目录")
+            for view in [AnyView(StatusMenu(model: model)), AnyView(SourceSettings(model: model))] {
+                _ = try measure(view, width: 560, minimumHeight: 0) { host in
+                    let text = try self.allScrolledText(in: host)
+                    XCTAssertTrue(text.contains(item.expected), text)
+                    XCTAssertFalse(text.contains("等待确认来源恢复"), text)
+                    XCTAssertFalse(text.contains("项问题"), text)
+                    if item.expected != "正在扫描目录" { XCTAssertFalse(text.contains("正在扫描目录"), text) }
+                }
+            }
+        }
+        _ = try measure(SourceIssuesContent(sourceURL: model.state.sources[0].url, issues: [],
+            recoveryPending: true, isScanningDirectory: true), width: 360, minimumHeight: 0) { host in
+            let text = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+            XCTAssertTrue(text.contains("正在扫描目录"), text)
+            XCTAssertFalse(text.contains("项问题"), text)
+        }
+    }
+
     func testRecoveryPendingDoesNotInventIssueCount() throws {
         _ = try measure(SourceRowLabel(url: URL(fileURLWithPath: "/示例来源"), status: "已启用",
             issues: [], recoveryPending: true).frame(width: 292), width: 292, minimumHeight: 0) { host in
             let text = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
-            XCTAssertTrue(text.contains("等待确认来源恢复"), text)
+            XCTAssertTrue(text.contains("目录扫描尚未完成，稍后继续"), text)
             XCTAssertFalse(text.contains("项问题"), text)
         }
     }
