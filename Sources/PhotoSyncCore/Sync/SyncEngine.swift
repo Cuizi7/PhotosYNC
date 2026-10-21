@@ -272,6 +272,10 @@ public struct EngineSnapshot: Sendable {
     public var deferredSources: Set<UUID> = []
     /// Current advanced preparation wait, separate from source read failures.
     public var advancedWaitingReasons: [UUID: String] = [:]
+    public var livePhotoInventory: LivePhotoInventorySummary?
+    public var livePhotoWork = LivePhotoWorkSummary()
+    public var livePhotoIssue: SourceIssue?
+    public var hasLivePhotoWork: Bool { livePhotoInventory != nil || livePhotoWork.activeGroups > 0 || livePhotoWork.awaitingVerification > 0 || livePhotoWork.awaitingRetirement > 0 || livePhotoWork.unknownMutation }
     public var indexProgress: IndexProgress?
     /// Raw engine-level failure, kept for the journal and the menu tooltip.
     public var blockingError: String?
@@ -307,6 +311,8 @@ public actor SyncEngine {
     private var scanning = false
     private var recovering = false
     private var storageFailed = false
+    private let livePhotoDirectoryObserver: (any LivePhotoDirectoryObserving)?
+    private let livePhotoMetadata: @Sendable (UUID) -> any LivePhotoMetadataReading
     private var drainTask: Task<Void, Never>?
     private var activeAttempt: UUID?
     private var uncertainSubmissions: Set<UUID> = []
@@ -346,6 +352,8 @@ public actor SyncEngine {
     public init(store: SyncStore, photos: any PhotosGateway,
                 directory: @escaping DirectoryFactory = { DirectoryReader(sourceID: $0) },
                 metadata: @escaping MetadataFactory = { MetadataReader(sourceID: $0) },
+                livePhotoDirectoryObserver: (any LivePhotoDirectoryObserving)? = nil,
+                livePhotoMetadata: @escaping @Sendable (UUID) -> any LivePhotoMetadataReading = { LivePhotoMetadataReader(sourceID: $0) },
                 policy: DuplicatePolicy = DuplicatePolicy(), logger: RunLogger? = nil,
                 advancedDedup: AdvancedDedupService? = nil, indexCoordinator: PhotosIndexCoordinator? = nil,
                 requiresAdvancedDedup: Bool = false, dedupConfiguration: DedupConfiguration? = nil, legacySkipReevaluation: LegacySkipReevaluation? = nil,
@@ -361,6 +369,8 @@ public actor SyncEngine {
         self.metadata = metadata; self.policy = policy; self.logger = logger; self.notify = notify
         self.notifyIssue = notifyIssue; self.notifySourceIssue = notifySourceIssue
         self.now = now
+        self.livePhotoDirectoryObserver = livePhotoDirectoryObserver; self.livePhotoMetadata = livePhotoMetadata
+        submissionState.enableDirectories(livePhotoDirectoryObserver != nil)
     }
 
     public func sources() async throws -> [RegisteredSource] { try await store.sources() }
@@ -405,6 +415,7 @@ public actor SyncEngine {
     public func wakeScan() async { await scanEnabledSources() }
     public func setPaused(_ paused: Bool) async {
         status.isPaused = paused
+        if paused { submissionState.invalidateDirectories() }
         await legacySkipReevaluation?.setPaused(paused)
         await advancedDedup?.setPaused(status.isPaused)
     }
@@ -437,6 +448,7 @@ public actor SyncEngine {
         }
         scanning = true
         let roundID = beginRound(sources: sources)
+        submissionState.beginDirectoryRound(sources: sources, roundID: roundID)
         // A round that starts with nothing blocking is a clean slate: the same problem is
         // announced again only after it has actually gone away. `clearBlockingError` re-reads the
         // conditions every round, so clearing the message alone must not clear the announcement.
@@ -556,6 +568,8 @@ public actor SyncEngine {
                 }
                 let rootClosureRevision = rootClosureRevisions[sourceID, default: 0]
                 do {
+                    let batchKey = DirectoryBatchKey(sourceID: sourceID, relativeDirectory: folder.relative)
+                    submissionState.recordDirectory(batchKey, phase: .enumerating, roundID: roundID)
                     let entries = try await reader.entries(in: folder.url)
                     guard canScan(sourceID: sourceID) else {
                         directoryTraversalComplete = false
@@ -675,6 +689,13 @@ public actor SyncEngine {
                                                path: entry.url.path, stage: MetadataReader.videoMetadataStage(error) ?? readStage, runID: run, error: error)
                                 logFailureOnce(phase: "metadata", sourceID: sourceID, keyPath: relative, runID: run, path: entry.url.path, stage: MetadataReader.videoMetadataStage(error) ?? readStage, error: error)
                             }
+                        }
+                    }
+                    if livePhotoDirectoryObserver != nil, canReadSource(sourceID) {
+                        submissionState.recordDirectory(batchKey, phase: .identifying, roundID: roundID)
+                        if try await identifyDirectory(sourceID: sourceID, folder: folder, entries: entries, roundID: roundID), canReadSource(sourceID) {
+                            submissionState.recordDirectory(batchKey, phase: .ready, roundID: roundID)
+                            startDrain(roundID: roundID)
                         }
                     }
                 } catch let error as SyncStoreError { throw error }
@@ -827,6 +848,50 @@ public actor SyncEngine {
         }
     }
 
+    private func identifyDirectory(sourceID: UUID, folder: (url: URL, relative: String), entries: [DirectoryEntry], roundID: UUID) async throws -> Bool {
+        guard let livePhotoDirectoryObserver else { return true }
+        var members = [UUID](), complete = true
+        let reader = livePhotoMetadata(sourceID)
+        for entry in entries where !entry.isDirectory && entry.failure == nil {
+            guard canReadSource(sourceID) else { return false }
+            guard ["image", "video"].contains(MetadataReader.classification(entry.url)),
+                  let record = try await store.file(sourceID: sourceID, relativePath: folder.relative + entry.url.lastPathComponent),
+                  entry.stamp == record.file.stamp else { continue }
+            let ref = LivePhotoResourceRef.source(fileID: record.id, stamp: record.file.stamp)
+            let cached = try await store.livePhotoObservation(for: ref)
+            let needsRead: Bool
+            if let cached { if case .unresolved = cached.inspection { needsRead = true } else { needsRead = false } }
+            else { needsRead = true }
+            if needsRead {
+                do {
+                    let inspection = try await reader.inspect(url: record.file.url, kind: record.file.metadata.kind)
+                    guard canReadSource(sourceID), try await self.directory(sourceID).stamp(of: record.file.url) == record.file.stamp else { complete = false; continue }
+                    try await store.saveLivePhotoObservation(.init(resource: ref, inspection: inspection))
+                } catch let error as SyncStoreError { throw error }
+                catch {
+                    if SourceIssueText.isReadContention(error) || error is CancellationError {
+                        recordDeferral(roundID, sourceID: sourceID); complete = false; continue
+                    }
+                    try await store.saveLivePhotoObservation(.init(resource: ref, inspection: .unresolved(SourceIssueText.systemDiagnostic(error))))
+                }
+            }
+            members.append(record.id)
+        }
+        guard complete, canReadSource(sourceID) else { return false }
+        try await livePhotoDirectoryObserver.observeDirectory(sourceID: sourceID, relativeDirectory: folder.relative.trimmingCharacters(in: CharacterSet(charactersIn: "/")), fileIDs: members)
+        return canReadSource(sourceID)
+    }
+
+    private func canSubmitDirectory(_ key: DirectoryBatchKey, roundID: UUID) -> Bool {
+        livePhotoDirectoryObserver == nil || submissionState.directoryIsReady(key, roundID: roundID)
+    }
+    private func canSubmit(_ record: StoredFile, roundID: UUID) -> Bool {
+        canSubmit(sourceID: record.file.sourceID) && canSubmitDirectory(.init(file: record.file), roundID: roundID)
+    }
+    public nonisolated func livePhotoSourceCanSubmit(_ file: SourceFile) -> Bool {
+        submissionState.allows(file)
+    }
+
     private func startDrain(roundID: UUID) {
         guard drainTask == nil, !status.isPaused, !storageFailed, status.blockingError == nil else { return }
         guard let sources = rounds[roundID]?.sources, !sources.isEmpty else { return }
@@ -842,9 +907,9 @@ public actor SyncEngine {
                 // temporarily blocked row. The next nil-cursor drain handles recovered rows.
                 cursor = record.createdOrder
                 let context = SubmissionContext(roundID: roundID, runID: runID(for: record.file.sourceID, roundID: roundID))
-                guard canSubmit(sourceID: record.file.sourceID) else { continue }
+                guard canSubmit(record, roundID: roundID) else { continue }
                 let source = try await store.source(id: record.file.sourceID)
-                guard source.enabled, canSubmit(sourceID: source.id) else { continue }
+                guard source.enabled, canSubmit(record, roundID: roundID) else { continue }
                 if let retry = record.nextRetryAt, retry > now() { continue }
                 do {
                     let stamp = try await directory(record.file.sourceID).stamp(of: record.file.url)
@@ -903,7 +968,7 @@ public actor SyncEngine {
                     }
                     continue
                 }
-                guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
+                guard canSubmit(record, roundID: roundID) else { continue drainLoop }
                 var photoSnapshot: PhotosCandidateSnapshot
                 var advanced: AdvancedPreparation?
                 if record.file.metadata.kind == .image && usesAdvancedDedup {
@@ -937,14 +1002,14 @@ public actor SyncEngine {
                             continue
                         }
                         guard pendingStampFailureID == record.id else { continue }
-                        guard canSubmit(sourceID: record.file.sourceID) else { continue }
+                        guard canSubmit(record, roundID: roundID) else { continue }
                         recordRoundFailure(context.roundID)
                         setSourceIssue(record.file.sourceID, key: issueKey(for: record.id),
                             issue: SourceIssueText.submissionStampFailed(error: error), path: record.file.url.path,
                             stage: "准备照片判重", runID: context.runID, fileID: record.id, error: error)
                         continue
                     }
-                    guard canSubmit(sourceID: record.file.sourceID) else { continue }
+                    guard canSubmit(record, roundID: roundID) else { continue }
                     switch preparation {
                     case .waiting(let reason):
                         recordAdvancedWait(reason, record: record, context: context)
@@ -971,7 +1036,7 @@ public actor SyncEngine {
                         break
                     }
                     var local = try await store.candidates(filename: record.file.metadata.filename, excludingID: record.id, olderPendingOnly: true)
-                    guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
+                    guard canSubmit(record, roundID: roundID) else { continue drainLoop }
                     var candidates = photoSnapshot.candidates(named: record.file.metadata.filename) + local
                     var decision = policy.evaluate(record.file.metadata, candidates: candidates)
                     var evidence = matchingCandidates(decision, candidates: candidates)
@@ -1019,9 +1084,9 @@ public actor SyncEngine {
                         break
                     }
                 }
-                guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
+                guard canSubmit(record, roundID: roundID) else { continue drainLoop }
                 guard try await store.source(id: record.file.sourceID).enabled else { continue }
-                guard canSubmit(sourceID: record.file.sourceID) else { continue drainLoop }
+                guard canSubmit(record, roundID: roundID) else { continue drainLoop }
                 let attempt = UUID()
                 activeAttempt = attempt
                 do {
@@ -1047,10 +1112,13 @@ public actor SyncEngine {
                     continue
                 }
                 let enabled = try await store.source(id: record.file.sourceID).enabled
-                guard enabled, canSubmit(sourceID: record.file.sourceID) else {
+                guard enabled, canSubmit(record, roundID: roundID) else {
                     // A durable attempt exists, but no Photos request has been dispatched.
                     if advanced != nil {
                         try await deferAdvancedAttempt(record, attempt: attempt, context: context)
+                    } else if livePhotoDirectoryObserver != nil {
+                        try await store.deferUnsubmittedAttempt(fileID: record.id, attemptID: attempt, nextRetry: now())
+                        recordDeferral(context.roundID, sourceID: record.file.sourceID)
                     } else {
                         try await store.recordRetry(fileID: record.id, attemptID: attempt, nextRetry: now(), error: "Submission stopped before dispatch", definitelyNotCommitted: true)
                     }
@@ -1082,15 +1150,22 @@ public actor SyncEngine {
                         let state = submissionState
                         id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind,
                             expectedGeneration: photoSnapshot.generation, beforeMutation: {
-                                guard state.allows(record.file.sourceID) else { return false }
+                                guard state.allows(record.file, roundID: roundID) else { return false }
                                 // One inline probe belongs to the native submission's physical
                                 // lifetime. No detached read, DB/Photos/state lock, or logical
                                 // timeout can release this submission while the OS call lives.
                                 guard try Self.physicalStampMatches(record.file),
                                       try store.advancedAttemptIsCurrentSynchronously(fileID: record.id, attemptID: attempt),
-                                      state.allows(record.file.sourceID) else { return false }
+                                      state.allows(record.file, roundID: roundID) else { return false }
                                 // Queue has been released before taking Photos validity.
                                 return try validity.commitIfCurrent({})
+                            }, onPlaceholder: checkpoint)
+                    } else if livePhotoDirectoryObserver != nil {
+                        let state = submissionState
+                        id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind,
+                            expectedGeneration: photoSnapshot.generation, beforeMutation: {
+                                guard state.allows(record.file, roundID: roundID) else { return false }
+                                return try Self.physicalStampMatches(record.file)
                             }, onPlaceholder: checkpoint)
                     } else {
                         id = try await photos.create(fileURL: record.file.url, kind: record.file.metadata.kind,
@@ -1104,7 +1179,11 @@ public actor SyncEngine {
                 } catch is PhotosAdmissionDeferred {
                     // Only the gateway's explicit no-mutation outcome reaches this
                     // path. Never infer it from a stale token on an in-flight call.
-                    try await deferAdvancedAttempt(record, attempt: attempt, context: context)
+                    if advanced != nil { try await deferAdvancedAttempt(record, attempt: attempt, context: context) }
+                    else {
+                        try await store.deferUnsubmittedAttempt(fileID: record.id, attemptID: attempt, nextRetry: now())
+                        recordDeferral(context.roundID, sourceID: record.file.sourceID)
+                    }
                 } catch let error as SyncStoreError { activeAttempt = nil; throw error }
                 catch {
                     let definite = (error as? PhotoKitGatewayError)?.recoveryEvidence == .definitelyNotCommitted
@@ -1152,6 +1231,7 @@ public actor SyncEngine {
                                            relativePath: record.file.relativePath)
         // An importing row may own an unknown Photos result and must remain blocking.
         // Only deletion, replacement, or an already terminal row supersedes this cursor.
+        if try await store.livePhotoMemberIsReserved(id: record.id) { return true }
         return current == nil || current?.id != record.id ||
             current?.state == .skipped || current?.state == .imported
     }
@@ -1625,14 +1705,35 @@ public actor SyncEngine {
 /// is never held across source I/O, SQLite, or Photos validity checks.
 private final class EngineSubmissionState: @unchecked Sendable {
     private let lock = NSLock()
-    private var paused = false, blocked = false
+    private var paused = false, blocked = false, requiresDirectories = false
     private var disabled: Set<UUID> = []
     private var verified: Set<UUID> = []
+    private var rounds = [UUID: UUID]()
+    private var directories = [DirectoryBatchKey: (UUID, DirectoryBatchState)]()
+    func enableDirectories(_ value: Bool) { lock.lock(); requiresDirectories = value; lock.unlock() }
+    func beginDirectoryRound(sources: Set<UUID>, roundID: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        for source in sources { rounds[source] = roundID }
+        directories = directories.filter { !sources.contains($0.key.sourceID) }
+    }
+    func invalidateDirectories() { lock.lock(); directories.removeAll(); lock.unlock() }
+    func recordDirectory(_ key: DirectoryBatchKey, phase: DirectoryBatchState, roundID: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        guard rounds[key.sourceID] == roundID else { return }
+        directories[key] = (roundID, phase)
+    }
+    func directoryIsReady(_ key: DirectoryBatchKey, roundID: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !requiresDirectories || (rounds[key.sourceID] == roundID && directories[key]?.0 == roundID && directories[key]?.1 == .ready)
+    }
     func update(paused: Bool, blocked: Bool, disabled: Set<UUID>, verified: Set<UUID>) {
         lock.lock(); self.paused = paused; self.blocked = blocked; self.disabled = disabled; self.verified = verified; lock.unlock()
     }
-    func allows(_ source: UUID) -> Bool {
+    func allows(_ file: SourceFile, roundID: UUID? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return !paused && !blocked && !disabled.contains(source) && verified.contains(source)
+        guard !paused, !blocked, !disabled.contains(file.sourceID), verified.contains(file.sourceID) else { return false }
+        guard requiresDirectories else { return true }
+        let key = DirectoryBatchKey(file: file)
+        return directories[key]?.1 == .ready && directories[key]?.0 == rounds[file.sourceID] && (roundID == nil || rounds[file.sourceID] == roundID)
     }
 }

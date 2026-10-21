@@ -76,15 +76,27 @@ struct SyncDetailsContent: View {
         DetailsScrollView(width: 300) {
             VStack(alignment: .leading, spacing: 10) {
                 if let analysis = SyncStatusPresentation(snapshot: snapshot).analysis {
-                    Text("图库分析").font(.headline)
+                    Text(snapshot.livePhotoInventory?.phase != .completed && snapshot.livePhotoInventory != nil ? "Live Photo" : "图库分析").font(.headline)
                     row("状态", analysis.title)
                     row("进度", analysis.progressText)
                     if let detail = analysis.detail, !detail.isEmpty {
-                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                        Text(detail).font(.caption).foregroundStyle(.secondary).help(snapshot.livePhotoIssue?.detail ?? detail)
                     }
                     Text(analysis.explanation).font(.caption).foregroundStyle(.secondary)
                     Text("统计 Photos 图库中的项目，与来源目录的文件数分别计算。")
                         .font(.caption).foregroundStyle(.secondary)
+                    Divider()
+                }
+                if let inventory = snapshot.livePhotoInventory, inventory.phase == .completed {
+                    Text("Live Photo").font(.headline)
+                    row("已清点", "\(inventory.inventoried)")
+                    row("已识别", "\(inventory.identified)")
+                    row("待核实", "\(inventory.unresolved)")
+                    if inventory.unresolved > 0 { Text("历史识别已完成，部分项目待核实").font(.caption) }
+                    if snapshot.livePhotoWork.awaitingVerification > 0 { row("等待验证", "\(snapshot.livePhotoWork.awaitingVerification)") }
+                    if snapshot.livePhotoWork.awaitingRetirement > 0 { Text("Live Photo 已补齐，旧项目待清理").font(.caption) }
+                    if snapshot.livePhotoWork.unknownMutation { Text("提交结果尚未确认，新的提交已停止").font(.caption) }
+                    if let issue = snapshot.livePhotoIssue { Text(issue.summary).font(.caption).help(issue.detail) }
                     Divider()
                 }
                 Text("已发现的文件").font(.headline)

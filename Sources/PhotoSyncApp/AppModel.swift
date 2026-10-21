@@ -245,7 +245,7 @@ final class AppModel: ObservableObject {
     var scanDescription: String { SyncStatusPresentation(snapshot: state.snapshot).scan }
     var recoveryAdvice: String? { SyncStatusPresentation(snapshot: state.snapshot).recoveryAdvice }
     var hasEnabledSources: Bool { state.sources.contains(where: \.enabled) }
-    var canTogglePause: Bool { ready && !demo && hasEnabledSources }
+    var canTogglePause: Bool { ready && !demo && (hasEnabledSources || state.snapshot.hasLivePhotoWork) }
     var isGUIQA: Bool {
 #if GUI_QA
         true
@@ -269,13 +269,13 @@ final class AppModel: ObservableObject {
         if isReadOnlyGUIQA {
             return "GUI QA 只读验证只枚举现有 Photos 候选。系统授权类别仍显示为“照片”访问，但此构建不会调用任何新增、编辑或删除 API。"
         }
-        return "需要“照片”的完整读写权限，才能核对重复并新增照片。请主动授权后开始同步。"
+        return "需要“照片”的完整读写权限，才能核对重复、保存完整 Live Photo，并在验证后清理可安全替代的单项。请主动授权后开始同步。"
     }
     var syncBoundaryDescription: String {
         if isReadOnlyGUIQA {
             return "GUI QA 只读验证：来源文件和 Photos 仅供读取；所有 Photos 写入请求都会被测试构建拒绝。"
         }
-        return "只读取来源文件，向“照片”新增内容。停用来源会保留同步记录。"
+        return "只读取来源文件，向“照片”保存内容。Live Photo 验证通过后，仅清理原资源与受保护信息均已保留的被替代单项。停用来源会保留同步记录。"
     }
 
     func openSettingsWindow() {

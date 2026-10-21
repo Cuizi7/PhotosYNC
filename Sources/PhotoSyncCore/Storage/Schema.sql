@@ -108,4 +108,43 @@ ALTER TABLE photos_representation ADD COLUMN input_vector_version TEXT CHECK(inp
 ALTER TABLE photos_representation ADD COLUMN observed_modification_date REAL;
 ALTER TABLE photos_representation ADD COLUMN successful_modification_date REAL;
 ALTER TABLE photos_representation ADD COLUMN successful_vector_version TEXT CHECK(successful_vector_version IS NULL OR length(successful_vector_version) > 0);
-PRAGMA user_version = 10;
+ALTER TABLE file_record ADD COLUMN live_photo_operation_id TEXT;
+CREATE TABLE IF NOT EXISTS live_photo_observation (
+ resource_key TEXT NOT NULL, revision TEXT NOT NULL, inspection_version INTEGER NOT NULL,
+ content_identifier TEXT, role TEXT, context_id TEXT, asset_id TEXT, file_id TEXT,
+ current INTEGER NOT NULL DEFAULT 1, handled_context_id TEXT, handled_target_id TEXT, payload BLOB NOT NULL,
+ PRIMARY KEY(resource_key, revision, inspection_version)
+);
+CREATE INDEX IF NOT EXISTS live_photo_observation_identity ON live_photo_observation(content_identifier, current, context_id);
+CREATE INDEX IF NOT EXISTS live_photo_observation_asset ON live_photo_observation(context_id, asset_id, current);
+CREATE INDEX IF NOT EXISTS live_photo_observation_file ON live_photo_observation(file_id, current);
+CREATE TABLE IF NOT EXISTS live_photo_group (
+ id TEXT PRIMARY KEY, context_id TEXT NOT NULL, content_identifier TEXT NOT NULL,
+ target_id TEXT, deleted INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0,
+ UNIQUE(context_id, content_identifier)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS live_photo_group_identity ON live_photo_group(context_id, content_identifier);
+CREATE TABLE IF NOT EXISTS live_photo_operation (
+ id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES live_photo_group(id),
+ stage TEXT NOT NULL, holds_unknown INTEGER NOT NULL, payload BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS live_photo_operation_stage ON live_photo_operation(stage, group_id);
+CREATE TABLE IF NOT EXISTS live_photo_operation_asset (operation_id TEXT NOT NULL REFERENCES live_photo_operation(id) ON DELETE CASCADE, asset_id TEXT NOT NULL, PRIMARY KEY(operation_id,asset_id));
+CREATE INDEX IF NOT EXISTS live_photo_operation_asset_id ON live_photo_operation_asset(asset_id,operation_id);
+CREATE TABLE IF NOT EXISTS live_photo_inventory (
+ context_id TEXT NOT NULL, task_key TEXT NOT NULL, phase TEXT NOT NULL, context_epoch INTEGER NOT NULL DEFAULT 0,
+ enumeration_generation INTEGER, completed_at REAL, identity_anchors BLOB,
+ PRIMARY KEY(context_id, task_key)
+);
+CREATE TABLE IF NOT EXISTS live_photo_inventory_item (
+ context_id TEXT NOT NULL, asset_id TEXT NOT NULL, revision TEXT NOT NULL,
+ status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL,
+ is_live_photo INTEGER NOT NULL, descriptor BLOB,
+ PRIMARY KEY(context_id, asset_id)
+);
+CREATE INDEX IF NOT EXISTS live_photo_inventory_queue ON live_photo_inventory_item(context_id, status, next_retry_at, asset_id);
+CREATE INDEX IF NOT EXISTS live_photo_unknown_descriptor ON live_photo_inventory_item(context_id,asset_id) WHERE descriptor IS NULL AND status!='deleted';
+CREATE INDEX IF NOT EXISTS live_photo_complete_candidates ON live_photo_inventory_item(context_id,asset_id,status) WHERE is_live_photo=1 AND status!='deleted';
+CREATE INDEX IF NOT EXISTS file_live_photo_owner ON file_record(live_photo_operation_id);
+
+PRAGMA user_version = 11;

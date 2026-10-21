@@ -30,8 +30,8 @@ struct SyncStatusPresentation {
         authorized: Bool,
         hasBlockingError: Bool
     ) -> GlobalStatus {
-        guard !enabledSourceIDs.isEmpty else { return .unconfigured }
-        guard authorized, !hasBlockingError else { return .error }
+        guard !enabledSourceIDs.isEmpty || snapshot.hasLivePhotoWork else { return .unconfigured }
+        guard authorized, !hasBlockingError, !snapshot.livePhotoWork.unknownMutation else { return .error }
         if snapshot.isPaused { return .paused }
 
         let issues = enabledIssues(for: enabledSourceIDs)
@@ -39,6 +39,10 @@ struct SyncStatusPresentation {
         if let progress = snapshot.indexProgress, progress.state != .ready {
             return progress.state == .waiting ? .waiting : .running
         }
+        if let inventory = snapshot.livePhotoInventory, inventory.phase != .completed { return .running }
+        if snapshot.livePhotoWork.activeGroups > 0 && snapshot.livePhotoInventory?.unresolved == 0 { return .running }
+        if snapshot.livePhotoWork.awaitingVerification > 0 || snapshot.livePhotoWork.awaitingRetirement > 0 || snapshot.livePhotoWork.limitedGroups > 0 || snapshot.livePhotoIssue != nil || (snapshot.livePhotoInventory?.unresolved ?? 0) > 0 { return .waiting }
+        if enabledSourceIDs.isEmpty { return .completed }
         if snapshot.activeWork { return .running }
         if hasDeferredWork(for: enabledSourceIDs) { return .waiting }
 
@@ -52,6 +56,8 @@ struct SyncStatusPresentation {
     func statusDescription(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String {
         let issues = enabledIssues(for: enabledSourceIDs)
         let summary = snapshot.summary
+        if status == .waiting && snapshot.livePhotoWork.awaitingRetirement > 0 { return "Live Photo 已补齐，旧项目待清理" }
+        if status == .waiting && (snapshot.livePhotoInventory?.unresolved ?? 0) > 0 { return "历史识别已完成，部分项目待核实" }
         if !snapshot.isPaused, !issues.contains(where: \.isSourceAvailability),
            let analysis, [.running, .waiting].contains(status) { return analysis.title }
         switch status {
@@ -101,6 +107,13 @@ struct SyncStatusPresentation {
     }
 
     var analysis: Analysis? {
+        if let inventory = snapshot.livePhotoInventory, inventory.phase != .completed {
+            return Analysis(title: snapshot.isPaused ? "历史 Live Photo 识别已暂停" : "正在识别历史 Live Photo",
+                progressText: "已清点 \(inventory.inventoried) · 已识别 \(inventory.identified) · 待核实 \(inventory.unresolved)",
+                fraction: inventory.phase == .identifying && inventory.inventoried > 0 ? Double(inventory.identified + inventory.unresolved) / Double(inventory.inventoried) : nil,
+                detail: snapshot.livePhotoIssue?.summary,
+                explanation: "首次运行会检查图库中的照片与视频。完成后只处理新增、变化和待核实项目；历史识别不会下载 iCloud 原件。")
+        }
         guard let p = snapshot.indexProgress, p.state != .ready else { return nil }
         let title: String
         switch p.state {
@@ -148,8 +161,14 @@ struct SyncStatusPresentation {
     }
 
     var summaryNotes: [String] {
-        guard let s = snapshot.summary else { return [] }
         var notes: [String] = []
+        if let inventory = snapshot.livePhotoInventory, inventory.phase == .completed, inventory.unresolved > 0 { notes.append("历史识别已完成，部分项目待核实") }
+        if snapshot.livePhotoWork.awaitingRetirement > 0 { notes.append("Live Photo 已补齐，旧项目待清理") }
+        if snapshot.livePhotoWork.awaitingVerification > 0 { notes.append("Live Photo 已保存，等待验证") }
+        if snapshot.livePhotoWork.limitedGroups > 0 && snapshot.livePhotoWork.awaitingRetirement == 0 { notes.append("部分 Live Photo 待核实") }
+        if snapshot.livePhotoWork.unknownMutation { notes.append("Live Photo 提交结果尚未确认，新的提交已停止") }
+        if let issue = snapshot.livePhotoIssue { notes.append(issue.summary) }
+        guard let s = snapshot.summary else { return notes }
         if s.retryPending > 0 { notes.append("待重试 \(s.retryPending)") }
         if s.importing > 0 { notes.append("提交中/待确认 \(s.importing)") }
         if s.retainedImported > 0 { notes.append("另有 \(s.retainedImported) 条历史属已停用或移除的来源") }

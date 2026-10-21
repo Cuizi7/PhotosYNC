@@ -1231,6 +1231,27 @@ final class PhotoKitContractTests: XCTestCase {
         guard case .incremental = await events.next() else { return XCTFail("successful retry acknowledges delivery") }
     }
 
+    func testLivePhotoHistoryDeletionIsDurableBeforeReplayReturns() async throws {
+        let f = try continuityFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let context = try await f.gateway.livePhotoLibraryContext()
+        let operation = LivePhotoOperation(context: context, contentIdentifier: "history-pair",
+            photo: .photos(contextID: context.id, assetID: "historical-photo", resourceKey: "photo", revision: "r1"),
+            motion: .photos(contextID: context.id, assetID: "historical-motion", resourceKey: "motion", revision: "r1"),
+            oldAssetIDs: ["historical-photo"])
+        let reserved = try await f.store.reserveLivePhotoOperation(operation); XCTAssertTrue(reserved)
+        let previousValue = try await f.gateway.contextCheckpoint(), previous = try XCTUnwrap(previousValue)
+        f.lifecycle.persistentToken += 1
+        f.lifecycle.replayDeletedIDs = ["historical-photo"]
+        f.lifecycle.afterReplay = {
+            XCTAssertEqual(try? engineSQLInteger("SELECT COUNT(*) FROM live_photo_group WHERE deleted=1", at: f.db), 1)
+        }
+        let proposedValue = try await f.gateway.contextCheckpoint(), proposed = try XCTUnwrap(proposedValue)
+        _ = try await f.gateway.coverPersistentHistory(from: previous, through: proposed)
+        let group = try await f.store.livePhotoGroup(context: context, contentIdentifier: "history-pair")
+        XCTAssertEqual(group?.deleted, true)
+    }
+
     private func enterExplicitHistoryRecovery(gateway: PhotoKitGateway, store: SyncStore) async throws {
         let previousValue = try await store.libraryResumeCheckpoint(), proposedValue = try await gateway.contextCheckpoint()
         let previous = try XCTUnwrap(previousValue), proposed = try XCTUnwrap(proposedValue)
@@ -1535,10 +1556,7 @@ final class PhotoKitContractTests: XCTestCase {
         })
         _ = try await gateway.loadCandidates()
         await assertThrows({ try await gateway.create(fileURL: source, kind: .image) { _ in } }, verify: { error in
-            XCTAssertEqual(
-                error as? PhotoKitGatewayError,
-                .checkpointFailed("New imports are blocked until the gateway is recreated after reconciliation.")
-            )
+            XCTAssertTrue(error is PhotosAdmissionDeferred, "The existing checkpoint failure blocks this unsubmitted caller without creating new unknown evidence")
         })
         XCTAssertEqual(lifecycle.commands.count, 1)
     }
@@ -1590,10 +1608,7 @@ final class PhotoKitContractTests: XCTestCase {
         _ = try await gateway.loadCandidates()
 
         await assertThrows({ try await gateway.create(fileURL: try temporaryFile(), kind: .image) { _ in } }, verify: { error in
-            XCTAssertEqual(
-                error as? PhotoKitGatewayError,
-                .resultUnknown("New imports are blocked until the gateway is recreated after reconciliation.")
-            )
+            XCTAssertTrue(error is PhotosAdmissionDeferred, "The original unknown request remains blocked; this caller never dispatched")
         })
         XCTAssertEqual(lifecycle.commands.count, 1)
     }
@@ -1807,9 +1822,15 @@ private final class FakePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendabl
     var afterReplay: (() -> Void)?
     var completeReplay = true
     var replayContentChangeIDs = ["page0"]
+    var replayDeletedIDs = [String]()
     var replayError: Error?
     var replayEvent: PhotosIndexChange?
     func archivedChangeToken() throws -> Data? { providesToken ? Data([persistentToken]) : nil }
+    func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void,
+                                 onClassifiedChanges: ([String], [String]) throws -> Void) throws -> Bool {
+        try onClassifiedChanges([], replayDeletedIDs)
+        return try replayPersistentChanges(token, onChange: onChange, onContentChange: onContentChange)
+    }
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool {
         replayAttempts += 1
         if let replayError { throw replayError }

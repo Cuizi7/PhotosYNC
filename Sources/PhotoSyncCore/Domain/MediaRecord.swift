@@ -18,7 +18,7 @@ public enum MediaKind: String, Codable, Sendable {
     case video
 }
 
-public struct FileStamp: Codable, Equatable, Sendable {
+public struct FileStamp: Codable, Hashable, Sendable {
     public let size: Int64
     public let modifiedNanoseconds: Int64
 

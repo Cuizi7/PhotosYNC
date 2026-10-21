@@ -6,6 +6,23 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testHistoricalLivePhotoProgressFitsExistingMenuAndDetails() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+        model.state.sources = []
+        model.state.snapshot.indexProgress = nil
+        model.state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 200000, identified: 120000, unresolved: 25)
+        for (view, width) in [(AnyView(StatusMenu(model: model)), CGFloat(320)), (AnyView(SyncDetailsContent(snapshot: model.state.snapshot)), CGFloat(300))] {
+            let height = try measure(view, width: width, minimumHeight: 0) { host in
+                XCTAssertLessThanOrEqual(host.fittingSize.width, width + 1)
+                let text = try self.recognizedText(in: host).map(\.text).joined(separator: " ")
+                XCTAssertTrue(text.contains("Live Photo"), text)
+                XCTAssertFalse(text.contains("operation_id"), text)
+            }
+            XCTAssertLessThan(height.height, 800)
+        }
+    }
+
     func testAnalysisDetailsUseSameAssetProgressAsMenu() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -411,14 +428,16 @@ final class AppViewTests: XCTestCase {
             for view in [AnyView(StatusMenu(model: model)), AnyView(SourceSettings(model: model))] {
                 _ = try measure(view, width: 560, appearance: appearance, minimumHeight: 0) { host in
                     let text = try self.allScrolledText(in: host)
-                    XCTAssertTrue(text.contains("来源目录不可用"), text)
+                    // Exact semantic copy is asserted above; OCR sometimes reads 录 as 求.
+                    XCTAssertTrue(text.contains("来源") && text.contains("不可用"), text)
                     XCTAssertFalse(text.contains("项问题"), text)
                 }
             }
             _ = try measure(SourceIssuesContent(sourceURL: source.url, issues: issues, recoveryPending: false),
                 width: 360, appearance: appearance, minimumHeight: 0) { host in
                 let text = try self.allScrolledText(in: host)
-                XCTAssertTrue(text.contains("来源目录不可用"), text)
+                // Exact semantic copy is asserted above; OCR sometimes reads 录 as 求.
+                    XCTAssertTrue(text.contains("来源") && text.contains("不可用"), text)
                 XCTAssertFalse(text.contains("项问题"), text)
             }
         }

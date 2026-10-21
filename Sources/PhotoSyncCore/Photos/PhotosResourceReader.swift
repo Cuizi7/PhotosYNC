@@ -19,7 +19,8 @@ struct PhotosResourceStorage: Sendable {
         self.root = root; self.availableBytes = availableBytes
     }
 
-    func create(limits: PhotosResourceLimits) throws -> OwnedPhotosResource {
+    func create(limits: PhotosResourceLimits, fileExtension: String? = nil) throws -> OwnedPhotosResource {
+        let encodedName = try Self.encodedName(fileExtension: fileExtension)
         // Only the documented system /tmp and /var aliases may normalize.
         let parent = try SourceRegistry.normalizedURL(root.deletingLastPathComponent())
         let root = parent.appendingPathComponent(root.lastPathComponent)
@@ -38,7 +39,7 @@ struct PhotosResourceStorage: Sendable {
         guard flock(ownerFD, LOCK_EX | LOCK_NB) == 0 else {
             close(ownerFD); close(directoryFD); throw storageError("owner lock")
         }
-        let streamFD = openat(directoryFD, "encoded", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        let streamFD = openat(directoryFD, encodedName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard streamFD >= 0 else { close(ownerFD); close(directoryFD); throw storageError("exclusive encoded file") }
         let marker: Data
         do { marker = try Self.ownerMarker(encodedFD: streamFD) }
@@ -47,10 +48,19 @@ struct PhotosResourceStorage: Sendable {
         guard written == marker.count else {
             close(streamFD); close(ownerFD); close(directoryFD); throw storageError("owner marker")
         }
-        let resource = OwnedPhotosResource(directory: root.appendingPathComponent(name), directoryFD: directoryFD,
+        let resource = OwnedPhotosResource(directory: root.appendingPathComponent(name), encodedName: encodedName, directoryFD: directoryFD,
             ownerFD: ownerFD, streamFD: streamFD, marker: marker, limits: limits, availableBytes: availableBytes)
         do { try resource.ensureSpace(for: 0); return resource }
         catch { resource.remove(); throw error }
+    }
+
+    private static func encodedName(fileExtension: String?) throws -> String {
+        guard let fileExtension else { return "encoded" }
+        guard !fileExtension.isEmpty, fileExtension.utf8.count <= 16,
+              fileExtension.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) }) else {
+            throw PhotosRepresentationError.resourceStorageUnavailable("invalid encoded resource container hint")
+        }
+        return "encoded." + fileExtension
     }
 
     static func ownerMarker(encodedFD: Int32) throws -> Data {
@@ -73,19 +83,20 @@ struct PhotosResourceStorage: Sendable {
             defer { close(fd) }
             guard isPrivate(fd, directory: true),
                   let entries = try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent(name).path),
-                  Set(entries) == Set(["owner", "encoded"]) else { continue }
+                  entries.count == 2, entries.contains("owner"), let encodedName = entries.first(where: { $0 != "owner" }),
+                  encodedName == "encoded" || (encodedName.hasPrefix("encoded.") && (try? Self.encodedName(fileExtension: String(encodedName.dropFirst(8)))) == encodedName) else { continue }
             let owner = openat(fd, "owner", O_RDWR | O_NOFOLLOW | O_CLOEXEC)
             guard owner >= 0 else { continue }
             defer { close(owner) }
             guard isPrivate(owner, directory: false), flock(owner, LOCK_EX | LOCK_NB) == 0 else { continue }
-            let encoded = openat(fd, "encoded", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            let encoded = openat(fd, encodedName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             guard encoded >= 0 else { continue }
             let expected = try? ownerMarker(encodedFD: encoded)
             let valid = isPrivate(encoded, directory: false); close(encoded)
             var bytes = [UInt8](repeating: 0, count: 256)
             let count = read(owner, &bytes, bytes.count)
             guard valid, count > 0, Data(bytes.prefix(count)) == expected, directoryStillMatches(fd, path: root.appendingPathComponent(name).path) else { continue }
-            guard unlinkat(fd, "encoded", 0) == 0, unlinkat(fd, "owner", 0) == 0 else { continue }
+            guard unlinkat(fd, encodedName, 0) == 0, unlinkat(fd, "owner", 0) == 0 else { continue }
             _ = unlinkat(rootFD, name, AT_REMOVEDIR)
         }
     }
@@ -110,11 +121,11 @@ final class OwnedPhotosResource: @unchecked Sendable {
     private var bytes: Int64 = 0
     private var removed = false
 
-    fileprivate init(directory: URL, directoryFD: Int32, ownerFD: Int32, streamFD: Int32, marker: Data,
+    fileprivate init(directory: URL, encodedName: String, directoryFD: Int32, ownerFD: Int32, streamFD: Int32, marker: Data,
                      limits: PhotosResourceLimits, availableBytes: (@Sendable () throws -> Int64)?) {
         self.directory = directory; self.directoryFD = directoryFD; self.ownerFD = ownerFD; self.streamFD = streamFD
         self.limits = limits; self.availableBytes = availableBytes; self.marker = marker
-        url = directory.appendingPathComponent("encoded")
+        url = directory.appendingPathComponent(encodedName)
     }
 
     func append(_ data: Data) throws {
@@ -155,14 +166,14 @@ final class OwnedPhotosResource: @unchecked Sendable {
         try? closeStream()
         // Never follow a replaced directory; only unlink known children through
         // the held directory handle. Unknown children prevent directory removal.
-        let encoded = openat(directoryFD, "encoded", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let encoded = openat(directoryFD, url.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         let unchanged = encoded >= 0 && (try? PhotosResourceStorage.ownerMarker(encodedFD: encoded)) == marker
         if encoded >= 0 { close(encoded) }
         var owner = stat(), currentOwner = stat()
         let ownerUnchanged = fstat(ownerFD, &owner) == 0 && fstatat(directoryFD, "owner", &currentOwner, AT_SYMLINK_NOFOLLOW) == 0 &&
             owner.st_dev == currentOwner.st_dev && owner.st_ino == currentOwner.st_ino
         if unchanged, ownerUnchanged, PhotosResourceStorage.directoryStillMatches(directoryFD, path: directory.path) {
-            _ = unlinkat(directoryFD, "encoded", 0)
+            _ = unlinkat(directoryFD, url.lastPathComponent, 0)
             _ = unlinkat(directoryFD, "owner", 0)
             _ = rmdir(directory.path)
         }

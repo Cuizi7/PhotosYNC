@@ -3,6 +3,13 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testPauseRemainsAvailableForHistoricalLivePhotoWorkWithoutSources() async throws {
+        let fixture = try await makeAppModelFixture()
+        fixture.model.state.sources = []
+        fixture.model.state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 10)
+        XCTAssertTrue(fixture.model.canTogglePause)
+        XCTAssertEqual(fixture.model.status, .running)
+    }
     func testUnmountedMenuBarDrawingKeepsBlockingErrorsVisible() async throws {
         let fixture = try await makeAppModelFixture()
         let model = fixture.model

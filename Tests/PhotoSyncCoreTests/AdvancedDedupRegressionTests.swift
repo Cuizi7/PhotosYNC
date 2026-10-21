@@ -455,8 +455,9 @@ extension AdvancedDedupRegressionTests {
             try await store.disableSource(id: historySource)
             try p9SeedHistory(db: db, count: historyCount, sourceID: historySource, seed: seed)
         }
-        let photos = P9ScalePhotos(count: count, image: image, budget: budget)
+        let photos = P9ScalePhotos(count: count, image: image, budget: budget, liveRoot: root.appendingPathComponent("live-photo-raw"))
         let context = photos.context
+        let livePhotoEvidence = try await p9LPScale(store: store, photos: photos, db: db, base: min(count, 100000))
         let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: c.fingerprint.version)
         let seedStart = ProcessInfo.processInfo.systemUptime
         try p9SeedScale(db: db, count: count, context: context, generation: generation, seed: seed)
@@ -661,7 +662,7 @@ extension AdvancedDedupRegressionTests {
         let peak = p9PeakRSS(), hot95 = p9Percentiles(hot)["p95"]!, cold95 = p9Percentiles(cold)["p95"]!
         let changeWithinBudget = changeSamples.values.flatMap { $0 }.allSatisfy { $0 <= 2000 }
         // Record even a failed budget so it cannot be laundered as a missing sample.
-        try p9WriteEvidence("\(sampleName).json", ["representations": count, "synthetic_assets": min(count, 100000), "success_history_vectors": historyCount,
+        try p9WriteEvidence("\(sampleName).json", ["representations": count, "synthetic_assets": min(count, 100000), "success_history_vectors": historyCount, "live_photo": livePhotoEvidence,
             "performance_contract": backgroundPreparationContract, "preparation_p95_budget_ms": preparationP95BudgetMS,
             "build_configuration": ProcessInfo.processInfo.environment["PHOTOSYNC_SCALE_BUILD_CONFIGURATION"] ?? "Debug",
             "edited_fraction": Double(max(0, count - 100000)) / Double(min(count, 100000)), "scope": "actual graph; synthetic persisted vectors and fake Photos; 20 real local synthetic-image CPU-only inferences",
@@ -843,18 +844,58 @@ private func p9RequireReadyEndpoint(_ coordinator: PhotosIndexCoordinator, store
             "representation_count": Int64(publication.entryCount)]
 }
 
-private actor P9ScalePhotos: PhotosIndexGateway {
+private actor P9ScalePhotos: LivePhotoPhotosGateway {
+    nonisolated let liveStore = P9LiveStore()
+    var liveCatalogRequests = 0
+    let liveRoot: URL
+    private var liveBase: Int { min(count, 100000) }
+    private var liveTotal: Int { liveBase + ((liveBase + 4095) / 4096) * 2 }
+    nonisolated func attachIndexStore(_ store: SyncStore) { liveStore.set(store) }
+    func verifyLivePhotoContext(context: LibraryContext, anchorAssetIDs: [String], allowUnanchored: Bool) async throws -> Bool { context == self.context }
+    func livePhotoLibraryContext() async throws -> LibraryContext { context }
+    func livePhotoAssetCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> LivePhotoAssetPage {
+        liveCatalogRequests += 1
+        let end = min(liveTotal, offset + limit)
+        return .init(context: context, generation: generation, assets: (offset..<end).map { p9LPAsset(context: context, index: $0, base: liveBase) }, nextOffset: end < liveTotal ? end : nil)
+    }
+    func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor] {
+        assetIDs.compactMap { id in
+            if id.hasPrefix("asset-"), let index = Int(id.dropFirst(6)), index < liveBase { return p9LPAsset(context: context, index: index, base: liveBase, revision: index == 0 ? "r\(originalRevision)" : "r1") }
+            if id.hasPrefix("lp-motion-"), let n = Int(id.dropFirst(10)), liveBase + n < liveTotal { return p9LPAsset(context: context, index: liveBase + n, base: liveBase) }
+            return nil
+        }
+    }
+    func readLivePhotoResource(_ ref: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease {
+        guard purpose == .inventory, let id = ref.assetID else { throw PhotosRepresentationError.unavailable }
+        let index: Int
+        if id.hasPrefix("lp-motion-"), let n = Int(id.dropFirst(10)) { index = liveBase + n }
+        else if id.hasPrefix("asset-"), let n = Int(id.dropFirst(6)) { index = n }
+        else { throw PhotosRepresentationError.unavailable }
+        let bytes = try JSONEncoder().encode(p9LPInspection(index: index, base: liveBase, motion: ref.key.contains("lp-motion")))
+        let reader = LivePhotoRawResourceReader(requester: BufferedLivePhotoRequester(chunks: [bytes]), storage: .init(root: liveRoot))
+        return try await reader.read(resource: ref, purpose: purpose, budget: budget)
+    }
+    func livePhotoPreservationSnapshot(assetID: String, context: LibraryContext) async throws -> LivePhotoPreservationSnapshot { throw PhotosRepresentationError.unavailable }
+    func resourcesEqual(_ lhs: LivePhotoResourceRef, _ rhs: LivePhotoResourceRef, budget: LivePhotoResourceBudget) async throws -> Bool { throw PhotosRepresentationError.unavailable }
+    func verifyLivePhoto(assetID: String, operation: LivePhotoOperation) async throws -> LivePhotoVerification { throw PhotosRepresentationError.unavailable }
+    func setLivePhotoRecoveryBlocks(_ operationIDs: Set<UUID>) async {}
+    func createLivePhoto(photoURL: URL, motionURL: URL, photoFilename: String?, motionFilename: String?, preservation: LivePhotoPreservationSnapshot, expectedGeneration: Int, beforeMutation: @escaping @Sendable () throws -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String { throw PhotosAdmissionDeferred() }
+    func retireLivePhotoComponents(assetIDs: [String], expectedGeneration: Int, beforeMutation: @escaping @Sendable () throws -> Bool) async throws { throw PhotosAdmissionDeferred() }
+
     let context = LibraryContext(id: UUID(), epoch: 1), count: Int, image: CGImage, budget: ImageWorkBudget
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 128)
     var generation = 1, originalRevision = 1, reads = 0, hasAdded = false, acknowledgementFails = false
     var additionSequence = 0, addedAssetID = "added-asset-0"
     var catalogRequests = 0
-    init(count: Int, image: CGImage, budget: ImageWorkBudget) { self.count = count; self.image = image; self.budget = budget }
+    init(count: Int, image: CGImage, budget: ImageWorkBudget, liveRoot: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)) {
+        self.count = count; self.image = image; self.budget = budget; self.liveRoot = liveRoot
+    }
     nonisolated func changes() -> AsyncStream<PhotosIndexChange> { channel.stream() }
     private func change(changed: [String] = [], deleted: [String] = []) -> PhotosIndexDelta {
         let from = generation; generation += 1
         let delta = PhotosIndexDelta(context: context, fromGeneration: from, toGeneration: generation,
             changedAssetIDs: changed, deletedAssetIDs: deleted)
+        liveStore.record(delta)
         channel.send(.incremental(delta)); return delta
     }
     @discardableResult func changeOne() -> PhotosIndexDelta { originalRevision += 1; return change(changed: ["asset-0"]) }
@@ -975,9 +1016,10 @@ private func p9LargeFixture(at url: URL, width: Int, height: Int, depth: Int) th
 }
 
 private func p9SeedHistory(db url: URL, count: Int, sourceID: UUID, seed: Fingerprint) throws {
-    var db: OpaquePointer?, file: OpaquePointer?, vector: OpaquePointer?
+    var db: OpaquePointer?, file: OpaquePointer?, vector: OpaquePointer?, live: OpaquePointer?
     guard sqlite3_open(url.path, &db) == SQLITE_OK else { throw FixtureError.unavailable("history open") }
-    defer { sqlite3_finalize(file); sqlite3_finalize(vector); sqlite3_close(db) }
+    defer { sqlite3_finalize(file); sqlite3_finalize(vector); sqlite3_finalize(live); sqlite3_close(db) }
+    guard sqlite3_prepare_v2(db, p9LPObservationSQL, -1, &live, nil) == SQLITE_OK else { throw FixtureError.unavailable("history Live Photo prepare") }
     let fileSQL = "INSERT INTO file_record(id,created_order,source_id,relative_path,filename,size,modified_ns,metadata_json,state,rule_version,success_id,success_metadata_json,succeeded_at) VALUES(?,?,?,?,'historical.png',1,1,?,'imported',1,?,?,1)"
     guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK,
           sqlite3_prepare_v2(db, fileSQL, -1, &file, nil) == SQLITE_OK,
@@ -1006,6 +1048,10 @@ private func p9SeedHistory(db url: URL, count: Int, sourceID: UUID, seed: Finger
         let bytes = n.isMultiple(of: 10000) ? seedBytes : basis[n % 1024]
         _ = bytes.withUnsafeBytes { sqlite3_bind_blob(vector, 3, $0.baseAddress, Int32($0.count), transient) }
         guard sqlite3_step(vector) == SQLITE_DONE else { throw FixtureError.unavailable("history vector insert") }
+        if n.isMultiple(of: 10000) {
+            try p9LPBind(live, observation: .init(resource: .source(fileID: UUID(uuidString: id)!, stamp: .init(size: 1, modifiedNanoseconds: 1)),
+                inspection: .identified(.init(contentIdentifier: "scale-history-\(n)", role: .photo))))
+        }
     }
     guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else { throw FixtureError.unavailable("history commit") }
 }
@@ -1086,4 +1132,103 @@ private final class P12NativeEvents: @unchecked Sendable {
     private let lock = NSLock(); private var entries: [[String: String]] = []
     func append(_ item: [String: String]) { lock.lock(); entries.append(item); lock.unlock() }
     var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return entries }
+}
+
+private struct P9LiveMetadata: LivePhotoMetadataReading {
+    func inspect(url: URL, kind: MediaKind) async throws -> LivePhotoInspection { try JSONDecoder().decode(LivePhotoInspection.self, from: Data(contentsOf: url)) }
+}
+private final class P9LiveStore: @unchecked Sendable {
+    private let lock = NSLock(); private var store: SyncStore?
+    func set(_ value: SyncStore) { lock.lock(); store = value; lock.unlock() }
+    func record(_ delta: PhotosIndexDelta) {
+        lock.lock(); let value = store; lock.unlock()
+        do { try value?.recordLivePhotoChanges(context: delta.context, changed: delta.changedAssetIDs, deleted: delta.deletedAssetIDs) }
+        catch { XCTFail("Synthetic Live Photo producer persistence failed: \(error)") }
+    }
+}
+private func p9LPAsset(context: LibraryContext, index: Int, base: Int, revision: String = "r1") -> LivePhotoAssetDescriptor {
+    let video = index >= base, full = !video && index % 4096 == 2
+    let id = video ? "lp-motion-\(index - base)" : "asset-\(index)"
+    let keys = full ? ["lp-photo", "lp-motion"] : [video ? "lp-motion" : "lp-photo"]
+    return .init(context: context, assetID: id, revision: revision, isLivePhoto: full, mediaKind: video ? .video : .image,
+        resources: keys.map { .photos(contextID: context.id, assetID: id, resourceKey: $0, revision: revision) },
+        resourceKinds: full ? [.image, .video] : [video ? .video : .image])
+}
+private func p9LPInspection(index: Int, base: Int, motion: Bool) -> LivePhotoInspection {
+    if index >= base {
+        let n = index - base
+        return .identified(.init(contentIdentifier: "scale-\(n % 2 == 0 ? "pair" : "video")-\(n / 2)", role: .motion, stillImageTime: 0.5, hasAudio: true))
+    }
+    let slot = index % 4096
+    guard slot <= 2 else { return .noIdentifier }
+    return .identified(.init(contentIdentifier: "scale-\(slot == 0 ? "pair" : slot == 1 ? "still" : "full")-\(index / 4096)",
+        role: motion ? .motion : .photo, stillImageTime: motion ? 0.5 : nil, hasAudio: motion ? true : nil))
+}
+private let p9LPObservationSQL = "INSERT OR REPLACE INTO live_photo_observation(resource_key,revision,inspection_version,content_identifier,role,context_id,asset_id,file_id,current,payload) VALUES(?,?,1,?,?,?,?,?,1,?)"
+private func p9LPBind(_ statement: OpaquePointer?, observation: LivePhotoObservation) throws {
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+    let ref = observation.resource
+    func text(_ index: Int32, _ value: String?) { if let value { sqlite3_bind_text(statement, index, value, -1, transient) } else { sqlite3_bind_null(statement, index) } }
+    text(1, ref.key); text(2, ref.revision); text(3, observation.identity?.contentIdentifier); text(4, observation.identity?.role.rawValue)
+    if case .photos(let context, _, _, _) = ref { text(5, context.uuidString) } else { text(5, nil) }
+    text(6, ref.assetID); text(7, ref.sourceFileID?.uuidString)
+    let payload = try JSONEncoder().encode(observation)
+    _ = payload.withUnsafeBytes { sqlite3_bind_blob(statement, 8, $0.baseAddress, Int32($0.count), transient) }
+    guard sqlite3_step(statement) == SQLITE_DONE else { throw FixtureError.unavailable("Live Photo observation seed") }
+}
+private func p9LPSeed(db url: URL, context: LibraryContext, base: Int) throws -> Int {
+    var db: OpaquePointer?, item: OpaquePointer?, observation: OpaquePointer?
+    guard sqlite3_open(url.path, &db) == SQLITE_OK else { throw FixtureError.unavailable("Live Photo seed open") }
+    defer { sqlite3_finalize(item); sqlite3_finalize(observation); sqlite3_close(db) }
+    guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK,
+          sqlite3_prepare_v2(db, "INSERT INTO live_photo_inventory_item(context_id,asset_id,revision,status,is_live_photo,descriptor) VALUES(?,?,?,?,?,?)", -1, &item, nil) == SQLITE_OK,
+          sqlite3_prepare_v2(db, p9LPObservationSQL, -1, &observation, nil) == SQLITE_OK else { throw FixtureError.unavailable("Live Photo seed prepare") }
+    let total = base + ((base + 4095) / 4096) * 2, stride = max(1, total / 32), transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    var pending = 0
+    for index in 0..<total {
+        let d = p9LPAsset(context: context, index: index, base: base), queued = index.isMultiple(of: stride)
+        if queued { pending += 1 }
+        sqlite3_reset(item); sqlite3_clear_bindings(item)
+        sqlite3_bind_text(item, 1, context.id.uuidString, -1, transient); sqlite3_bind_text(item, 2, d.assetID, -1, transient)
+        sqlite3_bind_text(item, 3, d.revision, -1, transient); sqlite3_bind_text(item, 4, queued ? "queued" : "checked", -1, transient)
+        sqlite3_bind_int(item, 5, d.isLivePhoto ? 1 : 0)
+        let payload = try JSONEncoder().encode(d)
+        _ = payload.withUnsafeBytes { sqlite3_bind_blob(item, 6, $0.baseAddress, Int32($0.count), transient) }
+        guard sqlite3_step(item) == SQLITE_DONE else { throw FixtureError.unavailable("Live Photo inventory seed") }
+        if !queued {
+            for ref in d.resources { try p9LPBind(observation, observation: .init(resource: ref,
+                inspection: p9LPInspection(index: index, base: base, motion: ref.key.contains("lp-motion")), checkedAt: Date(timeIntervalSince1970: 1))) }
+        }
+    }
+    guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else { throw FixtureError.unavailable("Live Photo seed commit") }
+    return pending
+}
+private func p9LPScale(store: SyncStore, photos: P9ScalePhotos, db: URL, base: Int) async throws -> [String: Any] {
+    let context = photos.context, pending = try p9LPSeed(db: db, context: context, base: base)
+    let inventory = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: P9LiveMetadata())
+    let begin = ProcessInfo.processInfo.systemUptime
+    try await inventory.resumeInitialInventory()
+    for _ in 0...pending { _ = try await inventory.processNextInventoryItem(now: Date()) }
+    let summary = try await inventory.summary(), catalogs = await photos.liveCatalogRequests
+    XCTAssertEqual(summary.phase, .completed); XCTAssertEqual(summary.inventoried, base + ((base + 4095) / 4096) * 2)
+    let pair = try await store.livePhotoObservations(contentIdentifier: "scale-pair-0", context: context)
+    XCTAssertEqual(pair.count, 2)
+    XCTAssertEqual(LivePhotoResourceBudget.shared.reservedBytes, 0)
+    let restarted = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: P9LiveMetadata())
+    try await restarted.resumeInitialInventory()
+    let after = await photos.liveCatalogRequests; XCTAssertEqual(after, catalogs)
+    var handle: OpaquePointer?, query: OpaquePointer?
+    guard sqlite3_open(db.path, &handle) == SQLITE_OK else { throw FixtureError.unavailable("Live Photo plan open") }
+    defer { sqlite3_finalize(query); sqlite3_close(handle) }
+    let sql = "EXPLAIN QUERY PLAN SELECT payload FROM live_photo_observation WHERE content_identifier='scale-pair-0' AND current=1 AND (context_id IS NULL OR context_id=?)"
+    guard sqlite3_prepare_v2(handle, sql, -1, &query, nil) == SQLITE_OK else { throw FixtureError.unavailable("Live Photo plan prepare") }
+    sqlite3_bind_text(query, 1, context.id.uuidString, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+    var plan = [String]()
+    while sqlite3_step(query) == SQLITE_ROW { if let value = sqlite3_column_text(query, 3) { plan.append(String(cString: value)) } }
+    XCTAssertTrue(plan.joined().contains("live_photo_observation_identity"))
+    return ["catalog_assets": summary.inventoried, "cached_before_run": summary.inventoried - pending, "pending_attempts": pending,
+        "catalog_pages": catalogs, "restart_new_catalog_pages": after - catalogs, "identity_query_plan": plan,
+        "inventory_ms": (ProcessInfo.processInfo.systemUptime - begin) * 1000, "network": false,
+        "scope": "synthetic cached identification resume; sparse mixed pairs, halves, full targets; no real Photos"]
 }

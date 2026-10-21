@@ -617,7 +617,7 @@ public final class SyncStore: @unchecked Sendable {
                 guard let row = try self.one("SELECT created_order FROM file_record WHERE id = ?", [.text(afterID.uuidString)]) else { throw SyncStoreError.notFound(afterID) }
                 afterOrder = try self.int64(row[0])
             } else { afterOrder = 0 }
-            return try self.rows("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.state = ? AND created_order > ? ORDER BY created_order LIMIT ?", [.text(state.rawValue), .int64(afterOrder), .int64(Int64(limit))]).map(self.decodeStoredFile)
+            return try self.rows("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.live_photo_operation_id IS NULL AND file_record.state = ? AND created_order > ? ORDER BY created_order LIMIT ?", [.text(state.rawValue), .int64(afterOrder), .int64(Int64(limit))]).map(self.decodeStoredFile)
         }
     }
 
@@ -636,6 +636,7 @@ public final class SyncStore: @unchecked Sendable {
                 FROM file_record
                 JOIN source ON source.id = file_record.source_id
                 WHERE file_record.state = 'pending'
+                  AND file_record.live_photo_operation_id IS NULL
                   AND file_record.created_order > ?
                   AND file_record.source_id IN (\(placeholders))
                   AND source.enabled = 1 AND source.removed = 0
@@ -919,7 +920,7 @@ public final class SyncStore: @unchecked Sendable {
                               let published = self.publishedIndexToken, self.samePhotosIndex(published, evidence.token),
                               try self.indexFactsComplete(state),
                               try !self.hasUnsupportedSuccessfulFingerprintSync(version: evidence.token.fingerprintVersion),
-                              let record = try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.id = ? AND source.enabled = 1 AND source.removed = 0 AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(fileID.uuidString)]),
+                              let record = try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id = file_record.source_id WHERE file_record.id = ? AND file_record.live_photo_operation_id IS NULL AND source.enabled = 1 AND source.removed = 0 AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(fileID.uuidString)]),
                               record.state == .pending, record.successID == nil, record.file.sourceID == file.sourceID,
                               record.file.relativePath == file.relativePath, record.file.stamp == file.stamp,
                               record.file.metadata == file.metadata,
@@ -1039,7 +1040,7 @@ public final class SyncStore: @unchecked Sendable {
     }
 
     private func beginAttemptSync(fileID: UUID, attemptID: UUID) throws {
-        try requireChange("UPDATE file_record SET state = 'importing', attempt_id = ?, placeholder_id = NULL, submitted_at = ?, definitely_not_committed = 0, last_error = NULL WHERE id = ? AND state = 'pending' AND success_id IS NULL AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(attemptID.uuidString), .double(Date().timeIntervalSince1970), .text(fileID.uuidString)])
+        try requireChange("UPDATE file_record SET state = 'importing', attempt_id = ?, placeholder_id = NULL, submitted_at = ?, definitely_not_committed = 0, last_error = NULL WHERE id = ? AND live_photo_operation_id IS NULL AND state = 'pending' AND success_id IS NULL AND (submitted_at IS NULL OR definitely_not_committed = 1)", [.text(attemptID.uuidString), .double(Date().timeIntervalSince1970), .text(fileID.uuidString)])
     }
 
     public func candidates(filename: String, excludingID: UUID?, olderPendingOnly: Bool = false) async throws -> [MatchCandidate] {
@@ -1094,6 +1095,19 @@ public final class SyncStore: @unchecked Sendable {
     /// not have called create). Logical cancellation/timeout is not such proof.
     /// Restrict cleanup to the matching, uncheckpointed advanced attempt. Preserve
     /// retry_count; normal admission deferral is not a failed file.
+    /// Call only with explicit proof that the physical mutation was prevented before submission.
+    func deferUnsubmittedAttempt(fileID: UUID, attemptID: UUID, nextRetry: Date) async throws {
+        try await perform { try self.transaction {
+            try self.requireChange("""
+                UPDATE file_record SET state='pending',attempt_id=NULL,placeholder_id=NULL,submitted_at=NULL,
+                    definitely_not_committed=1,next_retry_at=?,last_error=NULL
+                WHERE id=? AND state='importing' AND attempt_id=? AND success_id IS NULL
+                    AND placeholder_id IS NULL AND live_photo_operation_id IS NULL
+                """, [.double(nextRetry.timeIntervalSince1970), .text(fileID.uuidString), .text(attemptID.uuidString)])
+            try self.bumpLocalRevision()
+        } }
+    }
+
     func deferAdvancedAttempt(fileID: UUID, attemptID: UUID, nextRetry: Date) async throws {
         try await perform { try self.transaction {
             try self.requireChange("""
@@ -1234,6 +1248,7 @@ public final class SyncStore: @unchecked Sendable {
                 let batch = ids[start..<min(ids.count, start + max(1, batchSize))]
                 try queue.sync {
                     try self.transaction {
+                        try self.applyLivePhotoChangesSync(context: context, changed: removed ? [] : Array(batch), deleted: removed ? Array(batch) : [])
                         for id in batch {
                             try self.execute("""
                                 INSERT INTO photos_content_change(context_id, context_epoch, run_id, asset_id, generation, removed, content_changed)
@@ -1932,18 +1947,488 @@ public final class SyncStore: @unchecked Sendable {
         return try PixelSize(width: Int(int64(width)), height: Int(int64(height)))
     }
 
+    // MARK: - Live Photo durable identity, ownership and one-time inventory
+
+    private static let livePhotoInventoryKey = "live-photo-initial-identification-v1"
+
+    func livePhotoSavedContext() async throws -> LibraryContext? {
+        try await perform {
+            let rows = try self.rows("SELECT context_id,context_epoch FROM live_photo_inventory", [])
+            guard rows.count <= 1 else { throw PhotoKitGatewayError.libraryChanged }
+            return try rows.first.map { LibraryContext(id: try self.uuid($0[0]), epoch: try self.int64($0[1])) }
+        }
+    }
+    func livePhotoAssetsNeedingDescriptor(context: LibraryContext, now: Date, limit: Int) async throws -> [String] {
+        try await perform {
+            try self.rows("SELECT asset_id FROM live_photo_inventory_item WHERE context_id=? AND (status='needsDescriptor' OR (status='unresolved' AND descriptor IS NULL AND next_retry_at <= ?)) ORDER BY asset_id LIMIT ?", [.text(context.id.uuidString), .double(now.timeIntervalSince1970), .int64(Int64(limit))]).map { try self.text($0[0]) }
+        }
+    }
+    func markLivePhotoDescriptorUnresolved(context: LibraryContext, assetID: String) async throws {
+        try await perform {
+            try self.execute("UPDATE live_photo_inventory_item SET status='unresolved',descriptor=NULL,retry_count=retry_count+1,next_retry_at=? WHERE context_id=? AND asset_id=? AND status!='deleted'", [.double(Date().addingTimeInterval(60).timeIntervalSince1970), .text(context.id.uuidString), .text(assetID)])
+        }
+    }
+    func livePhotoGroup(context: LibraryContext, contentIdentifier: String) async throws -> LivePhotoGroup? {
+        try await perform {
+            guard let row = try self.one("SELECT id,target_id,deleted,completed FROM live_photo_group WHERE context_id=? AND content_identifier=?", [.text(context.id.uuidString), .text(contentIdentifier)]) else { return nil }
+            return LivePhotoGroup(id: try self.uuid(row[0]), contextID: context.id, contentIdentifier: contentIdentifier, targetID: self.optionalText(row[1]), deleted: try self.int64(row[2]) != 0, completed: try self.int64(row[3]) != 0)
+        }
+    }
+    func livePhotoAssetDescriptor(context: LibraryContext, assetID: String) async throws -> LivePhotoAssetDescriptor? {
+        try await perform {
+            guard let row = try self.one("SELECT descriptor FROM live_photo_inventory_item WHERE context_id=? AND asset_id=? AND status!='deleted'", [.text(context.id.uuidString), .text(assetID)]), case .blob(let bytes) = row[0] else { return nil }
+            return try self.decoder.decode(LivePhotoAssetDescriptor.self, from: bytes)
+        }
+    }
+    func hasUnresolvedLivePhotoCandidates(context: LibraryContext) async throws -> Bool {
+        try await perform {
+            if try self.one("SELECT 1 FROM live_photo_inventory_item WHERE context_id=? AND descriptor IS NULL AND status!='deleted' LIMIT 1", [.text(context.id.uuidString)]) != nil { return true }
+            return try self.one("""
+                SELECT 1 FROM live_photo_inventory_item i WHERE context_id=? AND is_live_photo=1 AND status!='deleted' AND
+                (status!='checked' OR NOT EXISTS (SELECT 1 FROM live_photo_observation p JOIN live_photo_observation m
+                    ON m.context_id=p.context_id AND m.asset_id=p.asset_id AND m.content_identifier=p.content_identifier
+                    WHERE p.context_id=i.context_id AND p.asset_id=i.asset_id AND p.current=1 AND m.current=1
+                    AND p.role='photo' AND m.role='motion' AND p.content_identifier IS NOT NULL)) LIMIT 1
+                """, [.text(context.id.uuidString)]) != nil
+        }
+    }
+    func applyLivePhotoDelta(_ delta: PhotosIndexDelta) async throws {
+        try await perform { try self.transaction {
+            try self.applyLivePhotoChangesSync(context: delta.context, changed: delta.changedAssetIDs, deleted: delta.deletedAssetIDs)
+        } }
+    }
+    /// Producer entry: classified deletion facts are committed before observer/history delivery can be acknowledged.
+    func recordLivePhotoChanges(context: LibraryContext, changed: [String], deleted: [String]) throws {
+        try queue.sync { try transaction { try applyLivePhotoChangesSync(context: context, changed: changed, deleted: deleted) } }
+    }
+    private func applyLivePhotoChangesSync(context: LibraryContext, changed: [String], deleted: [String]) throws {
+        for assetID in changed {
+            try execute("UPDATE live_photo_observation SET current=0 WHERE context_id=? AND asset_id=?", [.text(context.id.uuidString), .text(assetID)])
+            try execute("""
+                INSERT INTO live_photo_inventory_item(context_id,asset_id,revision,status,is_live_photo,descriptor)
+                VALUES(?,?,'','needsDescriptor',-1,NULL) ON CONFLICT(context_id,asset_id) DO UPDATE SET status='needsDescriptor',retry_count=0,next_retry_at=NULL
+                WHERE live_photo_inventory_item.status!='deleted'
+                """, [.text(context.id.uuidString), .text(assetID)])
+        }
+        for assetID in deleted {
+            try execute("UPDATE live_photo_observation SET current=0 WHERE context_id=? AND asset_id=?", [.text(context.id.uuidString), .text(assetID)])
+            try execute("UPDATE live_photo_inventory_item SET status='deleted' WHERE context_id=? AND asset_id=?", [.text(context.id.uuidString), .text(assetID)])
+            try execute("UPDATE live_photo_group SET deleted=1 WHERE context_id=? AND target_id=?", [.text(context.id.uuidString), .text(assetID)])
+            let active = try rows("SELECT o.payload FROM live_photo_operation o JOIN live_photo_operation_asset a ON a.operation_id=o.id JOIN live_photo_group g ON g.id=o.group_id WHERE a.asset_id=? AND g.context_id=? AND o.stage!='complete'", [.text(assetID), .text(context.id.uuidString)])
+            for row in active {
+                let op = try decoder.decode(LivePhotoOperation.self, from: blob(row[0]))
+                let ownRetirement = op.oldAssetIDs.contains(assetID) && [.submitted, .unknown, .confirmed].contains(op.retirementEvidence)
+                if !ownRetirement { try execute("UPDATE live_photo_group SET deleted=1 WHERE id=?", [.text(op.groupID.uuidString)]) }
+            }
+        }
+    }
+
+    func saveLivePhotoObservation(_ observation: LivePhotoObservation) async throws {
+        try await perform { try self.transaction { try self.saveLivePhotoObservationSync(observation) } }
+    }
+
+    private func saveLivePhotoObservationSync(_ observation: LivePhotoObservation) throws {
+        let ref = observation.resource
+        let context: Binding
+        if case .photos(let id, _, _, _) = ref { context = .text(id.uuidString) } else { context = .null }
+        try execute("UPDATE live_photo_observation SET current = 0 WHERE resource_key = ?", [.text(ref.key)])
+        try execute("""
+            INSERT INTO live_photo_observation(resource_key, revision, inspection_version, content_identifier, role, context_id, asset_id, file_id, current, payload)
+            VALUES(?,?,?,?,?,?,?,?,1,?) ON CONFLICT(resource_key,revision,inspection_version) DO UPDATE SET current = 1, payload = excluded.payload,
+            content_identifier = excluded.content_identifier, role = excluded.role,
+            handled_context_id = CASE WHEN content_identifier IS excluded.content_identifier AND role IS excluded.role THEN handled_context_id ELSE NULL END,
+            handled_target_id = CASE WHEN content_identifier IS excluded.content_identifier AND role IS excluded.role THEN handled_target_id ELSE NULL END
+            """, [.text(ref.key), .text(ref.revision), .int64(Int64(observation.inspectionVersion)),
+                   observation.identity.map { .text($0.contentIdentifier) } ?? .null, observation.identity.map { .text($0.role.rawValue) } ?? .null,
+                   context, ref.assetID.map(Binding.text) ?? .null, ref.sourceFileID.map { .text($0.uuidString) } ?? .null,
+                   .blob(try encoder.encode(observation))])
+    }
+
+    func livePhotoObservation(for ref: LivePhotoResourceRef) async throws -> LivePhotoObservation? {
+        try await perform {
+            guard let row = try self.one("SELECT payload FROM live_photo_observation WHERE resource_key = ? AND revision = ? AND inspection_version = 1 AND current = 1", [.text(ref.key), .text(ref.revision)]) else { return nil }
+            return try self.decoder.decode(LivePhotoObservation.self, from: self.blob(row[0]))
+        }
+    }
+
+    func livePhotoObservations(contentIdentifier: String, context: LibraryContext) async throws -> [LivePhotoObservation] {
+        try await perform {
+            try self.rows("SELECT payload FROM live_photo_observation WHERE content_identifier = ? AND current = 1 AND (context_id IS NULL OR context_id = ?)", [.text(contentIdentifier), .text(context.id.uuidString)]).map {
+                try self.decoder.decode(LivePhotoObservation.self, from: self.blob($0[0]))
+            }
+        }
+    }
+
+    func livePhotoIdentifiedIDs(context: LibraryContext, after: String?, limit: Int) async throws -> [String] {
+        try await perform {
+            try self.rows("SELECT DISTINCT content_identifier FROM live_photo_observation WHERE current = 1 AND content_identifier IS NOT NULL AND (context_id IS NULL OR context_id = ?) AND content_identifier > ? ORDER BY content_identifier LIMIT ?", [.text(context.id.uuidString), .text(after ?? ""), .int64(Int64(max(1, limit)))]).map { try self.text($0[0]) }
+        }
+    }
+
+    func reserveLivePhotoOperation(_ incoming: LivePhotoOperation) async throws -> Bool {
+        try await perform { try self.transaction {
+            var operation = incoming
+            let existing = try self.one("SELECT id,deleted,completed,target_id FROM live_photo_group WHERE context_id = ? AND content_identifier = ?", [.text(operation.context.id.uuidString), .text(operation.contentIdentifier)])
+            if let existing {
+                guard try self.int64(existing[1]) == 0 else { return false }
+                operation.requiredTargetID = self.optionalText(existing[3])
+                operation.groupID = UUID(uuidString: try self.text(existing[0]))!
+                if operation.requiredTargetID == nil, try self.one("SELECT 1 FROM live_photo_operation WHERE group_id = ? AND stage NOT IN ('complete','blocked')", [.text(operation.groupID.uuidString)]) != nil { return false }
+                if try self.one("SELECT 1 FROM live_photo_operation WHERE group_id = ? AND holds_unknown = 1", [.text(operation.groupID.uuidString)]) != nil { return false }
+            }
+            guard Set(operation.sourceFileIDs).count == operation.sourceFileIDs.count else { return false }
+            operation.sourceStamps = [:]
+            for fileID in operation.sourceFileIDs {
+                guard let row = try self.one("SELECT state,live_photo_operation_id,size,modified_ns FROM file_record WHERE id = ?", [.text(fileID.uuidString)]),
+                      try self.text(row[0]) != "importing", case .null = row[1] else { return false }
+                operation.sourceStamps?[fileID.uuidString] = FileStamp(size: try self.int64(row[2]), modifiedNanoseconds: try self.int64(row[3]))
+                for ref in [operation.photo, operation.motion] {
+                    if case .source(let id, let stamp) = ref, id == fileID {
+                        guard try self.int64(row[2]) == stamp.size, try self.int64(row[3]) == stamp.modifiedNanoseconds else { return false }
+                    }
+                }
+            }
+            if existing == nil {
+                try self.execute("INSERT INTO live_photo_group(id,context_id,content_identifier) VALUES(?,?,?)", [.text(operation.groupID.uuidString), .text(operation.context.id.uuidString), .text(operation.contentIdentifier)])
+            }
+            try self.writeLivePhotoOperation(operation)
+            for id in operation.sourceFileIDs {
+                try self.requireChange("UPDATE file_record SET live_photo_operation_id = ? WHERE id = ? AND live_photo_operation_id IS NULL AND state != 'importing'", [.text(operation.id.uuidString), .text(id.uuidString)])
+            }
+            return true
+        } }
+    }
+
+    func livePhotoOperation(id: UUID) async throws -> LivePhotoOperation? {
+        try await perform { try self.livePhotoOperationSync(id) }
+    }
+    private func livePhotoOperationSync(_ id: UUID) throws -> LivePhotoOperation? {
+        guard let row = try one("SELECT payload FROM live_photo_operation WHERE id = ?", [.text(id.uuidString)]) else { return nil }
+        return try decoder.decode(LivePhotoOperation.self, from: blob(row[0]))
+    }
+    private func writeLivePhotoOperation(_ operation: LivePhotoOperation) throws {
+        try execute("INSERT INTO live_photo_operation(id,group_id,stage,holds_unknown,payload) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET stage=excluded.stage,holds_unknown=excluded.holds_unknown,payload=excluded.payload",
+                    [.text(operation.id.uuidString), .text(operation.groupID.uuidString), .text(operation.stage.rawValue), .int64(operation.holdsUnknownMutation ? 1 : 0), .blob(try encoder.encode(operation))])
+        try execute("DELETE FROM live_photo_operation_asset WHERE operation_id=?", [.text(operation.id.uuidString)])
+        var assets = Set(operation.oldAssetIDs + [operation.photo.assetID, operation.motion.assetID, operation.targetID].compactMap { $0 } + (operation.equivalentResources ?? []).compactMap(\.assetID))
+        for id in operation.sourceFileIDs {
+            if let row = try one("SELECT success_id FROM file_record WHERE id=?", [.text(id.uuidString)]), let success = optionalText(row[0]) { assets.insert(success) }
+        }
+        for asset in assets {
+            try execute("INSERT INTO live_photo_operation_asset(operation_id,asset_id) VALUES(?,?)", [.text(operation.id.uuidString), .text(asset)])
+        }
+
+    }
+    func saveLivePhotoOperation(_ updated: LivePhotoOperation, expectedStage: LivePhotoOperation.Stage) async throws -> Bool {
+        try await perform { try self.transaction {
+            guard let old = try self.livePhotoOperationSync(updated.id), old.stage == expectedStage,
+                  old.groupID == updated.groupID, old.context == updated.context else { return false }
+            guard Set(updated.sourceFileIDs).isSubset(of: Set(old.sourceFileIDs)) else { return false }
+            if old.sourceFileIDs != updated.sourceFileIDs {
+                guard old.stage == .planned else { return false }
+                for id in Set(old.sourceFileIDs).subtracting(updated.sourceFileIDs) {
+                    try self.execute("UPDATE file_record SET live_photo_operation_id=NULL WHERE id=? AND live_photo_operation_id=?", [.text(id.uuidString), .text(old.id.uuidString)])
+                }
+            }
+            try self.writeLivePhotoOperation(updated)
+            if updated.releasesMembers {
+                try self.execute("UPDATE file_record SET live_photo_operation_id = NULL WHERE live_photo_operation_id = ?", [.text(updated.id.uuidString)])
+            }
+            return true
+        } }
+    }
+
+    func beginLivePhotoCreation(operationID: UUID) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .planned, !op.holdsUnknownMutation else { throw SyncStoreError.invalidTransition("Live Photo operation is not ready") }
+            // A group reservation is held before touching any row. Preserve imported/skipped success history.
+            try self.execute("UPDATE file_record SET state='importing',attempt_id=?,placeholder_id=NULL,submitted_at=?,definitely_not_committed=0 WHERE live_photo_operation_id=? AND success_id IS NULL AND state IN ('pending','skipped')", [.text(op.id.uuidString), .double(Date().timeIntervalSince1970), .text(op.id.uuidString)])
+            op.stage = .creating; op.creationEvidence = .submitted
+            try self.writeLivePhotoOperation(op); try self.bumpLocalRevision()
+        } }
+    }
+
+    func checkpointLivePhotoPlaceholder(operationID: UUID, identifier: String) throws {
+        try queue.sync { try transaction {
+            guard var op = try livePhotoOperationSync(operationID), op.stage == .creating else { throw SyncStoreError.invalidTransition("Live Photo placeholder has no active operation") }
+            op.placeholderID = identifier; try writeLivePhotoOperation(op)
+            try execute("UPDATE file_record SET placeholder_id=? WHERE live_photo_operation_id=? AND state='importing' AND attempt_id=?", [.text(identifier), .text(operationID.uuidString), .text(operationID.uuidString)])
+        } }
+    }
+
+    func confirmLivePhotoCreation(operationID: UUID, identifier: String) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .creating || op.creationEvidence == .unknown else { throw SyncStoreError.invalidTransition("No Live Photo creation to confirm") }
+            op.targetID = identifier; op.creationEvidence = .confirmed; op.stage = .created
+            try self.writeLivePhotoOperation(op)
+            try self.markLivePhotoMembersHandled(op, target: identifier)
+            try self.execute("UPDATE file_record SET state='imported',success_id=?,success_metadata_json=metadata_json,succeeded_at=?,attempt_id=NULL,placeholder_id=NULL,retry_count=0,next_retry_at=NULL,last_error=NULL WHERE live_photo_operation_id=? AND success_id IS NULL AND state='importing' AND attempt_id=?", [.text(identifier), .double(Date().timeIntervalSince1970), .text(op.id.uuidString), .text(op.id.uuidString)])
+            try self.execute("UPDATE live_photo_group SET target_id=? WHERE id=?", [.text(identifier), .text(op.groupID.uuidString)])
+            try self.bumpLocalRevision()
+        } }
+    }
+
+    func reuseLivePhotoTarget(operationID: UUID, identifier: String) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .planned else { throw SyncStoreError.invalidTransition("Cannot reuse target during submission") }
+            op.targetID = identifier; op.reusedTarget = true; op.stage = .created
+            try self.writeLivePhotoOperation(op)
+            try self.markLivePhotoMembersHandled(op, target: identifier)
+            try self.execute("UPDATE file_record SET state='skipped',skip_reason='suspectedDuplicate',last_error=NULL WHERE live_photo_operation_id=? AND success_id IS NULL AND state IN ('pending','skipped')", [.text(op.id.uuidString)])
+            try self.execute("UPDATE live_photo_group SET target_id=? WHERE id=?", [.text(identifier), .text(op.groupID.uuidString)])
+            try self.bumpLocalRevision()
+        } }
+    }
+
+    func loadLivePhotoOperationsForRecovery() async throws -> [LivePhotoOperation] {
+        try await perform {
+            try self.rows("SELECT payload FROM live_photo_operation WHERE stage != 'complete' OR holds_unknown=1", []).map { try self.decoder.decode(LivePhotoOperation.self, from: self.blob($0[0])) }
+        }
+    }
+    func sourceFile(id: UUID) async throws -> StoredFile? {
+        try await perform { try self.storedFile("SELECT \(Self.fileColumns) FROM file_record JOIN source ON source.id=file_record.source_id WHERE file_record.id=?", [.text(id.uuidString)]) }
+    }
+    func livePhotoSourceMayParticipate(_ id: UUID) async throws -> Bool {
+        try await perform {
+            try self.one("SELECT 1 FROM file_record f JOIN source s ON s.id=f.source_id WHERE f.id=? AND s.enabled=1 AND s.removed=0 AND (f.skip_reason IS NULL OR f.skip_reason!='sourceChanged')", [.text(id.uuidString)]) != nil
+        }
+    }
+    func isSourceEnabled(_ id: UUID) async throws -> Bool {
+        try await perform {
+            guard let row = try self.one("SELECT enabled,removed FROM source WHERE id=?", [.text(id.uuidString)]) else { return false }
+            return try self.int64(row[0]) == 1 && self.int64(row[1]) == 0
+        }
+    }
+    func livePhotoMemberIsReserved(id: UUID) async throws -> Bool {
+        try await perform { try self.one("SELECT 1 FROM file_record WHERE id=? AND live_photo_operation_id IS NOT NULL", [.text(id.uuidString)]) != nil }
+    }
+
+    /// No Photos I/O or await in the final durable intent guard.
+    func hasUnconfirmedOrdinaryMutation() throws -> Bool {
+        try queue.sync { try one("SELECT 1 FROM file_record WHERE state='importing' AND live_photo_operation_id IS NULL LIMIT 1", []) != nil }
+    }
+    func hasUnconfirmedLivePhotoMutation() throws -> Bool {
+        try queue.sync { try one("SELECT 1 FROM live_photo_operation WHERE holds_unknown=1 LIMIT 1", []) != nil }
+    }
+    func livePhotoMutationAllowed(operationID: UUID, stage: LivePhotoOperation.Stage) throws -> Bool {
+        try queue.sync {
+            guard let op = try livePhotoOperationSync(operationID), op.stage == stage,
+                  let group = try one("SELECT deleted FROM live_photo_group WHERE id=?", [.text(op.groupID.uuidString)]), try int64(group[0]) == 0 else { return false }
+            for id in op.sourceFileIDs {
+                guard let frozen = op.sourceStamps?[id.uuidString],
+                      let row = try one("SELECT f.size,f.modified_ns,s.enabled,s.removed FROM file_record f JOIN source s ON s.id=f.source_id WHERE f.id=? AND f.live_photo_operation_id=?", [.text(id.uuidString), .text(op.id.uuidString)]),
+                      try int64(row[0]) == frozen.size, try int64(row[1]) == frozen.modifiedNanoseconds, try int64(row[2]) == 1, try int64(row[3]) == 0 else { return false }
+            }
+            for ref in [op.photo, op.motion] {
+                if case .source(let id, let stamp) = ref {
+                    guard let row = try one("SELECT f.size,f.modified_ns,s.enabled,s.removed FROM file_record f JOIN source s ON s.id=f.source_id WHERE f.id=? AND f.live_photo_operation_id=?", [.text(id.uuidString), .text(op.id.uuidString)]),
+                          try int64(row[0]) == stamp.size, try int64(row[1]) == stamp.modifiedNanoseconds, try int64(row[2]) == 1, try int64(row[3]) == 0 else { return false }
+                } else if case .photos(_, let asset, _, let revision) = ref {
+                    guard let row = try one("SELECT revision,status FROM live_photo_inventory_item WHERE context_id=? AND asset_id=?", [.text(op.context.id.uuidString), .text(asset)]),
+                          try text(row[0]) == revision, try text(row[1]) == "checked" else { return false }
+                }
+            }
+            return true
+        }
+    }
+    func recordLivePhotoVerification(operationID: UUID, verification: LivePhotoVerification) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), [.created, .verifying].contains(op.stage), op.targetID == verification.assetID else { throw SyncStoreError.invalidTransition("Live Photo verification has no target") }
+            op.verification = verification; op.stage = verification.passed ? .readyToRetire : .verifying
+            op.error = verification.passed ? nil : "完整资源尚待核实"; op.nextRetryAt = verification.passed ? nil : Date().addingTimeInterval(60)
+            try self.writeLivePhotoOperation(op)
+        } }
+    }
+    func beginLivePhotoRetirement(operationID: UUID, assetIDs: [String]) async throws -> Bool {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .readyToRetire,
+                  op.verification?.passed == true, Set(assetIDs) == Set(op.oldAssetIDs), !assetIDs.isEmpty,
+                  let row = try self.one("SELECT deleted FROM live_photo_group WHERE id=?", [.text(op.groupID.uuidString)]), try self.int64(row[0]) == 0 else { return false }
+            op.stage = .retiring; op.retirementEvidence = .submitted; try self.writeLivePhotoOperation(op); return true
+        } }
+    }
+    func confirmLivePhotoRetirement(operationID: UUID) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .retiring else { throw SyncStoreError.invalidTransition("No Live Photo retirement to confirm") }
+            op.retirementEvidence = .confirmed; op.stage = .complete; op.error = nil
+            try self.writeLivePhotoOperation(op)
+            try self.execute("UPDATE live_photo_group SET completed=1 WHERE id=?", [.text(op.groupID.uuidString)])
+            try self.execute("UPDATE file_record SET live_photo_operation_id=NULL WHERE live_photo_operation_id=?", [.text(op.id.uuidString)])
+        } }
+    }
+    func completeLivePhotoWithoutRetirement(operationID: UUID) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .readyToRetire, op.oldAssetIDs.isEmpty, op.verification?.passed == true else { throw SyncStoreError.invalidTransition("Live Photo still needs retirement") }
+            op.stage = .complete; try self.writeLivePhotoOperation(op)
+            try self.execute("UPDATE live_photo_group SET completed=1 WHERE id=?", [.text(op.groupID.uuidString)])
+            try self.execute("UPDATE file_record SET live_photo_operation_id=NULL WHERE live_photo_operation_id=?", [.text(op.id.uuidString)])
+        } }
+    }
+    func deferLivePhotoCreation(operationID: UUID, detail: String?, definite: Bool) async throws {
+        try await perform { try self.transaction {
+            guard var op = try self.livePhotoOperationSync(operationID), op.stage == .creating else { return }
+            if definite {
+                op.stage = .planned; op.creationEvidence = .notSubmitted; op.placeholderID = nil
+                try self.execute("UPDATE file_record SET state='pending',attempt_id=NULL,placeholder_id=NULL,submitted_at=NULL WHERE live_photo_operation_id=? AND state='importing' AND success_id IS NULL", [.text(op.id.uuidString)])
+            } else { op.creationEvidence = .unknown }
+            op.error = detail; op.nextRetryAt = Date().addingTimeInterval(60); try self.writeLivePhotoOperation(op)
+        } }
+    }
+
+    func livePhotoDiscoveryIsBlocked(context: LibraryContext, contentIdentifier: String, resources: [LivePhotoResourceRef]) async throws -> Bool {
+        try await perform {
+            guard let row = try self.one("SELECT o.payload FROM live_photo_operation o JOIN live_photo_group g ON g.id=o.group_id WHERE g.context_id=? AND g.content_identifier=? AND o.stage='blocked' ORDER BY o.rowid DESC LIMIT 1", [.text(context.id.uuidString), .text(contentIdentifier)]) else { return false }
+            let operation = try self.decoder.decode(LivePhotoOperation.self, from: self.blob(row[0]))
+            return Set(operation.discoveryResources ?? [operation.photo, operation.motion]) == Set(resources)
+        }
+    }
+    func livePhotoObservationNeedsCompletion(_ ref: LivePhotoResourceRef, context: LibraryContext, targetID: String?) async throws -> Bool {
+        try await perform {
+            if let asset = ref.assetID, asset == targetID { return false }
+            guard let row = try self.one("SELECT handled_context_id,handled_target_id FROM live_photo_observation WHERE resource_key=? AND revision=? AND current=1", [.text(ref.key), .text(ref.revision)]) else { return false }
+            if self.optionalText(row[0]) == context.id.uuidString && self.optionalText(row[1]) != nil { return false }
+            if let fileID = ref.sourceFileID,
+               let file = try self.one("SELECT live_photo_operation_id FROM file_record WHERE id=?", [.text(fileID.uuidString)]), self.optionalText(file[0]) != nil { return false }
+            return true
+        }
+    }
+    private func markLivePhotoMembersHandled(_ op: LivePhotoOperation, target: String) throws {
+        for ref in [op.photo, op.motion] + (op.equivalentResources ?? []) {
+            try execute("UPDATE live_photo_observation SET handled_context_id=?,handled_target_id=? WHERE resource_key=? AND revision=? AND current=1", [.text(op.context.id.uuidString), .text(target), .text(ref.key), .text(ref.revision)])
+        }
+        for id in op.sourceFileIDs {
+            try execute("UPDATE live_photo_observation SET handled_context_id=?,handled_target_id=? WHERE file_id=? AND current=1", [.text(op.context.id.uuidString), .text(target), .text(id.uuidString)])
+        }
+        for id in op.oldAssetIDs {
+            if let frozen = op.oldSnapshots[id] {
+                try execute("UPDATE live_photo_observation SET handled_context_id=?,handled_target_id=? WHERE context_id=? AND asset_id=? AND revision=? AND current=1", [.text(op.context.id.uuidString), .text(target), .text(op.context.id.uuidString), .text(id), .text(frozen.revision)])
+            }
+        }
+    }
+    private func establishLivePhotoAnchors(context: LibraryContext, assetIDs: [String]) throws {
+        guard !assetIDs.isEmpty else { return }
+        try execute("UPDATE live_photo_inventory SET identity_anchors=? WHERE context_id=? AND task_key=? AND identity_anchors IS NULL", [.blob(try encoder.encode(Array(assetIDs.prefix(8)))), .text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
+    }
+    func livePhotoIdentityBinding(context: LibraryContext) async throws -> (anchors: [String], requiresProof: Bool) {
+        try await perform {
+            let task = try self.one("SELECT identity_anchors FROM live_photo_inventory WHERE context_id=? AND task_key=?", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
+            if let task, case .blob(let bytes) = task[0] {
+                let fixed = try self.decoder.decode([String].self, from: bytes)
+                let targets = try self.rows("SELECT target_id FROM live_photo_group WHERE context_id=? AND target_id IS NOT NULL AND deleted=0 LIMIT 8", [.text(context.id.uuidString)]).map { try self.text($0[0]) }
+                return (Array(Set(fixed + targets)).sorted(), true)
+            }
+            let successes = try self.rows("SELECT DISTINCT success_id FROM file_record WHERE success_id IS NOT NULL ORDER BY success_id LIMIT 8", []).map { try self.text($0[0]) }
+            if !successes.isEmpty { return (successes, true) }
+            let priorAssets = try self.rows("SELECT asset_id FROM photos_representation WHERE context_id=? ORDER BY asset_id LIMIT 8", [.text(context.id.uuidString)]).map { try self.text($0[0]) }
+            if !priorAssets.isEmpty { return (Array(Set(priorAssets)).sorted(), true) }
+            let rows = try self.rows("SELECT o.payload FROM live_photo_operation o JOIN live_photo_group g ON g.id=o.group_id WHERE g.context_id=? AND (o.holds_unknown=1 OR g.target_id IS NOT NULL) LIMIT 8", [.text(context.id.uuidString)])
+            let operations = try rows.map { try self.decoder.decode(LivePhotoOperation.self, from: self.blob($0[0])) }
+            let anchors = Array(Set(operations.flatMap { [$0.placeholderID, $0.targetID].compactMap { $0 } })).sorted()
+            return (anchors, !operations.isEmpty)
+        }
+    }
+    func rebindLivePhotoOperationContext(operationID: UUID, expected: LibraryContext, current: LibraryContext) async throws -> Bool {
+        try await perform { try self.transaction {
+            guard expected.id == current.id, var op = try self.livePhotoOperationSync(operationID), op.context == expected else { return false }
+            op.context = current; try self.writeLivePhotoOperation(op); return true
+        } }
+    }
+    func ensureLivePhotoInventory(context: LibraryContext) async throws {
+        try await perform {
+            try self.execute("INSERT OR IGNORE INTO live_photo_inventory(context_id,task_key,phase,context_epoch) VALUES(?,?,'enumerating',?)", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey), .int64(context.epoch)])
+        }
+    }
+    func enqueueLivePhotoAssets(context: LibraryContext, assets: [LivePhotoAssetDescriptor]) async throws {
+        try await perform { try self.transaction { try self.enqueueLivePhotoAssetsSync(context: context, assets: assets, trusted: true) } }
+    }
+    func enqueueLivePhotoCatalogAssets(context: LibraryContext, assets: [LivePhotoAssetDescriptor]) throws {
+        try queue.sync { try transaction { try enqueueLivePhotoAssetsSync(context: context, assets: assets) } }
+    }
+    private func enqueueLivePhotoAssetsSync(context: LibraryContext, assets: [LivePhotoAssetDescriptor], trusted: Bool = false) throws {
+        for asset in assets {
+            guard asset.context.id == context.id, asset.resourceKinds.count == asset.resources.count,
+                  asset.resources.allSatisfy({ ref in
+                      if case .photos(let id, let assetID, _, let revision) = ref { return id == context.id && assetID == asset.assetID && revision == asset.revision }
+                      return false
+                  }) else { throw PhotoKitGatewayError.libraryChanged }
+            try self.execute("""
+                INSERT INTO live_photo_inventory_item(context_id,asset_id,revision,status,is_live_photo,descriptor) VALUES(?,?,?,'queued',?,?)
+                ON CONFLICT(context_id,asset_id) DO UPDATE SET revision=excluded.revision,status='queued',retry_count=0,next_retry_at=NULL,is_live_photo=excluded.is_live_photo,descriptor=excluded.descriptor
+                WHERE live_photo_inventory_item.revision != excluded.revision OR live_photo_inventory_item.status IN ('deleted','needsDescriptor') OR live_photo_inventory_item.descriptor IS NULL
+                """, [.text(context.id.uuidString), .text(asset.assetID), .text(asset.revision), .int64(asset.isLivePhoto ? 1 : 0), .blob(try self.encoder.encode(asset))])
+        }
+        if trusted { try establishLivePhotoAnchors(context: context, assetIDs: assets.map(\.assetID)) }
+    }
+    func finishLivePhotoEnumeration(context: LibraryContext, generation: Int) async throws {
+        try await perform {
+            try self.execute("UPDATE live_photo_inventory SET phase=CASE WHEN phase='completed' THEN phase ELSE 'identifying' END,enumeration_generation=? WHERE context_id=? AND task_key=?", [.int64(Int64(generation)), .text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
+        }
+    }
+    func nextLivePhotoInventoryItem(context: LibraryContext, now: Date) async throws -> LivePhotoAssetDescriptor? {
+        try await perform {
+            guard let row = try self.one("SELECT descriptor FROM live_photo_inventory_item WHERE context_id=? AND descriptor IS NOT NULL AND (status='queued' OR (status='unresolved' AND next_retry_at <= ?)) ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,asset_id LIMIT 1", [.text(context.id.uuidString), .double(now.timeIntervalSince1970)]) else { return nil }
+            return try self.decoder.decode(LivePhotoAssetDescriptor.self, from: self.blob(row[0]))
+        }
+    }
+    func recordLivePhotoInventoryResult(context: LibraryContext, assetID: String, revision: String, observations: [LivePhotoObservation]) async throws {
+        try await perform { try self.transaction {
+            guard let row = try self.one("SELECT revision FROM live_photo_inventory_item WHERE context_id=? AND asset_id=? AND status IN ('queued','unresolved')", [.text(context.id.uuidString), .text(assetID)]), try self.text(row[0]) == revision else { throw PhotoKitGatewayError.libraryChanged }
+            guard observations.allSatisfy({ $0.resource.assetID == assetID && $0.resource.revision == revision }) else { throw PhotoKitGatewayError.libraryChanged }
+            var unresolved = observations.isEmpty
+            try self.establishLivePhotoAnchors(context: context, assetIDs: [assetID])
+            for observation in observations {
+                if case .unresolved = observation.inspection { unresolved = true }
+                try self.saveLivePhotoObservationSync(observation)
+            }
+            try self.execute("UPDATE live_photo_inventory_item SET status=?,retry_count=retry_count+?,next_retry_at=? WHERE context_id=? AND asset_id=? AND revision=?", [.text(unresolved ? "unresolved" : "checked"), .int64(unresolved ? 1 : 0), unresolved ? .double(Date().addingTimeInterval(60).timeIntervalSince1970) : .null, .text(context.id.uuidString), .text(assetID), .text(revision)])
+        } }
+    }
+    func completeLivePhotoInventory(context: LibraryContext, expectedGeneration: Int) async throws -> Bool {
+        try await perform { try self.transaction {
+            guard let task = try self.one("SELECT phase,enumeration_generation FROM live_photo_inventory WHERE context_id=? AND task_key=?", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey)]) else { return false }
+            if try self.text(task[0]) == "completed" { return true }
+            guard try self.text(task[0]) == "identifying", try self.int64(task[1]) == Int64(expectedGeneration),
+                  try self.one("SELECT 1 FROM live_photo_inventory_item WHERE context_id=? AND status IN ('queued','needsDescriptor') LIMIT 1", [.text(context.id.uuidString)]) == nil else { return false }
+            try self.execute("UPDATE live_photo_inventory SET phase='completed',completed_at=? WHERE context_id=? AND task_key=?", [.double(Date().timeIntervalSince1970), .text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
+            return true
+        } }
+    }
+    func livePhotoInventorySummary(context: LibraryContext) async throws -> LivePhotoInventorySummary {
+        try await perform {
+            let task = try self.one("SELECT phase,completed_at FROM live_photo_inventory WHERE context_id=? AND task_key=?", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
+            let counts = try self.one("SELECT COUNT(*),COALESCE(SUM(status='checked'),0),COALESCE(SUM(status='unresolved'),0) FROM live_photo_inventory_item WHERE context_id=? AND status!='deleted'", [.text(context.id.uuidString)])!
+            return LivePhotoInventorySummary(phase: task.flatMap { try? self.text($0[0]) }.flatMap(LivePhotoInventoryPhase.init(rawValue:)) ?? .enumerating,
+                inventoried: Int(try self.int64(counts[0])), identified: Int(try self.int64(counts[1])), unresolved: Int(try self.int64(counts[2])),
+                completedAt: task.flatMap { self.optionalDouble($0[1]) }.map(Date.init(timeIntervalSince1970:)))
+        }
+    }
+
     private func migrate() throws {
+        let originalVersion = try pragmaUserVersion()
+        guard originalVersion <= 11 else { throw SyncStoreError.unsupportedSchema(originalVersion) }
+        if originalVersion == 11 { return }
+        try transaction {
+            try migrateThroughV10()
+            if !(try rows("PRAGMA table_info(file_record)", []).map { try text($0[1]) }).contains("live_photo_operation_id") {
+                try execute("ALTER TABLE file_record ADD COLUMN live_photo_operation_id TEXT")
+            }
+            try execute(Self.livePhotoSchema)
+            try execute("PRAGMA user_version = 11")
+        }
+    }
+
+    private func migrateThroughV10() throws {
         let version = try pragmaUserVersion()
         guard version <= 10 else { throw SyncStoreError.unsupportedSchema(version) }
         if version == 10 {
             // Extend the unpublished investigation shape without changing facts.
-            try transaction { try addInputDigestColumns() }
+            do { try addInputDigestColumns() }
             return
         }
         if version == 9 {
             // Existing digests are diagnostic evidence, not a proved pairing with
             // the current vector. Preserve ready rows without manufacturing a binding.
-            try transaction {
+            do {
                 try addInputDigestColumns()
                 try execute("PRAGMA user_version = 10")
             }
@@ -1951,7 +2436,7 @@ public final class SyncStore: @unchecked Sendable {
         }
         if version == 8 {
             // Nullable diagnostics do not revoke publication or schedule new work.
-            try transaction {
+            do {
                 try addInputDigestColumns()
                 try execute("PRAGMA user_version = 10")
             }
@@ -1960,7 +2445,7 @@ public final class SyncStore: @unchecked Sendable {
         if version == 7 {
             // Fence durable readiness before new-contract startup. An already-open
             // legacy process is not revoked; normal instance ownership remains required.
-            try transaction {
+            do {
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
                 try addInputDigestColumns()
                 try execute("PRAGMA user_version = 10")
@@ -1968,7 +2453,7 @@ public final class SyncStore: @unchecked Sendable {
             return
         }
         if version == 6 {
-            try transaction {
+            do {
                 try addReadFailureKindColumn()
                 try execute("UPDATE dedup_index_state SET reconciliation_complete = 0, published_generation = NULL")
                 try addInputDigestColumns()
@@ -1977,7 +2462,7 @@ public final class SyncStore: @unchecked Sendable {
             return
         }
         if version == 5 {
-            try transaction {
+            do {
                 try execute(Self.photosChangeSchema)
                 if !(try rows("PRAGMA table_info(fingerprint_task)", []).map { try text($0[1]) }).contains("issuance_revision") {
                     try execute("ALTER TABLE fingerprint_task ADD COLUMN issuance_revision TEXT")
@@ -1992,7 +2477,7 @@ public final class SyncStore: @unchecked Sendable {
         if version == 4 {
             // P1/P2 integration snapshots already use v4. Extend that unpublished
             // schema transactionally without resetting any previously stored facts.
-            try transaction {
+            do {
                 let columns = try rows("PRAGMA table_info(dedup_index_state)", []).map { try text($0[1]) }
                 if !columns.contains("resume_checkpoint") { try execute("ALTER TABLE dedup_index_state ADD COLUMN resume_checkpoint BLOB") }
                 if !columns.contains("excluded_assets") { try execute("ALTER TABLE dedup_index_state ADD COLUMN excluded_assets INTEGER NOT NULL DEFAULT 0") }
@@ -2020,7 +2505,7 @@ public final class SyncStore: @unchecked Sendable {
             }
             return
         }
-        try transaction {
+        do {
             if version == 0 {
                 try execute(Self.schema)
             } else {
@@ -2042,6 +2527,46 @@ public final class SyncStore: @unchecked Sendable {
             try execute("PRAGMA user_version = 10")
         }
     }
+
+    private static let livePhotoSchema = """
+    CREATE TABLE IF NOT EXISTS live_photo_observation (
+     resource_key TEXT NOT NULL, revision TEXT NOT NULL, inspection_version INTEGER NOT NULL,
+     content_identifier TEXT, role TEXT, context_id TEXT, asset_id TEXT, file_id TEXT,
+     current INTEGER NOT NULL DEFAULT 1, handled_context_id TEXT, handled_target_id TEXT, payload BLOB NOT NULL,
+     PRIMARY KEY(resource_key, revision, inspection_version)
+    );
+    CREATE INDEX IF NOT EXISTS live_photo_observation_identity ON live_photo_observation(content_identifier, current, context_id);
+    CREATE INDEX IF NOT EXISTS live_photo_observation_asset ON live_photo_observation(context_id, asset_id, current);
+    CREATE INDEX IF NOT EXISTS live_photo_observation_file ON live_photo_observation(file_id, current);
+    CREATE TABLE IF NOT EXISTS live_photo_group (
+     id TEXT PRIMARY KEY, context_id TEXT NOT NULL, content_identifier TEXT NOT NULL,
+     target_id TEXT, deleted INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0,
+     UNIQUE(context_id, content_identifier)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS live_photo_group_identity ON live_photo_group(context_id, content_identifier);
+    CREATE TABLE IF NOT EXISTS live_photo_operation (
+     id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES live_photo_group(id),
+     stage TEXT NOT NULL, holds_unknown INTEGER NOT NULL, payload BLOB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS live_photo_operation_stage ON live_photo_operation(stage, group_id);
+    CREATE TABLE IF NOT EXISTS live_photo_operation_asset (operation_id TEXT NOT NULL REFERENCES live_photo_operation(id) ON DELETE CASCADE, asset_id TEXT NOT NULL, PRIMARY KEY(operation_id,asset_id));
+    CREATE INDEX IF NOT EXISTS live_photo_operation_asset_id ON live_photo_operation_asset(asset_id,operation_id);
+    CREATE TABLE IF NOT EXISTS live_photo_inventory (
+     context_id TEXT NOT NULL, task_key TEXT NOT NULL, phase TEXT NOT NULL, context_epoch INTEGER NOT NULL DEFAULT 0,
+     enumeration_generation INTEGER, completed_at REAL, identity_anchors BLOB,
+     PRIMARY KEY(context_id, task_key)
+    );
+    CREATE TABLE IF NOT EXISTS live_photo_inventory_item (
+     context_id TEXT NOT NULL, asset_id TEXT NOT NULL, revision TEXT NOT NULL,
+     status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL,
+     is_live_photo INTEGER NOT NULL, descriptor BLOB,
+     PRIMARY KEY(context_id, asset_id)
+    );
+    CREATE INDEX IF NOT EXISTS live_photo_inventory_queue ON live_photo_inventory_item(context_id, status, next_retry_at, asset_id);
+    CREATE INDEX IF NOT EXISTS live_photo_unknown_descriptor ON live_photo_inventory_item(context_id,asset_id) WHERE descriptor IS NULL AND status!='deleted';
+    CREATE INDEX IF NOT EXISTS live_photo_complete_candidates ON live_photo_inventory_item(context_id,asset_id,status) WHERE is_live_photo=1 AND status!='deleted';
+    CREATE INDEX IF NOT EXISTS file_live_photo_owner ON file_record(live_photo_operation_id);
+    """
 
     private func addInputDigestColumns() throws {
         let columns = try rows("PRAGMA table_info(photos_representation)", []).map { try text($0[1]) }
@@ -2217,6 +2742,7 @@ public final class SyncStore: @unchecked Sendable {
     private func fileState(_ value: Value) throws -> FileState { guard let state = FileState(rawValue: try text(value)) else { throw SyncStoreError.sqlite("Invalid file state.") }; return state }
     private func encode<T: Encodable>(_ value: T) throws -> String { String(decoding: try encoder.encode(value), as: UTF8.self) }
     private func decode<T: Decodable>(_ type: T.Type, from string: String) throws -> T { try decoder.decode(T.self, from: Data(string.utf8)) }
+    private func blob(_ value: Value) throws -> Data { if case .blob(let data) = value { return data }; throw SyncStoreError.sqlite("Expected blob value.") }
     private func text(_ value: Value) throws -> String { if case .text(let text) = value { return text }; throw SyncStoreError.sqlite("Expected text value.") }
     private func optionalText(_ value: Value) -> String? { if case .text(let text) = value { return text }; return nil }
     private func int(_ value: Value) throws -> Int64 { try int64(value) }

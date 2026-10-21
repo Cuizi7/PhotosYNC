@@ -1,6 +1,7 @@
 public enum GlobalStatus: String, CaseIterable, Sendable {
     case unconfigured, error, paused, waiting, running, completed
 
+    /// Configuration includes enabled sources or independent historical Live Photo work.
     /// Priority is fixed: unconfigured, then anything a person must handle (missing Photos
     /// authorization and engine-level errors), then pause, then waiting for a source, then work.
     /// A missing Photos permission is not a wait for a directory to come back: only the user can

@@ -1,8 +1,16 @@
 # PhotosYNC
 
-PhotosYNC scans selected filesystem folders and adds eligible images and videos to the current macOS System Photo Library. It is intentionally one-way: source files stay in place, and PhotosYNC never modifies or removes an existing Photos asset.
+PhotosYNC scans selected filesystem folders and saves eligible images and videos to the current macOS System Photo Library. Source files stay in place and are read-only. Precisely matched Live Photo components become one native Live Photo; replaced standalone assets can be removed only after their original content and protected information are verified as preserved.
 
-## 0.2.9 stable
+## 0.3.0 beta1 — Native Live Photo completion
+
+Live Photos use the original HEIC/JPEG and MOV together, including existing audio. Missing components are saved individually and completed when the exact partner becomes available, including components already in Photos. Each directory finishes enumerating and identifying its direct entries before admitting imports. This behavior has no setting.
+
+Schema v11 adds a resumable, one-time library identification task. Its completed marker survives restarts and normal upgrades; unresolved resources retry individually with network access disabled. Historical work also runs without enabled sources and obeys Pause. Matching names or visual similarity do not establish a pair. Unknown submission results block all further Photos mutations.
+
+After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta1.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
+
+## Previous stable: 0.2.9
 
 0.2.9 (build 17) replaces the generic status symbols with the app icon's folded S and a large lower-right ribbon tab. Six native vector marks distinguish complete, syncing, paused, waiting, error and unconfigured states. Light and dark appearances use the same monochrome template; waiting is labelled “等待中” and errors “同步异常”, with specific waiting explanations retained.
 
@@ -31,13 +39,13 @@ For a local build on macOS 13 or later with Xcode installed:
 ```sh
 # Xcode 26+ is required to compile the Icon Composer source.
 # Run from a clean committed checkout. Existing release directories are preserved.
-scripts/package-release.sh
+scripts/package-release.sh --scale-profile full
 ```
 
-Release configuration: **0.2.9 stable (build 17)**, targeting
-`outputs/releases/0.2.9/`; see [release notes](docs/release/0.2.9.md)
+Release configuration: **0.3.0 beta1 (build 18)**, targeting
+`outputs/releases/0.3.0-beta1/`; see [release notes](docs/release/0.3.0-beta1.md)
 and the [changelog](CHANGELOG.md).
-The stable package must archive the exact main commit and run full acceptance;
+The release package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
 status and results. Prior success cannot replace them. Previous
 [0.2.8 stable build 16](docs/release/0.2.8.md),
@@ -56,7 +64,7 @@ build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
 
 Before first launch after upgrading, quit PhotosYNC normally and back up the complete
 `~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
-files. The app transactionally migrates supported schemas v3–v9 to v10; older apps reject the upgraded database on reopening.
+files. The development app transactionally migrates supported schemas v3–v10 to v11; older apps reject the upgraded database on reopening.
 Direct downgrade is not supported. Restoring an old database after new imports can
 lose success evidence and cause duplicate additions; see the release notes for the
 backup and downgrade boundary. Packaging does not back up or migrate production data.
@@ -67,7 +75,7 @@ Open the DMG, drag `PhotosYNC.app` to `Applications`, then launch it. The menu-b
 
 Choose one or more source folders in Settings. PhotosYNC scans at launch and then every 30 minutes. A manual scan is available from the menu bar; overlapping scans are ignored, and sleep recovery does not create a backlog. Pausing stops new scan work. A Photos submission already handed to the system is allowed to finish so its result can be recorded conservatively.
 
-Only supported bitmap images and videos are considered. RAW files, Live Photo pairing, transcoding, album mapping, media hashing, and source-file caching are out of scope. Photos use visual fingerprints across filenames with the selected 0.98 threshold and resolution rules; videos retain exact-filename and conservative metadata matching. Eligible old suspected-duplicate photo skips are reconsidered under the new policy; successful imports and unknown submissions remain protected. A possible duplicate is skipped and logged rather than imported. An earlier successful import remains recorded even if the Photos asset is later removed, so it is not automatically re-imported. Removing a source in Settings hides and disables that configuration while retaining its import history; it does not delete any source files or Photos assets. Re-adding the same path restores that history.
+Only supported bitmap images and videos are considered. RAW files, transcoding, directory-to-album mapping, media hashing, and source-file caching are out of scope. Live Photo replacement preserves known ordinary album membership and retains old assets when preservation cannot be verified. Photos use visual fingerprints across filenames with the selected 0.98 threshold and resolution rules; videos retain exact-filename and conservative metadata matching. Eligible old suspected-duplicate photo skips are reconsidered under the new policy; successful imports and unknown submissions remain protected. A possible duplicate is skipped and logged rather than imported. An earlier successful import remains recorded even if the Photos asset is later removed, so it is not automatically re-imported. Removing a source in Settings hides and disables that configuration while retaining its import history; it does not delete any source files or Photos assets. Re-adding the same path restores that history.
 
 PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source file. It sends additions to Photos only. It also never deletes or overwrites a Photos asset. Import completion means PhotoKit accepted the addition; it does not mean the asset has finished syncing to iCloud.
 

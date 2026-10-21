@@ -5,6 +5,91 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testNativeSourceDirectoryPairUsesRuntimeGroupAndNeverSingleImport() async throws {
+        let root = try temporaryDirectory(), source = root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let photo = source.appendingPathComponent("pair.jpg"), motion = source.appendingPathComponent("pair.mov"), identifier = UUID().uuidString
+        try makeLivePhotoImage(at: photo, identifier: identifier)
+        try await makeLivePhotoMotion(at: motion, identifier: identifier, audio: true)
+        let originalPhoto = try Data(contentsOf: photo), originalMotion = try Data(contentsOf: motion)
+        let store = try SyncStore(url: root.appendingPathComponent("runtime.sqlite")), sourceID = try await store.registerSource(url: source)
+        let context = LibraryContext(id: UUID(), epoch: 0), photos = CompletionPhotos(context: context, root: root), config = try p8Configuration(), model = P8Model()
+        let factory: SyncRuntime.AdvancedFactory = { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: photos, model: model, configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }
+        let runtime = SyncRuntime(store: store, advancedFactory: factory, now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        for _ in 0..<5 { await runtime.tick(force: true); await runtime.waitForRound() }
+        let summary = try await store.activeSourceSummary(), creates = await photos.creates, inferences = await model.fingerprintCount
+        XCTAssertEqual(summary.imported, 2); XCTAssertEqual(creates, 1); XCTAssertEqual(inferences, 0)
+        let first = try await store.file(sourceID: sourceID, relativePath: "pair.jpg"), second = try await store.file(sourceID: sourceID, relativePath: "pair.mov")
+        XCTAssertEqual(first?.successID, second?.successID); XCTAssertNotNil(first?.successID)
+        XCTAssertEqual(try Data(contentsOf: photo), originalPhoto); XCTAssertEqual(try Data(contentsOf: motion), originalMotion)
+        let catalogs = await photos.liveCatalogCalls
+        await runtime.stop(); await runtime.waitForRound()
+        let restarted = SyncRuntime(store: store, advancedFactory: factory, now: { Date() }, authorized: { true })
+        try await restarted.prepareInjectedRuntime(); await restarted.tick(force: true); await restarted.waitForRound()
+        let after = await photos.liveCatalogCalls, afterCreates = await photos.creates
+        XCTAssertEqual(after, catalogs); XCTAssertEqual(afterCreates, 1)
+        await restarted.stop(); await restarted.waitForRound(); try FileManager.default.removeItem(at: root)
+    }
+    func testPhotosOnlyRuntimeInventoriesCompletesRetiresAndRestartsOnce() async throws {
+        let f = try await inventoryFixture(count: 0), context = f.photos.context
+        let photos = CompletionPhotos(context: context, root: f.root), config = try p8Configuration()
+        await photos.add(livePhotoAsset(context: context, id: "old-photo"))
+        await photos.add(livePhotoAsset(context: context, id: "old-motion", kind: .video))
+        let factory: SyncRuntime.AdvancedFactory = { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }
+        let runtime = SyncRuntime(store: f.store, advancedFactory: factory, livePhotoMetadata: CompletionMetadata(), now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true); await runtime.waitForRound()
+        let events = await photos.events, state = await runtime.current()
+        XCTAssertEqual(events, ["create", "verify", "retire"])
+        XCTAssertEqual(state.snapshot.livePhotoInventory?.phase, .completed); XCTAssertEqual(state.snapshot.summary?.imported, 0)
+        await runtime.stop(); await runtime.waitForRound()
+        let restarted = SyncRuntime(store: f.store, advancedFactory: factory, livePhotoMetadata: CompletionMetadata(), now: { Date() }, authorized: { true })
+        try await restarted.prepareInjectedRuntime(); await restarted.tick(force: true); await restarted.waitForRound()
+        let catalogs = await photos.liveCatalogCalls, creates = await photos.creates
+        XCTAssertEqual(catalogs, 1); XCTAssertEqual(creates, 1)
+        await restarted.stop(); await restarted.waitForRound(); try FileManager.default.removeItem(at: f.root)
+    }
+    func testPausedFactoryCompletionDoesNotStartLivePhotoReads() async throws {
+        let f = try await inventoryFixture(count: 1), config = try p8Configuration(), executor = ReadExecutor(), gate = P8Gate()
+        let runtime = SyncRuntime(store: f.store, executor: executor, advancedFactory: { store, executor, directory, now, _ in
+            await gate.hold()
+            return AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config,
+                executor: executor, budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, now: { Date(timeIntervalSince1970: 1000) }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        await runtime.tick(force: true); await gate.waitUntilEntered(); await runtime.pause(); await gate.release(); await runtime.waitForRound()
+        let contexts = await f.photos.contextReads, reads = await f.photos.resourceReads
+        XCTAssertEqual(contexts, 0); XCTAssertEqual(reads, 0)
+        await runtime.stop(); try FileManager.default.removeItem(at: f.root)
+    }
+    func testLivePhotoInventoryRunsWithoutSourcesAndNeverRepeatsCompletedCatalog() async throws {
+        let f = try await inventoryFixture(count: 3), config = try p8Configuration(), executor = ReadExecutor()
+        let runtime = SyncRuntime(store: f.store, executor: executor, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config,
+                executor: executor, budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, now: { Date(timeIntervalSince1970: 1000) }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        addTeardownBlock { await runtime.stop(); await runtime.waitForRound(); try? FileManager.default.removeItem(at: f.root) }
+        await runtime.tick(force: true); await runtime.waitForRound()
+        let state = await runtime.current(), calls = await f.photos.catalogCalls
+        XCTAssertEqual(state.snapshot.livePhotoInventory?.phase, .completed)
+        XCTAssertEqual(state.snapshot.livePhotoInventory?.inventoried, 3)
+        XCTAssertEqual(calls, 1)
+        await runtime.pause()
+        let reads = await f.photos.resourceReads
+        await runtime.tick(force: true); await runtime.waitForRound()
+        let pausedReads = await f.photos.resourceReads; XCTAssertEqual(pausedReads, reads)
+        await runtime.resume(); await runtime.waitForRound()
+        let after = await f.photos.catalogCalls; XCTAssertEqual(after, 1)
+        let count = try await f.store.countFiles(state: .imported); XCTAssertEqual(count, 0)
+    }
+
     func testFullRequestCoveredInsideBusyWorkDoesNotRepeatCatalog() async throws {
         for event in [PhotosIndexChange.fullReconcileRequired, .contextInvalidated] {
             let f = try await fixture(), gate = P8Gate()
@@ -228,11 +313,13 @@ final class AdvancedRuntimeTests: XCTestCase {
         XCTAssertEqual(f.loads.value, 1)
     }
 
-    func testNoEnabledSourceDoesNotLoadModel() async throws {
+    func testNoEnabledSourceCanConstructGraphWithoutImageInference() async throws {
         let f = try await fixture()
         try await f.runtime.disable(f.sourceID)
-        await f.runtime.tick(force: true)
-        XCTAssertEqual(f.loads.value, 0)
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        XCTAssertEqual(f.loads.value, 1)
+        let predictions = await f.model.fingerprintCount
+        XCTAssertEqual(predictions, 0)
     }
 
     func testContinuousEmptyEventUsesDeltaWithoutForcingFullCatalog() async throws {

@@ -62,11 +62,11 @@ struct AdvancedRuntimeGraph: Sendable {
                 diagnostics: { logger?.log($0) })
             model.setExecutionAuthorization(authorized)
             try Task.checkCancellation()
-            try await model.prepareExecution()
+            // The physical model is prepared by runtime only when image work is eligible.
             try Task.checkCancellation()
             let indexDiagnostics = IndexDiagnostics(sink: { logger?.log($0) })
             let budget = ImageWorkBudget(limits: configuration.resources)
-            let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget, indexDiagnostics: indexDiagnostics, diagnostics: { logger?.log($0) })
+            let photos = PhotoKitGateway(configuration: configuration, imageBudget: budget, livePhotoExecutor: executor, indexDiagnostics: indexDiagnostics, diagnostics: { logger?.log($0) })
             return AdvancedRuntimeGraph(store: store, photos: photos, model: model,
                 configuration: configuration, executor: executor, budget: budget, directory: directory, now: now, logger: logger, indexDiagnostics: indexDiagnostics)
         }
@@ -97,6 +97,11 @@ actor SyncRuntime {
     private let validatesBundledConfiguration: Bool
     private let notification: (@Sendable (String, String) -> Void)?
     private var advancedGraph: AdvancedRuntimeGraph?
+    private var livePhotoInventory: LivePhotoInventoryCoordinator?
+    private var livePhotoCompletion: LivePhotoCoordinator?
+    private var livePhotoRecoveryReady = false
+    private var livePhotoIssue: SourceIssue?
+    private let livePhotoMetadata: any LivePhotoMetadataReading
     private var loading: Task<Void, Never>?
     private var advancedWork: Task<Void, Never>?
     private var changeObserver: Task<Void, Never>?
@@ -104,6 +109,7 @@ actor SyncRuntime {
     private var modelRetryAt: Date?
     private var modelRecovery: Task<Void, Error>?
     private var manualModelRetryPending = false
+    private var lastImageEligibility: Bool?
     private var changePending = false
     private var pendingFullChangeSerial: UInt64?
     private var indexEventPending = false
@@ -134,6 +140,7 @@ actor SyncRuntime {
         engine: SyncEngine? = nil,
         executor: ReadExecutor = ReadExecutor(),
         advancedFactory: AdvancedFactory? = nil,
+        livePhotoMetadata: (any LivePhotoMetadataReading)? = nil,
         logsURL: URL = URL(fileURLWithPath: "/unused"),
         databaseURL: URL = URL(fileURLWithPath: "/unused"),
         now: @escaping @Sendable () -> Date,
@@ -143,6 +150,7 @@ actor SyncRuntime {
         notification: (@Sendable (String, String) -> Void)? = nil
     ) {
         self.store = store; self.engine = engine
+        self.livePhotoMetadata = livePhotoMetadata ?? LivePhotoMetadataReader(executor: executor)
         self.executor = executor; self.advancedFactory = advancedFactory; self.notification = notification
         validatesBundledConfiguration = false
         self.now = now; self.authorized = authorized
@@ -168,7 +176,9 @@ actor SyncRuntime {
     }
 
     init() {
-        executor = ReadExecutor()
+        let sharedExecutor = ReadExecutor()
+        executor = sharedExecutor
+        livePhotoMetadata = LivePhotoMetadataReader(executor: sharedExecutor)
         notification = nil
         advancedFactory = nil
         validatesBundledConfiguration = true
@@ -257,8 +267,9 @@ actor SyncRuntime {
                 publishedProgress = await graph.coordinator.progress()
                 nextProgressAt = now().addingTimeInterval(graph.configuration.resources.progressPublishIntervalSeconds)
             }
-            state.snapshot.indexProgress = publishedProgress
+            state.snapshot.indexProgress = state.sources.contains(where: \.enabled) ? publishedProgress : nil
         }
+        await publishLivePhotoProgress()
         state.nextScan = schedule.nextScanAt
         var result = state
         result.warning = loggingWarning
@@ -353,6 +364,8 @@ actor SyncRuntime {
         modelRecovery?.cancel()
         state.snapshot.isPaused = true
         updateModelEligibility()
+        await livePhotoCompletion?.setPaused(true)
+        await livePhotoInventory?.setPaused(true)
         await engine?.pause()
         await applyAnalysisEligibility()
         await advancedGraph?.coordinator.setPaused(true)
@@ -374,6 +387,8 @@ actor SyncRuntime {
         updateModelEligibility()
         changeObserver?.cancel(); changeObserver = nil
         schedule.pause()
+        await livePhotoCompletion?.setPaused(true)
+        await livePhotoInventory?.setPaused(true)
         await engine?.pause()
         await advancedGraph?.coordinator.setPaused(true)
         // Do not cancel physical Photos submission: the engine persists its callback.
@@ -386,7 +401,7 @@ actor SyncRuntime {
         guard eligibleForWork else { return }
         if retryModel { manualModelRetryPending = true }
         if engine == nil { startAdvancedGraphIfNeeded(); return }
-        if let model = advancedGraph?.model as? any ModelExecutionRecovering {
+        if eligibleForImageWork, let model = advancedGraph?.model as? any ModelExecutionRecovering {
             // Coalesce ticks while the single physical queue is loading/validating.
             guard modelRecovery == nil else { return }
             let retry = manualModelRetryPending
@@ -403,7 +418,10 @@ actor SyncRuntime {
             if manualModelRetryPending && eligibleForWork {
                 await tick(force: true); return
             }
-            guard failure == nil, eligibleForWork else { return }
+            guard failure == nil, eligibleForWork else {
+                if livePhotoInventory != nil && eligibleForWork { scheduleAdvancedWork(force: force) }
+                return
+            }
         }
         guard let engine else { return }
         if includeAdvanced { scheduleAdvancedWork(force: force) }
@@ -508,20 +526,27 @@ actor SyncRuntime {
     }
 
     private var eligibleForWork: Bool {
-        !stopped && state.authorized && !state.snapshot.isPaused && state.sources.contains(where: \.enabled)
+        !stopped && state.authorized && !state.snapshot.isPaused
     }
 
+    private var eligibleForImageWork: Bool { eligibleForWork && state.sources.contains(where: \.enabled) }
     private func updateModelEligibility() {
-        let eligible = eligibleForWork
+        let eligible = eligibleForImageWork
         (advancedGraph?.model as? any ModelExecutionRecovering)?.setExecutionEligible(eligible)
-        if !eligible { manualModelRetryPending = false; modelRecovery?.cancel(); loading?.cancel() }
+        if !eligible {
+            manualModelRetryPending = false; modelRecovery?.cancel()
+            if !eligibleForWork || lastImageEligibility == true { loading?.cancel() }
+        }
+        lastImageEligibility = eligible
     }
 
     private func applyAnalysisEligibility() async {
         updateModelEligibility()
+        await livePhotoInventory?.setPaused(!eligibleForWork)
+        await livePhotoCompletion?.setPaused(!eligibleForWork)
         guard let graph = advancedGraph else { return }
         await graph.coordinator.setPaused(!eligibleForWork)
-        await graph.service.setPaused(!eligibleForWork)
+        await graph.service.setPaused(!eligibleForImageWork)
     }
 
     private func startAdvancedGraphIfNeeded() {
@@ -582,8 +607,26 @@ actor SyncRuntime {
         updateModelEligibility()
         modelRetryAt = nil; state.message = nil; state.messageDetail = nil
         let executor = self.executor
+        let engineReference = LivePhotoEngineReference()
+        if let photos = graph.photos as? any LivePhotoPhotosGateway {
+            livePhotoInventory = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: livePhotoMetadata)
+            livePhotoCompletion = LivePhotoCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, executor: executor,
+                sourceAdmission: { engineReference.allows($0) })
+            await livePhotoInventory?.setPaused(!eligibleForWork)
+            await livePhotoCompletion?.setPaused(!eligibleForWork)
+            do {
+                if eligibleForWork {
+                    _ = try await livePhotoInventory?.prepareContext()
+                    try await livePhotoCompletion?.recover(); livePhotoRecoveryReady = true
+                }
+            } catch {
+                livePhotoIssue = SourceIssue(summary: "正在核实历史 Live Photo 提交结果。", detail: error.localizedDescription, kind: .submission)
+            }
+        }
         engine = SyncEngine(store: store, photos: graph.photos, directory: directory,
-            metadata: { MetadataReader(sourceID: $0, executor: executor) }, logger: logger,
+            metadata: { MetadataReader(sourceID: $0, executor: executor) },
+            livePhotoDirectoryObserver: livePhotoCompletion,
+            livePhotoMetadata: { LivePhotoMetadataReader(sourceID: $0, executor: executor) }, logger: logger,
             advancedDedup: graph.service, indexCoordinator: graph.coordinator, requiresAdvancedDedup: true,
             dedupConfiguration: graph.configuration, legacySkipReevaluation: graph.legacy,
             notifyIssue: { [weak self] summary in
@@ -592,6 +635,7 @@ actor SyncRuntime {
                 Task { await self?.postNotification(title: recovered ? "PhotosYNC 来源已恢复" : "PhotosYNC 来源等待恢复",
                     body: recovered ? "来源已恢复正常同步。" : (issue?.summary ?? "来源暂时不可用，将自动重试。恢复后不再提示。")) }
             }, now: now)
+        engineReference.set(engine)
         await engine?.setPaused(state.snapshot.isPaused || stopped)
         refreshAuthorization()
         await applyAnalysisEligibility()
@@ -652,6 +696,39 @@ actor SyncRuntime {
         advancedWork = Task { await self.runAdvancedWork(graph, reconcile: reconcile) }
     }
 
+    private func runLivePhotoWork() async {
+        guard eligibleForWork, let inventory = livePhotoInventory, let completion = livePhotoCompletion else { return }
+        do {
+            _ = try await inventory.prepareContext()
+            if !livePhotoRecoveryReady { try await completion.recover(); livePhotoRecoveryReady = true }
+            guard eligibleForWork else { return }
+            try await inventory.resumeInitialInventory()
+            for _ in 0..<32 {
+                guard eligibleForWork else { break }
+                if try await !inventory.processNextInventoryItem(now: now()) { break }
+            }
+            for _ in 0..<4 {
+                guard eligibleForWork else { break }
+                if try await !completion.advanceNext(now: now()) { break }
+            }
+            livePhotoIssue = nil
+        } catch is CancellationError { }
+        catch is ReadExecutorError { /* Physical reads remain owned; normal deferral. */ }
+        catch {
+            livePhotoIssue = SourceIssue(summary: "部分 Live Photo 暂时无法核实，稍后继续。", detail: error.localizedDescription, kind: .file)
+            logger?.log(["phase": "live-photo-work", "result": "waiting", "error": String(describing: error)])
+        }
+    }
+    private func publishLivePhotoProgress() async {
+        do {
+            state.snapshot.livePhotoInventory = try await livePhotoInventory?.summary()
+            state.snapshot.livePhotoWork = try await livePhotoCompletion?.summary() ?? LivePhotoWorkSummary()
+        } catch {
+            livePhotoIssue = SourceIssue(summary: "无法读取 Live Photo 处理进度，稍后继续。", detail: error.localizedDescription, kind: .file)
+        }
+        state.snapshot.livePhotoIssue = livePhotoIssue ?? state.snapshot.livePhotoWork.issue
+    }
+
     private func runAdvancedWork(_ graph: AdvancedRuntimeGraph, reconcile: Bool) async {
         let previousReady = publishedProgress?.state == .ready
         if eligibleForWork {
@@ -661,7 +738,8 @@ actor SyncRuntime {
                 catch is CancellationError { /* Paused before another catalog page. */ }
                 catch { logger?.log(["phase": "index-reconcile", "result": "waiting", "error": String(describing: error)]) }
             }
-            if eligibleForWork { await graph.coordinator.processDueWork(now: now()) }
+            if eligibleForImageWork { await graph.coordinator.processDueWork(now: now()) }
+            await runLivePhotoWork()
             if eligibleForWork, let engine {
                 do {
                     let reopened = try await engine.processLegacySkips(limit: graph.configuration.resources.catalogBatchSize)
@@ -674,8 +752,9 @@ actor SyncRuntime {
                 }
             }
         }
+        await publishLivePhotoProgress()
         publishedProgress = await graph.coordinator.progress()
-        state.snapshot.indexProgress = publishedProgress
+        state.snapshot.indexProgress = state.sources.contains(where: \.enabled) ? publishedProgress : nil
         nextProgressAt = now().addingTimeInterval(graph.configuration.resources.progressPublishIntervalSeconds)
         if let p = publishedProgress, p != loggedProgress {
             loggedProgress = p
@@ -694,4 +773,11 @@ actor SyncRuntime {
         if changePending || pendingFullChangeSerial != nil || indexEventPending { await tick() }
         else if pendingAdvancedScan && round == nil { await tick(includeAdvanced: false) }
     }
+}
+
+private final class LivePhotoEngineReference: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var engine: SyncEngine?
+    func set(_ value: SyncEngine?) { lock.lock(); engine = value; lock.unlock() }
+    func allows(_ file: SourceFile) -> Bool { lock.lock(); let current = engine; lock.unlock(); return current?.livePhotoSourceCanSubmit(file) ?? false }
 }

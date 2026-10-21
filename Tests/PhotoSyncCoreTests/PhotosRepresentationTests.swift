@@ -977,19 +977,21 @@ final class PhotosRepresentationTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: root) }
-        let old = root.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: old, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        let encoded = old.appendingPathComponent("encoded"), owner = old.appendingPathComponent("owner")
-        try Data([1]).write(to: encoded)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: encoded.path)
-        let fd = open(encoded.path, O_RDONLY)
-        XCTAssertGreaterThanOrEqual(fd, 0)
-        let marker = try PhotosResourceStorage.ownerMarker(encodedFD: fd); close(fd)
-        try marker.write(to: owner)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: owner.path)
-        let next = try PhotosResourceStorage(root: root).create(limits: PhotosResourceLimits())
-        next.remove()
-        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        for filename in ["encoded", "encoded.mov"] {
+            let old = root.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: old, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let encoded = old.appendingPathComponent(filename), owner = old.appendingPathComponent("owner")
+            try Data([1]).write(to: encoded)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: encoded.path)
+            let fd = open(encoded.path, O_RDONLY)
+            XCTAssertGreaterThanOrEqual(fd, 0)
+            let marker = try PhotosResourceStorage.ownerMarker(encodedFD: fd); close(fd)
+            try marker.write(to: owner)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: owner.path)
+            let next = try PhotosResourceStorage(root: root).create(limits: PhotosResourceLimits())
+            next.remove()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        }
     }
 
     func testDiskSpaceLossDuringChunkStaysWaitingUntilTerminalDrain() async throws {

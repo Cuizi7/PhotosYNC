@@ -1,18 +1,39 @@
 import Foundation
 import Photos
+import AVFoundation
+import AppKit
 
 enum PhotoKitAccess: Sendable, Equatable { case notDetermined, authorized, denied }
 
 // Internal deterministic ordering probe; production construction leaves it nil.
 enum PhotoKitQueueSubmissionPhase: Sendable { case observerRecorded, snapshotContended }
 
-struct PhotoKitCreateCommand: Equatable, Sendable {
-    let fileURL: URL
-    let kind: MediaKind
+struct PhotoKitResourceInput: Equatable, Sendable {
+    let type: PHAssetResourceType
+    let url: URL
+    let originalFilename: String?
     let shouldMoveFile: Bool
 }
 
+enum PhotoKitCreateCommand: Equatable, Sendable {
+    case single(fileURL: URL, kind: MediaKind, shouldMoveFile: Bool)
+    case livePhoto(photoURL: URL, motionURL: URL, photoFilename: String?, motionFilename: String?, preservation: LivePhotoPreservationSnapshot)
+    case retireComponents(assetIDs: [String])
+
+    init(fileURL: URL, kind: MediaKind, shouldMoveFile: Bool) { self = .single(fileURL: fileURL, kind: kind, shouldMoveFile: shouldMoveFile) }
+    var resources: [PhotoKitResourceInput] {
+        switch self {
+        case .single(let url, let kind, let move): return [.init(type: kind == .image ? .photo : .video, url: url, originalFilename: nil, shouldMoveFile: move)]
+        case .livePhoto(let photo, let motion, let photoName, let motionName, _):
+            return [.init(type: .photo, url: photo, originalFilename: photoName, shouldMoveFile: false),
+                    .init(type: .pairedVideo, url: motion, originalFilename: motionName, shouldMoveFile: false)]
+        case .retireComponents: return []
+        }
+    }
+}
+
 enum PhotoKitSubmissionResult: Sendable {
+    case retired
     case committed(identifier: String)
     case checkpointFailed
     case preventedBeforeMutation
@@ -65,6 +86,7 @@ protocol PhotoKitLifecycle: Sendable {
     func requestReadWriteAuthorization() async -> PhotoKitAccess
     func isAvailable() -> Bool
     func loadCandidateAssets() throws -> [PhotoKitCandidateAsset]
+    func attachLivePhotoInventory(store: SyncStore, context: @escaping @Sendable () -> LibraryContext)
     func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange
     func submit(
         _ command: PhotoKitCreateCommand,
@@ -77,9 +99,15 @@ protocol PhotoKitLifecycle: Sendable {
     func representationDelta(assetIDs: [String], context: LibraryContext, generation: Int) throws -> RepresentationPage
     func archivedChangeToken() throws -> Data?
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool
+    func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void, onClassifiedChanges: ([String], [String]) throws -> Void) throws -> Bool
 }
 
 extension PhotoKitLifecycle {
+    func attachLivePhotoInventory(store: SyncStore, context: @escaping @Sendable () -> LibraryContext) {}
+    func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void,
+                                 onClassifiedChanges: ([String], [String]) throws -> Void) throws -> Bool {
+        try replayPersistentChanges(token, onChange: onChange, onContentChange: onContentChange)
+    }
     func resetRepresentationCatalog() {}
     func representationCatalog(offset: Int, limit: Int, context: LibraryContext, generation: Int) throws -> RepresentationPage {
         throw PhotosRepresentationError.unavailable
@@ -89,7 +117,10 @@ extension PhotoKitLifecycle {
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool { false }
 }
 
-public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sendable {
+public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked Sendable {
+    private let mutationSlot = PhotoKitMutationSlot()
+    private let livePhotoCatalog = PhotoKitLivePhotoCatalog()
+    private let livePhotoRawReader: LivePhotoRawResourceReader
     private static let candidateLoadAttempts = 3
     private let lifecycle: any PhotoKitLifecycle
     private let photoLibrary: PHPhotoLibrary?
@@ -107,7 +138,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library), observedLibrary: library)
     }
 
-    public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+    public convenience init(configuration: DedupConfiguration, imageBudget: ImageWorkBudget, livePhotoExecutor: ReadExecutor = .shared, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
         let library = PHPhotoLibrary.shared()
         let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
         let reader = PhotosRepresentationReader(requester: SystemPhotosRepresentationRequester(), budget: imageBudget,
@@ -115,13 +146,14 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                                                 resourceLimits: PhotosResourceLimits(maxEncodedBytes: configuration.resources.maxEncodedBytes,
                                                     freeSpaceReserveBytes: configuration.resources.freeSpaceReserveBytes))
         self.init(lifecycle: SystemPhotoKitLifecycle(photoLibrary: library, eventBatchSize: configuration.resources.catalogBatchSize, diagnostics: { context.observation($0) }, indexDiagnostics: context), observedLibrary: library,
-                  representationReader: reader, catalogBatchSize: configuration.resources.catalogBatchSize, indexDiagnostics: context, diagnostics: diagnostics)
+                  representationReader: reader, livePhotoRawReader: .init(requester: SystemLivePhotoResourceRequester(), executor: livePhotoExecutor), catalogBatchSize: configuration.resources.catalogBatchSize, indexDiagnostics: context, diagnostics: diagnostics)
     }
 
     init(lifecycle: any PhotoKitLifecycle, representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0,
          indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in },
          queueSubmissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil,
          historyNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        livePhotoRawReader = .init(requester: SystemLivePhotoResourceRequester())
         historyRetry = PhotosHistoryRetry(now: historyNow)
         candidateIndex = PhotoKitCandidateIndex(submissionProbe: queueSubmissionProbe)
         let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
@@ -135,7 +167,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     private init(lifecycle: any PhotoKitLifecycle, observedLibrary: PHPhotoLibrary,
-                 representationReader: PhotosRepresentationReader? = nil, catalogBatchSize: Int = 0, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+                 representationReader: PhotosRepresentationReader? = nil, livePhotoRawReader: LivePhotoRawResourceReader = .init(requester: SystemLivePhotoResourceRequester()), catalogBatchSize: Int = 0, indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in }) {
+        self.livePhotoRawReader = livePhotoRawReader
         historyRetry = PhotosHistoryRetry(now: { ProcessInfo.processInfo.systemUptime })
         candidateIndex = PhotoKitCandidateIndex()
         let context = indexDiagnostics ?? IndexDiagnostics(sink: diagnostics)
@@ -153,6 +186,107 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     deinit {
         photoLibrary?.unregisterChangeObserver(self)
         photoLibrary?.unregisterAvailabilityObserver(self)
+    }
+
+    public func verifyLivePhotoContext(context: LibraryContext, anchorAssetIDs: [String], allowUnanchored: Bool) async throws -> Bool {
+        let generation = try await usableGeneration()
+        guard state.snapshot().context == context, anchorAssetIDs.count <= 32 else { return false }
+        if state.livePhotoIdentityVerified(context: context, generation: generation, anchors: anchorAssetIDs) { return true }
+        var matched = allowUnanchored && anchorAssetIDs.isEmpty
+        for id in anchorAssetIDs {
+            if try lifecycle.fetch(identifier: id) { matched = true; break }
+        }
+        try verifyUsable(generation: generation)
+        state.recordLivePhotoIdentity(context: context, generation: generation, anchors: anchorAssetIDs, verified: matched)
+        return matched
+    }
+
+    public func livePhotoLibraryContext() async throws -> LibraryContext {
+        _ = try await usableGeneration()
+        return state.snapshot().context
+    }
+    public func livePhotoAssetCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> LivePhotoAssetPage {
+        guard limit > 0, limit <= max(128, catalogBatchSize) else { throw PhotosRepresentationError.invalidPage }
+        _ = try await usableGeneration()
+        try state.validateCatalogSession(session)
+        let page = try livePhotoCatalog.page(session: session, context: state.snapshot().context, offset: offset, limit: limit)
+        try state.validateCatalogSession(session)
+        return page
+    }
+    public func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor] {
+        guard assetIDs.count <= max(128, catalogBatchSize) else { throw PhotosRepresentationError.invalidPage }
+        _ = try await usableGeneration()
+        guard state.snapshot().context == context else { throw PhotoKitGatewayError.libraryChanged }
+        let rows = livePhotoCatalog.descriptors(ids: assetIDs, context: context)
+        guard state.snapshot().context == context else { throw PhotoKitGatewayError.libraryChanged }
+        return rows
+    }
+
+    public func readLivePhotoResource(_ ref: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease {
+        let before = state.snapshot()
+        guard case .photos(let contextID, _, _, _) = ref, contextID == before.context.id,
+              lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else { throw PhotoKitGatewayError.libraryChanged }
+        let lease = try await livePhotoRawReader.read(resource: ref, purpose: purpose, budget: budget)
+        guard state.snapshot().context == before.context, state.snapshot().generation == before.generation,
+              lifecycle.currentAccess() == .authorized else { throw PhotoKitGatewayError.libraryChanged }
+        return lease
+    }
+
+    public func livePhotoPreservationSnapshot(assetID: String, context: LibraryContext) async throws -> LivePhotoPreservationSnapshot {
+        guard state.snapshot().context == context, lifecycle.currentAccess() == .authorized else { throw PhotoKitGatewayError.libraryChanged }
+        let value = try PhotoKitLivePhotoReader.snapshot(assetID: assetID, context: context)
+        guard state.snapshot().context == context else { throw PhotoKitGatewayError.libraryChanged }
+        return value
+    }
+
+    public func resourcesEqual(_ lhs: LivePhotoResourceRef, _ rhs: LivePhotoResourceRef, budget: LivePhotoResourceBudget) async throws -> Bool {
+        let left = try await readLivePhotoResource(lhs, purpose: .completion, budget: budget)
+        let right = try await readLivePhotoResource(rhs, purpose: .completion, budget: budget)
+        let equal = try await livePhotoRawReader.executor.execute(sourceID: UUID()) { try LivePhotoResourceLease.filesEqual(left.url, right.url) }
+        _ = try PhotoKitLivePhotoReader.selected(lhs); _ = try PhotoKitLivePhotoReader.selected(rhs)
+        return equal
+    }
+
+    public func verifyLivePhoto(assetID: String, operation: LivePhotoOperation) async throws -> LivePhotoVerification {
+        guard let descriptor = try await livePhotoAssets(assetIDs: [assetID], context: operation.context).first else { throw PhotosRepresentationError.unavailable }
+        guard descriptor.isLivePhoto, descriptor.resourceKinds.filter({ $0 == .image }).count == 1, descriptor.resourceKinds.filter({ $0 == .video }).count == 1,
+              let photoIndex = descriptor.resourceKinds.firstIndex(where: { $0 == .image }), let motionIndex = descriptor.resourceKinds.firstIndex(where: { $0 == .video }) else {
+            return .init(assetID: assetID, revision: descriptor.revision, passed: false, details: ["缺少原生 LIVE 类型或原始双资源"])
+        }
+        let photo = try await readLivePhotoResource(descriptor.resources[photoIndex], purpose: .completion, budget: .shared)
+        let motion = try await readLivePhotoResource(descriptor.resources[motionIndex], purpose: .completion, budget: .shared)
+        let reader = LivePhotoMetadataReader(executor: livePhotoRawReader.executor)
+        let p = try await reader.inspect(resource: photo, kind: .image), m = try await reader.inspect(resource: motion, kind: .video)
+        guard case .identified(let pi) = p, case .identified(let mi) = m,
+              pi.role == .photo, mi.role == .motion, pi.contentIdentifier == operation.contentIdentifier, mi.contentIdentifier == operation.contentIdentifier,
+              mi.stillImageTime != nil else { return .init(assetID: assetID, revision: descriptor.revision, passed: false, details: ["原始资源身份或静态帧位置不一致"]) }
+        let size: CGSize = try await livePhotoRawReader.executor.executeAsync(sourceID: UUID()) {
+            try await withCheckedThrowingContinuation { continuation in
+                let result = LivePhotoObjectResult { continuation.resume(with: $0) }
+                PHLivePhoto.request(withResourceFileURLs: [photo.url, motion.url], placeholderImage: nil, targetSize: .zero, contentMode: .aspectFit) { object, info in
+                    // Capturing leases keeps their backing until the actual request callback.
+                    withExtendedLifetime([photo, motion]) {}
+                    result.receive(size: object?.size, degraded: (info[PHLivePhotoInfoIsDegradedKey] as? NSNumber)?.boolValue == true,
+                        error: info[PHLivePhotoInfoErrorKey] as? Error)
+                }
+            }
+        }
+        let videoFacts: (duration: Double, valid: Bool) = try await livePhotoRawReader.executor.executeAsync(sourceID: UUID()) {
+            defer { withExtendedLifetime(motion) {} }
+            let video = AVURLAsset(url: motion.url), duration = try await video.load(.duration).seconds
+            let tracks = try await video.loadTracks(withMediaType: .video)
+            var valid = false
+            if let track = tracks.first {
+                let natural = try await track.load(.naturalSize), transform = try await track.load(.preferredTransform)
+                valid = natural.width > 0 && natural.height > 0 && [transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty].allSatisfy(\.isFinite)
+            }
+            return (duration, valid)
+        }
+        let duration = videoFacts.duration, videoValid = videoFacts.valid
+        guard let current = try await livePhotoAssets(assetIDs: [assetID], context: operation.context).first, current == descriptor else { throw PhotoKitGatewayError.libraryChanged }
+        let valid = size.width > 0 && size.height > 0 && duration.isFinite && duration > 0 && videoValid
+        return .init(assetID: assetID, revision: descriptor.revision, passed: valid,
+                     details: ["原生 LIVE 与照片/配套视频角色已确认", "双资源配对身份与实际 still-image-time 已确认", "原生播放对象尺寸：\(Int(size.width))×\(Int(size.height))", "视频时长和方向：\(duration)，有效：\(videoValid)", "音轨存在：\(mi.hasAudio == true)"])
     }
 
     public func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
@@ -219,7 +353,10 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         diagnostics(["phase": "photos-observer-continuity", "event": "revoked", "reason": "runtime-permission-transition"])
     }
 
-    public func attachIndexStore(_ store: SyncStore) { state.attach(store) }
+    public func attachIndexStore(_ store: SyncStore) {
+        state.attach(store)
+        lifecycle.attachLivePhotoInventory(store: store, context: { [state] in state.snapshot().context })
+    }
     public func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
         try historyRetry.check()
         // Drain the ordered classifier before deciding whether the observer session
@@ -401,6 +538,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                     facts: ["category": "unknown", "content": "unknown", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
                 diagnostic.record(["phase": "photos-history-obligation", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers", "assets": String(ids.count)])
                 for id in ids { diagnostic.record(["phase": "photos-history-sample", "source": "history", "category": "unknown", "reason": "conservative-history-identifiers"], assetID: id) }
+            }, onClassifiedChanges: { [state] changed, deleted in
+                try state.recordLivePhotoHistory(context: ticket.context, changed: changed, deleted: deleted)
             }) }
         } catch {
             state.requireInventoryReconciliation()
@@ -455,6 +594,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 indexDiagnostics.recordTiming(stage: "photos_history_scope_wall", seconds: ProcessInfo.processInfo.systemUptime - start)
                 for id in ids { indexDiagnostics.recordCause(context: checkpoint.context, assetID: id, source: "history", generation: generation,
                     facts: ["category": "unknown", "content": "unknown", "assetContentChanged": "unknown", "visibleInputFields": "unknown", "metadataFields": "unknown"], operation: diagnostic.id) }
+            }, onClassifiedChanges: { [state] changed, deleted in
+                try state.recordLivePhotoHistory(context: checkpoint.context, changed: changed, deleted: deleted)
             }), let adoptedGeneration = state.adoptContext(checkpoint.context, generation: generation, completingReplay: true) else {
                 state.requireInventoryReconciliation(); changeChannel.send(.fullReconcileRequired); return false
             }
@@ -481,6 +622,74 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
 
     public func loadCandidates() async throws -> [MatchCandidate] {
         try await candidateSnapshot().allCandidates
+    }
+
+    public func setLivePhotoRecoveryBlocks(_ operationIDs: Set<UUID>) async {
+        state.setLivePhotoRecoveryBlocks(operationIDs)
+    }
+
+    public func createLivePhoto(photoURL: URL, motionURL: URL, photoFilename: String? = nil, motionFilename: String? = nil,
+                                preservation: LivePhotoPreservationSnapshot, expectedGeneration: Int,
+                                beforeMutation: @escaping @Sendable () throws -> Bool,
+                                onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
+        for url in [photoURL, motionURL] {
+            guard url.isFileURL, FileManager.default.fileExists(atPath: url.path) else { throw PhotoKitGatewayError.definitelyNotCommitted("Live Photo resource unavailable before submission") }
+        }
+        let command = PhotoKitCreateCommand.livePhoto(photoURL: photoURL, motionURL: motionURL, photoFilename: photoFilename,
+            motionFilename: motionFilename, preservation: preservation)
+        let result = try await submitLivePhotoMutation(command, expectedGeneration: expectedGeneration, beforeMutation: beforeMutation, onPlaceholder: onPlaceholder)
+        guard case .committed(let identifier) = result else { throw PhotoKitGatewayError.resultUnknown("Unexpected Live Photo creation result") }
+        postCommitHealthCheck(identifier: identifier)
+        return identifier
+    }
+
+    public func retireLivePhotoComponents(assetIDs: [String], expectedGeneration: Int,
+                                          beforeMutation: @escaping @Sendable () throws -> Bool) async throws {
+        guard !assetIDs.isEmpty, assetIDs.allSatisfy({ !$0.isEmpty }), Set(assetIDs).count == assetIDs.count else { throw PhotoKitGatewayError.definitelyNotCommitted("Invalid component allowlist") }
+        let result = try await submitLivePhotoMutation(.retireComponents(assetIDs: assetIDs), expectedGeneration: expectedGeneration,
+            beforeMutation: beforeMutation, onPlaceholder: { _ in throw PhotoKitGatewayError.resultUnknown("Retirement cannot create an asset") })
+        guard case .retired = result else { throw PhotoKitGatewayError.resultUnknown("Unexpected component retirement result") }
+    }
+
+    private func submitLivePhotoMutation(_ command: PhotoKitCreateCommand, expectedGeneration: Int,
+                                         beforeMutation: @escaping @Sendable () throws -> Bool,
+                                         onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
+        let generation: Int
+        do {
+            generation = try await usableGeneration()
+            guard generation == expectedGeneration else { throw PhotosAdmissionDeferred() }
+            try requireAdmission(generation: generation)
+        } catch { throw PhotosAdmissionDeferred() } // No request has been dispatched.
+
+        guard mutationSlot.acquire() else { throw PhotosAdmissionDeferred() }
+        defer { mutationSlot.release() }
+        let check = PhotoKitMutationGuard(beforeMutation)
+        let result: PhotoKitSubmissionResult
+        do {
+            result = try await lifecycle.submit(command, beforeMutation: { [state, lifecycle] in
+                check.check() && state.livePhotoIdentityIsCurrent() && !state.durableOrdinaryMutationIsUnknown() && lifecycle.currentAccess() == .authorized && lifecycle.isAvailable() && state.isReady(generation: generation)
+            }, onPlaceholder: onPlaceholder)
+        } catch {
+            if case .checkpointFailed = error as? PhotoKitSubmissionError {
+                state.blockAdditions(.checkpointFailed)
+                throw PhotoKitGatewayError.checkpointFailed("Live Photo checkpoint failed")
+            }
+            let classified = classifyChangeFailure(error)
+            if classified.recoveryEvidence == .unknown { state.markLivePhotoMutationUnknown() }
+            throw classified
+        }
+        switch result {
+        case .preventedBeforeMutation:
+            if let failure = check.failure {
+                if let storageError = failure as? SyncStoreError { throw storageError }
+                throw PhotoKitGatewayError.definitelyNotCommitted(failure.localizedDescription)
+            }
+            throw PhotosAdmissionDeferred()
+        case .checkpointFailed:
+            state.blockAdditions(.checkpointFailed)
+            throw PhotoKitGatewayError.checkpointFailed("Live Photo checkpoint failed")
+        case .committed, .retired: return result
+        }
     }
 
     public func create(
@@ -517,18 +726,24 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         } catch PhotoKitGatewayError.libraryChanged {
             if guarded { throw PhotosAdmissionDeferred() }
             throw PhotoKitGatewayError.definitelyNotCommitted("The Photos candidate index was stale before PhotoKit submission.")
+        } catch {
+            // This caller has not dispatched a request. Preserve the earlier
+            // mutation's blocker without assigning its uncertainty to a new file.
+            throw PhotosAdmissionDeferred()
         }
         guard fileURL.isFileURL, FileManager.default.fileExists(atPath: fileURL.path) else {
             throw PhotoKitGatewayError.definitelyNotCommitted("The source file was unavailable before PhotoKit submission.")
         }
 
+        guard mutationSlot.acquire() else { throw PhotosAdmissionDeferred() }
+        defer { mutationSlot.release() }
         let guardCheck = PhotoKitMutationGuard(beforeMutation)
         let result: PhotoKitSubmissionResult
         do {
             result = try await lifecycle.submit(
                 PhotoKitCreateCommand(fileURL: fileURL, kind: kind, shouldMoveFile: false),
                 beforeMutation: { [state, lifecycle] in
-                    guardCheck.check() && lifecycle.currentAccess() == .authorized && lifecycle.isAvailable() && state.isReady(generation: generation)
+                    guardCheck.check() && !state.durableLivePhotoMutationIsUnknown() && lifecycle.currentAccess() == .authorized && lifecycle.isAvailable() && state.isReady(generation: generation)
                 },
                 onPlaceholder: onPlaceholder
             )
@@ -537,10 +752,15 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
                 state.blockAdditions(.checkpointFailed)
                 throw PhotoKitGatewayError.checkpointFailed("The placeholder checkpoint failed.")
             }
-            throw classifyChangeFailure(error)
+            let classified = classifyChangeFailure(error)
+            if classified.recoveryEvidence == .unknown { state.markOrdinaryMutationUnknown() }
+            throw classified
         }
 
         switch result {
+        case .retired:
+            state.blockAdditions(.unknownOutcome)
+            throw PhotoKitGatewayError.resultUnknown("Unexpected deletion result for ordinary import")
         case .preventedBeforeMutation:
             if let error = guardCheck.failure {
                 if let storageError = error as? SyncStoreError { throw storageError }
@@ -573,6 +793,7 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
         guard let placeholder, !placeholder.isEmpty else { return .unknown }
         let found = try lifecycle.fetch(identifier: placeholder)
         try verifyUsable(generation: generation)
+        if found { state.confirmOrdinaryMutationResolved() }
         return found ? .found(identifier: placeholder) : .unknown
     }
 
@@ -676,6 +897,8 @@ public final class PhotoKitGateway: NSObject, PhotosIndexGateway, @unchecked Sen
     }
 
     private func classifyChangeFailure(_ error: Error) -> PhotoKitGatewayError {
+        if let typed = error as? PhotoKitGatewayError { return typed }
+        if error is CancellationError { return .resultUnknown("Photos submission was cancelled after dispatch") }
         let nsError = error as NSError
         guard nsError.domain == PHPhotosErrorDomain,
               let code = PHPhotosError.Code(rawValue: nsError.code) else {
@@ -695,6 +918,12 @@ extension PhotoKitGateway: PHPhotoLibraryChangeObserver, PHPhotoLibraryAvailabil
 }
 
 private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecycle {
+    private let livePhotoAttachmentLock = NSLock()
+    private var livePhotoAttachment: (SyncStore, @Sendable () -> LibraryContext)?
+    func attachLivePhotoInventory(store: SyncStore, context: @escaping @Sendable () -> LibraryContext) {
+        livePhotoAttachmentLock.lock(); livePhotoAttachment = (store, context); livePhotoAttachmentLock.unlock()
+    }
+
     private let photoLibrary: PHPhotoLibrary
     private var fetchedAssets: PHFetchResult<PHAsset>?
     private let representationQueue = DispatchQueue(label: "PhotoSync.PhotoKitRepresentationCatalog")
@@ -721,18 +950,29 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     func isAvailable() -> Bool { photoLibrary.unavailabilityReason == nil }
     func loadCandidateAssets() throws -> [PhotoKitCandidateAsset] {
         let options = PHFetchOptions()
-        options.includeHiddenAssets = true
-        options.includeAllBurstAssets = true
+        options.includeHiddenAssets = true; options.includeAllBurstAssets = true
         let assets = PHAsset.fetchAssets(with: options)
         fetchedAssets = assets
-        var result: [PhotoKitCandidateAsset] = []
-        assets.enumerateObjects { asset, _, _ in
+        livePhotoAttachmentLock.lock(); let attachment = livePhotoAttachment; livePhotoAttachmentLock.unlock()
+        let context = attachment?.1()
+        var inventoryBatch = [LivePhotoAssetDescriptor]()
+        var result = [PhotoKitCandidateAsset]()
+        for index in 0..<assets.count {
+            let asset = assets.object(at: index)
             let candidates = PHAssetResource.assetResources(for: asset).compactMap { resource -> MatchCandidate? in
                 guard !resource.originalFilename.isEmpty else { return nil }
                 return MatchCandidate(key: "photos:\(asset.localIdentifier):\(resource.originalFilename)", metadata: Self.metadata(asset: asset, filename: resource.originalFilename))
             }
             result.append(PhotoKitCandidateAsset(identifier: asset.localIdentifier, candidates: candidates))
+            if let context, asset.mediaType == .image || asset.mediaType == .video {
+                inventoryBatch.append(PhotoKitLivePhotoReader.descriptor(asset, context: context))
+                if inventoryBatch.count >= max(1, eventBatchSize) {
+                    try attachment?.0.enqueueLivePhotoCatalogAssets(context: context, assets: inventoryBatch)
+                    inventoryBatch.removeAll(keepingCapacity: true)
+                }
+            }
         }
+        if let context, !inventoryBatch.isEmpty { try attachment?.0.enqueueLivePhotoCatalogAssets(context: context, assets: inventoryBatch) }
         return result
     }
 
@@ -867,6 +1107,10 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
         try NSKeyedArchiver.archivedData(withRootObject: photoLibrary.currentChangeToken, requiringSecureCoding: true)
     }
     func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void) throws -> Bool {
+        try replayPersistentChanges(token, onChange: onChange, onContentChange: onContentChange, onClassifiedChanges: { _, _ in })
+    }
+    func replayPersistentChanges(_ token: Data, onChange: (PhotosIndexChange) -> Void, onContentChange: ([String]) -> Void,
+                                 onClassifiedChanges: ([String], [String]) throws -> Void) throws -> Bool {
         guard let token = try NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: token) else { return false }
         let result = try photoLibrary.fetchPersistentChanges(since: token)
         let diagnostic = indexDiagnostics?.operation("history-replay")
@@ -880,7 +1124,9 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
                 for id in ids { diagnostic?.record(["phase": "photos-history-sample", "source": "history", "category": category, "content": "unknown", "reason": "conservative-history-identifiers"], assetID: id) }
                 let ordered = ids.sorted()
                 for offset in stride(from: 0, to: ordered.count, by: max(1, eventBatchSize)) {
-                    onContentChange(Array(ordered[offset..<min(ordered.count, offset + max(1, eventBatchSize))]))
+                    let batch = Array(ordered[offset..<min(ordered.count, offset + max(1, eventBatchSize))])
+                    try onClassifiedChanges(category == "deleted" ? [] : batch, category == "deleted" ? batch : [])
+                    onContentChange(batch)
                 }
             }
             // Persistent replay only supplies invalidation/continuity for the mandatory
@@ -892,15 +1138,40 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         let state = SubmissionState()
         do {
-            try await photoLibrary.performChanges {
-                guard beforeMutation() else { state.prevent(); return }
-                let options = PHAssetResourceCreationOptions()
-                options.shouldMoveFile = command.shouldMoveFile
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: command.kind == .image ? .photo : .video, fileURL: command.fileURL, options: options)
-                guard let identifier = request.placeholderForCreatedAsset?.localIdentifier else { state.checkpointFailed(); return }
-                do { try onPlaceholder(identifier); state.commit(identifier: identifier) }
-                catch { state.checkpointFailed() }
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                photoLibrary.performChanges({
+                    guard beforeMutation() else { state.prevent(); return }
+                    if case .retireComponents(let ids) = command {
+                        let options = PHFetchOptions(); options.includeHiddenAssets = true
+                        let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: options)
+                        guard assets.count == ids.count, (0..<assets.count).allSatisfy({ !assets.object(at: $0).mediaSubtypes.contains(.photoLive) }) else { state.prevent(); return }
+                        PHAssetChangeRequest.deleteAssets(assets)
+                        state.retired()
+                        return
+                    }
+                    let request = PHAssetCreationRequest.forAsset()
+                    for resource in command.resources {
+                        let options = PHAssetResourceCreationOptions()
+                        options.shouldMoveFile = resource.shouldMoveFile
+                        options.originalFilename = resource.originalFilename
+                        request.addResource(with: resource.type, fileURL: resource.url, options: options)
+                    }
+                    if case .livePhoto(_, _, _, _, let preservation) = command { Self.apply(preservation, to: request) }
+                    guard let placeholder = request.placeholderForCreatedAsset else { state.checkpointFailed(); return }
+                    if case .livePhoto(_, _, _, _, let preservation) = command, case .value(let albumIDs) = preservation.albumIDs {
+                        for id in albumIDs {
+                            if let album = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [id], options: nil).firstObject,
+                               album.canPerform(.addContent), let change = PHAssetCollectionChangeRequest(for: album) {
+                                change.addAssets([placeholder] as NSArray)
+                            }
+                        }
+                    }
+                    do { try onPlaceholder(placeholder.localIdentifier); state.commit(identifier: placeholder.localIdentifier) }
+                    catch { state.checkpointFailed() }
+                }, completionHandler: { success, error in
+                    if success { continuation.resume() }
+                    else { continuation.resume(throwing: error ?? PhotoKitGatewayError.resultUnknown("Photos returned no completion evidence")) }
+                })
             }
         } catch {
             if state.isCheckpointFailed { throw PhotoKitSubmissionError.checkpointFailed(error) }
@@ -908,8 +1179,23 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
         }
         return state.result()
     }
+
+    private static func apply(_ value: LivePhotoPreservationSnapshot, to request: PHAssetCreationRequest) {
+        if case .value(let date) = value.creationDate { request.creationDate = date }
+        if case .value(let location) = value.location {
+            request.location = CLLocation(coordinate: .init(latitude: location.latitude, longitude: location.longitude), altitude: location.altitude,
+                horizontalAccuracy: -1, verticalAccuracy: -1, timestamp: Date())
+        }
+        if case .value(let favorite) = value.favorite { request.isFavorite = favorite }
+        if case .value(let hidden) = value.hidden { request.isHidden = hidden }
+        if #available(macOS 27, *) {
+            if case .value(let rating) = value.rating, let native = PHAsset.Rating(rawValue: rating) { request.rating = native }
+            if case .value(let caption) = value.caption { request.caption = caption }
+            if case .value(let keywords) = value.keywords { for word in keywords { request.addKeyword(word) } }
+        }
+    }
     func fetch(identifier: String) throws -> Bool {
-        PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).count == 1
+        PhotoKitLivePhotoReader.fetchAsset(identifier) != nil
     }
     private static func metadata(asset: PHAsset, filename: String) -> MediaMetadata {
         MediaMetadata(filename: filename, kind: asset.mediaType == .video ? .video : .image, captureSecond: nil, rawCaptureTime: nil, rawCaptureOffset: nil, make: nil, model: nil, width: asset.pixelWidth == 0 ? nil : asset.pixelWidth, height: asset.pixelHeight == 0 ? nil : asset.pixelHeight, duration: asset.mediaType == .video ? asset.duration : nil)
@@ -1057,6 +1343,7 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
 private final class SubmissionState: @unchecked Sendable {
     private let lock = NSLock(); private var value: PhotoKitSubmissionResult = .preventedBeforeMutation
     func prevent() { lock.lock(); value = .preventedBeforeMutation; lock.unlock() }
+    func retired() { lock.lock(); value = .retired; lock.unlock() }
     func checkpointFailed() { lock.lock(); value = .checkpointFailed; lock.unlock() }
     func commit(identifier: String) { lock.lock(); value = .committed(identifier: identifier); lock.unlock() }
     func result() -> PhotoKitSubmissionResult { lock.lock(); defer { lock.unlock() }; return value }
@@ -1066,6 +1353,28 @@ private final class SubmissionState: @unchecked Sendable {
 private final class PhotoKitState: @unchecked Sendable {
     enum AdditionBlockReason { case checkpointFailed, unknownOutcome }
     private let lock = NSLock(); private var available = true; private var generation = 0; private var indexedGeneration: Int?; private var additionsBlocked: AdditionBlockReason?
+    private var livePhotoRecoveryBlocks = Set<UUID>()
+    private var livePhotoMutationUnknown = false
+    private var livePhotoIdentityKnown = true
+    private var livePhotoIdentityGeneration = 0
+    private var livePhotoIdentityAnchors = [String]()
+    func livePhotoIdentityVerified(context expected: LibraryContext, generation expectedGeneration: Int, anchors: [String]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return context == expected && generation == expectedGeneration && livePhotoIdentityKnown && livePhotoIdentityGeneration == generation && livePhotoIdentityAnchors == anchors
+    }
+    func livePhotoIdentityIsCurrent() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return livePhotoIdentityKnown && livePhotoIdentityGeneration == generation
+    }
+    func recordLivePhotoIdentity(context expected: LibraryContext, generation expectedGeneration: Int, anchors: [String], verified: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard context == expected && generation == expectedGeneration else { return }
+        livePhotoIdentityKnown = verified; livePhotoIdentityGeneration = generation; livePhotoIdentityAnchors = anchors
+    }
+    private var ordinaryMutationUnknown = false
+    func markOrdinaryMutationUnknown() { lock.lock(); ordinaryMutationUnknown = true; lock.unlock() }
+    func confirmOrdinaryMutationResolved() { lock.lock(); ordinaryMutationUnknown = false; lock.unlock() }
+    func setLivePhotoRecoveryBlocks(_ ids: Set<UUID>) { lock.lock(); livePhotoRecoveryBlocks = ids; if ids.isEmpty { livePhotoMutationUnknown = false }; lock.unlock() }
+    func markLivePhotoMutationUnknown() { lock.lock(); livePhotoMutationUnknown = true; lock.unlock() }
     private var context = LibraryContext(id: UUID(), epoch: 0)
     struct HistoryCoverageTicket { let context: LibraryContext; let generation: Int; let admissionRevision: UInt64 }
     private var admissionRevision: UInt64 = 0
@@ -1096,7 +1405,7 @@ private final class PhotoKitState: @unchecked Sendable {
     }
 
     func invalidateHistoryAdmission() {
-        lock.lock(); revokeObserverContinuityLocked(); historyAdmissionBlocked = true; indexedGeneration = nil; lock.unlock()
+        lock.lock(); revokeObserverContinuityLocked(); livePhotoIdentityKnown = false; historyAdmissionBlocked = true; indexedGeneration = nil; lock.unlock()
     }
     func beginHistoryCoverage() -> HistoryCoverageTicket {
         lock.lock(); defer { lock.unlock() }
@@ -1144,6 +1453,14 @@ private final class PhotoKitState: @unchecked Sendable {
     private var unknownGeneration = -1
     private var replayContext: LibraryContext?
     var hasStore: Bool { lock.lock(); defer { lock.unlock() }; return store != nil }
+    func durableOrdinaryMutationIsUnknown() -> Bool {
+        lock.lock(); let currentStore = store; lock.unlock()
+        do { return try currentStore?.hasUnconfirmedOrdinaryMutation() ?? false } catch { return true }
+    }
+    func durableLivePhotoMutationIsUnknown() -> Bool {
+        lock.lock(); let currentStore = store; lock.unlock()
+        do { return try currentStore?.hasUnconfirmedLivePhotoMutation() ?? false } catch { return true }
+    }
     func attach(_ store: SyncStore) { lock.lock(); self.store = store; lock.unlock() }
     func catalogCoverage(baseline: Int) throws -> Int {
         lock.lock(); defer { lock.unlock() }
@@ -1158,6 +1475,10 @@ private final class PhotoKitState: @unchecked Sendable {
         }
         return try store.photosCatalogChanges(context: context, runID: runID, afterGeneration: baseline,
             throughGeneration: endpoint, afterAssetID: after, limit: limit)
+    }
+    func recordLivePhotoHistory(context: LibraryContext, changed: [String], deleted: [String]) throws {
+        lock.lock(); let store = store; lock.unlock()
+        try store?.recordLivePhotoChanges(context: context, changed: changed, deleted: deleted)
     }
     func recordCatalogChanges(_ delta: PhotosIndexDelta, capacity: Int) -> Bool {
         lock.lock(); let store = store; lock.unlock()
@@ -1266,6 +1587,7 @@ private final class PhotoKitState: @unchecked Sendable {
         let expectedDetails = completingReplay ? 1 : 0
         guard available, generation == expected, pendingChangeDetails == expectedDetails,
               !completingReplay || replayContext == context else { return nil }
+        if self.context != context { livePhotoIdentityKnown = false }
         self.context = context
         // Replay runs outside the lock. Snapshots acquired during that work
         // belong to the provisional context and must not survive adoption.
@@ -1285,13 +1607,14 @@ private final class PhotoKitState: @unchecked Sendable {
     }
     func recordUnavailable() {
         lock.lock(); defer { lock.unlock() }
-        revokeObserverContinuityLocked(); available = false; generation += 1; indexedGeneration = nil
+        revokeObserverContinuityLocked(); livePhotoIdentityKnown = false; available = false; generation += 1; indexedGeneration = nil
         for (ticket, read) in reads { reads[ticket] = (read.assetID, false) }
     }
     func markIndexed(generation expected: Int) -> Bool { lock.lock(); defer { lock.unlock() }; guard available, generation == expected else { return false }; indexedGeneration = expected; return true }
     enum Admission { case ready, libraryChanged, blockedAfterCheckpointFailure, blockedAfterUnknownOutcome }
     func admission(generation expected: Int) -> Admission {
         lock.lock(); defer { lock.unlock() }
+        if !livePhotoRecoveryBlocks.isEmpty || livePhotoMutationUnknown || ordinaryMutationUnknown { return .blockedAfterUnknownOutcome }
         switch additionsBlocked {
         case .checkpointFailed: return .blockedAfterCheckpointFailure
         case .unknownOutcome: return .blockedAfterUnknownOutcome
@@ -1359,4 +1682,11 @@ private final class PhotosHistoryRetry: @unchecked Sendable {
         nextAttempt = now() + [5.0, 15, 30, 60][failures - 1]
     }
     func succeeded() { lock.lock(); failures = 0; nextAttempt = 0; lock.unlock() }
+}
+
+private final class PhotoKitMutationSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var held = false
+    func acquire() -> Bool { lock.lock(); defer { lock.unlock() }; guard !held else { return false }; held = true; return true }
+    func release() { lock.lock(); held = false; lock.unlock() }
 }

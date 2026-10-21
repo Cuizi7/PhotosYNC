@@ -2,6 +2,25 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testLivePhotoProgressIsSeparateAndWorksWithoutSources() {
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(imported: 9)
+        snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 100, identified: 35, unresolved: 4)
+        let p = SyncStatusPresentation(snapshot: snapshot)
+        XCTAssertEqual(p.analysis?.title, "正在识别历史 Live Photo")
+        XCTAssertTrue(p.analysis?.progressText.contains("100") == true)
+        XCTAssertEqual(p.baseSummary, "已导入 9 · 已跳过 0 · 待处理 0")
+        XCTAssertEqual(p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .running)
+        snapshot.livePhotoInventory = .init(phase: .completed, inventoried: 100, identified: 96, unresolved: 4)
+        let waiting = SyncStatusPresentation(snapshot: snapshot)
+        XCTAssertTrue(waiting.summaryNotes.contains("历史识别已完成，部分项目待核实"))
+        XCTAssertEqual(waiting.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .waiting)
+        snapshot.livePhotoWork.awaitingRetirement = 1
+        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).summaryNotes.contains("Live Photo 已补齐，旧项目待清理"))
+        snapshot.livePhotoWork.unknownMutation = true
+        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .error)
+    }
+
     func testOnlyEnabledUnmountedRootDimsWaitingIcon() {
         let source = RegisteredSource(id: UUID(), url: URL(fileURLWithPath: "/Volumes/Example/Photos"), enabled: true)
         var snapshot = EngineSnapshot()
