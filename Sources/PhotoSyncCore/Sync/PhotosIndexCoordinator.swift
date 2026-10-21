@@ -10,6 +10,7 @@ private struct RepresentationStageFailure: Error {
 public actor PhotosIndexCoordinator {
     private let wallNow: @Sendable () -> Date
     private let monotonic: @Sendable () -> TimeInterval
+    private var performingRead = false
     private var taskCursor: RepresentationKey?
     private var readerTimeoutWaiting = false
     private var readerAdmission: PhotosReaderAdmission = .available
@@ -311,6 +312,8 @@ public actor PhotosIndexCoordinator {
                     }
                     // An unstructured owned Task does not inherit later caller
                     // cancellation. Pause cannot cancel already-started consumers.
+                    performingRead = true
+                    defer { performingRead = false }
                     attempted += 1; taskCursor = task.descriptor.key
                     sliceReason = attempted == 16 ? "attempt-budget" : "selected-work-complete"
                     diagnostic.record(["phase": "index-task", "event": "attempt", "retryCount": String(task.retryCount)], task: task)
@@ -433,6 +436,12 @@ public actor PhotosIndexCoordinator {
     }
 
     public func setPaused(_ paused: Bool) async { self.paused = paused }
+
+    public func activity() async -> IndexActivity {
+        if reconciling || performingRead { return .working }
+        let progress = await progress()
+        return progress.state == .ready ? .idle : .waiting
+    }
 
     public func progress() async -> IndexProgress {
         do {

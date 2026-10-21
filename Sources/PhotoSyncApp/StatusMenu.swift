@@ -43,7 +43,7 @@ struct StatusMenu: View {
                     .font(.headline).accessibilityLabel(model.statusDescription)
                     .accessibilityIdentifier("photosync-status")
                 Spacer()
-                if model.state.snapshot.activeWork {
+                if model.status == .preparing || model.status == .running {
                     ProgressView().controlSize(.small)
                 }
             }
@@ -64,33 +64,13 @@ struct StatusMenu: View {
             if let hint = model.recoveryAdvice {
                 Text(hint).font(.caption).foregroundStyle(.secondary)
             }
-            VStack(alignment: .leading, spacing: 6) {
-                // Keep the trigger outside the changing analysis/standing-state branches.
-                HStack(spacing: 6) {
-                    if let analysis = model.analysis {
-                        StatusMenuSingleLine(text: analysis.progressText)
-                    } else if model.state.sources.contains(where: \.enabled) {
-                        StatusMenuSingleLine(text: standingSummary)
-                    }
-                    SyncDetailsButton(snapshot: model.state.snapshot)
-                }
-                if let analysis = model.analysis {
-                    LibraryAnalysisView(analysis: analysis).tint(.accentColor)
-                    if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
-                        Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
-                    }
-                } else if model.state.sources.contains(where: \.enabled) {
-                    SyncProgressView(summary: model.state.snapshot.summary,
-                        stale: model.state.snapshot.summaryError != nil)
-                } else if model.state.snapshot.summary != nil, model.state.snapshot.summaryError != nil {
-                    Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
-                }
-            }
+            SyncWorkProgressView(snapshot: model.state.snapshot, showSourceProgress: model.hasEnabledSources,
+                showActiveProgress: model.status == .preparing || model.status == .running)
             ForEach(model.state.sources.filter(\.enabled), id: \.id) { source in
                 let issues = model.state.snapshot.sourceIssueDetails[source.id] ?? []
                 if model.enabledWaiting[source.id] != nil || !issues.isEmpty || model.state.snapshot.advancedWaitingReasons[source.id] != nil || model.state.snapshot.sourcePhases[source.id] != nil {
                     SourceRowLabel(url: source.url,
-                        status: model.enabledWaiting[source.id]?.summary ?? model.state.snapshot.advancedWaitingReasons[source.id] ?? model.state.snapshot.sourcePhases[source.id] ?? "已启用",
+                        status: model.enabledWaiting[source.id]?.summary ?? model.state.snapshot.advancedWaitingReasons[source.id] ?? (model.state.snapshot.sourceActivities[source.id] == .waiting ? "等待恢复" : "正在同步"),
                         issues: issues, recoveryPending: model.recoveryPending(for: source.id),
                         isScanningDirectory: model.isScanningDirectory(for: source.id))
                 }
@@ -103,13 +83,6 @@ struct StatusMenu: View {
                 Text("下次扫描：\(next.formatted(date: .omitted, time: .shortened))").font(.caption)
             }
         }
-    }
-
-    private var standingSummary: String {
-        guard let metrics = SyncProgressMetrics(summary: model.state.snapshot.summary) else {
-            return model.state.snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用"
-        }
-        return metrics.known == 0 ? "已发现 0 个文件" : "已处理 \(metrics.processed) / 已发现 \(metrics.known)"
     }
 
     private var actions: some View {
@@ -166,28 +139,5 @@ struct StatusMenuSingleLine: View {
     var body: some View {
         Text(text).font(.caption).foregroundStyle(.secondary)
             .fixedSize(horizontal: true, vertical: true)
-    }
-}
-
-struct LibraryAnalysisView: View {
-    let analysis: SyncStatusPresentation.Analysis
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            if let fraction = analysis.fraction {
-                ProgressView(value: fraction).accessibilityLabel(analysis.progressText)
-            } else {
-                ProgressView().controlSize(.small).accessibilityLabel(analysis.progressText)
-            }
-            if let detail = analysis.detail {
-                if detail == "正在等待 iCloud 图像，连接恢复后自动继续" {
-                    StatusMenuSingleLine(text: detail)
-                } else {
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            Text(analysis.explanation).font(.caption).foregroundStyle(.secondary)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("library-analysis")
     }
 }

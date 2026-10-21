@@ -75,30 +75,29 @@ struct SyncDetailsContent: View {
     var body: some View {
         DetailsScrollView(width: 300) {
             VStack(alignment: .leading, spacing: 10) {
-                if let analysis = SyncStatusPresentation(snapshot: snapshot).analysis {
-                    Text(snapshot.livePhotoInventory?.phase != .completed && snapshot.livePhotoInventory != nil ? "Live Photo" : "图库分析").font(.headline)
-                    row("状态", analysis.title)
-                    row("进度", analysis.progressText)
-                    if let detail = analysis.detail, !detail.isEmpty {
-                        Text(detail).font(.caption).foregroundStyle(.secondary).help(snapshot.livePhotoIssue?.detail ?? detail)
-                    }
-                    Text(analysis.explanation).font(.caption).foregroundStyle(.secondary)
-                    Text("统计 Photos 图库中的项目，与来源目录的文件数分别计算。")
-                        .font(.caption).foregroundStyle(.secondary)
+                let presentation = SyncStatusPresentation(snapshot: snapshot)
+                ForEach(presentation.progressRows) { progress in
+                    Text(progress.subtitle).font(.headline)
+                    if let text = progress.progressText { row("进度", text) }
+                    Text(progress.explanation).font(.caption).foregroundStyle(.secondary)
                     Divider()
                 }
-                if let inventory = snapshot.livePhotoInventory, inventory.phase == .completed {
+                if presentation.progressRows.isEmpty, let p = snapshot.indexProgress, p.state != .ready {
+                    Text("视觉索引").font(.headline)
+                    row("进度", p.totalsKnown ? "已分析 \(p.readyAssets) / \(p.totalAssets) 张" : "已分析 \(p.readyAssets) 张")
+                    if let issue = p.issue { Text(issue).font(.caption).foregroundStyle(.secondary) }
+                    Text(SyncStatusPresentation.indexExplanation).font(.caption).foregroundStyle(.secondary)
+                    Divider()
+                }
+                if let inventory = snapshot.livePhotoInventory, !presentation.progressRows.contains(where: { $0.id == "livePhoto" }) {
                     Text("Live Photo").font(.headline)
-                    row("已清点", "\(inventory.inventoried)")
-                    row("已识别", "\(inventory.identified)")
-                    row("待核实", "\(inventory.unresolved)")
-                    if inventory.unresolved > 0 { Text("历史识别已完成，部分项目待核实").font(.caption) }
-                    if snapshot.livePhotoWork.awaitingVerification > 0 { row("等待验证", "\(snapshot.livePhotoWork.awaitingVerification)") }
-                    if snapshot.livePhotoWork.awaitingRetirement > 0 { Text("Live Photo 已补齐，旧项目待清理").font(.caption) }
-                    if snapshot.livePhotoWork.unknownMutation { Text("提交结果尚未确认，新的提交已停止").font(.caption) }
-                    if let issue = snapshot.livePhotoIssue { Text(issue.summary).font(.caption).help(issue.detail) }
+                    row("进度", inventory.phase == .enumerating ? "已处理 \(inventory.identified) 项" : "已处理 \(inventory.identified) / \(inventory.inventoried) 项")
+                    if inventory.retryWaiting > 0 { row("等待重试", "\(inventory.retryWaiting)") }
+                    if inventory.requiresAttention > 0 { row("需要处理", "\(inventory.requiresAttention)") }
+                    Text(SyncStatusPresentation.livePhotoExplanation).font(.caption).foregroundStyle(.secondary)
                     Divider()
                 }
+                ForEach(presentation.summaryNotes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
                 Text("已发现的文件").font(.headline)
                 if let summary = snapshot.summary {
                     VStack(spacing: 5) {
@@ -161,7 +160,7 @@ struct SyncDetailsButton: View {
     let snapshot: EngineSnapshot
 
     var accessibilityLabel: String {
-        SyncStatusPresentation(snapshot: snapshot).analysis == nil ? "查看同步详情" : "查看图库分析与同步详情"
+        SyncStatusPresentation(snapshot: snapshot).progressRows.isEmpty ? "查看同步详情" : "查看图库分析与同步详情"
     }
 
     var body: some View {
@@ -170,5 +169,42 @@ struct SyncDetailsButton: View {
         } content: {
             SyncDetailsContent(snapshot: snapshot)
         }
+    }
+}
+
+/// Both surfaces consume the same rows. The details trigger retains identity through activity changes.
+struct SyncWorkProgressView: View {
+    let snapshot: EngineSnapshot
+    let showSourceProgress: Bool
+    let showActiveProgress: Bool
+
+    private var rows: [SyncStatusPresentation.PreparationProgress] { showActiveProgress ? SyncStatusPresentation(snapshot: snapshot).progressRows : [] }
+    private var sourceCount: String {
+        guard let metrics = SyncProgressMetrics(summary: snapshot.summary) else { return snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用" }
+        return "已处理 \(metrics.processed) / 已发现 \(metrics.known)"
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                if let text = rows.first?.progressText { StatusMenuSingleLine(text: text) }
+                else if showSourceProgress { StatusMenuSingleLine(text: sourceCount) }
+                SyncDetailsButton(snapshot: snapshot)
+            }
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                if index > 0, let text = row.progressText { StatusMenuSingleLine(text: text) }
+                if let fraction = row.fraction {
+                    ProgressView(value: fraction).accessibilityLabel(row.progressText ?? row.subtitle)
+                } else { ProgressView().controlSize(.small).accessibilityLabel(row.subtitle) }
+                Text(row.subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            if showActiveProgress && showSourceProgress && (rows.isEmpty || snapshot.sourceActivities.values.contains(where: { $0 != .waiting })) {
+                if !rows.isEmpty { StatusMenuSingleLine(text: sourceCount) }
+                SyncProgressView(summary: snapshot.summary, stale: snapshot.summaryError != nil)
+            }
+            if showActiveProgress && rows.isEmpty && !showSourceProgress { ProgressView().controlSize(.small) }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sync-work-progress")
+        .tint(.accentColor)
     }
 }

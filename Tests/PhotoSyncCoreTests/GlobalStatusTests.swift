@@ -4,12 +4,12 @@ import AppKit
 
 final class GlobalStatusTests: XCTestCase {
     func testWaitingAndFailureHaveDistinctHeadings() {
-        XCTAssertEqual(GlobalStatus.waiting.description, "等待中")
-        XCTAssertEqual(GlobalStatus.error.description, "同步异常")
+        XCTAssertEqual(GlobalStatus.waiting.description, "等待恢复")
+        XCTAssertEqual(GlobalStatus.error.description, "需要处理")
     }
 
     func testWaitingIsVisibleWhileAnotherSourceRuns() {
-        XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: false, waiting: true, running: true), .waiting)
+        XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: false, waiting: true, running: true), .running)
     }
     func testErrorIsNotReportedAsCompleted() {
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: true, paused: false, waiting: false, running: false), .error)
@@ -19,7 +19,7 @@ final class GlobalStatusTests: XCTestCase {
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: false, waiting: true, running: true, authorized: false), .error)
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: true, waiting: false, running: false, authorized: false), .error)
         // Without configured sources nothing can be synced yet, so the plain symbol stays.
-        XCTAssertEqual(GlobalStatus.resolve(configured: false, error: false, paused: false, waiting: false, running: false, authorized: false), .unconfigured)
+        XCTAssertEqual(GlobalStatus.resolve(configured: false, error: false, paused: false, waiting: false, running: false, authorized: false), .error)
     }
     func testSymbolsExistOnHostOS() {
         for status in GlobalStatus.allCases {
@@ -35,7 +35,7 @@ final class GlobalStatusTests: XCTestCase {
         await fulfillment(of: [failure], timeout: 2)
     }
     func testPriorityAndSymbols() {
-        XCTAssertEqual(GlobalStatus.resolve(configured: false, error: true, paused: true, waiting: true, running: true), .unconfigured)
+        XCTAssertEqual(GlobalStatus.resolve(configured: false, error: true, paused: true, waiting: true, running: true), .error)
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: true, waiting: true, running: true), .paused)
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: false, waiting: false, running: true), .running)
         XCTAssertEqual(GlobalStatus.resolve(configured: true, error: false, paused: false, waiting: false, running: false), .completed)

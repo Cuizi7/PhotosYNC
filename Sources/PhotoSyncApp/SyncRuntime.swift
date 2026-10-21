@@ -104,6 +104,10 @@ actor SyncRuntime {
     private let livePhotoMetadata: any LivePhotoMetadataReading
     private var loading: Task<Void, Never>?
     private var advancedWork: Task<Void, Never>?
+    private var livePhotoWorkTask: Task<Void, Never>?
+    private var nextLivePhotoWorkAt: Date?
+    private var livePhotoDeferrals = 0
+    private var manualLivePhotoRetryPending = false
     private var changeObserver: Task<Void, Never>?
     private var advancedLoadAttempted = false
     private var modelRetryAt: Date?
@@ -166,11 +170,12 @@ actor SyncRuntime {
     }
 
     func waitForRound() async {
-        while loading != nil || modelRecovery != nil || advancedWork != nil || round != nil {
+        while loading != nil || modelRecovery != nil || advancedWork != nil || livePhotoWorkTask != nil || round != nil {
             await loading?.value
             _ = await modelRecovery?.result
             await Task.yield()
             await advancedWork?.value
+            await livePhotoWorkTask?.value
             await round?.value
         }
     }
@@ -263,11 +268,13 @@ actor SyncRuntime {
         if let graph = advancedGraph {
             // UI polling publishes aggregates at the profile cadence; transitions are also
             // published when an owned batch ends. No per-representation main-actor traffic.
-            if nextProgressAt == nil || now() >= nextProgressAt! {
+            let activity = eligibleForImageWork ? await graph.coordinator.activity() : .idle
+            if nextProgressAt == nil || now() >= nextProgressAt! || activity != state.snapshot.indexActivity {
                 publishedProgress = await graph.coordinator.progress()
                 nextProgressAt = now().addingTimeInterval(graph.configuration.resources.progressPublishIntervalSeconds)
             }
             state.snapshot.indexProgress = state.sources.contains(where: \.enabled) ? publishedProgress : nil
+            state.snapshot.indexActivity = activity
         }
         await publishLivePhotoProgress()
         state.nextScan = schedule.nextScanAt
@@ -394,11 +401,12 @@ actor SyncRuntime {
         // Do not cancel physical Photos submission: the engine persists its callback.
     }
 
-    func tick(force: Bool = false, includeAdvanced: Bool = true, retryModel: Bool = false) async {
+    func tick(force: Bool = false, includeAdvanced: Bool = true, retryModel: Bool = false, retryLivePhoto: Bool = false) async {
         guard !stopped else { return }
         refreshAuthorization()
         await applyAnalysisEligibility()
         guard eligibleForWork else { return }
+        if retryLivePhoto { manualLivePhotoRetryPending = true; nextLivePhotoWorkAt = nil }
         if retryModel { manualModelRetryPending = true }
         if engine == nil { startAdvancedGraphIfNeeded(); return }
         if eligibleForImageWork, let model = advancedGraph?.model as? any ModelExecutionRecovering {
@@ -425,6 +433,7 @@ actor SyncRuntime {
         }
         guard let engine else { return }
         if includeAdvanced { scheduleAdvancedWork(force: force) }
+        scheduleLivePhotoWork()
         let explicitForce = force
         let force = force || pendingAdvancedScan
         let now = now()
@@ -609,8 +618,8 @@ actor SyncRuntime {
         let executor = self.executor
         let engineReference = LivePhotoEngineReference()
         if let photos = graph.photos as? any LivePhotoPhotosGateway {
-            livePhotoInventory = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: livePhotoMetadata)
-            livePhotoCompletion = LivePhotoCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, executor: executor,
+            livePhotoInventory = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, wallNow: now)
+            livePhotoCompletion = LivePhotoCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, executor: executor, wallNow: now,
                 sourceAdmission: { engineReference.allows($0) })
             await livePhotoInventory?.setPaused(!eligibleForWork)
             await livePhotoCompletion?.setPaused(!eligibleForWork)
@@ -696,28 +705,48 @@ actor SyncRuntime {
         advancedWork = Task { await self.runAdvancedWork(graph, reconcile: reconcile) }
     }
 
+    private func scheduleLivePhotoWork() {
+        guard eligibleForWork, livePhotoWorkTask == nil, livePhotoInventory != nil,
+              nextLivePhotoWorkAt == nil || now() >= nextLivePhotoWorkAt! else { return }
+        livePhotoWorkTask = Task { await self.runLivePhotoWork() }
+    }
     private func runLivePhotoWork() async {
-        guard eligibleForWork, let inventory = livePhotoInventory, let completion = livePhotoCompletion else { return }
+        defer { livePhotoWorkTask = nil }
+        guard eligibleForWork, let inventory = livePhotoInventory, let completion = livePhotoCompletion,
+              let photos = advancedGraph?.photos as? any LivePhotoPhotosGateway else { return }
+        let admission = await photos.livePhotoReadAdmission()
+        guard eligibleForWork, admission == .available else { return }
         do {
-            _ = try await inventory.prepareContext()
+            // Catalog enumeration belongs exclusively to runAdvancedWork's serial entry.
+            let summary = try await inventory.summary()
+            guard summary.phase != .enumerating else { return }
             if !livePhotoRecoveryReady { try await completion.recover(); livePhotoRecoveryReady = true }
             guard eligibleForWork else { return }
-            try await inventory.resumeInitialInventory()
-            for _ in 0..<32 {
-                guard eligibleForWork else { break }
-                if try await !inventory.processNextInventoryItem(now: now()) { break }
+            if manualLivePhotoRetryPending {
+                manualLivePhotoRetryPending = false
+                try await inventory.retryAttention(now: now())
+                try await completion.retryAttention(now: now())
             }
-            for _ in 0..<4 {
-                guard eligibleForWork else { break }
-                if try await !completion.advanceNext(now: now()) { break }
-            }
-            livePhotoIssue = nil
+            _ = try await inventory.processNextInventoryItem(now: now())
+            guard eligibleForWork else { return }
+            _ = try await completion.advanceNext(now: now())
+            livePhotoIssue = nil; livePhotoDeferrals = 0; nextLivePhotoWorkAt = nil
         } catch is CancellationError { }
-        catch is ReadExecutorError { /* Physical reads remain owned; normal deferral. */ }
+        catch is ReadExecutorError { deferLivePhotoWork() }
+        catch LivePhotoResourceReadError.budgetBusy { deferLivePhotoWork() }
+        catch is PhotosAdmissionDeferred { deferLivePhotoWork() }
+        catch LivePhotoResourceReadError.resourceLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil }
+        catch LivePhotoResourceReadError.workingSetLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil }
         catch {
-            livePhotoIssue = SourceIssue(summary: "部分 Live Photo 暂时无法核实，稍后继续。", detail: error.localizedDescription, kind: .file)
+            nextLivePhotoWorkAt = now().addingTimeInterval(60)
+            livePhotoIssue = SourceIssue(summary: "部分 Live Photo 暂时无法处理，稍后自动重试。", detail: error.localizedDescription, kind: .file)
             logger?.log(["phase": "live-photo-work", "result": "waiting", "error": String(describing: error)])
         }
+        await publishLivePhotoProgress()
+    }
+    private func deferLivePhotoWork() {
+        livePhotoDeferrals += 1
+        nextLivePhotoWorkAt = now().addingTimeInterval(sourceDeferralDelay(count: livePhotoDeferrals))
     }
     private func publishLivePhotoProgress() async {
         do {
@@ -726,6 +755,9 @@ actor SyncRuntime {
         } catch {
             livePhotoIssue = SourceIssue(summary: "无法读取 Live Photo 处理进度，稍后继续。", detail: error.localizedDescription, kind: .file)
         }
+        state.snapshot.livePhotoActivities = []
+        if let inventory = livePhotoInventory { state.snapshot.livePhotoActivities.append(await inventory.activity()) }
+        if let completion = livePhotoCompletion { state.snapshot.livePhotoActivities.append(await completion.activity()) }
         state.snapshot.livePhotoIssue = livePhotoIssue ?? state.snapshot.livePhotoWork.issue
     }
 
@@ -739,7 +771,17 @@ actor SyncRuntime {
                 catch { logger?.log(["phase": "index-reconcile", "result": "waiting", "error": String(describing: error)]) }
             }
             if eligibleForImageWork { await graph.coordinator.processDueWork(now: now()) }
-            await runLivePhotoWork()
+            // The gateway owns a single catalog session. Keep both enumerators here.
+            if eligibleForWork {
+                do {
+                    if let inventory = livePhotoInventory, try await inventory.summary().phase == .enumerating {
+                        try await inventory.resumeInitialInventory()
+                    }
+                }
+                catch is CancellationError { }
+                catch { livePhotoIssue = SourceIssue(summary: "图库分析暂时无法继续，稍后自动重试。", detail: error.localizedDescription, kind: .file) }
+            }
+            scheduleLivePhotoWork()
             if eligibleForWork, let engine {
                 do {
                     let reopened = try await engine.processLegacySkips(limit: graph.configuration.resources.catalogBatchSize)

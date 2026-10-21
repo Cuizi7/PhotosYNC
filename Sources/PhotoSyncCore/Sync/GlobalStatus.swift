@@ -1,23 +1,22 @@
 public enum GlobalStatus: String, CaseIterable, Sendable {
-    case unconfigured, error, paused, waiting, running, completed
+    case preparing, error, paused, waiting, running, completed
 
-    /// Configuration includes enabled sources or independent historical Live Photo work.
-    /// Priority is fixed: unconfigured, then anything a person must handle (missing Photos
-    /// authorization and engine-level errors), then pause, then waiting for a source, then work.
-    /// A missing Photos permission is not a wait for a directory to come back: only the user can
-    /// grant it, so it must not hide behind the waiting symbol.
-    public static func resolve(configured: Bool, error: Bool, paused: Bool, waiting: Bool, running: Bool, authorized: Bool = true) -> Self {
-        guard configured else { return .unconfigured }
-        if !authorized { return .error }
-        if error { return .error }
+    /// Global blocks, pause and unknown writes precede real work; local waits do not hide it.
+    public static func resolve(configured: Bool, error: Bool, paused: Bool, waiting: Bool, running: Bool,
+                               authorized: Bool = true, preparing: Bool = false, unknownMutation: Bool = false,
+                               requiresAttention: Bool = false) -> Self {
+        if !authorized || error || !configured { return .error }
         if paused { return .paused }
-        if waiting { return .waiting }
-        return running ? .running : .completed
+        if unknownMutation { return .waiting }
+        if running { return .running }
+        if preparing { return .preparing }
+        if requiresAttention { return .error }
+        return waiting ? .waiting : .completed
     }
 
     public var symbol: String {
         switch self {
-        case .unconfigured: return "photo"
+        case .preparing: return "hourglass"
         case .error: return "exclamationmark.triangle"
         case .paused: return "pause.circle"
         case .waiting: return "clock"
@@ -28,12 +27,12 @@ public enum GlobalStatus: String, CaseIterable, Sendable {
 
     public var description: String {
         switch self {
-        case .unconfigured: return "未配置来源"
-        case .error: return "同步异常"
+        case .preparing: return "正在准备"
+        case .error: return "需要处理"
         case .paused: return "已暂停"
-        case .waiting: return "等待中"
+        case .waiting: return "等待恢复"
         case .running: return "正在同步"
-        case .completed: return "已完成"
+        case .completed: return "同步完成"
         }
     }
 }

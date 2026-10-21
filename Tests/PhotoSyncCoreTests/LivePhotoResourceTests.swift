@@ -2,6 +2,41 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoResourceTests: XCTestCase {
+    func testKnownResourceLimitSurvivesLogicalTimeoutBeforeTerminal() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "started"), cancelled = expectation(description: "cancelled")
+        let requester = ControlledCloudRequester(started: started, cancelled: cancelled), executor = ReadExecutor()
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor, requestTimeout: .seconds(1), logicalTimeout: .milliseconds(40))
+        let budget = LivePhotoResourceBudget(maxBytes: 2)
+        let ref = LivePhotoResourceRef.photos(contextID: UUID(), assetID: "oversized", resourceKey: "original", revision: "r1")
+        let task = Task { try await reader.read(resource: ref, purpose: .inventory, budget: budget) }
+        await fulfillment(of: [started, cancelled], timeout: 2)
+        do { _ = try await task.value; XCTFail("Expected known limit") }
+        catch { XCTAssertEqual(error as? LivePhotoResourceReadError, .resourceLimit(bytes: 3)) }
+        let held = await executor.snapshot(); XCTAssertEqual(held.physicalOccupancy, 1)
+        requester.finish()
+        let released = await engineEventually { await executor.snapshot().physicalOccupancy == 0 }; XCTAssertTrue(released)
+    }
+
+    func testCancelBeforeRequestHandleRegistrationIsSentExactlyOnce() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "request entered"), cancelled = expectation(description: "late cancel handle")
+        let gate = DispatchSemaphore(value: 0)
+        let requester = ControlledCloudRequester(started: started, cancelled: cancelled, returnGate: gate)
+        let budget = LivePhotoResourceBudget()
+        let executor = ReadExecutor(maxConcurrentOperations: 1)
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor)
+        let task = Task { try await reader.read(resource: resource(), purpose: .inventory, budget: budget) }
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Expected cancellation") } catch { }
+        gate.signal()
+        await fulfillment(of: [cancelled], timeout: 2)
+        requester.sendLateData(); XCTAssertEqual(budget.reservedBytes, 3)
+        requester.finish()
+        let drained = await engineEventually { await executor.snapshot().physicalOccupancy == 0 && budget.reservedBytes == 0 }
+        XCTAssertTrue(drained); XCTAssertEqual(requester.cancelCount, 1)
+    }
     func testInvalidContainerHintCannotCreatePathsOrStartResourceRequest() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let requester = BufferedLivePhotoRequester(chunks: [Data([1])], fileExtension: "../mov")
@@ -66,12 +101,33 @@ final class LivePhotoResourceTests: XCTestCase {
         XCTAssertTrue(drained)
         XCTAssertEqual(budget.reservedBytes, 0)
     }
-    func testInventoryNeverEnablesNetwork() async throws {
+    func testInventoryAndCompletionAllowCloudOriginals() async throws {
         let requester = BufferedLivePhotoRequester(chunks: [Data([1,2,3])])
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let reader = LivePhotoRawResourceReader(requester: requester, storage: PhotosResourceStorage(root: root.appendingPathComponent("raw")))
         let lease = try await reader.read(resource: resource(), purpose: .inventory, budget: LivePhotoResourceBudget())
-        XCTAssertEqual(try Data(contentsOf: lease.url), Data([1,2,3])); XCTAssertEqual(requester.networkFlags, [false])
+        XCTAssertEqual(try Data(contentsOf: lease.url), Data([1,2,3]))
+        _ = try await reader.read(resource: resource(), purpose: .completion, budget: LivePhotoResourceBudget())
+        XCTAssertEqual(requester.networkFlags, [true, true])
+    }
+
+    func testCallerCancellationReachesPhysicalRequestAndRetainsOwnership() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "physical request"), cancelled = expectation(description: "physical cancel")
+        let requester = ControlledCloudRequester(started: started, cancelled: cancelled)
+        let executor = ReadExecutor(maxConcurrentOperations: 1)
+        let budget = LivePhotoResourceBudget()
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor)
+        let task = Task { try await reader.read(resource: resource(), purpose: .inventory, budget: budget) }
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Cancelled caller succeeded") } catch is CancellationError { }
+        await fulfillment(of: [cancelled], timeout: 0.5)
+        XCTAssertEqual(budget.reservedBytes, 3)
+        let occupied = await executor.snapshot(); XCTAssertEqual(occupied.physicalOccupancy, 1)
+        requester.finish(); requester.finish()
+        let drained = await engineEventually { await executor.snapshot().physicalOccupancy == 0 && budget.reservedBytes == 0 }
+        XCTAssertTrue(drained); XCTAssertEqual(requester.cancelCount, 1)
     }
 
     func testCombinedResourcesRespect512MiB() async throws {
@@ -100,7 +156,8 @@ final class LivePhotoResourceTests: XCTestCase {
         let requester = HeldLivePhotoRequester(started: started)
         let executor = ReadExecutor(maxConcurrentOperations: 1, defaultTimeout: .seconds(0.05))
         let budget = LivePhotoResourceBudget()
-        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor)
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor,
+            requestTimeout: .seconds(0.02), logicalTimeout: .seconds(0.05))
         let task = Task { try await reader.read(resource: resource(), purpose: .inventory, budget: budget) }
         await fulfillment(of: [started], timeout: 2)
         do { _ = try await task.value; XCTFail("Expected logical timeout") } catch { }
@@ -109,6 +166,43 @@ final class LivePhotoResourceTests: XCTestCase {
         requester.finish()
         let released = await engineEventually { budget.reservedBytes == 0 }
         XCTAssertTrue(released)
+    }
+
+    func testCloudDeadlineCancelsOnceAndDrainsUntilTerminal() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "request"), cancelled = expectation(description: "deadline cancel")
+        let requester = ControlledCloudRequester(started: started, cancelled: cancelled)
+        let executor = ReadExecutor(maxConcurrentOperations: 1, defaultTimeout: .seconds(0.01))
+        let budget = LivePhotoResourceBudget()
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor,
+            requestTimeout: .seconds(0.05), logicalTimeout: .seconds(0.1))
+        let task = Task { try await reader.read(resource: resource(), purpose: .inventory, budget: budget) }
+        await fulfillment(of: [started, cancelled], timeout: 2)
+        XCTAssertEqual(budget.reservedBytes, 3)
+        let admission = await reader.admission(); XCTAssertEqual(admission, .draining)
+        requester.sendLateData(); XCTAssertEqual(budget.reservedBytes, 3)
+        do { _ = try await task.value; XCTFail("Expected bounded logical timeout") } catch { }
+        do { _ = try await reader.read(resource: resource(), purpose: .inventory, budget: budget); XCTFail("Draining request was replaced") }
+        catch let error as ReadExecutorError { XCTAssertEqual(error, .sourceBusy) }
+        requester.finish()
+        let drained = await engineEventually { await executor.snapshot().physicalOccupancy == 0 && budget.reservedBytes == 0 }
+        XCTAssertTrue(drained)
+        let final = await reader.admission(); XCTAssertEqual(final, .available)
+        XCTAssertEqual(requester.cancelCount, 1)
+    }
+
+    func testCloudReadOutlivesExecutorDefaultWithoutLosingSuccess() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "request")
+        let requester = ControlledCloudRequester(started: started)
+        let executor = ReadExecutor(maxConcurrentOperations: 1, defaultTimeout: .zero)
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor)
+        let task = Task { try await reader.read(resource: resource(), purpose: .inventory, budget: LivePhotoResourceBudget()) }
+        await fulfillment(of: [started], timeout: 2)
+        requester.finish()
+        let lease = try await task.value
+        XCTAssertEqual(try Data(contentsOf: lease.url), Data([1,2,3]))
+        XCTAssertEqual(requester.cancelCount, 0)
     }
 
     func testExactComparisonRejectsSameIDWithDifferentBytes() throws {
@@ -129,6 +223,30 @@ final class LivePhotoResourceTests: XCTestCase {
     }
 
     private func resource() -> LivePhotoResourceRef { .photos(contextID: UUID(), assetID: "asset", resourceKey: "original", revision: "r1") }
+}
+
+final class ControlledCloudRequester: LivePhotoResourceRequesting, @unchecked Sendable {
+    private let lock = NSLock()
+    private let started: XCTestExpectation
+    private let cancelled: XCTestExpectation?
+    private let returnGate: DispatchSemaphore?
+    private var completion: (@Sendable (Error?) -> Void)?
+    private var receive: (@Sendable (Data) -> Void)?
+    private var cancellations = 0
+    var cancelCount: Int { lock.lock(); defer { lock.unlock() }; return cancellations }
+    init(started: XCTestExpectation, cancelled: XCTestExpectation? = nil, returnGate: DispatchSemaphore? = nil) { self.started = started; self.cancelled = cancelled; self.returnGate = returnGate }
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+                 completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
+        lock.lock(); self.completion = completion; self.receive = receive; lock.unlock()
+        receive(Data([1,2,3])); started.fulfill()
+        if let returnGate { _ = returnGate.wait(timeout: .now() + 5) }
+        return { [self] in
+            lock.lock(); cancellations += 1; lock.unlock()
+            cancelled?.fulfill()
+        }
+    }
+    func finish(_ error: Error? = nil) { lock.lock(); let callback = completion; completion = nil; lock.unlock(); callback?(error) }
+    func sendLateData() { lock.lock(); let callback = receive; lock.unlock(); callback?(Data([4,5,6])) }
 }
 
 func knownLivePhotoSnapshot(revision: String = "r1") -> LivePhotoPreservationSnapshot {

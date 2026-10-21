@@ -6,11 +6,33 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testConcurrentProgressIsConsistentAcrossMenuSettingsAndDetails() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+        model.state.snapshot.indexProgress = .init(state: .updating, totalsKnown: true, totalAssets: 100, readyAssets: 50, totalRepresentations: 300, readyRepresentations: 250, excludedAssets: 0, issue: nil)
+        model.state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 2, unresolved: 626, retryWaiting: 626)
+        model.state.snapshot.livePhotoActivities = [.working(.identification)]
+        for (look, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            for (name, view, width) in [("menu", AnyView(StatusMenu(model: model)), CGFloat(320)), ("settings", AnyView(SourceSettings(model: model)), CGFloat(600)), ("details", AnyView(SyncDetailsContent(snapshot: model.state.snapshot)), CGFloat(300))] {
+                _ = try UIReviewCapture.render(view, width: width, appearance: appearance) { host, _ in
+                    let text = try self.allScrolledText(in: host)
+                    XCTAssertTrue(text.contains("16222") && text.contains("50"), text)
+                    XCTAssertTrue(text.contains("Live Photo") && text.contains("索引"), text)
+                    for obsolete in ["已清点", "已识别", "待核实", "正在下载", "不会下载"] { XCTAssertFalse(text.contains(obsolete), text) }
+                    if let folder = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] {
+                        let output = URL(fileURLWithPath: folder); try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+                        _ = try UIReviewCapture.write(host, to: output.appendingPathComponent("dual-\(look)-\(name).png"))
+                    }
+                }
+            }
+        }
+    }
     func testHistoricalLivePhotoProgressFitsExistingMenuAndDetails() throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let model = try makeUIReviewModel(scenario: .analyzing, root: root)
         model.state.sources = []
         model.state.snapshot.indexProgress = nil
+        model.state.snapshot.livePhotoActivities = [.working(.identification)]
         model.state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 200000, identified: 120000, unresolved: 25)
         for (view, width) in [(AnyView(StatusMenu(model: model)), CGFloat(320)), (AnyView(SyncDetailsContent(snapshot: model.state.snapshot)), CGFloat(300))] {
             let height = try measure(view, width: width, minimumHeight: 0) { host in
@@ -27,12 +49,13 @@ final class AppViewTests: XCTestCase {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = try makeUIReviewModel(scenario: .analyzing, root: root)
-        model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
+        model.state.snapshot.indexActivity = .working
+            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
             totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
             readyRepresentations: 6789, excludedAssets: 99, issue: nil)
         for (view, width) in [(AnyView(StatusMenu(model: model)), CGFloat(320)), (AnyView(SyncDetailsContent(snapshot: model.state.snapshot)), CGFloat(300))] {
             _ = try measure(view, width: width, minimumHeight: 0) { host in
-                XCTAssertEqual(SyncStatusPresentation(snapshot: model.state.snapshot).analysis?.progressText, "已分析 2192 / 15702 张")
+                XCTAssertEqual(SyncStatusPresentation(snapshot: model.state.snapshot).progressRows.first?.progressText, "已分析 2192 / 15702 张")
                 let texts = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
                 XCTAssertTrue(texts.contains("已分析") && texts.contains("2192") && texts.contains("15702"), texts)
                 XCTAssertFalse(texts.contains("6789"), texts)
@@ -495,6 +518,7 @@ final class AppViewTests: XCTestCase {
             ("扫描目录与元数据", true, "目录扫描尚未完成")]
         for item in cases {
             model.state.snapshot.sourcePhases[id] = item.phase
+            model.state.snapshot.sourceActivities[id] = item.phase == "扫描目录与元数据" ? .scanning : nil
             model.state.snapshot.isPaused = item.paused
             XCTAssertEqual(model.isScanningDirectory(for: id), item.expected == "正在扫描目录")
             for view in [AnyView(StatusMenu(model: model)), AnyView(SourceSettings(model: model))] {
@@ -552,14 +576,14 @@ final class AppViewTests: XCTestCase {
             snapshot.isPaused = true
             _ = try measure(SyncDetailsContent(snapshot: snapshot), width: 300, minimumHeight: 0) { host in
                 let text = try self.allScrolledText(in: host)
-                XCTAssertEqual(text.contains("图库分析"), state != .ready, text)
+                XCTAssertEqual(text.contains("视觉索引"), state != .ready, text)
                 XCTAssertTrue(text.contains("已发现") && text.contains("文件") && text.contains("已导入"), text)
                 XCTAssertTrue(text.contains("本次扫描"), text)
                 XCTAssertTrue(text.contains("统计当前启用来源") && text.contains("记录") && text.contains("此前扫描"), text)
                 XCTAssertTrue(text.contains("仅统计本轮扫描事件"), text)
                 if state != .ready {
-                    XCTAssertTrue(text.contains("统计 Photos 图库中的项目"), text)
-                    XCTAssertTrue((state == .preparing ? text.contains("正在读取图库") : (text.contains("已分析") && text.contains("0"))), text)
+                    XCTAssertTrue(text.contains("避免重复导入"), text)
+                    XCTAssertTrue((text.contains("已分析") && text.contains("0")), text)
                 }
                 if state == .waiting { XCTAssertTrue(text.contains("iCloud"), text) }
                 XCTAssertFalse(text.contains("888"), text)
@@ -594,10 +618,12 @@ final class AppViewTests: XCTestCase {
             let popup = try XCTUnwrap(self.waitForWindow(excluding: before))
             defer { popup.orderOut(nil); popup.close() }
             let content = try XCTUnwrap(popup.contentView)
+            model.state.snapshot.indexActivity = .working
             model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
                 totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
                 readyRepresentations: 6789, excludedAssets: 99, issue: nil)
             XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { $0.contains("2192") && $0.contains("15702") } ?? false })
+            model.state.snapshot.indexActivity = .working
             model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
                 totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
                 readyRepresentations: 45000, excludedAssets: 99, issue: nil)
@@ -813,7 +839,7 @@ extension AppViewTests {
         model.state.snapshot.blockingSummary = "Photos 提交结果尚未确认。"
         model.state.snapshot.blockingError = "synthetic unknown result"
         model.state.snapshot.recoveryHint = .uncertainSubmission(message: "synthetic unknown result")
-        XCTAssertEqual(model.statusDescription, "同步异常")
+        XCTAssertEqual(model.statusDescription, "等待恢复")
         model.state.snapshot.summaryError = "synthetic stale summary"
         XCTAssertEqual(try XCTUnwrap(SyncProgressMetrics(summary: model.state.snapshot.summary)).processed, 200)
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
@@ -835,6 +861,7 @@ extension AppViewTests {
         let summary = NSHostingView(rootView: StatusMenuSingleLine(text: "已处理 1999998 / 已发现 3000004"))
         XCTAssertLessThanOrEqual(summary.fittingSize.width, 266)
         for totalsKnown in [true, false] {
+            model.state.snapshot.indexActivity = .working
             model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: totalsKnown,
                 totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
                 readyRepresentations: 100000, excludedAssets: 0, issue: nil)
@@ -849,12 +876,13 @@ extension AppViewTests {
     func testUnavailableSourceKeepsRecoveryHeadlineAndAnalysisInNativeMenu() async throws {
         let model = try await makeModel(sourceCount: 1)
         for state in [IndexState.preparing, .updating, .waiting, .ready] {
+            model.state.snapshot.indexActivity = state == .ready ? .idle : .working
             model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
                 totalAssets: 2, readyAssets: 1, totalRepresentations: 3,
                 readyRepresentations: 1, excludedAssets: 0, issue: nil)
-            XCTAssertEqual(model.status, .waiting)
-            XCTAssertEqual(model.statusDescription, "等待恢复")
-            XCTAssertEqual(model.analysis != nil, state != .ready)
+            XCTAssertEqual(model.status, state == .ready ? .waiting : .preparing)
+            XCTAssertEqual(model.statusDescription, state == .ready ? "等待恢复" : "正在准备")
+            XCTAssertEqual(!model.progressRows.isEmpty, state != .ready)
             for appearance in [NSAppearance.Name.aqua, .darkAqua] {
                 let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
                 XCTAssertEqual(size.width, 320, accuracy: 1)
@@ -876,10 +904,11 @@ extension AppViewTests {
             XCTAssertLessThanOrEqual(size.width, 292, "Critical row must fit at native caption size: \(text)")
             XCTAssertLessThanOrEqual(size.height, 16, "Critical row must remain a single native line")
         }
-        XCTAssertEqual(model.counterNotes.count, 3)
+        XCTAssertEqual(model.counterNotes.count, 4)
         let details = NSHostingView(rootView: SyncDetailsContent(snapshot: model.state.snapshot))
         XCTAssertLessThanOrEqual(details.fittingSize.width, 320)
         for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
+            model.state.snapshot.indexActivity = state == .ready ? .idle : .working
             model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
                 totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
                 readyRepresentations: 100000, excludedAssets: 0, issue: state == .waiting ? cloud : nil)
@@ -887,7 +916,7 @@ extension AppViewTests {
                 let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
                 XCTAssertEqual(size.width, 320, accuracy: 1)
                 XCTAssertLessThanOrEqual(size.height, 680)
-                XCTAssertEqual(model.analysis == nil, state == .ready)
+                XCTAssertEqual(model.progressRows.isEmpty, state == .ready)
                 try renderMenu(model, name: "\(state)-\(appearance.rawValue)", appearance: appearance)
             }
         }

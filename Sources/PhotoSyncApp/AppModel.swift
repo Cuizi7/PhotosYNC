@@ -18,7 +18,7 @@ final class AppModel: ObservableObject {
     @Published var notificationsEnabled = false
     @Published private(set) var notificationIssue: NotificationPermissionWarning?
     @Published var ready = false
-    @Published var demoStatus: GlobalStatus = .unconfigured
+    @Published var demoStatus: GlobalStatus = .error
     @Published private(set) var qaMode: GUIQAMode?
     @Published private(set) var qaRoot: URL?
     @Published private(set) var qaBlockedReason: String?
@@ -152,6 +152,7 @@ final class AppModel: ObservableObject {
 
     var status: GlobalStatus {
         if qaBlockedReason != nil { return .error }
+        if !ready { return .preparing }
         if demo { return demoStatus }
         let presentation = SyncStatusPresentation(snapshot: state.snapshot)
         return presentation.globalStatus(
@@ -167,9 +168,15 @@ final class AppModel: ObservableObject {
         Set(state.sources.filter(\.enabled).map(\.id))
     }
     private var hasBlockingStatusError: Bool {
-        error != nil || state.message != nil || state.snapshot.blockingError != nil ||
+        error != nil || state.message != nil || (state.snapshot.blockingError != nil && !hasUncertainSubmissionHint) ||
             state.snapshot.summaryError != nil
     }
+    private var hasUncertainSubmissionHint: Bool {
+        if case .checkpointFailure = state.snapshot.recoveryHint { return false }
+        if case .uncertainSubmission = state.snapshot.recoveryHint { return true }
+        return state.snapshot.unknownSubmissionBlock
+    }
+    var engineBlockingSummary: String? { hasUncertainSubmissionHint ? nil : state.snapshot.blockingSummary }
     /// Only a completed bootstrap can tell "not authorized" from "not read yet"; before that the
     /// icon must not claim the user has to act.
     var needsPhotosAuthorization: Bool { ready && !state.authorized }
@@ -188,14 +195,14 @@ final class AppModel: ObservableObject {
 
     /// A submission or work on another source is not evidence that this directory is scanning.
     func isScanningDirectory(for sourceID: UUID) -> Bool {
-        !state.snapshot.isPaused && state.snapshot.sourcePhases[sourceID] == "扫描目录与元数据"
+        !state.snapshot.isPaused && state.snapshot.sourceActivities[sourceID] == .scanning
     }
 
     func fileIssueCount(for sourceID: UUID) -> Int {
         state.snapshot.sourceFileIssueCounts[sourceID] ?? 0
     }
     var statusDescription: String {
-        if !ready { return "正在读取配置" }
+        if !ready { return "正在准备" }
         if qaBlockedReason != nil || demo { return status.description }
         let currentStatus = status
         // A global failure or missing Photos access must keep its generic error heading even if
@@ -208,7 +215,7 @@ final class AppModel: ObservableObject {
     }
     /// Headline text only: it must read as plain language, never as a system error message.
     var syncDetail: String? {
-        authorizationIssue ?? state.snapshot.blockingSummary ?? summaryFailureNotice ?? state.message ?? state.warning ?? error
+        authorizationIssue ?? engineBlockingSummary ?? summaryFailureNotice ?? state.message ?? error ?? SyncStatusPresentation(snapshot: state.snapshot).statusReason(for: status, enabledSourceIDs: enabledSourceIDs) ?? state.warning
     }
     /// Raw system text behind the headline, offered as a tooltip for diagnosis and support.
     var syncDetailHelp: String? {
@@ -239,7 +246,7 @@ final class AppModel: ObservableObject {
             return "无法请求通知权限：\(message)。请稍后重试或在系统设置中检查 PhotosYNC 通知。"
         }
     }
-    var analysis: SyncStatusPresentation.Analysis? { SyncStatusPresentation(snapshot: state.snapshot).analysis }
+    var progressRows: [SyncStatusPresentation.PreparationProgress] { SyncStatusPresentation(snapshot: state.snapshot).progressRows }
     var counterNotes: [String] { SyncStatusPresentation(snapshot: state.snapshot).summaryNotes }
     var counters: String { SyncStatusPresentation(snapshot: state.snapshot).baseSummary }
     var scanDescription: String { SyncStatusPresentation(snapshot: state.snapshot).scan }
@@ -297,7 +304,7 @@ final class AppModel: ObservableObject {
     }
 
     func authorize() { guard !demo else { return }; Task { await runtime?.requestAuthorization() } }
-    func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true, retryModel: true) } }
+    func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true, retryModel: true, retryLivePhoto: true) } }
     func togglePause() {
         guard canTogglePause else { return }
         Task {

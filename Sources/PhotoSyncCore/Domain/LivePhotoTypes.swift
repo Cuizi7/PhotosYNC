@@ -122,6 +122,8 @@ public struct LivePhotoVerification: Codable, Equatable, Sendable {
     }
 }
 
+public enum LivePhotoDeferralReason: String, Codable, Sendable { case protectedInformation, workingSetLimit, otherFailure }
+
 public struct LivePhotoOperation: Codable, Equatable, Sendable {
     public enum Stage: String, Codable, Sendable { case planned, creating, created, verifying, readyToRetire, retiring, complete, blocked }
     public enum Evidence: String, Codable, Sendable { case notSubmitted, submitted, confirmed, unknown, failed }
@@ -148,6 +150,8 @@ public struct LivePhotoOperation: Codable, Equatable, Sendable {
     public var verification: LivePhotoVerification?
     public var error: String?
     public var nextRetryAt: Date?
+    public var deferralReason: LivePhotoDeferralReason?
+    public var limitedResources: [LivePhotoResourceRef]?
     public init(id: UUID = UUID(), groupID: UUID = UUID(), context: LibraryContext, contentIdentifier: String,
                 photo: LivePhotoResourceRef, motion: LivePhotoResourceRef, sourceFileIDs: [UUID] = [], oldAssetIDs: [String] = []) {
         self.id = id; self.groupID = groupID; self.context = context; self.contentIdentifier = contentIdentifier
@@ -157,21 +161,34 @@ public struct LivePhotoOperation: Codable, Equatable, Sendable {
     var releasesMembers: Bool { stage == .complete || (stage == .blocked && !holdsUnknownMutation && targetID == nil) }
 }
 
+public enum LivePhotoInventoryRetryPolicy: Equatable, Sendable {
+    case automatic(nextRetryAt: Date)
+    case requiresAttention
+}
+
 public enum LivePhotoInventoryPhase: String, Codable, Sendable { case enumerating, identifying, completed }
 public struct LivePhotoInventorySummary: Equatable, Sendable {
     public var phase: LivePhotoInventoryPhase
     public var inventoried: Int
     public var identified: Int
     public var unresolved: Int
+    public var pending: Int
+    public var retryWaiting: Int
+    public var requiresAttention: Int
+    public var nextRetryAt: Date?
     public var completedAt: Date?
-    public init(phase: LivePhotoInventoryPhase = .enumerating, inventoried: Int = 0, identified: Int = 0, unresolved: Int = 0, completedAt: Date? = nil) {
+    public init(phase: LivePhotoInventoryPhase = .enumerating, inventoried: Int = 0, identified: Int = 0, unresolved: Int = 0, pending: Int = 0, retryWaiting: Int = 0, requiresAttention: Int = 0, nextRetryAt: Date? = nil, completedAt: Date? = nil) {
+        self.pending = pending; self.retryWaiting = retryWaiting; self.requiresAttention = requiresAttention; self.nextRetryAt = nextRetryAt
         self.phase = phase; self.inventoried = inventoried; self.identified = identified; self.unresolved = unresolved; self.completedAt = completedAt
     }
 }
 public struct LivePhotoWorkSummary: Equatable, Sendable {
     public var activeGroups = 0, awaitingVerification = 0, awaitingRetirement = 0
     public var unknownMutation = false
+    public var ownedImportingFiles = 0
     public var limitedGroups = 0
+    public var retryWaitingGroups = 0, requiresAttentionGroups = 0
+    public var nextRetryAt: Date?
     public var issue: SourceIssue?
     public init() {}
 }
@@ -184,4 +201,15 @@ public struct LivePhotoAssetPage: Sendable {
     public init(context: LibraryContext, generation: Int, assets: [LivePhotoAssetDescriptor], nextOffset: Int?) {
         self.context = context; self.generation = generation; self.assets = assets; self.nextOffset = nextOffset
     }
+}
+
+public enum IndexActivity: Equatable, Sendable { case idle, working, waiting }
+public enum SourceActivity: Equatable, Sendable { case scanning, submitting, waiting }
+public enum LivePhotoActivityKind: Equatable, Sendable { case identification, completion }
+public enum LivePhotoActivity: Equatable, Sendable {
+    case idle
+    case working(LivePhotoActivityKind)
+    case waiting(nextRetryAt: Date?)
+    case draining
+    case requiresAttention(SourceIssue)
 }

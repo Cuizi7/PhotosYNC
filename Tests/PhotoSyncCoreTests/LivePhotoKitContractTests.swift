@@ -3,6 +3,60 @@ import Photos
 @testable import PhotoSyncCore
 
 final class LivePhotoKitContractTests: XCTestCase {
+    func testUnknownCoverageWhileInspectingCannotSaveIdentityObservation() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let started = expectation(description: "raw read"), requester = ControlledCloudRequester(started: started)
+        let lifecycle = LivePhotoKitLifecycle()
+        lifecycle.initialAssets = [.init(identifier: "asset-0", candidates: [cloudCandidate("asset-0")])]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, livePhotoRawReader: .init(requester: requester, storage: .init(root: f.root.appendingPathComponent("raw"))), livePhotoResourceIsCurrent: { _ in true })
+        try await gateway.restoreInventoryContext(f.photos.context); _ = try await gateway.candidateSnapshot()
+        await f.photos.useNativeRead { ref, purpose, budget in try await gateway.readLivePhotoResource(ref, purpose: purpose, budget: budget) }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: MutatingInventoryMetadata {
+            gateway.invalidateObservationContinuity(); _ = try await gateway.candidateSnapshot()
+        })
+        try await c.resumeInitialInventory()
+        let task = Task { try await c.processNextInventoryItem(now: Date()) }
+        await fulfillment(of: [started], timeout: 2); requester.finish()
+        do { _ = try await task.value; XCTFail("Unknown coverage accepted during metadata inspection") } catch { }
+        let summary = try await c.summary(); XCTAssertEqual(summary.identified, 0); XCTAssertEqual(summary.pending, 1)
+    }
+    func testCloudResourceReadAcceptsUnrelatedChangesAndRejectsInvalidation() async throws {
+        for mode in ["unrelated", "target", "deleted", "unknown", "revision", "permission"] {
+            let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+            let started = expectation(description: "read " + mode)
+            let requester = ControlledCloudRequester(started: started)
+            let lifecycle = LivePhotoKitLifecycle(), validity = CloudResourceValidity()
+            lifecycle.initialAssets = [.init(identifier: "target", candidates: [cloudCandidate("target")])]
+            let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")))
+            let gateway = PhotoKitGateway(lifecycle: lifecycle, livePhotoRawReader: reader, livePhotoResourceIsCurrent: { _ in validity.current })
+            _ = try await gateway.candidateSnapshot()
+            let context = try await gateway.livePhotoLibraryContext()
+            let ref = LivePhotoResourceRef.photos(contextID: context.id, assetID: "target", resourceKey: "original", revision: "r1")
+            let budget = LivePhotoResourceBudget()
+            let task = Task {
+                let lease = try await gateway.readLivePhotoResource(ref, purpose: .inventory, budget: budget)
+                return try Data(contentsOf: lease.url)
+            }
+            await fulfillment(of: [started], timeout: 2)
+            if mode == "permission" { lifecycle.access = .denied }
+            else if mode == "revision" { validity.invalidate() }
+            else {
+                if mode == "unrelated" { lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [.init(identifier: "other", candidates: [cloudCandidate("other")])], changedAssets: []) }
+                if mode == "target" { lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [.init(identifier: "target", candidates: [cloudCandidate("target")])]) }
+                if mode == "deleted" { lifecycle.nextChange = .incremental(removedAssetIDs: ["target"], insertedAssets: [], changedAssets: []) }
+                gateway.recordLibraryChangeForTesting()
+                _ = try await gateway.candidateSnapshot()
+            }
+            requester.finish()
+            if mode == "unrelated" {
+                let bytes = try await task.value
+                XCTAssertEqual(bytes, Data([1,2,3]))
+            } else {
+                do { _ = try await task.value; XCTFail("Accepted " + mode) } catch { }
+            }
+            let released = await engineEventually { budget.reservedBytes == 0 }; XCTAssertTrue(released, mode)
+        }
+    }
     func testGuardedOrdinaryCallDefersBehindRecoveredPairedBlock() async throws {
         let f = try await contractFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
         await f.gateway.setLivePhotoRecoveryBlocks([UUID()])
@@ -207,7 +261,10 @@ final class LivePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
     var entered: XCTestExpectation?
     var gate: DirectoryTestGate?
     var failure: Error?
-    func currentAccess() -> PhotoKitAccess { .authorized }
+    var access: PhotoKitAccess = .authorized
+    var initialAssets: [PhotoKitCandidateAsset] = []
+    var nextChange: PhotoKitCandidateIndexChange = .reload
+    func currentAccess() -> PhotoKitAccess { access }
     func requestReadWriteAuthorization() async -> PhotoKitAccess { .authorized }
     func isAvailable() -> Bool { true }
     var emitInventoryOnLoad = false
@@ -219,9 +276,9 @@ final class LivePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
             let context = attachment.1()
             try attachment.0.enqueueLivePhotoCatalogAssets(context: context, assets: [livePhotoAsset(context: context, id: "new-on-start")])
         }
-        return []
+        return initialAssets
     }
-    func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange { .reload }
+    func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange { nextChange }
     func fetch(identifier: String) throws -> Bool { !missingIDs.contains(identifier) }
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         guard beforeMutation() else { return .preventedBeforeMutation }
@@ -234,4 +291,15 @@ final class LivePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
         do { try onPlaceholder("created") } catch { return .checkpointFailed }
         return .committed(identifier: "created")
     }
+}
+
+private final class CloudResourceValidity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+    var current: Bool { lock.lock(); defer { lock.unlock() }; return valid }
+    func invalidate() { lock.lock(); valid = false; lock.unlock() }
+}
+
+private func cloudCandidate(_ key: String) -> MatchCandidate {
+    MatchCandidate(key: key, metadata: MediaMetadata(filename: "fixture.jpg", kind: .image, captureSecond: nil, rawCaptureTime: nil, make: nil, model: nil, width: nil, height: nil, duration: nil))
 }

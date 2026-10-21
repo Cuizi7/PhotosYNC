@@ -5,6 +5,61 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testRestartAndWakeDoNotAutomaticallyReopenHeldInventory() async throws {
+        let f = try await inventoryFixture(count: 1), config = try p8Configuration()
+        let inventory = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: UnresolvableInventoryMetadata())
+        try await inventory.resumeInitialInventory(); _ = try await inventory.processNextInventoryItem(now: Date())
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, livePhotoMetadata: UnresolvableInventoryMetadata(), now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        for _ in 0..<3 { await runtime.tick(force: true); await runtime.waitForRound() }
+        let reads = await f.photos.resourceReads; XCTAssertEqual(reads, 1, "Forced reconciliation on launch/wake is not an explicit retry")
+        await runtime.tick(force: true, retryLivePhoto: true); await runtime.waitForRound()
+        let retried = await f.photos.resourceReads; XCTAssertEqual(retried, 2)
+        await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
+    }
+    func testVisualAndLivePhotoCatalogsCannotReplaceEachOthersSession() async throws {
+        for holdVisual in [true, false] {
+            let f = try await inventoryFixture(count: 0), config = try p8Configuration(), gate = InventoryReadGate()
+            await f.photos.holdCatalog(gate, visual: holdVisual)
+            let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+                AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                    budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+            }, now: { Date() }, authorized: { true })
+            try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true)
+            let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+            for _ in 0..<3 { await runtime.tick(force: true) }
+            let begins = await f.photos.catalogBeginCount; XCTAssertEqual(begins, holdVisual ? 1 : 2)
+            await gate.release(); await runtime.waitForRound()
+            await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
+        }
+    }
+    func testHeldLivePhotoReadDoesNotBlockReconciliationOrSourceScan() async throws {
+        let f = try await inventoryFixture(count: 1), config = try p8Configuration(), gate = InventoryReadGate()
+        let source = f.root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        _ = try await f.store.registerSource(url: source)
+        await f.photos.holdNextRead(gate)
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, livePhotoMetadata: InventoryMetadata(), now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true)
+        let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+        let running = await runtime.current()
+        XCTAssertTrue(running.snapshot.livePhotoActivities.contains(.working(.identification)))
+        let before = await f.photos.visualCatalogCalls
+        await runtime.tick(force: true)
+        let advanced = await engineEventually { await f.photos.visualCatalogCalls > before }
+        XCTAssertTrue(advanced, "Cloud resource read must not own the visual/catalog task")
+        let reads = await f.photos.resourceReads; XCTAssertEqual(reads, 1)
+        let state = await runtime.current(); XCTAssertEqual(state.snapshot.latestScan.state, .completed)
+        await runtime.pause(); await gate.release(); await runtime.waitForRound()
+        let final = await runtime.current(); XCTAssertEqual(final.snapshot.livePhotoInventory?.identified, 0, "Pause cannot publish a late result as new progress")
+        await runtime.stop(); try FileManager.default.removeItem(at: f.root)
+    }
     func testNativeSourceDirectoryPairUsesRuntimeGroupAndNeverSingleImport() async throws {
         let root = try temporaryDirectory(), source = root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
@@ -18,9 +73,19 @@ final class AdvancedRuntimeTests: XCTestCase {
             AdvancedRuntimeGraph(store: store, photos: photos, model: model, configuration: config, executor: executor,
                 budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
         }
-        let runtime = SyncRuntime(store: store, advancedFactory: factory, now: { Date() }, authorized: { true })
+        let clock = P12Clock()
+        let runtime = SyncRuntime(store: store, advancedFactory: factory, now: { clock.value }, authorized: { true })
         try await runtime.prepareInjectedRuntime()
-        for _ in 0..<5 { await runtime.tick(force: true); await runtime.waitForRound() }
+        let gate = InventoryReadGate(); await photos.holdMutation(gate, retirement: false)
+        let drive = Task { for _ in 0..<8 { clock.advance(6); await runtime.tick(force: true); await runtime.waitForRound() } }
+        let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+        let inFlight = await runtime.current()
+        XCTAssertEqual(inFlight.snapshot.summary?.importing, 2)
+        XCTAssertFalse(inFlight.snapshot.livePhotoWork.unknownMutation)
+        let presentation = SyncStatusPresentation(snapshot: inFlight.snapshot)
+        XCTAssertFalse(presentation.unknownMutation)
+        XCTAssertEqual(presentation.globalStatus(enabledSourceIDs: [sourceID], authorized: true, hasBlockingError: false), .running)
+        await gate.release(); await drive.value
         let summary = try await store.activeSourceSummary(), creates = await photos.creates, inferences = await model.fingerprintCount
         XCTAssertEqual(summary.imported, 2); XCTAssertEqual(creates, 1); XCTAssertEqual(inferences, 0)
         let first = try await store.file(sourceID: sourceID, relativePath: "pair.jpg"), second = try await store.file(sourceID: sourceID, relativePath: "pair.mov")
@@ -28,7 +93,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: photo), originalPhoto); XCTAssertEqual(try Data(contentsOf: motion), originalMotion)
         let catalogs = await photos.liveCatalogCalls
         await runtime.stop(); await runtime.waitForRound()
-        let restarted = SyncRuntime(store: store, advancedFactory: factory, now: { Date() }, authorized: { true })
+        let restarted = SyncRuntime(store: store, advancedFactory: factory, now: { clock.value }, authorized: { true })
         try await restarted.prepareInjectedRuntime(); await restarted.tick(force: true); await restarted.waitForRound()
         let after = await photos.liveCatalogCalls, afterCreates = await photos.creates
         XCTAssertEqual(after, catalogs); XCTAssertEqual(afterCreates, 1)
@@ -44,7 +109,8 @@ final class AdvancedRuntimeTests: XCTestCase {
                 budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
         }
         let runtime = SyncRuntime(store: f.store, advancedFactory: factory, livePhotoMetadata: CompletionMetadata(), now: { Date() }, authorized: { true })
-        try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true); await runtime.waitForRound()
+        try await runtime.prepareInjectedRuntime()
+        for _ in 0..<8 { await runtime.tick(); await runtime.waitForRound() }
         let events = await photos.events, state = await runtime.current()
         XCTAssertEqual(events, ["create", "verify", "retire"])
         XCTAssertEqual(state.snapshot.livePhotoInventory?.phase, .completed); XCTAssertEqual(state.snapshot.summary?.imported, 0)
@@ -76,7 +142,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         }, now: { Date(timeIntervalSince1970: 1000) }, authorized: { true })
         try await runtime.prepareInjectedRuntime()
         addTeardownBlock { await runtime.stop(); await runtime.waitForRound(); try? FileManager.default.removeItem(at: f.root) }
-        await runtime.tick(force: true); await runtime.waitForRound()
+        for _ in 0..<4 { await runtime.tick(); await runtime.waitForRound() }
         let state = await runtime.current(), calls = await f.photos.catalogCalls
         XCTAssertEqual(state.snapshot.livePhotoInventory?.phase, .completed)
         XCTAssertEqual(state.snapshot.livePhotoInventory?.inventoried, 3)

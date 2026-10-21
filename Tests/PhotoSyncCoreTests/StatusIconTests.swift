@@ -11,7 +11,7 @@ final class StatusIconTests: XCTestCase {
             root.appendingPathComponent("Design/Icons/MenuBar/Selected-Design.png"))))
         let columns: [(GlobalStatus, Int, Int, Bool)] = [(.completed, 45, 240, false),
             (.running, 273, 470, false), (.paused, 500, 700, false), (.waiting, 730, 925, false),
-            (.error, 960, 1160, false), (.unconfigured, 1195, 1395, false), (.waiting, 1428, 1600, true)]
+            (.error, 960, 1160, false), (.preparing, 273, 470, false), (.waiting, 1428, 1600, true)]
         for (status, left, right, dimmed) in columns {
             let expected = silhouette(reference, bounds: NSRect(x: left, y: 278, width: right - left, height: 218)) {
                 max($0.redComponent, $0.greenComponent, $0.blueComponent) < (dimmed ? 0.82 : 0.5)
@@ -51,7 +51,7 @@ final class StatusIconTests: XCTestCase {
                 states.insert(bytes)
                 brandStrips.insert(brand)
             }
-            XCTAssertEqual(states.count, GlobalStatus.allCases.count, "Each state needs a readable, different mark")
+            XCTAssertEqual(states.count, GlobalStatus.allCases.count - 1, "Preparing reuses the running mark")
             XCTAssertEqual(brandStrips.count, 1, "State marks must retain the same left-hand S silhouette")
         }
     }

@@ -149,6 +149,8 @@ struct SourceSettings: View {
                     }
                 }
             }
+            SyncWorkProgressView(snapshot: model.state.snapshot, showSourceProgress: model.hasEnabledSources,
+                showActiveProgress: model.status == .preparing || model.status == .running)
             Text(model.syncBoundaryDescription)
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -178,7 +180,7 @@ struct SourceSettings: View {
 
     private var settingsIssueSummaries: [String] {
         let candidates: [String?] = [model.state.authorized ? model.syncDetail : nil,
-            model.state.snapshot.blockingSummary,
+            model.engineBlockingSummary,
             model.state.snapshot.summaryError == nil ? nil : "同步统计暂时读不到，稍后会自动重试。",
             model.state.message, model.state.warning, model.error]
         return candidates.compactMap { $0 }.reduce(into: []) { result, text in

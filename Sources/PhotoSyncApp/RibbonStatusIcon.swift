@@ -36,7 +36,7 @@ struct RibbonStatusIcon: View {
             if let status {
                 fill(tab, in: context)
                 context.setBlendMode(.destinationOut)
-                fill(marks[status]!, in: context)
+                fill(marks[status == .preparing ? .running : status]!, in: context)
             }
             return true
         }
@@ -113,12 +113,6 @@ struct RibbonStatusIcon: View {
         ], [
             126.0, 115.4, 131.6, 116.3, 136.4, 121.2, 134.5, 158.2, 129.7, 163.1, 124.1, 163.1,
             118.4, 159.2, 116.5, 123.2, 122.2, 116.3
-        ]],
-        .unconfigured: [[
-            129.2, 118.5, 133.9, 122.5, 132.9, 142.1, 151.7, 143.1, 154.5, 147.0, 154.5, 155.9,
-            148.9, 161.8, 132.9, 161.8, 132.0, 181.4, 129.2, 184.4, 118.8, 185.4, 114.2, 180.4,
-            115.1, 161.8, 98.2, 161.8, 94.5, 158.8, 93.5, 151.9, 94.5, 146.0, 97.3, 143.1,
-            115.1, 143.1, 116.0, 122.5, 121.7, 118.5
         ]],
     ]
     private static let fullRibbon: [[CGFloat]] = [[

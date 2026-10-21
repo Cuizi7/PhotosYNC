@@ -2,13 +2,15 @@
 
 PhotosYNC scans selected filesystem folders and saves eligible images and videos to the current macOS System Photo Library. Source files stay in place and are read-only. Precisely matched Live Photo components become one native Live Photo; replaced standalone assets can be removed only after their original content and protected information are verified as preserved.
 
-## 0.3.0 beta1 — Native Live Photo completion
+## 0.3.0 beta2 — Native Live Photo completion
 
 Live Photos use the original HEIC/JPEG and MOV together, including existing audio. Missing components are saved individually and completed when the exact partner becomes available, including components already in Photos. Each directory finishes enumerating and identifying its direct entries before admitting imports. This behavior has no setting.
 
-Schema v11 adds a resumable, one-time library identification task. Its completed marker survives restarts and normal upgrades; unresolved resources retry individually with network access disabled. Historical work also runs without enabled sources and obeys Pause. Matching names or visual similarity do not establish a pair. Unknown submission results block all further Photos mutations.
+Schema v11 adds a resumable, one-time library identification task. Its completed marker survives restarts and normal upgrades; unresolved resources retry individually and may fetch iCloud originals within the existing resource budget. Historical work also runs without enabled sources and obeys Pause. Matching names or visual similarity do not establish a pair. Unknown submission results block all further Photos mutations.
 
-After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta1.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
+The menu, settings and details use the same six states: 正在准备, 正在同步, 等待恢复, 已暂停, 需要处理 and 同步完成. Visual indexing and Live Photo pairing have independent progress; cloud downloads are internal steps. Long Live Photo reads run independently of visual work. Existing completed identification results and successful import history remain intact.
+
+After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta2.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
 
 ## Previous stable: 0.2.9
 
@@ -42,8 +44,8 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh --scale-profile full
 ```
 
-Release configuration: **0.3.0 beta1 (build 18)**, targeting
-`outputs/releases/0.3.0-beta1/`; see [release notes](docs/release/0.3.0-beta1.md)
+Release configuration: **0.3.0 beta2 (build 19)**, targeting
+`outputs/releases/0.3.0-beta2/`; see [release notes](docs/release/0.3.0-beta2.md)
 and the [changelog](CHANGELOG.md).
 The release package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
@@ -77,7 +79,7 @@ Choose one or more source folders in Settings. PhotosYNC scans at launch and the
 
 Only supported bitmap images and videos are considered. RAW files, transcoding, directory-to-album mapping, media hashing, and source-file caching are out of scope. Live Photo replacement preserves known ordinary album membership and retains old assets when preservation cannot be verified. Photos use visual fingerprints across filenames with the selected 0.98 threshold and resolution rules; videos retain exact-filename and conservative metadata matching. Eligible old suspected-duplicate photo skips are reconsidered under the new policy; successful imports and unknown submissions remain protected. A possible duplicate is skipped and logged rather than imported. An earlier successful import remains recorded even if the Photos asset is later removed, so it is not automatically re-imported. Removing a source in Settings hides and disables that configuration while retaining its import history; it does not delete any source files or Photos assets. Re-adding the same path restores that history.
 
-PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source file. It sends additions to Photos only. It also never deletes or overwrites a Photos asset. Import completion means PhotoKit accepted the addition; it does not mean the asset has finished syncing to iCloud.
+PhotosYNC never moves, deletes, renames, transcodes, writes, or hashes a source file. Ordinary synchronization adds assets. After exact Live Photo pairing and verification, it may delete only the replaced singleton assets whose original resources and protected information have been preserved; other existing assets are not overwritten or deleted. Import completion means PhotoKit accepted the addition; it does not mean the asset has finished syncing to iCloud.
 
 ## Model input diagnostics
 
@@ -115,3 +117,7 @@ For a full-profile release, run `scripts/package-release.sh --scale-profile full
 `scripts/package-release.sh` performs this validation inside a clean committed `git archive`, then builds the normal Universal Release app from the same source. Only validated and verified bundles are published into a new release directory; old releases and concurrent publication locks are not overwritten. Validation evidence accompanies the package and is tied to its source provenance. There is no test-skip or cached-success release path.
 
 Routine beta iterations reuse established real-Photos integration evidence and require the automated gates. Changes to actual PhotoKit/authorization/media/platform boundaries need targeted system acceptance. The automation does not use personal Photos, production database snapshots or system-permission changes. See [agent acceptance rules](AGENTS.md) and [validation history](Design/Validation.md) for the distinction between automated, historical and current system evidence.
+
+The current cloud/status repair keeps schema v11 and the one-time historical inventory marker. Live Photo identification can fetch required iCloud originals within the shared 512 MiB budget and 128 MiB disk reserve. Requests cancel after 600 seconds, with a 610-second logical bound; physical ownership remains until the terminal callback. Temporary failures retry per item, while deterministic parsing/resource limits require changed resources or an explicit scan. Launch and wake do not re-open held failures. One independent Live Photo task handles one asset and one group per batch; visual and Live Photo catalog enumeration remains serialized.
+
+Menu and Settings share six status headlines: 正在准备 / 正在同步 / 等待恢复 / 已暂停 / 需要处理 / 同步完成. Preparation tasks have separate counts; failed reads do not count as processed. Cloud acquisition and Photos save steps stay internal. Details explain purpose, possible traffic/system caching and restart continuation. See the [repair contract](docs/superpowers/specs/2026-10-21-cloud-livephoto-status-repair-design.md). This source change does not itself establish a required-network iCloud test or a new release.

@@ -23,61 +23,46 @@ struct SyncStatusPresentation {
         }
     }
 
-    /// Maps only enabled sources to the global icon state, so a stale snapshot for a disabled
-    /// source cannot hide work that is still progressing elsewhere.
-    func globalStatus(
-        enabledSourceIDs: Set<UUID>,
-        authorized: Bool,
-        hasBlockingError: Bool
-    ) -> GlobalStatus {
-        guard !enabledSourceIDs.isEmpty || snapshot.hasLivePhotoWork else { return .unconfigured }
-        guard authorized, !hasBlockingError, !snapshot.livePhotoWork.unknownMutation else { return .error }
-        if snapshot.isPaused { return .paused }
-
-        let issues = enabledIssues(for: enabledSourceIDs)
-        if issues.contains(where: \.isSourceAvailability) { return .waiting }
-        if let progress = snapshot.indexProgress, progress.state != .ready {
-            return progress.state == .waiting ? .waiting : .running
-        }
-        if let inventory = snapshot.livePhotoInventory, inventory.phase != .completed { return .running }
-        if snapshot.livePhotoWork.activeGroups > 0 && snapshot.livePhotoInventory?.unresolved == 0 { return .running }
-        if snapshot.livePhotoWork.awaitingVerification > 0 || snapshot.livePhotoWork.awaitingRetirement > 0 || snapshot.livePhotoWork.limitedGroups > 0 || snapshot.livePhotoIssue != nil || (snapshot.livePhotoInventory?.unresolved ?? 0) > 0 { return .waiting }
-        if enabledSourceIDs.isEmpty { return .completed }
-        if snapshot.activeWork { return .running }
-        if hasDeferredWork(for: enabledSourceIDs) { return .waiting }
-
-        let summary = snapshot.summary
-        if (summary?.importing ?? 0) > 0 { return .waiting }
-        if (summary?.pending ?? 0) > 0 || (summary?.retryPending ?? 0) > 0 { return .waiting }
-        if hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs) { return .error }
-        return snapshot.latestScan.state == .completed ? .completed : .waiting
+    var unknownMutation: Bool {
+        if snapshot.livePhotoWork.unknownMutation || snapshot.unknownSubmissionBlock { return true }
+        if case .uncertainSubmission = snapshot.recoveryHint { return true }
+        return (snapshot.summary?.importing ?? 0) > snapshot.livePhotoWork.ownedImportingFiles && !snapshot.sourceActivities.values.contains(.submitting)
     }
 
-    func statusDescription(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String {
+    func globalStatus(enabledSourceIDs: Set<UUID>, authorized: Bool, hasBlockingError: Bool) -> GlobalStatus {
+        guard authorized, !hasBlockingError else { return .error }
+        let initial = snapshot.summary == nil && snapshot.indexProgress == nil && snapshot.livePhotoInventory == nil && snapshot.latestScan.state == .notStarted
+        if initial { return snapshot.isPaused ? .paused : .preparing }
         let issues = enabledIssues(for: enabledSourceIDs)
-        let summary = snapshot.summary
-        if status == .waiting && snapshot.livePhotoWork.awaitingRetirement > 0 { return "Live Photo 已补齐，旧项目待清理" }
-        if status == .waiting && (snapshot.livePhotoInventory?.unresolved ?? 0) > 0 { return "历史识别已完成，部分项目待核实" }
-        if !snapshot.isPaused, !issues.contains(where: \.isSourceAvailability),
-           let analysis, [.running, .waiting].contains(status) { return analysis.title }
-        switch status {
-        case .error:
-            return status.description
-        case .paused:
-            return snapshot.activeWork ? "正在暂停，等待当前操作返回" : status.description
-        case .waiting:
-            if issues.contains(where: \.isSourceAvailability) { return "等待恢复" }
-            if hasDeferredWork(for: enabledSourceIDs) { return "稍后继续" }
-            if (summary?.importing ?? 0) > 0 { return "等待核对" }
-            let pending = summary?.pending ?? 0
-            let retryPending = summary?.retryPending ?? 0
-            if pending > 0 || retryPending > 0 {
-                return pending == 0 ? "等待重试" : status.description
-            }
-            return "等待扫描"
-        default:
-            return status.description
+        let synchronizing = snapshot.sourceActivities.contains { enabledSourceIDs.contains($0.key) && $0.value != .waiting } || snapshot.livePhotoActivities.contains(.working(.completion))
+        let preparing = snapshot.indexActivity == .working || snapshot.livePhotoActivities.contains(.working(.identification))
+        let attention = (snapshot.livePhotoInventory?.requiresAttention ?? 0) > 0 || snapshot.livePhotoWork.requiresAttentionGroups > 0 || snapshot.livePhotoActivities.contains { if case .requiresAttention = $0 { return true }; return false } || (hasFileOrSubmissionIssue(issues, enabledSourceIDs: enabledSourceIDs) && (snapshot.summary?.retryPending ?? 0) == 0)
+        let waiting = issues.contains(where: \.isSourceAvailability) || hasDeferredWork(for: enabledSourceIDs) ||
+            (snapshot.indexProgress.map { $0.state != .ready } ?? false) || snapshot.hasLivePhotoWork ||
+            snapshot.livePhotoIssue != nil || (snapshot.summary?.pending ?? 0) > 0 || (snapshot.summary?.retryPending ?? 0) > 0 ||
+            snapshot.latestScan.state != .completed || snapshot.livePhotoActivities.contains { $0 != .idle }
+        return .resolve(configured: !enabledSourceIDs.isEmpty || snapshot.hasLivePhotoWork || snapshot.livePhotoActivities.contains(.working(.completion)) || snapshot.livePhotoActivities.contains(.working(.identification)),
+            error: false, paused: snapshot.isPaused, waiting: waiting, running: synchronizing, authorized: authorized,
+            preparing: preparing, unknownMutation: unknownMutation, requiresAttention: attention)
+    }
+
+    func statusDescription(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String { status.description }
+
+    func statusReason(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String? {
+        if unknownMutation { return "等待‘照片’确认结果，新的保存已暂停" }
+        if enabledSourceIDs.isEmpty && !snapshot.hasLivePhotoWork { return "请添加或启用来源目录" }
+        if let attention = snapshot.livePhotoActivities.compactMap({ activity -> SourceIssue? in
+            if case .requiresAttention(let issue) = activity { return issue }; return nil
+        }).first { return attention.summary }
+        if status == .paused && snapshot.activeWork { return "当前操作结束后暂停，已完成的结果会保留。" }
+        if status == .waiting {
+            if enabledIssues(for: enabledSourceIDs).contains(where: \.isSourceAvailability) { return "来源目录暂不可用，连接恢复后自动继续" }
+            if snapshot.livePhotoActivities.contains(.draining) { return "等待系统结束资源读取，完成后自动继续。" }
+            if (snapshot.livePhotoInventory?.retryWaiting ?? 0) > 0 || snapshot.livePhotoIssue != nil || snapshot.livePhotoWork.retryWaitingGroups > 0 { return "部分项目暂时无法读取，稍后自动重试" }
+            if let issue = snapshot.indexProgress?.issue { return issue }
+            return "仍有项目等待处理，稍后自动继续。"
         }
+        return nil
     }
 
     private func enabledIssues(for enabledSourceIDs: Set<UUID>) -> [SourceIssue] {
@@ -98,36 +83,35 @@ struct SyncStatusPresentation {
             }
     }
 
-    struct Analysis {
-        let title: String
-        let progressText: String
+    struct PreparationProgress: Identifiable {
+        let id: String
+        let subtitle: String
+        let progressText: String?
         let fraction: Double?
-        let detail: String?
         let explanation: String
     }
+    static let indexExplanation = "视觉索引用于避免重复导入。必要时会从 iCloud 获取原文件并产生流量，系统可能保留本地缓存。分析结果会保存，重启后继续未完成项，不会重复分析未变化的成功结果。"
+    static let livePhotoExplanation = "核对原文件中的配对关系，并补齐包含动态画面和声音的 Live Photo。必要时会从 iCloud 获取原文件并产生流量，系统可能保留本地缓存。结果会保存，重启后继续未完成项，不会重复分析未变化的成功结果。"
 
-    var analysis: Analysis? {
-        if let inventory = snapshot.livePhotoInventory, inventory.phase != .completed {
-            return Analysis(title: snapshot.isPaused ? "历史 Live Photo 识别已暂停" : "正在识别历史 Live Photo",
-                progressText: "已清点 \(inventory.inventoried) · 已识别 \(inventory.identified) · 待核实 \(inventory.unresolved)",
-                fraction: inventory.phase == .identifying && inventory.inventoried > 0 ? Double(inventory.identified + inventory.unresolved) / Double(inventory.inventoried) : nil,
-                detail: snapshot.livePhotoIssue?.summary,
-                explanation: "首次运行会检查图库中的照片与视频。完成后只处理新增、变化和待核实项目；历史识别不会下载 iCloud 原件。")
+    var progressRows: [PreparationProgress] {
+        guard !snapshot.isPaused else { return [] }
+        var rows = [PreparationProgress]()
+        if snapshot.indexActivity == .working, let p = snapshot.indexProgress, p.state != .ready {
+            rows.append(.init(id: "visualIndex", subtitle: "正在建立视觉索引",
+                progressText: p.totalsKnown ? "已分析 \(p.readyAssets) / \(p.totalAssets) 张" : "已分析 \(p.readyAssets) 张",
+                fraction: p.totalsKnown && p.totalAssets > 0 ? min(1, Double(p.readyAssets) / Double(p.totalAssets)) : nil,
+                explanation: Self.indexExplanation))
         }
-        guard let p = snapshot.indexProgress, p.state != .ready else { return nil }
-        let title: String
-        switch p.state {
-        case .preparing: title = "正在准备图库分析"
-        case .updating: title = "正在分析图库"
-        case .waiting: title = "图库分析正在等待"
-        case .paused: title = "图库分析已暂停"
-        case .ready: return nil
+        let identifying = snapshot.livePhotoActivities.contains(.working(.identification))
+        let completing = snapshot.livePhotoActivities.contains(.working(.completion))
+        if identifying || completing {
+            let inventory = snapshot.livePhotoInventory
+            let known = inventory?.phase != .enumerating
+            let text = identifying ? inventory.map { known ? "已处理 \($0.identified) / \($0.inventoried) 项" : "已处理 \($0.identified) 项" } : nil
+            let fraction = identifying && !completing && known && (inventory?.inventoried ?? 0) > 0 ? Double(inventory!.identified) / Double(inventory!.inventoried) : nil
+            rows.append(.init(id: "livePhoto", subtitle: "正在配对 Live Photo", progressText: text, fraction: fraction, explanation: Self.livePhotoExplanation))
         }
-        return Analysis(title: title,
-            progressText: p.totalsKnown ? "已分析 \(p.readyAssets) / \(p.totalAssets) 张" : "正在读取图库…",
-            fraction: p.totalsKnown && p.totalAssets > 0 ? Double(p.readyAssets) / Double(p.totalAssets) : nil,
-            detail: p.issue,
-            explanation: "完成图库分析后开始导入。部分照片可能需要从 iCloud 下载。")
+        return rows
     }
 
     /// Exact displayed rows, preserving scan events separately from standing records.
@@ -162,11 +146,9 @@ struct SyncStatusPresentation {
 
     var summaryNotes: [String] {
         var notes: [String] = []
-        if let inventory = snapshot.livePhotoInventory, inventory.phase == .completed, inventory.unresolved > 0 { notes.append("历史识别已完成，部分项目待核实") }
-        if snapshot.livePhotoWork.awaitingRetirement > 0 { notes.append("Live Photo 已补齐，旧项目待清理") }
-        if snapshot.livePhotoWork.awaitingVerification > 0 { notes.append("Live Photo 已保存，等待验证") }
-        if snapshot.livePhotoWork.limitedGroups > 0 && snapshot.livePhotoWork.awaitingRetirement == 0 { notes.append("部分 Live Photo 待核实") }
-        if snapshot.livePhotoWork.unknownMutation { notes.append("Live Photo 提交结果尚未确认，新的提交已停止") }
+        if (snapshot.livePhotoInventory?.requiresAttention ?? 0) > 0 || snapshot.livePhotoWork.requiresAttentionGroups > 0 { notes.append("部分 Live Photo 需要处理，请重新尝试或查看诊断。") }
+        if (snapshot.livePhotoInventory?.retryWaiting ?? 0) > 0 { notes.append("部分项目暂时无法读取，稍后自动重试") }
+        if unknownMutation { notes.append("等待‘照片’确认结果，新的保存已暂停") }
         if let issue = snapshot.livePhotoIssue { notes.append(issue.summary) }
         guard let s = snapshot.summary else { return notes }
         if s.retryPending > 0 { notes.append("待重试 \(s.retryPending)") }

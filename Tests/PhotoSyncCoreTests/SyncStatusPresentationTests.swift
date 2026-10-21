@@ -2,23 +2,44 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testOwnedLivePhotoImportsDoNotHideOtherUnknownImports() {
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(importing: 2)
+        snapshot.livePhotoWork.ownedImportingFiles = 2
+        snapshot.livePhotoActivities = [.working(.completion)]
+        XCTAssertFalse(SyncStatusPresentation(snapshot: snapshot).unknownMutation)
+        snapshot.summary = SyncStatusSummary(importing: 3)
+        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).unknownMutation)
+        snapshot.summary = SyncStatusSummary(importing: 2)
+        snapshot.unknownSubmissionBlock = true
+        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).unknownMutation)
+    }
+    func testApprovedSixHeadlinesAndUnknownMutationPriority() {
+        XCTAssertEqual(Set(GlobalStatus.allCases.map(\.description)), Set(["正在准备", "正在同步", "等待恢复", "已暂停", "需要处理", "同步完成"]))
+        let id = UUID()
+        var snapshot = EngineSnapshot()
+        snapshot.summary = SyncStatusSummary(imported: 1)
+        snapshot.livePhotoWork.unknownMutation = true
+        snapshot.sourceActivities[id] = .submitting
+        let p = SyncStatusPresentation(snapshot: snapshot)
+        XCTAssertEqual(p.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false), .waiting)
+    }
+    func testLivePhotoFailureCannotIncreaseProcessedFraction() {
+        var snapshot = EngineSnapshot()
+        snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 2, unresolved: 626, retryWaiting: 626)
+        snapshot.livePhotoActivities = [.working(.identification)]
+        let p = SyncStatusPresentation(snapshot: snapshot)
+        XCTAssertEqual(p.progressRows.first?.fraction ?? -1, 2.0 / 16222, accuracy: 0.000001)
+    }
     func testLivePhotoProgressIsSeparateAndWorksWithoutSources() {
         var snapshot = EngineSnapshot()
         snapshot.summary = SyncStatusSummary(imported: 9)
-        snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 100, identified: 35, unresolved: 4)
+        snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 100, identified: 35, unresolved: 4, pending: 61, retryWaiting: 4)
+        snapshot.livePhotoActivities = [.working(.identification)]
         let p = SyncStatusPresentation(snapshot: snapshot)
-        XCTAssertEqual(p.analysis?.title, "正在识别历史 Live Photo")
-        XCTAssertTrue(p.analysis?.progressText.contains("100") == true)
+        XCTAssertEqual(p.progressRows.first?.subtitle, "正在配对 Live Photo")
         XCTAssertEqual(p.baseSummary, "已导入 9 · 已跳过 0 · 待处理 0")
-        XCTAssertEqual(p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .running)
-        snapshot.livePhotoInventory = .init(phase: .completed, inventoried: 100, identified: 96, unresolved: 4)
-        let waiting = SyncStatusPresentation(snapshot: snapshot)
-        XCTAssertTrue(waiting.summaryNotes.contains("历史识别已完成，部分项目待核实"))
-        XCTAssertEqual(waiting.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .waiting)
-        snapshot.livePhotoWork.awaitingRetirement = 1
-        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).summaryNotes.contains("Live Photo 已补齐，旧项目待清理"))
-        snapshot.livePhotoWork.unknownMutation = true
-        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .error)
+        XCTAssertEqual(p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .preparing)
     }
 
     func testOnlyEnabledUnmountedRootDimsWaitingIcon() {
@@ -71,10 +92,10 @@ final class SyncStatusPresentationTests: XCTestCase {
         snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
             totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
             readyRepresentations: 6789, excludedAssets: 99, issue: "原始分析原因")
-        let analysis = SyncStatusPresentation(snapshot: snapshot).analysis
+        snapshot.indexActivity = .working
+        let analysis = SyncStatusPresentation(snapshot: snapshot).progressRows.first
         XCTAssertEqual(analysis?.progressText, "已分析 2192 / 15702 张")
-        XCTAssertEqual(analysis?.title, "正在分析图库")
-        XCTAssertEqual(analysis?.detail, "原始分析原因")
+        XCTAssertEqual(analysis?.subtitle, "正在建立视觉索引")
         XCTAssertEqual(analysis?.fraction ?? -1, 2192.0 / 15702.0, accuracy: 0.000001)
         XCTAssertEqual(SyncDetailsButton(snapshot: snapshot).accessibilityLabel, "查看图库分析与同步详情")
     }
@@ -196,269 +217,78 @@ final class SyncStatusPresentationTests: XCTestCase {
         XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).recoveryAdvice!.contains("重新启动"))
     }
 
-    func testDeferredRoundIsNotCompleted() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.summary = SyncStatusSummary()
-        snapshot.latestScan = ScanProgress(state: .interrupted, deferred: true)
-        snapshot.deferredSources = [id]
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .waiting)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "稍后继续")
-    }
-
-    func testFileIssueDoesNotHideHealthyWork() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.activeWork = true
-        snapshot.waitingSources[id] = SourceIssue(summary: "文件无法读取。", detail: "fixture", kind: .file)
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        XCTAssertEqual(view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false), .running)
-    }
-
-    func testNoEnabledSourcesIsUnconfigured() {
-        let view = SyncStatusPresentation(snapshot: EngineSnapshot())
-        let status = view.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .unconfigured)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: []), "未配置来源")
-    }
-
-    func testBlockingErrorsOutrankPauseAndDoNotUsePauseDescription() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.isPaused = true
-        snapshot.activeWork = true
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let blocked = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: true)
-        let unauthorized = view.globalStatus(enabledSourceIDs: [id], authorized: false, hasBlockingError: false)
-
-        XCTAssertEqual(blocked, .error)
-        XCTAssertEqual(unauthorized, .error)
-        XCTAssertEqual(view.statusDescription(for: blocked, enabledSourceIDs: [id]), "同步异常")
-    }
-
-    func testPausedWorkDescribesPendingStop() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.isPaused = true
-        snapshot.activeWork = true
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .paused)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "正在暂停，等待当前操作返回")
-    }
-
-    func testEnabledSourceAvailabilityPrecedesRunningWork() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.activeWork = true
-        snapshot.waitingSources[id] = SourceIssue(summary: "来源目录不可用。", detail: "fixture")
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .waiting)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "等待恢复")
-    }
-
-    func testDisabledSourceIssueDoesNotAffectCompletedStatus() {
-        let enabledID = UUID()
-        let disabledID = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.summary = SyncStatusSummary()
-        snapshot.latestScan = ScanProgress(state: .completed)
-        snapshot.waitingSources[disabledID] = SourceIssue(summary: "来源目录不可用。", detail: "fixture")
-        snapshot.sourceFileIssueCounts[disabledID] = 1
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [enabledID], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .completed)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [enabledID]), "已完成")
-    }
-
-    func testDisabledDeferredSourceDoesNotHideHealthyWork() {
-        let enabledID = UUID()
-        let disabledID = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.activeWork = true
-        snapshot.latestScan = ScanProgress(state: .interrupted, deferred: true)
-        snapshot.deferredSources = [disabledID]
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [enabledID], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .running)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [enabledID]), "正在同步")
-    }
-
-    func testUnknownAndInterruptedRoundsWaitForScan() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let unknown = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(unknown, .waiting)
-        XCTAssertEqual(view.statusDescription(for: unknown, enabledSourceIDs: [id]), "等待扫描")
-
-        snapshot.latestScan = ScanProgress(state: .interrupted)
-        let interrupted = SyncStatusPresentation(snapshot: snapshot)
-        let status = interrupted.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .waiting)
-        XCTAssertEqual(interrupted.statusDescription(for: status, enabledSourceIDs: [id]), "等待扫描")
-    }
-
-    func testQueuedWorkUsesSpecificWaitingDescription() {
-        let id = UUID()
-        let cases: [(name: String, summary: SyncStatusSummary, description: String)] = [
-            ("importing", SyncStatusSummary(importing: 1), "等待核对"),
-            ("retry only", SyncStatusSummary(retryPending: 1), "等待重试"),
-            ("new pending", SyncStatusSummary(pending: 1), "等待中"),
-            ("mixed pending", SyncStatusSummary(pending: 1, retryPending: 1), "等待中")
-        ]
-
-        for item in cases {
+    func testSixStateProjectionAcrossConcurrentAndIdleWork() {
+        let id = UUID(), disabled = UUID()
+        func check(_ name: String, _ expected: GlobalStatus, sources: Set<UUID>? = nil, authorized: Bool = true, blocked: Bool = false, edit: (inout EngineSnapshot) -> Void) {
             var snapshot = EngineSnapshot()
-            snapshot.summary = item.summary
-            let view = SyncStatusPresentation(snapshot: snapshot)
-            let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-            XCTAssertEqual(status, .waiting, item.name)
-            XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), item.description, item.name)
-        }
-    }
-
-    func testIdleFileAndSubmissionIssuesNeedAttention() {
-        let id = UUID()
-        let cases: [(name: String, kind: SourceIssueKind)] = [
-            ("file", .file),
-            ("submission", .submission)
-        ]
-
-        for item in cases {
-            var snapshot = EngineSnapshot()
-            snapshot.summary = SyncStatusSummary()
-            snapshot.waitingSources[id] = SourceIssue(summary: "需要处理。", detail: "fixture", kind: item.kind)
-            let view = SyncStatusPresentation(snapshot: snapshot)
-            let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-            XCTAssertEqual(status, .error, item.name)
-            XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "同步异常", item.name)
-        }
-    }
-
-    func testEnabledFileIssueCountNeedsAttention() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.summary = SyncStatusSummary()
-        snapshot.sourceFileIssueCounts[id] = 1
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .error)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "同步异常")
-    }
-
-    func testCompletedRoundWithoutOutstandingWorkIsCompleted() {
-        let id = UUID()
-        var snapshot = EngineSnapshot()
-        snapshot.summary = SyncStatusSummary(imported: 1)
-        snapshot.latestScan = ScanProgress(state: .completed)
-        let view = SyncStatusPresentation(snapshot: snapshot)
-
-        let status = view.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-
-        XCTAssertEqual(status, .completed)
-        XCTAssertEqual(view.statusDescription(for: status, enabledSourceIDs: [id]), "已完成")
-    }
-
-}
-
-extension SyncStatusPresentationTests {
-    // Analysis remains visible, but must not replace the headline explaining an unavailable source.
-    func testUnavailableSourceHeadlineWinsWhileAnalysisVisible() {
-        let id = UUID()
-        for state in [IndexState.preparing, .updating, .waiting] {
-            var snapshot = EngineSnapshot()
-            snapshot.indexProgress = IndexProgress(state: state, totalsKnown: true,
-                totalAssets: 2, readyAssets: 1, totalRepresentations: 3,
-                readyRepresentations: 1, excludedAssets: 0, issue: nil)
-            snapshot.waitingSources[id] = SourceIssue(summary: "来源目录暂时不可用。",
-                detail: "synthetic unavailable source", kind: .sourceAvailability)
+            snapshot.summary = SyncStatusSummary(imported: 1)
+            snapshot.latestScan.state = .completed
+            edit(&snapshot)
             let p = SyncStatusPresentation(snapshot: snapshot)
-            let status = p.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-            XCTAssertEqual(status, .waiting, state.rawValue)
-            XCTAssertEqual(p.statusDescription(for: status, enabledSourceIDs: [id]), "等待恢复", state.rawValue)
-            XCTAssertNotNil(p.analysis, state.rawValue)
-
-            snapshot.isPaused = true
-            let paused = SyncStatusPresentation(snapshot: snapshot)
-            let pausedStatus = paused.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false)
-            XCTAssertEqual(pausedStatus, .paused)
-            XCTAssertEqual(paused.statusDescription(for: pausedStatus, enabledSourceIDs: [id]), "已暂停")
-            for (authorized, blocked) in [(false, false), (true, true)] {
-                let error = p.globalStatus(enabledSourceIDs: [id], authorized: authorized, hasBlockingError: blocked)
-                XCTAssertEqual(error, .error)
-                XCTAssertEqual(p.statusDescription(for: error, enabledSourceIDs: [id]), "同步异常")
-            }
-            let unconfigured = p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false)
-            XCTAssertEqual(unconfigured, .unconfigured)
-            XCTAssertEqual(p.statusDescription(for: unconfigured, enabledSourceIDs: []), "未配置来源")
-
-            snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
-                totalAssets: 2, readyAssets: 2, totalRepresentations: 3,
-                readyRepresentations: 3, excludedAssets: 0, issue: nil)
-            XCTAssertNil(SyncStatusPresentation(snapshot: snapshot).analysis)
+            let result = p.globalStatus(enabledSourceIDs: sources ?? [id], authorized: authorized, hasBlockingError: blocked)
+            XCTAssertEqual(result, expected, name)
+            XCTAssertEqual(p.statusDescription(for: result, enabledSourceIDs: sources ?? [id]), expected.description, name)
         }
+        check("idle between scans", .completed) { _ in }
+        check("pause", .paused) { $0.isPaused = true; $0.sourceActivities[id] = .submitting }
+        check("permission outranks pause", .error, authorized: false) { $0.isPaused = true }
+        check("global failure outranks pause", .error, blocked: true) { $0.isPaused = true }
+        check("healthy source progresses beside offline source", .running) { $0.sourceActivities[id] = .scanning; $0.waitingSources[id] = SourceIssue(summary: "离线", detail: "fixture") }
+        check("index works beside offline source", .preparing) { $0.indexActivity = .working; $0.waitingSources[id] = SourceIssue(summary: "离线", detail: "fixture") }
+        check("sync beside preparation", .running) { $0.indexActivity = .working; $0.sourceActivities[id] = .submitting }
+        check("unknown mutation outranks work", .waiting) { $0.livePhotoWork.unknownMutation = true; $0.sourceActivities[id] = .submitting; $0.indexActivity = .working }
+        check("unknown without specialized hint", .waiting) { $0.unknownSubmissionBlock = true; $0.indexActivity = .working }
+        check("ordinary unknown", .waiting) { $0.recoveryHint = .uncertainSubmission(message: "fixture"); $0.indexActivity = .working }
+        check("pause before unknown", .paused) { $0.isPaused = true; $0.livePhotoWork.unknownMutation = true }
+        check("queued even after one-time completion", .waiting, sources: []) { $0.livePhotoInventory = .init(phase: .completed, inventoried: 3, identified: 2, pending: 1) }
+        check("automatic unresolved", .waiting, sources: []) { $0.livePhotoInventory = .init(phase: .completed, inventoried: 3, identified: 2, unresolved: 1, retryWaiting: 1) }
+        check("held unresolved", .error, sources: []) { $0.livePhotoInventory = .init(phase: .completed, inventoried: 3, identified: 2, unresolved: 1, requiresAttention: 1) }
+        check("unconfirmed verification", .waiting, sources: []) { $0.livePhotoWork.awaitingVerification = 1 }
+        check("held group", .error, sources: []) { $0.livePhotoWork.requiresAttentionGroups = 1 }
+        check("index awaiting resources", .waiting) { $0.indexActivity = .waiting; $0.indexProgress = .init(state: .waiting, totalsKnown: false, totalAssets: 0, readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil) }
+        check("activeWork alone does not prove sync", .waiting) { $0.activeWork = true; $0.summary = .init(pending: 1) }
+        check("photos-only preparation", .preparing, sources: []) { $0.livePhotoInventory = .init(phase: .identifying, inventoried: 1, pending: 1); $0.livePhotoActivities = [.working(.identification)] }
+        check("photos-only completion", .running, sources: []) { $0.livePhotoWork.activeGroups = 1; $0.livePhotoActivities = [.working(.completion)] }
+        check("missing configuration after photos-only work ends", .error, sources: []) { $0.livePhotoInventory = .init(phase: .completed) }
+        check("disabled source issue ignored", .completed) { $0.waitingSources[disabled] = SourceIssue(summary: "离线", detail: "fixture"); $0.sourceFileIssueCounts[disabled] = 1 }
+        check("pending new source file", .waiting) { $0.summary = .init(pending: 1) }
+        check("source retry", .waiting) { $0.summary = .init(retryPending: 1) }
+        check("deferred physical work", .waiting) { $0.deferredSources = [id] }
+        check("local issue while healthy work continues", .running) { $0.sourceFileIssueCounts[id] = 1; $0.sourceActivities[id] = .scanning }
+        check("only local manual issue", .error) { $0.sourceFileIssueCounts[id] = 1 }
+        let initial = SyncStatusPresentation(snapshot: EngineSnapshot())
+        XCTAssertEqual(initial.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), .preparing)
     }
-
-    func testLibraryAnalysisVisibility() {
-        for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
-            var snapshot = EngineSnapshot()
-            snapshot.indexProgress = IndexProgress(state: state, totalsKnown: true,
-                totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
-                readyRepresentations: 90000, excludedAssets: 0, issue: nil)
-            let p = SyncStatusPresentation(snapshot: snapshot)
-            XCTAssertEqual(p.analysis != nil, state != .ready)
-            snapshot.isPaused = true
-            XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).analysis != nil, state != .ready)
-        }
-    }
-
-    func testIndexProgressCountsAssetsAndRepresentationsSeparately() {
+    func testReasonsAreActionableAndSeparateFromHeadlines() {
         var snapshot = EngineSnapshot()
-        snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
-            totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
-            readyRepresentations: 90000, excludedAssets: 0, issue: nil)
-        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).analysis?.progressText, "已分析 50000 / 100000 张")
-        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).analysis?.fraction, 0.5)
-        snapshot.indexProgress = IndexProgress(state: .preparing, totalsKnown: false,
-            totalAssets: 0, readyAssets: 0, totalRepresentations: 0,
-            readyRepresentations: 0, excludedAssets: 0, issue: nil)
-        XCTAssertNil(SyncStatusPresentation(snapshot: snapshot).analysis?.fraction)
-        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).analysis?.progressText, "正在读取图库…")
+        snapshot.summary = .init()
+        var p = SyncStatusPresentation(snapshot: snapshot)
+        XCTAssertEqual(p.statusReason(for: .error, enabledSourceIDs: []), "请添加或启用来源目录")
+        snapshot.livePhotoWork.unknownMutation = true
+        p = SyncStatusPresentation(snapshot: snapshot)
+        XCTAssertEqual(p.statusReason(for: .waiting, enabledSourceIDs: []), "等待‘照片’确认结果，新的保存已暂停")
     }
-
-    func testWaitingIndexIsNotFinishedOrFileError() {
+    func testIndependentProgressAndUnknownTotals() {
         var snapshot = EngineSnapshot()
-        snapshot.latestScan = ScanProgress(state: .completed)
-        snapshot.indexProgress = IndexProgress(state: .waiting, totalsKnown: true,
-            totalAssets: 2, readyAssets: 1, totalRepresentations: 3,
-            readyRepresentations: 1, excludedAssets: 0, issue: "正在等待 iCloud 图像，连接恢复后自动继续")
-        let p = SyncStatusPresentation(snapshot: snapshot)
-        XCTAssertEqual(p.globalStatus(enabledSourceIDs: [UUID()], authorized: true, hasBlockingError: false), .waiting)
-        XCTAssertEqual(p.analysis?.detail, "正在等待 iCloud 图像，连接恢复后自动继续")
-        XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
+        snapshot.indexActivity = .working
+        snapshot.indexProgress = .init(state: .updating, totalsKnown: true, totalAssets: 100, readyAssets: 50, totalRepresentations: 300, readyRepresentations: 250, excludedAssets: 0, issue: nil)
+        snapshot.livePhotoActivities = [.working(.identification)]
+        snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 2, unresolved: 626, retryWaiting: 626)
+        var rows = SyncStatusPresentation(snapshot: snapshot).progressRows
+        XCTAssertEqual(rows.map(\.id), ["visualIndex", "livePhoto"])
+        XCTAssertEqual(rows.map(\.subtitle), ["正在建立视觉索引", "正在配对 Live Photo"])
+        XCTAssertEqual(rows[0].progressText, "已分析 50 / 100 张"); XCTAssertEqual(rows[0].fraction, 0.5)
+        XCTAssertEqual(rows[1].progressText, "已处理 2 / 16222 项")
+        snapshot.livePhotoInventory?.phase = .enumerating
+        rows = SyncStatusPresentation(snapshot: snapshot).progressRows
+        XCTAssertEqual(rows[1].progressText, "已处理 2 项"); XCTAssertNil(rows[1].fraction)
+        snapshot.livePhotoActivities = [.working(.completion)]
+        rows = SyncStatusPresentation(snapshot: snapshot).progressRows
+        XCTAssertNil(rows[1].fraction); XCTAssertNil(rows[1].progressText)
+        snapshot.indexProgress = .init(state: .preparing, totalsKnown: false, totalAssets: 0, readyAssets: 7, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
+        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).progressRows[0].progressText, "已分析 7 张")
+        snapshot.isPaused = true; XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).progressRows.isEmpty)
+        snapshot.isPaused = false; snapshot.indexActivity = .waiting; snapshot.livePhotoActivities = [.waiting(nextRetryAt: nil)]
+        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).progressRows.isEmpty)
     }
 }

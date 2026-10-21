@@ -2,6 +2,13 @@ import Foundation
 
 public enum LivePhotoReadPurpose: Sendable { case inventory, completion }
 
+public enum LivePhotoResourceReadError: Error, Equatable, Sendable {
+    case requestTimedOut
+    case resourceLimit(bytes: Int64)
+    case budgetBusy(resourceBytes: Int64)
+    case workingSetLimit
+}
+
 public protocol LivePhotoPhotosGateway: PhotosIndexGateway {
     func createLivePhoto(photoURL: URL, motionURL: URL, photoFilename: String?, motionFilename: String?, preservation: LivePhotoPreservationSnapshot, expectedGeneration: Int,
                          beforeMutation: @escaping @Sendable () throws -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String
@@ -14,6 +21,7 @@ public protocol LivePhotoPhotosGateway: PhotosIndexGateway {
     func livePhotoAssetCatalog(session: PhotosCatalogSession, offset: Int, limit: Int) async throws -> LivePhotoAssetPage
     func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor]
     func readLivePhotoResource(_ ref: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease
+    func livePhotoReadAdmission() async -> PhotosReaderAdmission
     func livePhotoPreservationSnapshot(assetID: String, context: LibraryContext) async throws -> LivePhotoPreservationSnapshot
     func resourcesEqual(_ lhs: LivePhotoResourceRef, _ rhs: LivePhotoResourceRef, budget: LivePhotoResourceBudget) async throws -> Bool
 }
@@ -36,14 +44,26 @@ public final class LivePhotoResourceBudget: @unchecked Sendable {
     func release(_ bytes: Int64) { lock.lock(); held -= bytes; assert(held >= 0); lock.unlock() }
 }
 
+/// An observation keeps its asset ticket through parsing/commit without retaining encoded bytes.
+final class LivePhotoResourceValidity: @unchecked Sendable {
+    private let validate: @Sendable () -> Bool
+    private let release: @Sendable () -> Void
+    init(validate: @escaping @Sendable () -> Bool, release: @escaping @Sendable () -> Void) { self.validate = validate; self.release = release }
+    var isCurrent: Bool { validate() }
+    deinit { release() }
+}
+
 /// The lease, not the caller's logical timeout, owns the encoded backing and its aggregate budget.
 public final class LivePhotoResourceLease: @unchecked Sendable {
     public let url: URL
     private let owner: OwnedPhotosResource?
     private let budget: LivePhotoResourceBudget?
     private let bytes: Int64
-    init(url: URL, owner: OwnedPhotosResource? = nil, budget: LivePhotoResourceBudget? = nil, bytes: Int64 = 0) {
-        self.url = url; self.owner = owner; self.budget = budget; self.bytes = bytes
+    private let retaining: LivePhotoResourceLease?
+    let validity: LivePhotoResourceValidity?
+    var encodedBytes: Int64 { bytes }
+    init(url: URL, owner: OwnedPhotosResource? = nil, budget: LivePhotoResourceBudget? = nil, bytes: Int64 = 0, retaining: LivePhotoResourceLease? = nil, validity: LivePhotoResourceValidity? = nil) {
+        self.url = url; self.owner = owner; self.budget = budget; self.bytes = bytes; self.retaining = retaining; self.validity = validity
     }
     deinit { owner?.remove(); budget?.release(bytes) }
 
@@ -73,22 +93,68 @@ struct LivePhotoRawResourceReader: Sendable {
     let storage: PhotosResourceStorage
     let executor: ReadExecutor
     private let sourceID = UUID()
-    init(requester: any LivePhotoResourceRequesting, storage: PhotosResourceStorage = .init(), executor: ReadExecutor = .shared) {
+    private let requestTimeout: Duration
+    private let logicalTimeout: Duration
+    private let tracker = LivePhotoReadTracker()
+    init(requester: any LivePhotoResourceRequesting, storage: PhotosResourceStorage = .init(), executor: ReadExecutor = .shared,
+         requestTimeout: Duration = .seconds(600), logicalTimeout: Duration = .seconds(610)) {
         self.requester = requester; self.storage = storage; self.executor = executor
+        self.requestTimeout = requestTimeout; self.logicalTimeout = logicalTimeout
     }
+    func admission() async -> PhotosReaderAdmission { tracker.admission() }
     func read(resource: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease {
-        try await executor.executeAsync(sourceID: sourceID) {
-            let owner = try storage.create(limits: budget.limits, fileExtension: requester.resourceFileExtension(resource))
-            let stream = LivePhotoResourceStream(owner: owner, budget: budget)
-            return try await withCheckedThrowingContinuation { continuation in
-                stream.install(continuation)
-                do {
-                    let cancel = try requester.request(resource, allowNetwork: purpose == .completion,
-                        receive: { stream.receive($0) }, completion: { stream.complete($0) })
-                    stream.installCancel(cancel)
-                } catch { stream.complete(error) }
+        let cancellation = LivePhotoReadCancellation()
+        return try await withTaskCancellationHandler {
+            do { return try await executor.executeAsync(sourceID: sourceID, timeout: logicalTimeout) {
+                let owner = try storage.create(limits: budget.limits, fileExtension: requester.resourceFileExtension(resource))
+                let stream = LivePhotoResourceStream(owner: owner, budget: budget)
+                tracker.install(stream); cancellation.install(stream)
+                defer { tracker.finish(stream) }
+                return try await withCheckedThrowingContinuation { continuation in
+                    stream.install(continuation)
+                    guard stream.begin(timeout: requestTimeout) else { stream.complete(CancellationError()); return }
+                    do {
+                        let cancel = try requester.request(resource, allowNetwork: true,
+                            receive: { stream.receive($0) }, completion: { stream.complete($0) })
+                        stream.installCancel(cancel)
+                    } catch { stream.complete(error) }
+                }
             }
-        }
+            } catch ReadExecutorError.timedOut {
+                // The logical waiter may finish before PhotoKit's terminal callback. Preserve
+                // already-known capacity facts, but leave physical ownership with that Task.
+                let failure = cancellation.knownFailure
+                cancellation.cancel(with: LivePhotoResourceReadError.requestTimedOut)
+                throw failure ?? LivePhotoResourceReadError.requestTimedOut
+            }
+        } onCancel: { cancellation.cancel() }
+    }
+}
+
+/// This bridge is installed outside executeAsync's unstructured physical Task.
+private final class LivePhotoReadCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var stream: LivePhotoResourceStream?
+    func install(_ value: LivePhotoResourceStream) {
+        lock.lock(); stream = value; let cancelled = cancelled; lock.unlock()
+        if cancelled { value.requestCancellation(CancellationError()) }
+    }
+    var knownFailure: Error? { lock.lock(); let stream = stream; lock.unlock(); return stream?.knownFailure }
+    func cancel(with error: Error = CancellationError()) {
+        lock.lock(); cancelled = true; let stream = stream; lock.unlock()
+        stream?.requestCancellation(error)
+    }
+}
+
+private final class LivePhotoReadTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stream: LivePhotoResourceStream?
+    func install(_ value: LivePhotoResourceStream) { lock.lock(); stream = value; lock.unlock() }
+    func finish(_ value: LivePhotoResourceStream) { lock.lock(); if stream === value { stream = nil }; lock.unlock() }
+    func admission() -> PhotosReaderAdmission {
+        lock.lock(); let stream = stream; lock.unlock()
+        return stream?.admission() ?? .available
     }
 }
 
@@ -101,27 +167,60 @@ private final class LivePhotoResourceStream: @unchecked Sendable {
     private var failure: Error?
     private var finished = false
     private var cancel: (@Sendable () -> Void)?
+    private var cancelSent = false
+    private var drainingSince: TimeInterval?
+    private var deadline: Task<Void, Never>?
     init(owner: OwnedPhotosResource, budget: LivePhotoResourceBudget) { self.owner = owner; self.budget = budget }
+    var knownFailure: Error? { lock.lock(); defer { lock.unlock() }; return failure }
     func install(_ value: CheckedContinuation<LivePhotoResourceLease, Error>) { lock.lock(); continuation = value; lock.unlock() }
+    func begin(timeout: Duration) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard failure == nil, !finished else { return false }
+        deadline = Task { [weak self] in
+            do { try await Task.sleep(for: timeout); self?.requestCancellation(LivePhotoResourceReadError.requestTimedOut) } catch { }
+        }
+        return true
+    }
+    func admission() -> PhotosReaderAdmission {
+        lock.lock(); defer { lock.unlock() }
+        if finished { return .available }
+        guard let since = drainingSince else { return .busy }
+        return ProcessInfo.processInfo.systemUptime - since >= 60 ? .stalled : .draining
+    }
+    private func takeCancel() -> (@Sendable () -> Void)? {
+        guard !finished, failure != nil, !cancelSent, let cancel else { return nil }
+        cancelSent = true; return cancel
+    }
+    func requestCancellation(_ error: Error) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        if failure == nil { failure = error; drainingSince = ProcessInfo.processInfo.systemUptime }
+        let action = takeCancel(); lock.unlock()
+        action?()
+    }
     func installCancel(_ value: @escaping @Sendable () -> Void) {
-        lock.lock(); cancel = finished ? nil : value; let needsCancel = failure != nil && !finished; lock.unlock()
-        if needsCancel { value() }
+        lock.lock(); cancel = finished ? nil : value; let action = takeCancel(); lock.unlock()
+        action?()
     }
     func receive(_ data: Data) {
         lock.lock()
         guard !finished, failure == nil, let owner else { lock.unlock(); return }
         do {
-            try budget.reserve(Int64(data.count))
+            let attempted = bytes + Int64(data.count)
+            guard attempted <= budget.limits.maxEncodedBytes else { throw LivePhotoResourceReadError.resourceLimit(bytes: attempted) }
+            do { try budget.reserve(Int64(data.count)) }
+            catch { throw LivePhotoResourceReadError.budgetBusy(resourceBytes: attempted) }
             do { try owner.append(data); bytes += Int64(data.count) }
             catch { budget.release(Int64(data.count)); throw error }
-        } catch { failure = error }
-        let action = failure == nil ? nil : cancel
+        } catch { failure = error; drainingSince = ProcessInfo.processInfo.systemUptime }
+        let action = takeCancel()
         lock.unlock(); action?()
     }
     func complete(_ error: Error?) {
         lock.lock()
         guard !finished, let owner else { lock.unlock(); return }
         finished = true
+        deadline?.cancel(); deadline = nil
         var result: Result<LivePhotoResourceLease, Error>
         if let error = failure ?? error {
             owner.remove(); budget.release(bytes); result = .failure(error)
@@ -144,6 +243,7 @@ extension LivePhotoPreservationSnapshot {
 }
 
 public extension LivePhotoPhotosGateway {
+    func livePhotoReadAdmission() async -> PhotosReaderAdmission { .available }
     func verifyLivePhotoContext(context: LibraryContext, anchorAssetIDs: [String], allowUnanchored: Bool) async throws -> Bool { false }
     func createLivePhoto(photoURL: URL, motionURL: URL, preservation: LivePhotoPreservationSnapshot, expectedGeneration: Int,
                          beforeMutation: @escaping @Sendable () throws -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {

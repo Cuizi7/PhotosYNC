@@ -2051,6 +2051,21 @@ public final class SyncStore: @unchecked Sendable {
         }
     }
 
+    /// Historical identity can identify the role to retry, never prove current content.
+    func historicalLivePhotoIdentity(for ref: LivePhotoResourceRef) async throws -> LivePhotoIdentity? {
+        try await perform {
+            guard let row = try self.one("SELECT payload FROM live_photo_observation WHERE resource_key = ? AND revision = ? AND inspection_version = 1", [.text(ref.key), .text(ref.revision)]) else { return nil }
+            return try self.decoder.decode(LivePhotoObservation.self, from: self.blob(row[0])).identity
+        }
+    }
+
+    func livePhotoImportingFileCount(operationID: UUID) async throws -> Int {
+        try await perform {
+            let row = try self.one("SELECT COUNT(*) FROM file_record f JOIN source s ON s.id=f.source_id WHERE f.live_photo_operation_id=? AND f.attempt_id=? AND f.state='importing' AND s.enabled=1 AND s.removed=0", [.text(operationID.uuidString), .text(operationID.uuidString)])
+            return try row.map { Int(try self.int64($0[0])) } ?? 0
+        }
+    }
+
     func livePhotoObservations(contentIdentifier: String, context: LibraryContext) async throws -> [LivePhotoObservation] {
         try await perform {
             try self.rows("SELECT payload FROM live_photo_observation WHERE content_identifier = ? AND current = 1 AND (context_id IS NULL OR context_id = ?)", [.text(contentIdentifier), .text(context.id.uuidString)]).map {
@@ -2370,18 +2385,29 @@ public final class SyncStore: @unchecked Sendable {
             return try self.decoder.decode(LivePhotoAssetDescriptor.self, from: self.blob(row[0]))
         }
     }
-    func recordLivePhotoInventoryResult(context: LibraryContext, assetID: String, revision: String, observations: [LivePhotoObservation]) async throws {
+    func recordLivePhotoInventoryResult(context: LibraryContext, assetID: String, revision: String, observations: [LivePhotoObservation], retryPolicy: LivePhotoInventoryRetryPolicy, observationsAreCurrent: @escaping @Sendable () -> Bool = { true }) async throws {
         try await perform { try self.transaction {
             guard let row = try self.one("SELECT revision FROM live_photo_inventory_item WHERE context_id=? AND asset_id=? AND status IN ('queued','unresolved')", [.text(context.id.uuidString), .text(assetID)]), try self.text(row[0]) == revision else { throw PhotoKitGatewayError.libraryChanged }
-            guard observations.allSatisfy({ $0.resource.assetID == assetID && $0.resource.revision == revision }) else { throw PhotoKitGatewayError.libraryChanged }
+            guard observationsAreCurrent(), observations.allSatisfy({ $0.resource.assetID == assetID && $0.resource.revision == revision }) else { throw PhotoKitGatewayError.libraryChanged }
+            let retryDate: Binding
+            switch retryPolicy {
+            case .automatic(let date): retryDate = .double(date.timeIntervalSince1970)
+            case .requiresAttention: retryDate = .null
+            }
             var unresolved = observations.isEmpty
             try self.establishLivePhotoAnchors(context: context, assetIDs: [assetID])
             for observation in observations {
                 if case .unresolved = observation.inspection { unresolved = true }
                 try self.saveLivePhotoObservationSync(observation)
             }
-            try self.execute("UPDATE live_photo_inventory_item SET status=?,retry_count=retry_count+?,next_retry_at=? WHERE context_id=? AND asset_id=? AND revision=?", [.text(unresolved ? "unresolved" : "checked"), .int64(unresolved ? 1 : 0), unresolved ? .double(Date().addingTimeInterval(60).timeIntervalSince1970) : .null, .text(context.id.uuidString), .text(assetID), .text(revision)])
+            try self.execute("UPDATE live_photo_inventory_item SET status=?,retry_count=retry_count+?,next_retry_at=? WHERE context_id=? AND asset_id=? AND revision=?", [.text(unresolved ? "unresolved" : "checked"), .int64(unresolved ? 1 : 0), unresolved ? retryDate : .null, .text(context.id.uuidString), .text(assetID), .text(revision)])
         } }
+    }
+    func retryLivePhotoInventoryAttention(context: LibraryContext, now: Date) async throws -> Int {
+        try await perform {
+            try self.execute("UPDATE live_photo_inventory_item SET next_retry_at=? WHERE context_id=? AND status='unresolved' AND next_retry_at IS NULL", [.double(now.timeIntervalSince1970), .text(context.id.uuidString)])
+            return Int(sqlite3_changes(self.database))
+        }
     }
     func completeLivePhotoInventory(context: LibraryContext, expectedGeneration: Int) async throws -> Bool {
         try await perform { try self.transaction {
@@ -2396,9 +2422,11 @@ public final class SyncStore: @unchecked Sendable {
     func livePhotoInventorySummary(context: LibraryContext) async throws -> LivePhotoInventorySummary {
         try await perform {
             let task = try self.one("SELECT phase,completed_at FROM live_photo_inventory WHERE context_id=? AND task_key=?", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
-            let counts = try self.one("SELECT COUNT(*),COALESCE(SUM(status='checked'),0),COALESCE(SUM(status='unresolved'),0) FROM live_photo_inventory_item WHERE context_id=? AND status!='deleted'", [.text(context.id.uuidString)])!
+            let counts = try self.one("SELECT COUNT(*),COALESCE(SUM(status='checked'),0),COALESCE(SUM(status='unresolved'),0),COALESCE(SUM(status IN ('queued','needsDescriptor')),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NOT NULL),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NULL),0),MIN(CASE WHEN status='unresolved' THEN next_retry_at END) FROM live_photo_inventory_item WHERE context_id=? AND status!='deleted'", [.text(context.id.uuidString)])!
             return LivePhotoInventorySummary(phase: task.flatMap { try? self.text($0[0]) }.flatMap(LivePhotoInventoryPhase.init(rawValue:)) ?? .enumerating,
                 inventoried: Int(try self.int64(counts[0])), identified: Int(try self.int64(counts[1])), unresolved: Int(try self.int64(counts[2])),
+                pending: Int(try self.int64(counts[3])), retryWaiting: Int(try self.int64(counts[4])), requiresAttention: Int(try self.int64(counts[5])),
+                nextRetryAt: self.optionalDouble(counts[6]).map(Date.init(timeIntervalSince1970:)),
                 completedAt: task.flatMap { self.optionalDouble($0[1]) }.map(Date.init(timeIntervalSince1970:)))
         }
     }

@@ -8,7 +8,7 @@ final class LivePhotoStoreTests: XCTestCase {
             resources: [.photos(contextID: f.context.id, assetID: "partial-full", resourceKey: "photo", revision: "r1"), .photos(contextID: f.context.id, assetID: "partial-full", resourceKey: "motion", revision: "r1")], resourceKinds: [.image, .video])
         try await f.store.enqueueLivePhotoAssets(context: f.context, assets: [d])
         try await f.store.recordLivePhotoInventoryResult(context: f.context, assetID: d.assetID, revision: d.revision, observations: [
-            .init(resource: d.resources[0], inspection: .noIdentifier), .init(resource: d.resources[1], inspection: .identified(.init(contentIdentifier: "pair", role: .motion)))])
+            .init(resource: d.resources[0], inspection: .noIdentifier), .init(resource: d.resources[1], inspection: .identified(.init(contentIdentifier: "pair", role: .motion)))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         let unresolved = try await f.store.hasUnresolvedLivePhotoCandidates(context: f.context)
         XCTAssertTrue(unresolved)
     }
@@ -17,7 +17,7 @@ final class LivePhotoStoreTests: XCTestCase {
         let photo = livePhotoAsset(context: f.context, id: "old-photo"), motion = livePhotoAsset(context: f.context, id: "old-motion", kind: .video)
         try await f.store.enqueueLivePhotoAssets(context: f.context, assets: [photo, motion])
         for asset in [photo, motion] {
-            try await f.store.recordLivePhotoInventoryResult(context: f.context, assetID: asset.assetID, revision: asset.revision, observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: asset.mediaKind == .image ? .photo : .motion)))])
+            try await f.store.recordLivePhotoInventoryResult(context: f.context, assetID: asset.assetID, revision: asset.revision, observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: asset.mediaKind == .image ? .photo : .motion)))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         }
         var op = livePhotoOperation(context: f.context, photoID: f.first, motionID: f.second)
         op.photo = photo.resources[0]; op.motion = motion.resources[0]
@@ -67,7 +67,7 @@ final class LivePhotoStoreTests: XCTestCase {
         let queued = try await store.completeLivePhotoInventory(context: context, expectedGeneration: 1)
         XCTAssertFalse(queued)
         try await store.recordLivePhotoInventoryResult(context: context, assetID: asset.assetID, revision: asset.revision,
-            observations: [.init(resource: asset.resources[0], inspection: .unresolved("cloud"))])
+            observations: [.init(resource: asset.resources[0], inspection: .unresolved("cloud"))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         let done = try await store.completeLivePhotoInventory(context: context, expectedGeneration: 1)
         XCTAssertTrue(done)
         let summary = try await store.livePhotoInventorySummary(context: context)

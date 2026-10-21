@@ -25,17 +25,21 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
     private let metadata: any LivePhotoMetadataReading
     private let budget: LivePhotoResourceBudget
     private let executor: ReadExecutor
+    private let wallNow: @Sendable () -> Date
     private let sourceAdmission: @Sendable (SourceFile) -> Bool
     private let admission = LivePhotoPauseGate()
     private var paused = false, working = false, recovered = false
+    private var active = false
+    private var activeOperationID: UUID?
+    private var attemptedResources = [LivePhotoResourceRef]()
     private var discoveryCursor: String?
     private var operationCursor: UUID?
     /// Source admission must synchronously consult the current directory round;
     /// it is checked again by the physical mutation guard. Without it only
     /// Photos-only groups can advance. The gateway still owns callback lifetime.
     public init(store: SyncStore, photos: any LivePhotoPhotosGateway, metadata: any LivePhotoMetadataReading = LivePhotoMetadataReader(),
-                budget: LivePhotoResourceBudget = .shared, executor: ReadExecutor = .shared, sourceAdmission: @escaping @Sendable (SourceFile) -> Bool = { _ in false }) {
-        self.store = store; self.photos = photos; self.metadata = metadata; self.budget = budget; self.executor = executor; self.sourceAdmission = sourceAdmission
+                budget: LivePhotoResourceBudget = .shared, executor: ReadExecutor = .shared, wallNow: @escaping @Sendable () -> Date = { Date() }, sourceAdmission: @escaping @Sendable (SourceFile) -> Bool = { _ in false }) {
+        self.store = store; self.photos = photos; self.metadata = metadata; self.budget = budget; self.executor = executor; self.wallNow = wallNow; self.sourceAdmission = sourceAdmission
     }
     public func setPaused(_ value: Bool) { paused = value; admission.setPaused(value) }
     public func observeDirectory(sourceID: UUID, relativeDirectory: String, fileIDs: [UUID]) async throws {
@@ -105,10 +109,22 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         var value = LivePhotoWorkSummary()
         var active = Set<UUID>(), verify = Set<UUID>(), retire = Set<UUID>(), limited = Set<UUID>()
         for op in operations {
-            if op.holdsUnknownMutation { value.unknownMutation = true }
+            // A submitted request owned by this instance is normal work. Durable safety
+            // admission still uses holdsUnknownMutation, including this same request.
+            let recoveredSubmission = (op.creationEvidence == .submitted || op.retirementEvidence == .submitted) && activeOperationID != op.id
+            if op.creationEvidence == .unknown || op.retirementEvidence == .unknown || recoveredSubmission { value.unknownMutation = true }
+            if op.stage == .creating, op.creationEvidence == .submitted, activeOperationID == op.id {
+                let count = try await store.livePhotoImportingFileCount(operationID: op.id)
+                if activeOperationID == op.id { value.ownedImportingFiles += count }
+            }
+            if op.deferralReason == .protectedInformation { continue }
+            if let retry = op.nextRetryAt {
+                if retry == .distantFuture { value.requiresAttentionGroups += 1 }
+                else { value.retryWaitingGroups += 1; value.nextRetryAt = min(value.nextRetryAt ?? retry, retry) }
+            } else if op.stage == .blocked { value.requiresAttentionGroups += 1 }
             if let error = op.error {
                 if !op.holdsUnknownMutation { limited.insert(op.groupID) }
-                if value.issue == nil { value.issue = SourceIssue(summary: op.targetID == nil ? "部分 Live Photo 待核实" : "Live Photo 已补齐，旧项目待清理", detail: error, kind: .submission) }
+                if value.issue == nil { value.issue = SourceIssue(summary: op.nextRetryAt == .distantFuture || op.stage == .blocked ? "部分 Live Photo 需要处理，请重新尝试或查看诊断。" : "部分 Live Photo 暂时无法处理，稍后自动重试。", detail: error, kind: .submission) }
             }
             if op.stage == .created || op.stage == .verifying { verify.insert(op.groupID) }
             if op.stage == .readyToRetire || op.stage == .retiring { retire.insert(op.groupID) }
@@ -116,6 +132,22 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         }
         value.activeGroups = active.count; value.awaitingVerification = verify.count; value.awaitingRetirement = retire.count; value.limitedGroups = limited.count
         return value
+    }
+    public func activity() async -> LivePhotoActivity {
+        let admission = await photos.livePhotoReadAdmission()
+        if admission == .draining || admission == .stalled { return .draining }
+        if active { return .working(.completion) }
+        guard let s = try? await summary() else { return .waiting(nextRetryAt: nil) }
+        if s.requiresAttentionGroups > 0 { return .requiresAttention(s.issue ?? SourceIssue(summary: "部分 Live Photo 需要处理，请重新尝试或查看诊断。", detail: "Completion requires attention", kind: .file)) }
+        if s.unknownMutation || s.activeGroups > 0 || s.awaitingVerification > 0 || s.awaitingRetirement > 0 || s.retryWaitingGroups > 0 { return .waiting(nextRetryAt: s.nextRetryAt) }
+        return .idle
+    }
+    public func retryAttention(now: Date) async throws {
+        guard !paused else { return }
+        for var op in try await store.loadLivePhotoOperationsForRecovery() where !op.holdsUnknownMutation && op.nextRetryAt == .distantFuture && op.deferralReason != .protectedInformation {
+            op.nextRetryAt = now; op.deferralReason = nil; op.error = nil
+            _ = try await store.saveLivePhotoOperation(op, expectedStage: op.stage)
+        }
     }
     public func advanceNext(now: Date) async throws -> Bool {
         guard !paused, !working else { return false }
@@ -128,6 +160,9 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         discoveryCursor = ids.last
         let operations = try await store.loadLivePhotoOperationsForRecovery()
         guard !operations.contains(where: \.holdsUnknownMutation), !paused else { return false }
+        for op in operations where op.deferralReason == .workingSetLimit && op.context == context {
+            if try await reopenChangedLimitedResources(op) { return true }
+        }
         let prioritized = operations.filter { $0.context == context && $0.stage != .blocked && ($0.nextRetryAt == nil || $0.nextRetryAt! <= now) }
             .sorted { ($0.stage == .planned ? 1 : 0, $0.id.uuidString) < ($1.stage == .planned ? 1 : 0, $1.id.uuidString) }
         var ordered = prioritized
@@ -141,13 +176,21 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
                 var stopped = op; stopped.stage = .blocked; stopped.error = "关联项目已删除，已停止自动补齐"
                 _ = try await store.saveLivePhotoOperation(stopped, expectedStage: op.stage); continue
             }
+            active = true; activeOperationID = op.id; attemptedResources = []
+            defer { active = false; activeOperationID = nil; attemptedResources = [] }
             do { if try await advance(op, now: now) { return true } }
             catch {
                 if error is CancellationError { return false }
-                if error is PhotosAdmissionDeferred || error is ReadExecutorError { continue }
+                if error is PhotosAdmissionDeferred || error is ReadExecutorError { throw error }
+                if case .budgetBusy = error as? LivePhotoResourceReadError { throw error }
                 // Read/verification limits affect this group, not unrelated ordinary imports.
                 if let current = try await store.livePhotoOperation(id: op.id), !current.holdsUnknownMutation {
-                    var waiting = current; waiting.error = "Live Photo 补齐受限：" + SourceIssueText.systemDiagnostic(error); waiting.nextRetryAt = now.addingTimeInterval(60)
+                    var waiting = current; waiting.error = "Live Photo 补齐受限：" + SourceIssueText.systemDiagnostic(error)
+                    let permanent: Bool
+                    switch error as? LivePhotoResourceReadError { case .resourceLimit, .workingSetLimit: permanent = true; default: permanent = false }
+                    waiting.deferralReason = permanent ? .workingSetLimit : .otherFailure
+                    waiting.limitedResources = permanent ? attemptedResources : nil
+                    waiting.nextRetryAt = permanent ? .distantFuture : wallNow().addingTimeInterval(60)
                     _ = try await store.saveLivePhotoOperation(waiting, expectedStage: current.stage)
                 }
                 throw error
@@ -176,9 +219,11 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
                 guard !paused, try await sourcesAdmitted(op), try await photos.livePhotoLibraryContext() == op.context else { return false }
                 try await store.reuseLivePhotoTarget(operationID: op.id, identifier: target); return true
             }
-            let photo = try await input(op.photo), motion = try await input(op.motion)
+            let (photo, motion) = try await inputs(op.photo, op.motion)
             let photoIdentity = try await metadata.inspect(resource: photo, kind: .image)
+            guard !paused else { return false }
             let motionIdentity = try await metadata.inspect(resource: motion, kind: .video)
+            guard !paused else { return false }
             guard case .identified(let p) = photoIdentity, case .identified(let m) = motionIdentity,
                   p.role == .photo, m.role == .motion, p.contentIdentifier == op.contentIdentifier, m.contentIdentifier == op.contentIdentifier,
                   m.stillImageTime != nil else {
@@ -236,6 +281,7 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
             }
             guard reasons.isEmpty else {
                 op.error = "Live Photo 已补齐，旧项目待清理：" + Set(reasons).sorted().joined(separator: "；")
+                op.deferralReason = .protectedInformation
                 op.nextRetryAt = .distantFuture // Do not repeatedly prompt or reread unchanged protected information.
                 _ = try await store.saveLivePhotoOperation(op, expectedStage: .readyToRetire); return true
             }
@@ -248,9 +294,10 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
             } catch {
                 if var current = try await store.livePhotoOperation(id: op.id) {
                     current.error = "Live Photo 已补齐，旧项目待清理：" + SourceIssueText.systemDiagnostic(error)
+                    current.deferralReason = .otherFailure
                     current.nextRetryAt = .distantFuture
                     if error is PhotosAdmissionDeferred {
-                        current.error = nil; current.nextRetryAt = now.addingTimeInterval(5)
+                        current.error = nil; current.nextRetryAt = wallNow().addingTimeInterval(5)
                         current.retirementEvidence = .notSubmitted; current.stage = .readyToRetire
                     } else if (error as? PhotoKitGatewayError)?.recoveryEvidence == .definitelyNotCommitted {
                         current.retirementEvidence = .failed; current.stage = .readyToRetire
@@ -262,6 +309,31 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
             return true
         default: return false
         }
+    }
+    private func reopenChangedLimitedResources(_ op: LivePhotoOperation) async throws -> Bool {
+        guard !paused, !op.holdsUnknownMutation else { return false }
+        // New payloads freeze the exact failing pair. Older payloads can safely use
+        // their fixed inputs. Unrelated catalog changes do not open this hold.
+        for ref in op.limitedResources ?? [op.photo, op.motion] {
+            guard let previousIdentity = try await store.historicalLivePhotoIdentity(for: ref),
+                  previousIdentity.contentIdentifier == op.contentIdentifier else { continue }
+            let candidates: [LivePhotoResourceRef]
+            if let assetID = ref.assetID {
+                candidates = try await store.livePhotoAssetDescriptor(context: op.context, assetID: assetID)?.resources ?? []
+            } else if let id = ref.sourceFileID, let file = try await store.sourceFile(id: id) { candidates = [.source(fileID: id, stamp: file.file.stamp)] }
+            else { candidates = [] }
+            var replacements = [LivePhotoResourceRef]()
+            for candidate in candidates where candidate.revision != ref.revision {
+                guard let identity = try await store.livePhotoObservation(for: candidate)?.identity,
+                      identity.contentIdentifier == op.contentIdentifier, identity.role == previousIdentity.role else { continue }
+                replacements.append(candidate)
+            }
+            guard replacements.count == 1 else { continue }
+            guard !paused else { return false }
+            var reopened = op; reopened.nextRetryAt = nil; reopened.error = nil; reopened.deferralReason = nil; reopened.limitedResources = nil
+            return try await store.saveLivePhotoOperation(reopened, expectedStage: op.stage)
+        }
+        return false
     }
     private func eligibleDiscoveryResources(context: LibraryContext, identifier: String) async throws -> [LivePhotoResourceRef] {
         let observed = try await store.livePhotoObservations(contentIdentifier: identifier, context: context)
@@ -329,6 +401,7 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
             if let known = cached.first(where: { $0.resource == ref }) { inspection = known.inspection }
             else {
                 let lease = try await input(ref)
+                guard !paused else { throw CancellationError() }
                 inspection = try await metadata.inspect(resource: lease, kind: kind)
                 needsInventoryResult = true
             }
@@ -337,7 +410,7 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         }
         guard let photo = byRole[.photo], let motion = byRole[.motion] else { return nil }
         if needsInventoryResult {
-            try await store.recordLivePhotoInventoryResult(context: op.context, assetID: targetID, revision: target.revision, observations: observations)
+            try await store.recordLivePhotoInventoryResult(context: op.context, assetID: targetID, revision: target.revision, observations: observations, retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         }
         var result = op; result.photo = photo; result.motion = motion; result.oldAssetIDs = []; result.oldSnapshots = [:]
         result.equivalentResources = [photo, motion]
@@ -370,16 +443,35 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         return nil
     }
     private func input(_ ref: LivePhotoResourceRef) async throws -> LivePhotoResourceLease {
+        guard !paused else { throw CancellationError() }
+        if !attemptedResources.contains(ref) { attemptedResources = Array((attemptedResources + [ref]).suffix(2)) }
         if case .source(let id, let stamp) = ref {
-            guard let file = try await store.sourceFile(id: id), file.file.stamp == stamp,
-                  try await DirectoryReader(sourceID: file.file.sourceID, executor: executor).stamp(of: file.file.url) == stamp else { throw PhotoKitGatewayError.libraryChanged }
+            guard let file = try await store.sourceFile(id: id), file.file.stamp == stamp else { throw PhotoKitGatewayError.libraryChanged }
+            guard !paused else { throw CancellationError() }
+            guard try await DirectoryReader(sourceID: file.file.sourceID, executor: executor).stamp(of: file.file.url) == stamp else { throw PhotoKitGatewayError.libraryChanged }
+            guard !paused else { throw CancellationError() }
             return .init(url: file.file.url)
         }
         return try await photos.readLivePhotoResource(ref, purpose: .completion, budget: budget)
     }
+    private func inputs(_ first: LivePhotoResourceRef, _ second: LivePhotoResourceRef) async throws -> (LivePhotoResourceLease, LivePhotoResourceLease) {
+        attemptedResources = [first, second]
+        let left = try await input(first)
+        guard !paused else { throw CancellationError() }
+        do {
+            let right = try await input(second)
+            guard !paused else { throw CancellationError() }
+            return (left, right)
+        }
+        catch LivePhotoResourceReadError.budgetBusy(let attempted) {
+            // Only bytes held by this exact pair prove an impossible fixed working set.
+            if left.encodedBytes + attempted > budget.limits.maxEncodedBytes { throw LivePhotoResourceReadError.workingSetLimit }
+            throw LivePhotoResourceReadError.budgetBusy(resourceBytes: attempted)
+        }
+    }
     private func equal(_ a: LivePhotoResourceRef, _ b: LivePhotoResourceRef) async throws -> Bool {
         if a == b { return true }
-        let left = try await input(a), right = try await input(b)
+        let (left, right) = try await inputs(a, b)
         return try await executor.execute(sourceID: UUID()) { try LivePhotoResourceLease.filesEqual(left.url, right.url) }
     }
     private func filename(_ ref: LivePhotoResourceRef) async throws -> String? {

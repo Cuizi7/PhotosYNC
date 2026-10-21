@@ -2,6 +2,105 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoCoordinatorTests: XCTestCase {
+    func testPauseAfterFirstCloudResourceDoesNotStartSecondRead() async throws {
+        let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+        let gate = InventoryReadGate(); await f.photos.holdRawRead(gate)
+        let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+        let task = Task { try await c.advanceNext(now: Date()) }
+        let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+        await c.setPaused(true); await gate.release(); _ = try await task.value
+        let reads = await f.photos.rawReadCount; XCTAssertEqual(reads, 1)
+        let creates = await f.photos.creates; XCTAssertEqual(creates, 0)
+    }
+    func testNormalInFlightCreateAndRetirementAreWorkRatherThanUnknown() async throws {
+        for retirement in [false, true] {
+            let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+            let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata()), gate = InventoryReadGate()
+            if retirement { for _ in 0..<2 { _ = try await c.advanceNext(now: Date()) } }
+            await f.photos.holdMutation(gate, retirement: retirement)
+            let task = Task { try await c.advanceNext(now: Date()) }
+            let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+            let summary = try await c.summary(); XCTAssertFalse(summary.unknownMutation)
+            let activity = await c.activity(); XCTAssertEqual(activity, .working(.completion))
+            await gate.release(); _ = try await task.value
+        }
+    }
+    func testChangedRevisionReopensWorkingSetLimitWithoutExplicitRetry() async throws {
+        let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+        let budget = LivePhotoResourceBudget(maxBytes: 5)
+        await f.photos.useEncodedFixtures(bytes: 3)
+        let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), budget: budget)
+        do { _ = try await c.advanceNext(now: Date()); XCTFail("Expected working-set limit") } catch { }
+        let changed = livePhotoAsset(context: f.photos.context, id: "old-photo", revision: "r2")
+        await f.photos.replace(changed, bytes: 2)
+        try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [changed])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: changed.assetID, revision: changed.revision, observations: [.init(resource: changed.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: .photo)))], retryPolicy: .requiresAttention)
+        for _ in 0..<3 { _ = try await c.advanceNext(now: Date()) }
+        let creates = await f.photos.creates; XCTAssertEqual(creates, 1)
+    }
+    func testReplacementResourceKeyReopensOnlyUnambiguousMatchingRole() async throws {
+        for ambiguous in [false, true] {
+            let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+            let budget = LivePhotoResourceBudget(maxBytes: 5)
+            await f.photos.useEncodedFixtures(bytes: 3)
+            let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), budget: budget)
+            do { _ = try await c.advanceNext(now: Date()); XCTFail("Expected limit") } catch { }
+            let context = f.photos.context
+            let refs = (0..<(ambiguous ? 2 : 1)).map { LivePhotoResourceRef.photos(contextID: context.id, assetID: "old-photo", resourceKey: "replacement-\($0)", revision: "r2") }
+            let changed = LivePhotoAssetDescriptor(context: context, assetID: "old-photo", revision: "r2", isLivePhoto: false, mediaKind: .image, resources: refs)
+            await f.photos.replace(changed, bytes: 2)
+            try await f.store.applyLivePhotoDelta(.init(context: context, fromGeneration: 0, toGeneration: 1, changedAssetIDs: [changed.assetID], deletedAssetIDs: []))
+            try await f.store.enqueueLivePhotoAssets(context: context, assets: [changed])
+            try await f.store.recordLivePhotoInventoryResult(context: context, assetID: changed.assetID, revision: changed.revision, observations: refs.map { .init(resource: $0, inspection: .identified(.init(contentIdentifier: "pair", role: .photo))) }, retryPolicy: .requiresAttention)
+            for _ in 0..<3 { _ = try await c.advanceNext(now: Date()) }
+            let creates = await f.photos.creates; XCTAssertEqual(creates, ambiguous ? 0 : 1)
+        }
+    }
+    func testCompletionDrainingIsNotReportedAsWorking() async throws {
+        let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+        let gate = InventoryReadGate(); await f.photos.holdRawRead(gate)
+        let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+        let task = Task { try await c.advanceNext(now: Date()) }
+        let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+        await f.photos.setRawAdmission(.draining)
+        let activity = await c.activity(); XCTAssertEqual(activity, .draining)
+        await c.setPaused(true); await gate.release(); _ = try await task.value
+    }
+    func testPairWorkingSetLimitIsHeldButOtherOwnersBudgetIsRetryable() async throws {
+        for oversized in [true, false] {
+            let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+            let budget = LivePhotoResourceBudget(maxBytes: 5)
+            await f.photos.useEncodedFixtures(bytes: oversized ? 3 : 2)
+            if !oversized { try budget.reserve(2) }
+            let coordinator = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), budget: budget)
+            do { _ = try await coordinator.advanceNext(now: Date()); XCTFail("Expected capacity rejection") } catch { }
+            let operations = try await f.store.loadLivePhotoOperationsForRecovery()
+            let op = try XCTUnwrap(operations.first)
+            let reads = await f.photos.rawReadCount
+            if oversized {
+                XCTAssertEqual(op.deferralReason, .workingSetLimit); XCTAssertEqual(op.nextRetryAt, .distantFuture)
+                _ = try await coordinator.advanceNext(now: Date().addingTimeInterval(1000))
+                let after = await f.photos.rawReadCount; XCTAssertEqual(after, reads)
+                let summary = try await coordinator.summary(); XCTAssertEqual(summary.requiresAttentionGroups, 1)
+                try await coordinator.retryAttention(now: Date())
+                let rearmed = try await f.store.livePhotoOperation(id: op.id); XCTAssertNotEqual(rearmed?.nextRetryAt, .distantFuture)
+            } else {
+                XCTAssertNil(op.deferralReason); XCTAssertNil(op.error)
+                budget.release(2)
+                _ = try await coordinator.advanceNext(now: Date())
+                let creates = await f.photos.creates; XCTAssertEqual(creates, 1)
+            }
+            XCTAssertEqual(budget.reservedBytes, 0)
+        }
+    }
+    func testLegacyOperationWithoutDeferralReasonStillDecodes() throws {
+        let context = LibraryContext(id: UUID(), epoch: 0)
+        let op = LivePhotoOperation(context: context, contentIdentifier: "pair", photo: .source(fileID: UUID(), stamp: .init(size: 1, modifiedNanoseconds: 1)), motion: .source(fileID: UUID(), stamp: .init(size: 1, modifiedNanoseconds: 1)))
+        let data = try JSONEncoder().encode(op)
+        var value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any]); value.removeValue(forKey: "deferralReason")
+        let legacy = try JSONDecoder().decode(LivePhotoOperation.self, from: JSONSerialization.data(withJSONObject: value))
+        XCTAssertNil(legacy.deferralReason); XCTAssertEqual(legacy.id, op.id)
+    }
     func testSourceGroupsWaitWithoutAdmissionDependency() async throws {
         let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
         try await completeEmptyInventory(f.store, f.photos.context)
@@ -22,7 +121,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         try await f.store.enqueueLivePhotoAssets(context: f.context, assets: all)
         for d in all {
             try await f.store.recordLivePhotoInventoryResult(context: f.context, assetID: d.assetID, revision: d.revision,
-                observations: d.resources.enumerated().map { i, ref in .init(resource: ref, inspection: .identified(.init(contentIdentifier: "pair", role: i == 0 ? .photo : .motion))) })
+                observations: d.resources.enumerated().map { i, ref in .init(resource: ref, inspection: .identified(.init(contentIdentifier: "pair", role: i == 0 ? .photo : .motion))) }, retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         }
         try await completeEmptyInventory(f.store, f.context)
         let c = LivePhotoCoordinator(store: f.store, photos: photos, metadata: CompletionMetadata(), sourceAdmission: { _ in true })
@@ -41,7 +140,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
             await f.photos.add(asset)
             try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [asset])
             try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: id, revision: asset.revision,
-                observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "ready", role: kind == .image ? .photo : .motion)))])
+                observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "ready", role: kind == .image ? .photo : .motion)))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         }
         for _ in 0..<6 { _ = try await c.advanceNext(now: Date()) }
         let creates = await f.photos.creates, retires = await f.photos.retires, state = try await f.store.state(of: f.first)
@@ -59,7 +158,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let observations = target.resources.enumerated().map { i, ref in
             LivePhotoObservation(resource: ref, inspection: .identified(.init(contentIdentifier: "pair", role: i == 0 ? .photo : .motion)))
         }
-        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: target.assetID, revision: target.revision, observations: observations)
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: target.assetID, revision: target.revision, observations: observations, retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         for batch in 1...2 {
             let motion = try await appendCompletionSource(store: f.store, sourceID: f.sourceID, filename: "late-\(batch).mov", kind: .video)
             try await c.observeDirectory(sourceID: f.sourceID, relativeDirectory: "", fileIDs: [motion])
@@ -119,7 +218,9 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         for _ in 0..<6 { _ = try await c.advanceNext(now: Date()) }
         let creates = await f.photos.creates, retires = await f.photos.retires, state = try await f.store.state(of: motion)
         XCTAssertEqual(creates, 1); XCTAssertEqual(retires, 0); XCTAssertEqual(state, .skipped)
-        let summary = try await c.summary(); XCTAssertEqual(summary.awaitingRetirement, 1)
+        let summary = try await c.summary(); XCTAssertEqual(summary.awaitingRetirement, 0)
+        XCTAssertEqual(summary.limitedGroups, 0)
+        let activity = await c.activity(); XCTAssertEqual(activity, .idle)
     }
     func testContextChangeDuringInputInspectionCannotRedirectNewPair() async throws {
         let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
@@ -185,7 +286,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let descriptors = try await f.photos.livePhotoAssets(assetIDs: ["complete"], context: f.photos.context)
         let d = try XCTUnwrap(descriptors.first)
         try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [d])
-        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: d.assetID, revision: d.revision, observations: d.resources.enumerated().map { i, ref in .init(resource: ref, inspection: .identified(.init(contentIdentifier: "pair", role: i == 0 ? .photo : .motion))) })
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: d.assetID, revision: d.revision, observations: d.resources.enumerated().map { i, ref in .init(resource: ref, inspection: .identified(.init(contentIdentifier: "pair", role: i == 0 ? .photo : .motion))) }, retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         try await completeEmptyInventory(f.store, f.photos.context)
         let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), sourceAdmission: { _ in true })
         for _ in 0..<6 { _ = try await c.advanceNext(now: Date()) }
@@ -200,7 +301,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
             let d = livePhotoAsset(context: f.photos.context, id: id, kind: photoInPhotos ? .image : .video)
             await f.photos.add(d)
             try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [d])
-            try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: id, revision: d.revision, observations: [.init(resource: d.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: role)))])
+            try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: id, revision: d.revision, observations: [.init(resource: d.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: role)))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
             try await completeEmptyInventory(f.store, f.photos.context)
             let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), sourceAdmission: { _ in true })
             for _ in 0..<6 { _ = try await c.advanceNext(now: Date()) }
@@ -226,7 +327,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let d = livePhotoAsset(context: f.photos.context, id: "different-photo")
         await f.photos.add(d)
         try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [d])
-        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: d.assetID, revision: d.revision, observations: [.init(resource: d.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: .photo)))])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: d.assetID, revision: d.revision, observations: [.init(resource: d.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: .photo)))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), sourceAdmission: { _ in true })
         for _ in 0..<4 { _ = try await c.advanceNext(now: Date()) }
         let calls = await f.photos.creates, retires = await f.photos.retires; XCTAssertEqual(calls, 0); XCTAssertEqual(retires, 0)
@@ -264,7 +365,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
         let unknown = livePhotoAsset(context: f.photos.context, id: "cloud-full", isLivePhoto: true)
         try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [unknown])
-        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: unknown.assetID, revision: unknown.revision, observations: [.init(resource: unknown.resources[0], inspection: .unresolved("cloud"))])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: unknown.assetID, revision: unknown.revision, observations: [.init(resource: unknown.resources[0], inspection: .unresolved("cloud"))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         try await completeEmptyInventory(f.store, f.photos.context)
         let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), sourceAdmission: { _ in true })
         for _ in 0..<4 { _ = try await c.advanceNext(now: Date()) }
@@ -316,7 +417,9 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         await c.setPaused(false)
         for _ in 0..<8 { _ = try await c.advanceNext(now: Date()) }
         let creates = await f.photos.creates, retires = await f.photos.retires; XCTAssertEqual(creates, 1); XCTAssertEqual(retires, 0)
-        let summary = try await c.summary(); XCTAssertEqual(summary.awaitingRetirement, 1)
+        let summary = try await c.summary(); XCTAssertEqual(summary.awaitingRetirement, 0)
+        XCTAssertEqual(summary.limitedGroups, 0)
+        let activity = await c.activity(); XCTAssertEqual(activity, .idle)
     }
     func testUnknownOrChangedTitlesDoNotPreventVerifiedRetirement() async throws {
         for unknownTitle in [true, false] {
@@ -354,7 +457,7 @@ func completionFixture(photosOnly: Bool = false) async throws -> (root: URL, sto
             let asset = livePhotoAsset(context: f.context, id: id, kind: role == .photo ? .image : .video)
             await photos.add(asset)
             try await f.store.enqueueLivePhotoAssets(context: f.context, assets: [asset])
-            try await f.store.recordLivePhotoInventoryResult(context: f.context, assetID: id, revision: asset.revision, observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: role)))])
+            try await f.store.recordLivePhotoInventoryResult(context: f.context, assetID: id, revision: asset.revision, observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "pair", role: role)))], retryPolicy: .automatic(nextRetryAt: Date().addingTimeInterval(60)))
         }
         try await completeEmptyInventory(f.store, f.context)
     } else {
@@ -376,6 +479,17 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
     var activeContext: LibraryContext?
     var generation = 0
     func switchContext() { activeContext = .init(id: UUID(), epoch: 0); generation += 1 }
+    var rawGate: InventoryReadGate?, createGate: InventoryReadGate?, retirementGate: InventoryReadGate?
+    var rawAdmission: PhotosReaderAdmission = .available
+    var encodedSizes: [String: Int] = [:]
+    func replace(_ asset: LivePhotoAssetDescriptor, bytes: Int) { assets.removeAll { $0.assetID == asset.assetID }; assets.append(asset); encodedSizes[asset.assetID] = bytes }
+    func holdRawRead(_ gate: InventoryReadGate) { rawGate = gate }
+    func holdMutation(_ gate: InventoryReadGate, retirement: Bool) { if retirement { retirementGate = gate } else { createGate = gate } }
+    func setRawAdmission(_ value: PhotosReaderAdmission) { rawAdmission = value }
+    func livePhotoReadAdmission() async -> PhotosReaderAdmission { rawAdmission }
+    var encodedFixtureBytes: Int?
+    var rawReadCount = 0
+    func useEncodedFixtures(bytes: Int) { encodedFixtureBytes = bytes }
     var createdResourceURLs = [MediaKind: URL]()
     var liveCatalogCalls = 0
     var assets = [LivePhotoAssetDescriptor](), creates = 0, retires = 0, events = [String](), inputs = [String]()
@@ -404,13 +518,14 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
         guard expectedGeneration == generation, try beforeMutation() else { throw PhotosAdmissionDeferred() }
         creates += 1; events.append("create"); inputs = [photoURL.lastPathComponent, motionURL.lastPathComponent]
         createdResourceURLs = [.image: photoURL, .video: motionURL]
-        try onPlaceholder("complete"); addComplete(); return "complete"
+        try onPlaceholder("complete"); addComplete(); if let gate = createGate { createGate = nil; await gate.hold() }; return "complete"
     }
     func verifyLivePhoto(assetID: String, operation: LivePhotoOperation) async throws -> LivePhotoVerification { events.append("verify"); return .init(assetID: assetID, revision: "r1", passed: true, details: ["fake verified native content"]) }
     func retireLivePhotoComponents(assetIDs: [String], expectedGeneration: Int, beforeMutation: @escaping @Sendable () throws -> Bool) async throws {
         guard try beforeMutation() else { throw PhotosAdmissionDeferred() }
         if retirementDeferrals > 0 { retirementDeferrals -= 1; throw PhotosAdmissionDeferred() }
         retires += 1; events.append("retire")
+        if let gate = retirementGate { retirementGate = nil; await gate.hold() }
         if unknownRetirement { throw PhotoKitGatewayError.resultUnknown("test") }
         assets.removeAll { assetIDs.contains($0.assetID) }
     }
@@ -423,7 +538,17 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
         return value
     }
     func readLivePhotoResource(_ ref: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease {
+        rawReadCount += 1
+        if let gate = rawGate { rawGate = nil; await gate.hold() }
         let kind: MediaKind = ref.key.contains("motion") ? .video : .image
+        if let count = encodedSizes[ref.assetID ?? ""] ?? encodedFixtureBytes {
+            let bytes = Int64(count)
+            guard bytes <= budget.limits.maxEncodedBytes else { throw LivePhotoResourceReadError.resourceLimit(bytes: bytes) }
+            do { try budget.reserve(bytes) } catch { throw LivePhotoResourceReadError.budgetBusy(resourceBytes: bytes) }
+            let owner = try PhotosResourceStorage(root: root.appendingPathComponent("encoded")).create(limits: budget.limits)
+            try owner.append(Data(repeating: kind == .image ? 1 : 2, count: count)); try owner.closeStream()
+            return .init(url: owner.url, owner: owner, budget: budget, bytes: bytes)
+        }
         let url = root.appendingPathComponent(ref.assetID! + (ref.assetID == "complete" ? (kind == .image ? "-photo" : "-motion") : ""))
         let bytes = ref.assetID == "complete" && createdResourceURLs[kind] != nil ? try Data(contentsOf: createdResourceURLs[kind]!) : Data([ref.key.contains("different-photo") ? 3 : (kind == .video ? 2 : 1)])
         try bytes.write(to: url); return .init(url: url)

@@ -253,6 +253,9 @@ public struct EngineSnapshot: Sendable {
     public var summaryError: String?
     public var latestScan = ScanProgress()
     public var activeWork = false
+    public var sourceActivities: [UUID: SourceActivity] = [:]
+    public var indexActivity: IndexActivity = .idle
+    public var livePhotoActivities: [LivePhotoActivity] = []
     public var sourcePhases: [UUID: String] = [:]
     public var waitingSources: [UUID: SourceIssue] = [:]
     /// Migration aid for clients that consumed the pre-SourceIssue `[UUID: String]` view.
@@ -275,12 +278,13 @@ public struct EngineSnapshot: Sendable {
     public var livePhotoInventory: LivePhotoInventorySummary?
     public var livePhotoWork = LivePhotoWorkSummary()
     public var livePhotoIssue: SourceIssue?
-    public var hasLivePhotoWork: Bool { livePhotoInventory != nil || livePhotoWork.activeGroups > 0 || livePhotoWork.awaitingVerification > 0 || livePhotoWork.awaitingRetirement > 0 || livePhotoWork.unknownMutation }
+    public var hasLivePhotoWork: Bool { (livePhotoInventory.map { $0.phase != .completed || $0.pending > 0 || $0.unresolved > 0 } ?? false) || livePhotoWork.activeGroups > 0 || livePhotoWork.awaitingVerification > 0 || livePhotoWork.awaitingRetirement > 0 || livePhotoWork.unknownMutation || livePhotoWork.limitedGroups > 0 || livePhotoWork.requiresAttentionGroups > 0 || livePhotoWork.retryWaitingGroups > 0 }
     public var indexProgress: IndexProgress?
     /// Raw engine-level failure, kept for the journal and the menu tooltip.
     public var blockingError: String?
     /// Plain-language headline for `blockingError`, and the text a notification carries.
     public var blockingSummary: String?
+    public var unknownSubmissionBlock = false
     public var recoveryHint: EngineRecoveryHint?
     public var isPaused = false
 }
@@ -308,6 +312,8 @@ public actor SyncEngine {
     private let notifyIssue: @Sendable (String) -> Void
     private let now: @Sendable () -> Date
     private var status = EngineSnapshot() { didSet { refreshSubmissionState() } }
+    private var activeSourceScans = Set<UUID>()
+    private var activeSourceProcessing = Set<UUID>()
     private var scanning = false
     private var recovering = false
     private var storageFailed = false
@@ -431,7 +437,11 @@ public actor SyncEngine {
     public func snapshot() async -> EngineSnapshot {
         await refreshSummary()
         var result = status
+        result.unknownSubmissionBlock = hasUncertainSubmissionBlock
         result.activeWork = scanning || drainTask != nil || recovering
+        result.sourceActivities = result.waitingSources.mapValues { _ in .waiting }
+        for id in activeSourceScans { result.sourceActivities[id] = .scanning }
+        for id in activeSourceProcessing { result.sourceActivities[id] = .submitting }
         return result
     }
     public func scanEnabledSources() async {
@@ -538,6 +548,8 @@ public actor SyncEngine {
     }
 
     private func scanSource(_ sourceID: UUID, roundID: UUID, photosSnapshot: PhotosCandidateSnapshot) async {
+        activeSourceScans.insert(sourceID)
+        defer { activeSourceScans.remove(sourceID) }
         status.sourcePhases[sourceID] = "扫描目录与元数据"
         status.deferredSources.remove(sourceID)
         status.advancedWaitingReasons.removeValue(forKey: sourceID)
@@ -977,7 +989,11 @@ public actor SyncEngine {
                         continue
                     }
                     let preparation: AdvancedPreparation
-                    do { preparation = try await advancedDedup.prepare(fileID: record.id, file: record.file) }
+                    do {
+                        activeSourceProcessing.insert(record.file.sourceID)
+                        defer { activeSourceProcessing.remove(record.file.sourceID) }
+                        preparation = try await advancedDedup.prepare(fileID: record.id, file: record.file)
+                    }
                     catch let error as SyncStoreError { throw error }
                     catch {
                         if SourceIssueText.isReadContention(error) {
@@ -1134,6 +1150,8 @@ public actor SyncEngine {
                         }
                     }
                     let store = self.store
+                    activeSourceProcessing.insert(record.file.sourceID)
+                    defer { activeSourceProcessing.remove(record.file.sourceID) }
                     status.sourcePhases[record.file.sourceID] = "新增到照片"
                     defer { status.sourcePhases.removeValue(forKey: record.file.sourceID) }
                     let id: String

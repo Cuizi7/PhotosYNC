@@ -40,8 +40,10 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         state.snapshot.activeWork = true
         state.snapshot.latestScan.state = .running
         state.snapshot.latestScan.endedAt = nil
-        if let first { state.snapshot.sourcePhases[first] = "正在导入，保留原始文件" }
+        if let first { state.snapshot.sourcePhases[first] = "正在同步"; state.snapshot.sourceActivities[first] = .submitting }
     case .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero:
+        state.snapshot.summary = .init(imported: 120, skipped: 30, pending: 50)
+        state.snapshot.indexActivity = [.icloud, .analysisPaused].contains(scenario) ? .waiting : .working
         state.snapshot.activeWork = true
         state.snapshot.indexProgress = IndexProgress(
             state: scenario == .preparing ? .preparing : (scenario == .icloud ? .waiting : (scenario == .analysisPaused ? .paused : .updating)),
@@ -71,7 +73,7 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
         state.snapshot.activeWork = true
         if let first { state.snapshot.waitingSources[first] = SourceIssue(
             summary: "来源磁盘尚未挂载，正在等待恢复。", detail: "合成卷诊断", kind: .sourceAvailability) }
-        state.snapshot.sourcePhases[state.sources[1].id] = "正在导入，保留原始文件"
+        state.snapshot.sourcePhases[state.sources[1].id] = "正在同步"; state.snapshot.sourceActivities[state.sources[1].id] = .submitting
     case .fileIssue:
         state.snapshot.summary = SyncStatusSummary(imported: 120, skipped: 30, retryPending: 3)
         if let first {

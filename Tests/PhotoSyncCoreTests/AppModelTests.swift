@@ -3,12 +3,24 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testUnknownSubmissionWithoutSpecializedHintStillWaitsSafely() async throws {
+        let fixture = try await makeAppModelFixture()
+        let model = fixture.model
+        model.state.snapshot.unknownSubmissionBlock = true
+        model.state.snapshot.blockingError = "unclassified unknown commit"
+        model.state.snapshot.blockingSummary = "旧说明"
+        XCTAssertEqual(model.status, .waiting)
+        XCTAssertEqual(model.syncDetail, "等待‘照片’确认结果，新的保存已暂停")
+        model.state.snapshot.recoveryHint = .checkpointFailure(message: "durability lost")
+        XCTAssertEqual(model.status, .error)
+    }
     func testPauseRemainsAvailableForHistoricalLivePhotoWorkWithoutSources() async throws {
         let fixture = try await makeAppModelFixture()
         fixture.model.state.sources = []
         fixture.model.state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 10)
+        fixture.model.state.snapshot.livePhotoActivities = [.working(.identification)]
         XCTAssertTrue(fixture.model.canTogglePause)
-        XCTAssertEqual(fixture.model.status, .running)
+        XCTAssertEqual(fixture.model.status, .preparing)
     }
     func testUnmountedMenuBarDrawingKeepsBlockingErrorsVisible() async throws {
         let fixture = try await makeAppModelFixture()
@@ -23,12 +35,12 @@ final class AppModelTests: XCTestCase {
         model.state.authorized = false
         XCTAssertEqual(model.status, .error)
         XCTAssertFalse(model.statusIconIsDimmed)
-        XCTAssertEqual(model.statusDescription, "同步异常")
+        XCTAssertEqual(model.statusDescription, "需要处理")
         model.state.authorized = true
         model.state.snapshot.sourceIssueDetails = [:]
         XCTAssertFalse(model.statusIconIsDimmed, "A recovered root must immediately return to the normal waiting mark")
         model.state.sources = []
-        XCTAssertEqual(model.status, .unconfigured)
+        XCTAssertEqual(model.status, .error)
         XCTAssertFalse(model.statusIconIsDimmed)
     }
 
