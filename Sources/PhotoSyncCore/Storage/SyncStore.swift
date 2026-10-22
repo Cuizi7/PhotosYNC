@@ -1242,13 +1242,18 @@ public final class SyncStore: @unchecked Sendable {
     /// Synchronous producer checkpoint, invoked outside PhotoKit/state locks. Each
     /// transaction is bounded; a process-local generation is always paired with runID.
     func recordPhotosChanges(context: LibraryContext, runID: UUID, generation: Int,
-                             changed: [String], deleted: [String], content: Set<String>, batchSize: Int) throws {
+                             changed: [String], deleted: [String], content: Set<String>, batchSize: Int,
+                             livePhotoUnchanged: Set<String> = []) throws {
         for (ids, removed) in [(changed, false), (deleted, true)] {
             for start in stride(from: 0, to: ids.count, by: max(1, batchSize)) {
                 let batch = ids[start..<min(ids.count, start + max(1, batchSize))]
                 try queue.sync {
                     try self.transaction {
-                        try self.applyLivePhotoChangesSync(context: context, changed: removed ? [] : Array(batch), deleted: removed ? Array(batch) : [])
+                        // A catalog change is not necessarily a change to the original
+                        // resources. Only explicit per-asset proof preserves LP reads;
+                        // unknown/history changes retain the conservative default.
+                        let invalidated = batch.filter { !livePhotoUnchanged.contains($0) || content.contains($0) }
+                        try self.applyLivePhotoChangesSync(context: context, changed: removed ? [] : invalidated, deleted: removed ? Array(batch) : [])
                         for id in batch {
                             try self.execute("""
                                 INSERT INTO photos_content_change(context_id, context_epoch, run_id, asset_id, generation, removed, content_changed)

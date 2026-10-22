@@ -4,6 +4,54 @@ import ImageIO
 @testable import PhotoSyncCore
 
 final class PhotoKitContractTests: XCTestCase {
+    func testIncompleteIncrementalDetailsNeverAdvancePartOfTheBeforeSnapshot() {
+        struct Asset { let id: String; let version: Int }
+        var baseline = PhotoKitObjectBaseline(objects: ["a": Asset(id: "a", version: 1), "b": Asset(id: "b", version: 1)])
+        let failed = baseline.apply(removed: [], inserted: [], changed: ["a", "b"], afterCount: 2,
+            identifier: { $0.id }, candidate: { .init(identifier: $0.id, candidates: []) }, classify: { old in
+                old.id == "b" ? nil : (Asset(id: old.id, version: 2), .init(identifier: old.id, candidates: []))
+            })
+        guard case .reload = failed else { return XCTFail("Incomplete object details were accepted") }
+        let changed = baseline.apply(removed: [], inserted: [], changed: ["a"], afterCount: 2,
+            identifier: { $0.id }, candidate: { .init(identifier: $0.id, candidates: []) }, classify: { old in
+                XCTAssertEqual(old.version, 1)
+                return (old, .init(identifier: old.id, candidates: []))
+            })
+        guard case .incremental = changed else { return XCTFail("Before snapshot was damaged") }
+        let movesOnly = baseline.apply(removed: [], inserted: [], changed: [], afterCount: 2,
+            identifier: { $0.id }, candidate: { _ in XCTFail("Move-only delta mapped an insertion"); return .init(identifier: "", candidates: []) },
+            classify: { _ in XCTFail("Move-only delta reread an unchanged asset"); return nil })
+        guard case .incremental = movesOnly else { return XCTFail("Move-only delta requires no object read") }
+        for ids in [["a", "a"], ["missing"]] {
+            let bad = baseline.apply(removed: [], inserted: [], changed: ids, afterCount: 2,
+                identifier: { $0.id }, candidate: { .init(identifier: $0.id, candidates: []) }, classify: { _ in XCTFail("Malformed membership reached classifier"); return nil })
+            guard case .reload = bad else { return XCTFail("Malformed membership accepted") }
+        }
+    }
+
+    func testIncrementalObjectBaselineReadsOnlyChangedBeforeObjectsAndAdvancesAtomically() {
+        struct Asset { let id: String; let version: Int }
+        let values = (0..<16_225).map { Asset(id: "asset-\($0)", version: 1) }
+        var baseline = PhotoKitObjectBaseline(objects: Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) }))
+        var inspected = 0
+        let result = baseline.apply(removed: ["asset-0"], inserted: [Asset(id: "new", version: 1)], changed: ["asset-16224"], afterCount: 16_225,
+            identifier: { $0.id }, candidate: { .init(identifier: $0.id, candidates: []) }, classify: { old in
+                inspected += 1; XCTAssertEqual(old.version, 1)
+                return (Asset(id: old.id, version: 2), .init(identifier: old.id, candidates: []))
+            })
+        guard case let .incremental(removed, inserted, changed) = result else { return XCTFail("Complete incremental details were not applied") }
+        XCTAssertEqual(inspected, 1); XCTAssertEqual(removed, ["asset-0"])
+        XCTAssertEqual(inserted.map(\.identifier), ["new"]); XCTAssertEqual(changed.map(\.identifier), ["asset-16224"])
+        let malformed = baseline.apply(removed: [], inserted: [], changed: ["asset-16224", "missing"], afterCount: 16_225,
+            identifier: { $0.id }, candidate: { .init(identifier: $0.id, candidates: []) }, classify: { _ in XCTFail("Incomplete membership reached classifier"); return nil })
+        guard case .reload = malformed else { return XCTFail("Malformed delta accepted") }
+        _ = baseline.apply(removed: [], inserted: [], changed: ["asset-16224"], afterCount: 16_225,
+            identifier: { $0.id }, candidate: { .init(identifier: $0.id, candidates: []) }, classify: { old in
+                XCTAssertEqual(old.version, 2, "Rejected delta cannot replace the before snapshot")
+                return (old, .init(identifier: old.id, candidates: []))
+            })
+    }
+
     func testStartupContentBeforeAdoptionReusesSameDateWithoutAnyImageWork() async throws {
         let reads = ContractReadProbe(), f = try continuityFixture(readProbe: reads)
         defer { try? FileManager.default.removeItem(at: f.root) }

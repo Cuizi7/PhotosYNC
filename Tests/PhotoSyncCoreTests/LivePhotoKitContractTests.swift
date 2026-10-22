@@ -3,6 +3,36 @@ import Photos
 @testable import PhotoSyncCore
 
 final class LivePhotoKitContractTests: XCTestCase {
+    func testNeutralObserverPreservesInventoryCommitWhileMixedChangedItemIsInvalidated() async throws {
+        let f = try await inventoryFixture(count: 2)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let lifecycle = LivePhotoKitLifecycle()
+        lifecycle.initialAssets = ["asset-0", "asset-1"].map { .init(identifier: $0, candidates: [cloudCandidate($0)]) }
+        let observer = PhotoKitGateway(lifecycle: lifecycle)
+        try await observer.restoreInventoryContext(f.photos.context)
+        observer.attachIndexStore(f.store)
+        _ = try await observer.candidateSnapshot()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [
+            .init(identifier: "asset-0", candidates: [cloudCandidate("asset-0")], inputUnchanged: true,
+                  livePhotoInputsUnchanged: true, assetContentChanged: false),
+            .init(identifier: "asset-1", candidates: [cloudCandidate("asset-1")], assetContentChanged: true)
+        ])
+        let coordinator = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: MutatingInventoryMetadata {
+            observer.recordLibraryChangeForTesting()
+            _ = try await observer.candidateSnapshot()
+        })
+        try await coordinator.resumeInitialInventory()
+        do { _ = try await coordinator.processNextInventoryItem(now: Date()) }
+        catch { XCTFail("Neutral observer discarded a current read: \(error)") }
+        let summary = try await coordinator.summary(), reads = await f.photos.resourceReads
+        let refresh = try await f.store.livePhotoAssetsNeedingDescriptor(context: f.photos.context, now: Date(), limit: 8)
+        XCTAssertEqual(summary.identified, 1)
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(refresh, ["asset-1"])
+        let journal = try f.store.photosContentChanges(context: f.photos.context, assetIDs: ["asset-0", "asset-1"])
+        XCTAssertEqual(journal, ["asset-1"], "Content obligations still survive the neutral fast path")
+    }
+
     func testNewNotificationAfterClassificationMarkerDefersWithoutWaitingAgain() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let raw = expectation(description: "raw"), pending = expectation(description: "read waiting"), finished = expectation(description: "read deferred")
@@ -103,6 +133,11 @@ final class LivePhotoKitContractTests: XCTestCase {
         let values = rows.values
         let summary = try XCTUnwrap(values.last { $0["phase"] == "live-photo-summary" })
         XCTAssertEqual(summary["raw-read.completed"], "10"); XCTAssertEqual(summary["raw-read.bytes"], "30")
+        XCTAssertEqual(summary["resource-read.completed"], "10")
+        XCTAssertEqual(summary["resource-read.writtenBytes"], "30")
+        let resources = values.filter { $0["phase"] == "live-photo-resource" && $0["event"] == "terminal" }
+        XCTAssertFalse(resources.isEmpty); XCTAssertLessThanOrEqual(resources.count, 2)
+        XCTAssertTrue(resources.allSatisfy { $0["firstDataMS"] != nil && $0["completionGapMS"] != nil && $0["writeSumMS"] != nil })
         let details = values.filter { $0["phase"] == "live-photo-stage" && $0["stage"] == "raw-read" }
         XCTAssertFalse(details.isEmpty); XCTAssertLessThanOrEqual(details.count, 2)
         XCTAssertTrue(details.allSatisfy { $0["assetHandle"]?.hasPrefix("asset-") == true && $0["elapsedMS"] != nil })

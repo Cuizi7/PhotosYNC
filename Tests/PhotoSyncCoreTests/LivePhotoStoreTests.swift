@@ -2,6 +2,47 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoStoreTests: XCTestCase {
+    func testNeutralCatalogProofCannotSuppressContentDeletionOrEarlierInvalidation() async throws {
+        for scenario in ["neutral", "content", "unknown", "deleted", "earlier-change"] {
+            let f = try await inventoryFixture(count: 1)
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            let asset = livePhotoAsset(context: f.photos.context, id: "asset-0")
+            try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [asset])
+            try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: asset.assetID, revision: asset.revision,
+                observations: [.init(resource: asset.resources[0], inspection: .noIdentifier)], retryPolicy: .requiresAttention)
+            if scenario == "earlier-change" {
+                try f.store.recordLivePhotoChanges(context: f.photos.context, changed: [asset.assetID], deleted: [])
+            }
+            try f.store.recordPhotosChanges(context: f.photos.context, runID: UUID(), generation: 1,
+                changed: scenario == "deleted" ? [] : [asset.assetID], deleted: scenario == "deleted" ? [asset.assetID] : [],
+                content: scenario == "content" ? [asset.assetID] : [], batchSize: 1,
+                livePhotoUnchanged: scenario == "unknown" ? [] : [asset.assetID])
+            let observation = try await f.store.livePhotoObservation(for: asset.resources[0])
+            XCTAssertEqual(observation != nil, scenario == "neutral", scenario)
+            let refresh = try await f.store.livePhotoAssetsNeedingDescriptor(context: f.photos.context, now: Date(), limit: 1)
+            XCTAssertEqual(refresh, ["content", "unknown", "earlier-change"].contains(scenario) ? [asset.assetID] : [], scenario)
+        }
+    }
+
+    func testLivePhotoNeutralProofRequiresCompleteContentAndResourceFacts() {
+        let context = LibraryContext(id: UUID(), epoch: 0), original = livePhotoAsset(context: .init(id: UUID(), epoch: 0), id: "asset")
+        XCTAssertTrue(PhotoKitLivePhotoReader.inputsUnchanged(before: original, after: original, assetContentChanged: false))
+        for contentChanged: Bool? in [true, nil] {
+            XCTAssertFalse(PhotoKitLivePhotoReader.inputsUnchanged(before: original, after: original, assetContentChanged: contentChanged))
+        }
+        let variants = [
+            livePhotoAsset(context: original.context, id: "asset", revision: "r2"),
+            livePhotoAsset(context: original.context, id: "asset", isLivePhoto: true),
+            livePhotoAsset(context: context, id: "asset"),
+            livePhotoAsset(context: original.context, id: "asset", kind: .video),
+            LivePhotoAssetDescriptor(context: original.context, assetID: "asset", revision: "r1", isLivePhoto: false,
+                mediaKind: .image, resources: original.resources, resourceKinds: [.image], duration: 11)
+        ]
+        for changed in variants {
+            XCTAssertFalse(PhotoKitLivePhotoReader.inputsUnchanged(before: original, after: changed, assetContentChanged: false))
+        }
+    }
+
     func testCompleteCandidateWithOnlyOneKnownRoleRemainsUnresolved() async throws {
         let f = try await makeLivePhotoStoreFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
         let d = LivePhotoAssetDescriptor(context: f.context, assetID: "partial-full", revision: "r1", isLivePhoto: true, mediaKind: .image,

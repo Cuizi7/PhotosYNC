@@ -171,7 +171,12 @@ final class AppViewTests: XCTestCase {
                     let texts = try self.recognizedText(in: host)
                     for (row, button) in zip(rows, buttons) {
                         let frame = host.convert(button.bounds, from: button)
-                        let title = try XCTUnwrap(texts.first { $0.text.contains(row.id == "visualIndex" ? "索引" : "Live") }, "\(scenario.rawValue): \(texts)")
+                        // This test checks native geometry, not Vision's Chinese spelling
+                        // (for example 索引 can be recognized as 素引). Locate the caption
+                        // to the left of its real info button; a missing or wrapped title
+                        // still fails the vertical alignment checks below. No OCR hints.
+                        let title = try XCTUnwrap(texts.filter { $0.frame.minX < frame.minX && $0.frame.maxX <= frame.maxX + 4 }
+                            .min { abs($0.frame.midY - frame.midY) < abs($1.frame.midY - frame.midY) }, "\(scenario.rawValue): \(texts)")
                         XCTAssertEqual(frame.midY, title.frame.midY, accuracy: 4, scenario.rawValue)
                         if let count = row.countText {
                             let number = try XCTUnwrap(count.split(whereSeparator: { !$0.isNumber }).first)

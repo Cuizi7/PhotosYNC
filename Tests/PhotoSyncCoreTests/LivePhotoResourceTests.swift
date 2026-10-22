@@ -2,20 +2,69 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoResourceTests: XCTestCase {
+    func testPhysicalReadTraceSeparatesDeliveryAndCallbackWaitWithoutChangingBytes() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let rows = ResourceTraceRows(), clock = ResourceTraceClock(), logger = try RunLogger(directory: root.appendingPathComponent("logs"))
+        let diagnostics = IndexDiagnostics(sink: { rows.append($0); logger.log($0) }, monotonic: { clock.now })
+        let ref = LivePhotoResourceRef.photos(contextID: UUID(), assetID: "private-asset", resourceKey: "private-name.mov", revision: "private-revision")
+        let reader = LivePhotoRawResourceReader(requester: TimedResourceRequester(clock: clock), storage: .init(root: root.appendingPathComponent("raw")))
+        let budget = LivePhotoResourceBudget()
+        var lease: LivePhotoResourceLease? = try await reader.read(resource: ref, purpose: .inventory, budget: budget,
+            trace: diagnostics.livePhotoResourceTrace(ref, purpose: .inventory))
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(lease).url), Data([1, 2, 3, 4, 5]))
+        let terminal = rows.values.filter { $0["event"] == "terminal" }
+        XCTAssertEqual(terminal.count, 1, "Late data and duplicate completion cannot emit another terminal")
+        let row = try XCTUnwrap(terminal.first)
+        for (key, expected) in ["firstDataMS": 2000.0, "deliverySpanMS": 3000.0, "completionGapMS": 4000.0, "totalMS": 9000.0] {
+            XCTAssertEqual(Double(row[key] ?? ""), expected, key)
+        }
+        XCTAssertEqual(row["receivedBytes"], "5"); XCTAssertEqual(row["writtenBytes"], "5"); XCTAssertEqual(row["chunks"], "2")
+        XCTAssertEqual(row["resourceKind"], "video"); XCTAssertEqual(row["durationSeconds"], "3.0")
+        lease = nil; XCTAssertEqual(budget.reservedBytes, 0)
+        logger.flushForTesting()
+        let journal = try String(contentsOf: root.appendingPathComponent("logs/photo-sync.jsonl"), encoding: .utf8)
+        XCTAssertTrue(journal.contains("live-photo-resource")); XCTAssertFalse(journal.contains("private-"))
+    }
+
+    func testReadTraceWaitAndCancellationStayBoundedUntilPhysicalTerminal() throws {
+        let rows = ResourceTraceRows(), clock = ResourceTraceClock()
+        let diagnostics = IndexDiagnostics(sink: { rows.append($0) }, monotonic: { clock.now })
+        let trace = diagnostics.livePhotoResourceTrace(resource(), purpose: .completion)
+        trace.start(.init(assetKind: .video, resourceKind: .video, resourceType: 2, duration: .nan))
+        clock.set(129); trace.heartbeat()
+        XCTAssertFalse(rows.values.contains { $0["event"] == "waiting" })
+        clock.set(130); trace.heartbeat(); trace.heartbeat(); trace.cancelRequested(); trace.cancelRequested()
+        clock.set(160); trace.heartbeat()
+        XCTAssertEqual(rows.values.filter { $0["event"] == "waiting" }.count, 2)
+        XCTAssertEqual(rows.values.filter { $0["event"] == "cancel-requested" }.count, 1)
+        XCTAssertFalse(rows.values.contains { $0["event"] == "terminal" })
+        trace.complete(error: CancellationError(), callbackAt: 160, finalizeSeconds: 0)
+        clock.set(200); trace.heartbeat(); trace.complete(error: nil, callbackAt: 200, finalizeSeconds: 0)
+        let final = try XCTUnwrap(rows.values.last { $0["event"] == "terminal" })
+        XCTAssertEqual(final["firstDataMS"], "unavailable"); XCTAssertEqual(final["durationSeconds"], "unknown")
+        XCTAssertEqual(final["result"], "cancelled")
+        XCTAssertEqual(rows.values.filter { $0["event"] == "terminal" }.count, 1)
+    }
+
     func testKnownResourceLimitSurvivesLogicalTimeoutBeforeTerminal() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let rows = ResourceTraceRows(), diagnostics = IndexDiagnostics(sink: { rows.append($0) })
         let started = expectation(description: "started"), cancelled = expectation(description: "cancelled")
         let requester = ControlledCloudRequester(started: started, cancelled: cancelled), executor = ReadExecutor()
         let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor, requestTimeout: .seconds(1), logicalTimeout: .milliseconds(40))
         let budget = LivePhotoResourceBudget(maxBytes: 2)
         let ref = LivePhotoResourceRef.photos(contextID: UUID(), assetID: "oversized", resourceKey: "original", revision: "r1")
-        let task = Task { try await reader.read(resource: ref, purpose: .inventory, budget: budget) }
+        let task = Task { try await reader.read(resource: ref, purpose: .inventory, budget: budget, trace: diagnostics.livePhotoResourceTrace(ref, purpose: .inventory)) }
         await fulfillment(of: [started, cancelled], timeout: 2)
         do { _ = try await task.value; XCTFail("Expected known limit") }
         catch { XCTAssertEqual(error as? LivePhotoResourceReadError, .resourceLimit(bytes: 3)) }
         let held = await executor.snapshot(); XCTAssertEqual(held.physicalOccupancy, 1)
+        XCTAssertFalse(rows.values.contains { $0["event"] == "terminal" })
         requester.finish()
         let released = await engineEventually { await executor.snapshot().physicalOccupancy == 0 }; XCTAssertTrue(released)
+        let terminal = try XCTUnwrap(rows.values.last { $0["event"] == "terminal" })
+        XCTAssertEqual(terminal["result"], "resource-limit"); XCTAssertEqual(terminal["receivedBytes"], "3")
+        XCTAssertEqual(terminal["writtenBytes"], "0")
     }
 
     func testCancelBeforeRequestHandleRegistrationIsSentExactlyOnce() async throws {
@@ -263,7 +312,7 @@ final class BufferedLivePhotoRequester: LivePhotoResourceRequesting, @unchecked 
     let fileExtension: String?
     private(set) var networkFlags = [Bool]()
     init(chunks: [Data], fileExtension: String? = nil) { self.chunks = chunks; self.fileExtension = fileExtension }
-    func resourceFileExtension(_ ref: LivePhotoResourceRef) throws -> String? { fileExtension }
+    func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo { .init(fileExtension: fileExtension) }
     func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
         networkFlags.append(allowNetwork)
@@ -283,4 +332,31 @@ final class HeldLivePhotoRequester: LivePhotoResourceRequesting, @unchecked Send
         receive(Data([1,2,3])); started.fulfill(); return {}
     }
     func finish() { lock.lock(); let call = done; done = nil; lock.unlock(); call?(nil) }
+}
+
+private final class ResourceTraceClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 100
+    var now: TimeInterval { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ value: TimeInterval) { lock.lock(); self.value = value; lock.unlock() }
+}
+private final class ResourceTraceRows: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows = [[String: String]]()
+    var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return rows }
+    func append(_ row: [String: String]) { lock.lock(); rows.append(row); lock.unlock() }
+}
+private struct TimedResourceRequester: LivePhotoResourceRequesting {
+    let clock: ResourceTraceClock
+    func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo {
+        .init(assetKind: .video, resourceKind: .video, resourceType: 2, duration: 3)
+    }
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+                 completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
+        clock.set(102); receive(Data([1, 2]))
+        clock.set(105); receive(Data([3, 4, 5]))
+        clock.set(109); completion(nil)
+        receive(Data([6])); completion(nil)
+        return {}
+    }
 }

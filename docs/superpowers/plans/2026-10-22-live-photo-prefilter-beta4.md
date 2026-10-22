@@ -10,6 +10,8 @@
 
 **Spec:** 本文“批准范围”及既有 `docs/superpowers/specs/2026-10-21-task-progress-and-scheduling-repair-design.md`。用户已明确要求写计划后直接执行、完成 beta 发布；不再重复申请实施或本地合并授权。
 
+**阶段调整（2026-10-22，用户最新指令）：** 开发完成后先分析运行中版本的 Live Photo 日志和速度，暂停后续 merge/release。此前 main 已合并到 `8eacc21`，首次归档验收失败，未产生 beta4 包或 tag；新增修复保留在 `codex/beta4-release-validation-fix`。后续只做分支开发验收和只读诊断，不安装或启动生产应用。
+
 ## 批准范围与约束
 
 - 阈值固定为 `duration > 10` 秒；恰好 10 秒、未知、非有限或无效时长继续识别。仅作用于普通视频；Photos 已标为 Live Photo 或当前修订已有明确配对身份时不跳过。此为产品筛选规则，不宣称 Apple 格式限制。
@@ -67,11 +69,12 @@
 
 - [x] deep_reviewer 对最终集成 diff 做一次完整评审；修复范围内重要发现，只复核改变边界。tester 核对集成行为及证据。
 - [x] 更新 0.3.0 / beta4 / build 21；聚焦工具测试通过，确保没有个人数据或无关改动。
-- [ ] squash merge 至本地 main，核对树一致；从 main 确切提交执行 `scripts/package-release.sh --scale-profile full`，新目录 `outputs/releases/0.3.0-beta4/`。
-- [ ] 核对 canonical 完整 XCTest、Tools、4 档规模、续体竞争，以及 Universal app/Core、图标、ad-hoc 签名、DMG、校验值和 provenance。创建本地版本 tag，交付链接；未做真实图库、安装、公证或远端发布如实说明。
+- [x] 按最新指令完成独立分支的 canonical full 开发验收：`e08b890`，912 XCTest（2 skip / 0 failure）、102 Tools、四档规模、两类续体竞争；独立证据核对通过。
+- [ ] （按最新指令暂缓）再次 squash merge 与打包。首次 `8eacc21` 的归档在 XCTest 阶段失败，保持失败证据，不计为发布。
+- [ ] （按最新指令暂缓）产物核验和版本 tag。分支开发验收仍执行 canonical full；之后先按日志证据分析真实吞吐、重复读取、准入等待和后台任务干扰，汇总额外问题及修复方案。
 
 ## 聚焦验证入口
 
 `xcodebuild -project PhotoSync.xcodeproj -scheme PhotoSync -destination 'platform=macOS' -derivedDataPath work/Beta4Derived CODE_SIGNING_ALLOWED=NO build-for-testing` 成功后，用 `xcrun xctest -XCTest PhotoSyncCoreTests.<TestClass> work/Beta4Derived/Build/Products/Debug/PhotoSyncCoreTests.xctest` 跑相关类。日志放 `work/beta4/`。
 
-发布采用 full：本次涉及 SQLite 队列查询和资源工作量。开发阶段先聚焦回归；最终在打包归档内执行一次完整 canonical，不以局部测试替代发布门槛。
+本次涉及 SQLite 队列查询和资源工作量，采用 full。用户暂缓发布后，最终分支已经完成一次 canonical 开发验收；将来恢复发布时仍需在最终打包归档内验证，不以本次分支或局部测试替代另一提交的发布门槛。

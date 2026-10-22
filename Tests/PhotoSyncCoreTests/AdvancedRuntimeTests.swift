@@ -5,6 +5,28 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testConcurrentProgressPublicationDoesNotInterleaveActivityArrays() async throws {
+        let f = try await inventoryFixture(count: 0), config = try p8Configuration()
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true); await runtime.waitForRound()
+        let gate = InventoryReadGate(); await f.photos.holdReadAdmissionOnce(gate)
+        let first = Task { await runtime.current() }
+        let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+        let held = livePhotoAsset(context: f.photos.context, id: "new-held")
+        try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [held])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: held.assetID, revision: held.revision,
+            observations: [.init(resource: held.resources[0], inspection: .unresolved("held"))], retryPolicy: .requiresAttention)
+        let second = await runtime.current()
+        await gate.release(); let resumed = await first.value
+        XCTAssertEqual(second.snapshot.livePhotoActivities.count, 2)
+        XCTAssertEqual(second.snapshot.livePhotoInventory?.requiresAttention, 1)
+        XCTAssertEqual(resumed.snapshot.livePhotoActivities.count, 2, "Each publication owns its complete inventory/completion array")
+        XCTAssertEqual(resumed.snapshot.livePhotoInventory?.requiresAttention, 1, "An older publisher cannot erase a newly published problem")
+        await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
+    }
     func testFinishedLivePhotoInventoryDoesNotPollPhotoContextOnIdleTicks() async throws {
         let f = try await inventoryFixture(count: 0), config = try p8Configuration(), clock = P12Clock()
         defer { try? FileManager.default.removeItem(at: f.root) }

@@ -58,6 +58,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
     private var livePhotoTimings: [String: DiagnosticElapsed] = [:]
     private var livePhotoCounts: [String: Int64] = [:]
     private var livePhotoDetails: [LivePhotoDiagnosticStage: Int] = [:]
+    private var livePhotoResourceDetails = 0
     private var livePhotoReasons: [LivePhotoDiagnosticStage: String] = [:]
     private var windowStarted: TimeInterval
     private var readerCounts: [String: Int] = [:]
@@ -74,6 +75,31 @@ public final class IndexDiagnostics: @unchecked Sendable {
         return category + "-" + HMAC<SHA256>.authenticationCode(for: bytes, using: secret).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
     public func tokenHandle(_ value: Data) -> String { handle("range", value.base64EncodedString()) }
+    func livePhotoResourceTrace(_ resource: LivePhotoResourceRef, purpose: LivePhotoReadPurpose) -> LivePhotoResourceTrace {
+        lock.lock(); sequence &+= 1
+        let request = "resource-\(sequence)", sampled = livePhotoResourceDetails < 2
+        livePhotoResourceDetails += 1; lock.unlock()
+        var fields = ["requestHandle": request, "resourceHandle": handle("resource", resource.key),
+                      "purpose": purpose == .inventory ? "inventory" : "completion"]
+        if let id = resource.assetID { fields["assetHandle"] = handle("asset", id) }
+        return LivePhotoResourceTrace(fields: fields, monotonic: monotonic) { [self] fields, timings in
+            let event = fields["event"] ?? "unknown", result = fields["result"] ?? event
+            lock.lock()
+            livePhotoCounts["resource-read." + result, default: 0] += 1
+            if event == "terminal" {
+                for key in ["receivedBytes", "writtenBytes"] {
+                    livePhotoCounts["resource-read." + key, default: 0] += Int64(fields[key] ?? "0") ?? 0
+                }
+                for (name, seconds) in timings { livePhotoTimings["resource-" + name, default: DiagnosticElapsed()].add(seconds) }
+            }
+            let flush = monotonic() - windowStarted >= 30
+            lock.unlock()
+            if sampled || event == "waiting" || event == "cancel-requested" || result != "completed" && event == "terminal" || (Double(fields["totalMS"] ?? "0") ?? 0) >= 5000 {
+                emit(fields)
+            }
+            if flush { flushObservations() }
+        }
+    }
     public func measureLivePhoto<Value>(_ stage: LivePhotoDiagnosticStage, assetID: String? = nil, event: Int? = nil,
                                        bytes: (Value) -> Int64 = { _ in 0 },
                                        _ operation: () async throws -> Value) async throws -> Value {
@@ -318,7 +344,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let timings = flushWindow ? windowTimings : [:]
         let causal = flushWindow ? causeCounts : [:]
         let lpTimings = flushWindow ? livePhotoTimings : [:], lpCounts = flushWindow ? livePhotoCounts : [:]
-        if flushWindow { livePhotoTimings.removeAll(); livePhotoCounts.removeAll(); livePhotoDetails.removeAll() }
+        if flushWindow { livePhotoTimings.removeAll(); livePhotoCounts.removeAll(); livePhotoDetails.removeAll(); livePhotoResourceDetails = 0 }
         if flushWindow { windowTimings.removeAll(); causeCounts.removeAll(); causeDetails = 0; windowStarted = now }
         let readyStates = states.filter { force || now - $0.value.start >= 30 }
         let readyNeutral = neutral.filter { force || now - $0.value.start >= 30 }
@@ -441,5 +467,107 @@ public final class IndexDiagnosticOperation: @unchecked Sendable {
         }
         if emitted > 0 || suppressed > 0 || !comparisons.isEmpty || !timings.isEmpty { context.emit(fields) }
         return fields
+    }
+}
+
+/// Diagnostic ownership follows the physical request through its terminal callback.
+/// Timings overlap (for example disk writes occur during delivery); they are not a CPU breakdown.
+final class LivePhotoResourceTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private let monotonic: @Sendable () -> TimeInterval
+    private let sink: @Sendable ([String: String], [String: TimeInterval]) -> Void
+    private var fields: [String: String]
+    private var started: TimeInterval?, firstData: TimeInterval?, lastData: TimeInterval?, lastHeartbeat: TimeInterval?
+    private var receivedBytes: Int64 = 0, writtenBytes: Int64 = 0, chunks = 0
+    private var writeSum: TimeInterval = 0, writeMax: TimeInterval = 0
+    private var finished = false, cancelling = false
+    private var heartbeatTask: Task<Void, Never>?
+    init(fields: [String: String], monotonic: @escaping @Sendable () -> TimeInterval,
+         sink: @escaping @Sendable ([String: String], [String: TimeInterval]) -> Void) {
+        self.fields = fields; self.monotonic = monotonic; self.sink = sink
+    }
+    deinit { heartbeatTask?.cancel() }
+    func now() -> TimeInterval { monotonic() }
+    func start(_ metadata: LivePhotoResourceInfo?) {
+        lock.lock()
+        guard started == nil, !finished else { lock.unlock(); return }
+        started = monotonic()
+        lastHeartbeat = started
+        fields["assetKind"] = metadata?.assetKind?.rawValue ?? "unknown"
+        fields["resourceKind"] = metadata?.resourceKind?.rawValue ?? "unknown"
+        fields["resourceType"] = metadata?.resourceType.map(String.init) ?? "unknown"
+        fields["durationSeconds"] = metadata?.duration.flatMap { $0.isFinite && $0 > 0 ? String($0) : nil } ?? "unknown"
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+                self?.heartbeat()
+            }
+        }
+        let row = snapshot(event: "started", at: started!)
+        lock.unlock(); sink(row, [:])
+    }
+    func received(_ count: Int) {
+        guard count > 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard !finished, started != nil else { return }
+        let now = monotonic(); firstData = firstData ?? now; lastData = now
+        receivedBytes += Int64(count); chunks += 1
+    }
+    /// Counter update only: safe while the stream owns its write lock; no sink call.
+    func wrote(_ count: Int, seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        guard !finished else { return }
+        writtenBytes += Int64(count); writeSum += max(0, seconds); writeMax = max(writeMax, seconds)
+    }
+    func cancelRequested() {
+        lock.lock()
+        guard !finished, !cancelling, started != nil else { lock.unlock(); return }
+        cancelling = true
+        let row = snapshot(event: "cancel-requested", at: monotonic())
+        lock.unlock(); sink(row, [:])
+    }
+    func heartbeat() {
+        lock.lock()
+        let now = monotonic()
+        guard !finished, let lastHeartbeat, now - lastHeartbeat >= 30 else { lock.unlock(); return }
+        self.lastHeartbeat = now
+        let row = snapshot(event: "waiting", at: now)
+        lock.unlock(); sink(row, [:])
+    }
+    func complete(error: Error?, callbackAt: TimeInterval, finalizeSeconds: TimeInterval) {
+        lock.lock()
+        guard !finished, let start = started else { lock.unlock(); return }
+        finished = true; heartbeatTask?.cancel(); heartbeatTask = nil
+        let end = monotonic()
+        var row = snapshot(event: "terminal", at: end)
+        let result: String
+        switch error {
+        case nil: result = "completed"
+        case is CancellationError: result = "cancelled"
+        case LivePhotoResourceReadError.requestTimedOut?: result = "read-timeout"
+        case LivePhotoResourceReadError.resourceLimit?, LivePhotoResourceReadError.workingSetLimit?: result = "resource-limit"
+        case LivePhotoResourceReadError.budgetBusy?: result = "budget-busy"
+        default: result = "failed"
+        }
+        row["result"] = result
+        var timings: [String: TimeInterval] = ["total": max(0, end - start), "write": writeSum, "finalize": max(0, finalizeSeconds)]
+        if let firstData { timings["first-data"] = max(0, firstData - start) }
+        if let firstData, let lastData { timings["delivery"] = max(0, lastData - firstData) }
+        if let lastData { timings["completion-gap"] = max(0, callbackAt - lastData) }
+        row["firstDataMS"] = timings["first-data"].map { String($0 * 1000) } ?? "unavailable"
+        row["deliverySpanMS"] = timings["delivery"].map { String($0 * 1000) } ?? "unavailable"
+        row["completionGapMS"] = timings["completion-gap"].map { String($0 * 1000) } ?? "unavailable"
+        row["finalizeMS"] = String(max(0, finalizeSeconds) * 1000)
+        lock.unlock(); sink(row, timings)
+    }
+    private func snapshot(event: String, at now: TimeInterval) -> [String: String] {
+        var row = fields
+        row["phase"] = "live-photo-resource"; row["event"] = event
+        row["state"] = cancelling ? "draining" : firstData == nil ? "awaiting-first-data" : "receiving-or-awaiting-completion"
+        row["totalMS"] = String(max(0, now - (started ?? now)) * 1000)
+        row["sinceLastDataMS"] = lastData.map { String(max(0, now - $0) * 1000) } ?? "unavailable"
+        row["receivedBytes"] = String(receivedBytes); row["writtenBytes"] = String(writtenBytes); row["chunks"] = String(chunks)
+        row["writeSumMS"] = String(writeSum * 1000); row["writeMaxMS"] = String(writeMax * 1000)
+        return row
     }
 }

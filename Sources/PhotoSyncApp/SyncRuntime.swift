@@ -107,6 +107,8 @@ actor SyncRuntime {
     private var loading: Task<Void, Never>?
     private var advancedWork: Task<Void, Never>?
     private var livePhotoWorkTask: Task<Void, Never>?
+    private var livePhotoSourceReadyPending = false
+    private var livePhotoProgressGeneration: UInt64 = 0
     private var nextLivePhotoWorkAt: Date?
     private var livePhotoDeferrals = 0
     private var manualLivePhotoRetryPending = false
@@ -543,6 +545,12 @@ actor SyncRuntime {
         }
         schedule.finished(now: now())
         round = nil
+        // Pre-scan admission may have rejected a reserved pair while its directory
+        // was still enumerating. Preserve this wake even if another LP slice owns work.
+        if !ids.isEmpty {
+            livePhotoSourceReadyPending = true
+            scheduleLivePhotoWork()
+        }
         if pendingAdvancedScan { await tick(includeAdvanced: false) }
     }
 
@@ -720,10 +728,14 @@ actor SyncRuntime {
     private func scheduleLivePhotoWork() {
         guard eligibleForWork, livePhotoWorkTask == nil, livePhotoInventory != nil,
               nextLivePhotoWorkAt == nil || now() >= nextLivePhotoWorkAt! else { return }
+        livePhotoSourceReadyPending = false
         livePhotoWorkTask = Task { await self.runLivePhotoWork() }
     }
     private func runLivePhotoWork() async {
-        defer { livePhotoWorkTask = nil }
+        defer {
+            livePhotoWorkTask = nil
+            if livePhotoSourceReadyPending { scheduleLivePhotoWork() }
+        }
         guard eligibleForWork, let inventory = livePhotoInventory, let completion = livePhotoCompletion,
               let photos = advancedGraph?.photos as? any LivePhotoPhotosGateway else { return }
         let admission = await photos.livePhotoReadAdmission()
@@ -766,21 +778,34 @@ actor SyncRuntime {
         nextLivePhotoWorkAt = now().addingTimeInterval(sourceDeferralDelay(count: livePhotoDeferrals))
     }
     private func publishLivePhotoProgress() async {
+        livePhotoProgressGeneration &+= 1
+        let generation = livePhotoProgressGeneration
+        var inventorySummary = state.snapshot.livePhotoInventory
+        var completionSummary = state.snapshot.livePhotoWork
+        var progressIssue: SourceIssue?
         do {
-            state.snapshot.livePhotoInventory = try await livePhotoInventory?.summary()
-            state.snapshot.livePhotoWork = try await livePhotoCompletion?.summary() ?? LivePhotoWorkSummary()
+            inventorySummary = try await livePhotoInventory?.summary()
+            completionSummary = try await livePhotoCompletion?.summary() ?? LivePhotoWorkSummary()
         } catch {
-            livePhotoIssue = SourceIssue(summary: "无法读取 Live Photo 处理进度，稍后继续。", detail: error.localizedDescription, kind: .file)
+            progressIssue = SourceIssue(summary: "无法读取 Live Photo 处理进度，稍后继续。", detail: error.localizedDescription, kind: .file)
         }
-        state.snapshot.livePhotoActivities = []
-        if let inventory = livePhotoInventory { state.snapshot.livePhotoActivities.append(await inventory.activity(now: now(), summary: state.snapshot.livePhotoInventory)) }
-        if let completion = livePhotoCompletion { state.snapshot.livePhotoActivities.append(await completion.activity(now: now(), summary: state.snapshot.livePhotoWork)) }
+        // These awaits may reenter current()/other publishers. Never assemble a
+        // partial array in shared state or append to another invocation's result.
+        var activities = [LivePhotoActivity]()
+        if let inventory = livePhotoInventory { activities.append(await inventory.activity(now: now(), summary: inventorySummary)) }
+        if let completion = livePhotoCompletion { activities.append(await completion.activity(now: now(), summary: completionSummary)) }
         if !eligibleForWork || nextLivePhotoWorkAt.map({ $0 > now() }) == true {
-            state.snapshot.livePhotoActivities = state.snapshot.livePhotoActivities.map {
+            activities = activities.map {
                 if case .queued = $0 { return .waiting(nextRetryAt: nextLivePhotoWorkAt) }; return $0
             }
         }
-        state.snapshot.livePhotoIssue = livePhotoIssue ?? state.snapshot.livePhotoWork.issue
+        // A newer publisher may have read newer durable facts while this one
+        // awaited activity. Do not roll its counters or attention state back.
+        guard generation == livePhotoProgressGeneration else { return }
+        state.snapshot.livePhotoInventory = inventorySummary
+        state.snapshot.livePhotoWork = completionSummary
+        state.snapshot.livePhotoActivities = activities
+        state.snapshot.livePhotoIssue = progressIssue ?? livePhotoIssue ?? completionSummary.issue
     }
 
     private func runAdvancedWork(_ graph: AdvancedRuntimeGraph, reconcile: Bool) async {

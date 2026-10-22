@@ -4,6 +4,9 @@ import UniformTypeIdentifiers
 
 /// All references use public descriptor facts and are revalidated. Their revision is an observation token, not a content hash.
 struct PhotoKitLivePhotoReader: Sendable {
+    static func inputsUnchanged(before: LivePhotoAssetDescriptor, after: LivePhotoAssetDescriptor, assetContentChanged: Bool?) -> Bool {
+        assetContentChanged == false && !before.resources.isEmpty && before == after
+    }
     static func fetchAsset(_ id: String) -> PHAsset? {
         let options = PHFetchOptions(); options.includeHiddenAssets = true; options.includeAllBurstAssets = true
         return PHAsset.fetchAssets(withLocalIdentifiers: [id], options: options).firstObject
@@ -66,9 +69,12 @@ struct PhotoKitLivePhotoReader: Sendable {
 
 final class SystemLivePhotoResourceRequester: LivePhotoResourceRequesting, @unchecked Sendable {
     private let manager = PHAssetResourceManager.default()
-    func resourceFileExtension(_ ref: LivePhotoResourceRef) throws -> String? {
-        let (_, resource) = try PhotoKitLivePhotoReader.selected(ref)
-        return UTType(resource.uniformTypeIdentifier)?.preferredFilenameExtension
+    func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo {
+        let (asset, resource) = try PhotoKitLivePhotoReader.selected(ref)
+        let resourceKind: MediaKind? = [.photo, .fullSizePhoto, .alternatePhoto].contains(resource.type) ? .image : [.video, .pairedVideo, .fullSizeVideo, .fullSizePairedVideo].contains(resource.type) ? .video : nil
+        return .init(fileExtension: UTType(resource.uniformTypeIdentifier)?.preferredFilenameExtension, assetKind: asset.mediaType == .video ? .video : asset.mediaType == .image ? .image : nil,
+                     resourceKind: resourceKind, resourceType: resource.type.rawValue,
+                     duration: asset.mediaType == .video ? asset.duration : nil)
     }
     func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {

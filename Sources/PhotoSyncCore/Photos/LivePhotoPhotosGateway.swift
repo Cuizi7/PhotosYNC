@@ -88,14 +88,22 @@ public final class LivePhotoResourceLease: @unchecked Sendable {
     }
 }
 
+struct LivePhotoResourceInfo: Sendable {
+    var fileExtension: String?
+    var assetKind: MediaKind?
+    var resourceKind: MediaKind?
+    var resourceType: Int?
+    var duration: TimeInterval?
+}
+
 protocol LivePhotoResourceRequesting: Sendable {
-    func resourceFileExtension(_ ref: LivePhotoResourceRef) throws -> String?
+    func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo
     func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool,
                  receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void
 }
 extension LivePhotoResourceRequesting {
-    func resourceFileExtension(_ ref: LivePhotoResourceRef) throws -> String? { nil }
+    func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo { .init() }
 }
 
 struct LivePhotoRawResourceReader: Sendable {
@@ -112,17 +120,20 @@ struct LivePhotoRawResourceReader: Sendable {
         self.requestTimeout = requestTimeout; self.logicalTimeout = logicalTimeout
     }
     func admission() async -> PhotosReaderAdmission { tracker.admission() }
-    func read(resource: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease {
+    func read(resource: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget, trace: LivePhotoResourceTrace? = nil) async throws -> LivePhotoResourceLease {
         let cancellation = LivePhotoReadCancellation()
         return try await withTaskCancellationHandler {
             do { return try await executor.executeAsync(sourceID: sourceID, timeout: logicalTimeout) {
-                let owner = try storage.create(limits: budget.limits, fileExtension: requester.resourceFileExtension(resource))
-                let stream = LivePhotoResourceStream(owner: owner, budget: budget)
+                let info = try requester.resourceInfo(resource)
+                let owner = try storage.create(limits: budget.limits, fileExtension: info.fileExtension)
+                let stream = LivePhotoResourceStream(owner: owner, budget: budget, trace: trace)
                 tracker.install(stream); cancellation.install(stream)
                 defer { tracker.finish(stream) }
                 return try await withCheckedThrowingContinuation { continuation in
                     stream.install(continuation)
                     guard stream.begin(timeout: requestTimeout) else { stream.complete(CancellationError()); return }
+                    // Reuse the same resource lookup that supplies the container hint.
+                    trace?.start(info)
                     do {
                         let cancel = try requester.request(resource, allowNetwork: true,
                             receive: { stream.receive($0) }, completion: { stream.complete($0) })
@@ -180,7 +191,8 @@ private final class LivePhotoResourceStream: @unchecked Sendable {
     private var cancelSent = false
     private var drainingSince: TimeInterval?
     private var deadline: Task<Void, Never>?
-    init(owner: OwnedPhotosResource, budget: LivePhotoResourceBudget) { self.owner = owner; self.budget = budget }
+    private let trace: LivePhotoResourceTrace?
+    init(owner: OwnedPhotosResource, budget: LivePhotoResourceBudget, trace: LivePhotoResourceTrace?) { self.owner = owner; self.budget = budget; self.trace = trace }
     var knownFailure: Error? { lock.lock(); defer { lock.unlock() }; return failure }
     func install(_ value: CheckedContinuation<LivePhotoResourceLease, Error>) { lock.lock(); continuation = value; lock.unlock() }
     func begin(timeout: Duration) -> Bool {
@@ -206,6 +218,7 @@ private final class LivePhotoResourceStream: @unchecked Sendable {
         guard !finished else { lock.unlock(); return }
         if failure == nil { failure = error; drainingSince = ProcessInfo.processInfo.systemUptime }
         let action = takeCancel(); lock.unlock()
+        trace?.cancelRequested()
         action?()
     }
     func installCancel(_ value: @escaping @Sendable () -> Void) {
@@ -213,6 +226,7 @@ private final class LivePhotoResourceStream: @unchecked Sendable {
         action?()
     }
     func receive(_ data: Data) {
+        trace?.received(data.count)
         lock.lock()
         guard !finished, failure == nil, let owner else { lock.unlock(); return }
         do {
@@ -220,13 +234,23 @@ private final class LivePhotoResourceStream: @unchecked Sendable {
             guard attempted <= budget.limits.maxEncodedBytes else { throw LivePhotoResourceReadError.resourceLimit(bytes: attempted) }
             do { try budget.reserve(Int64(data.count)) }
             catch { throw LivePhotoResourceReadError.budgetBusy(resourceBytes: attempted) }
-            do { try owner.append(data); bytes += Int64(data.count) }
-            catch { budget.release(Int64(data.count)); throw error }
+            let start = trace?.now()
+            do {
+                try owner.append(data); bytes += Int64(data.count)
+                if let start { trace?.wrote(data.count, seconds: (trace?.now() ?? start) - start) }
+            }
+            catch {
+                if let start { trace?.wrote(0, seconds: (trace?.now() ?? start) - start) }
+                budget.release(Int64(data.count)); throw error
+            }
         } catch { failure = error; drainingSince = ProcessInfo.processInfo.systemUptime }
-        let action = takeCancel()
-        lock.unlock(); action?()
+        let action = takeCancel(), failed = failure != nil
+        lock.unlock()
+        if failed { trace?.cancelRequested() }
+        action?()
     }
     func complete(_ error: Error?) {
+        let callbackAt = trace?.now()
         lock.lock()
         guard !finished, let owner else { lock.unlock(); return }
         finished = true
@@ -240,7 +264,13 @@ private final class LivePhotoResourceStream: @unchecked Sendable {
         }
         self.owner = nil; cancel = nil
         let call = continuation; continuation = nil
-        lock.unlock(); call?.resume(with: result)
+        lock.unlock()
+        if let callbackAt {
+            let terminalError: Error?
+            if case .failure(let error) = result { terminalError = error } else { terminalError = nil }
+            trace?.complete(error: terminalError, callbackAt: callbackAt, finalizeSeconds: (trace?.now() ?? callbackAt) - callbackAt)
+        }
+        call?.resume(with: result)
     }
 }
 

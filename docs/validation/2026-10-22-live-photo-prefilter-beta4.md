@@ -29,3 +29,25 @@ beta4/build21 发布工具的合成测试 20 项通过；随后补齐 provenance
 最终归档必须通过 `scripts/package-release.sh --scale-profile full`；四档分别为 10/15/20 万表示无成功历史，以及 20 万表示＋10 万成功历史。它们不代表实际 iCloud 下载速度。
 
 随包 `validation/validation.json`、报告、源码清单、签名/架构/DMG 检查和 `PhotosYNC.provenance` 绑定确切提交，不能用上述聚焦回归替代完整发布门槛。真实 Photos 写入、平台实机、安装及公证未在本轮执行。
+
+## 首次归档失败与后续开发
+
+main `8eacc21` 的首次归档 `work/release-0.3.0-beta4.1xzJw9` 在完整 XCTest 阶段失败：911 项、2 项跳过、5 个失败断言，未生成发行目录或 tag。失败集中于 `AdvancedRuntimeTests` 两个场景及 `AppViewTests` 一个 OCR 几何定位场景。
+
+独立复现确认新准入前移后，来源目录扫描结束未明确重新唤醒补齐，可能令已预留的配对无法推进。修复为非空来源扫描完成后保留一次待消费唤醒；任务仍被占用时在其结束后消费，继续遵守暂停、期限和实际准入。空来源扫描不额外消费识别项目。
+
+另用受控门闩交错两次 `current()`，稳定复现活动数组得到 3 项而非两个协调器的 2 项。状态改为局部组装摘要和活动，再一次性发布；不在 await 之间清空、追加共享数组。OCR 曾将“索引”读成“素引”；布局测试按实际说明按钮左侧的原生文字位置定位，继续检查同一行和内容宽度，不改变原图、OCR 输入或词典。
+
+上述修复后的聚焦验证为 96 项、0 失败，包含完整 AdvancedRuntimeTests 40 项。证据 `work/beta4/canonical-runtime-green-tests.log`；早先失败保留。用户随后要求开发后先诊断日志，新增修复不再合并/发布；分支 canonical 开发验收另行记录。
+
+增量评审进一步发现较早的进度发布可在 await 后覆盖新摘要。扩展同一个受控测试，在挂起期间新增持久待处理项，RED 确认计数从 1 被回滚至 0（`work/beta4/publication-red-tests.log`）。发布改用递增代次拒绝过期写回，读取失败信息也只随当前发布提交，避免过期失败污染新状态。
+
+补充修复后相关 96 项全部通过（`work/beta4/publication-green-tests.log`）；等待增量复核与完整开发验收。
+
+## 最终分支开发验收
+
+行为冻结提交 `e08b89099b8b5605ed47090e15b8569132e892a3` 的增量深度评审通过。`scripts/validate.py --scale-profile full` 退出 0，证据在 `work/validation-beta4-e08b890/validation.json`：完整 XCTest 912 项、2 项跳过、0 失败；Tools 102 项通过；四档规模和 stamp / advanced-preparation 两类续体竞争均通过。
+
+两项 XCTest 跳过分别是由 canonical 子进程单独执行的规模样本，以及需要显式本地输入的历史向量重放；四档规模确实在本次随后执行。源码清单 381 项，验收前后 SHA-256 均为 `965c7c739e41a2949d85eccbda7f3531fb75b8f47b9bde6409cadf0930084994`。独立 tester 已核对完整结果、必要样本集合、报告哈希和未改动的源码清单，没有重复运行同一套测试。
+
+新增修复继续留在 `codex/beta4-release-validation-fix`，不再合并或发布；没有 beta4 tag 或发行目录。此后仅追加验证和诊断文档，不改动已验收的产品代码。只读运行诊断另见 `work/beta4-runtime-analysis/findings.md`，其中额外发现的中性通知失效、全库通知遍历及慢读阻塞尚未修复，不能将本次开发验收解读为这些问题已解决。

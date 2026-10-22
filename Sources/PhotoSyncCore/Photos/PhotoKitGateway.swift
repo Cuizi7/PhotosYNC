@@ -32,6 +32,34 @@ enum PhotoKitCreateCommand: Equatable, Sendable {
     }
 }
 
+/// Retains the actual before objects; changedObjects does not promise a before version.
+struct PhotoKitObjectBaseline<Object> {
+    private var objects: [String: Object]
+    init(objects: [String: Object] = [:]) { self.objects = objects }
+    var count: Int { objects.count }
+    mutating func apply(removed: Set<String>, inserted: [Object], changed: [String], afterCount: Int,
+                        identifier: (Object) -> String, candidate: (Object) -> PhotoKitCandidateAsset,
+                        classify: (Object) -> (Object, PhotoKitCandidateAsset)?) -> PhotoKitCandidateIndexChange {
+        let insertedIDs = inserted.map(identifier), changedIDs = Set(changed), insertedSet = Set(insertedIDs)
+        guard changedIDs.count == changed.count, insertedSet.count == insertedIDs.count,
+              removed.isDisjoint(with: changedIDs), removed.isDisjoint(with: insertedSet), changedIDs.isDisjoint(with: insertedSet),
+              removed.allSatisfy({ objects[$0] != nil }), changed.allSatisfy({ objects[$0] != nil }),
+              insertedIDs.allSatisfy({ objects[$0] == nil }), objects.count - removed.count + inserted.count == afterCount else { return .reload }
+        var updates = [(String, Object)](), changedCandidates = [PhotoKitCandidateAsset]()
+        for id in changed {
+            guard let old = objects[id], let (current, mapped) = classify(old), identifier(current) == id, mapped.identifier == id else { return .reload }
+            updates.append((id, current)); changedCandidates.append(mapped)
+        }
+        let insertedCandidates = inserted.map(candidate)
+        guard insertedCandidates.map(\.identifier) == insertedIDs else { return .reload }
+        // Do not mutate the old-object snapshot until every detail is complete.
+        for id in removed { objects.removeValue(forKey: id) }
+        for (id, current) in updates { objects[id] = current }
+        for (id, current) in zip(insertedIDs, inserted) { objects[id] = current }
+        return .incremental(removedAssetIDs: removed, insertedAssets: insertedCandidates, changedAssets: changedCandidates)
+    }
+}
+
 enum PhotoKitSubmissionResult: Sendable {
     case retired
     case committed(identifier: String)
@@ -47,6 +75,7 @@ struct PhotoKitCandidateAsset: Sendable {
     let identifier: String
     let candidates: [MatchCandidate]
     var inputUnchanged: Bool = false
+    var livePhotoInputsUnchanged: Bool = false
     // Diagnostic facts are independent of the conservative invalidation decision.
     // nil means unavailable; an empty field list means observed with no difference.
     var assetContentChanged: Bool? = nil
@@ -242,8 +271,9 @@ public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked
         var handedOff = false
         defer { if !handedOff { state.endRepresentationRead(ticket) } }
         let lease: LivePhotoResourceLease
+        let trace = indexDiagnostics.livePhotoResourceTrace(ref, purpose: purpose)
         do { lease = try await indexDiagnostics.measureLivePhoto(.rawRead, assetID: assetID, event: before.generation, bytes: { $0.encodedBytes }) {
-            try await self.livePhotoRawReader.read(resource: ref, purpose: purpose, budget: budget)
+            try await self.livePhotoRawReader.read(resource: ref, purpose: purpose, budget: budget, trace: trace)
         } }
         catch PhotoKitGatewayError.libraryChanged { throw LivePhotoReadDeferred.resourceChanged }
         if state.livePhotoClassificationPending {
@@ -854,11 +884,11 @@ public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked
                 guard let self else { return false }
                 return self.state.markIndexed(generation: generation)
             },
-            onChange: { [state, changeChannel, catalogBatchSize, indexDiagnostics] event, knownNeutral in
+            onChange: { [state, changeChannel, catalogBatchSize, indexDiagnostics] event, knownNeutral, livePhotoUnchanged in
                 switch event {
                 case .incremental(let delta):
                     let persistStart = ProcessInfo.processInfo.systemUptime
-                    if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize)) { state.requireInventoryReconciliation() }
+                    if !state.recordCatalogChanges(delta, capacity: max(1, catalogBatchSize), livePhotoUnchanged: livePhotoUnchanged) { state.requireInventoryReconciliation() }
                     indexDiagnostics.recordTiming(stage: "photos_live_catalog_persist_wall", seconds: ProcessInfo.processInfo.systemUptime - persistStart)
                     // A large complete scope is durable; stream buffers hold only a wakeup.
                     if delta.changedAssetIDs.count + delta.deletedAssetIDs.count > max(1, catalogBatchSize / 2), state.hasStore {
@@ -971,6 +1001,7 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
 
     private let photoLibrary: PHPhotoLibrary
     private var fetchedAssets: PHFetchResult<PHAsset>?
+    private var objectBaseline = PhotoKitObjectBaseline<PHAsset>()
     private let representationQueue = DispatchQueue(label: "PhotoSync.PhotoKitRepresentationCatalog")
     private var representationAssets: PHFetchResult<PHAsset>?
     private var representationGeneration: Int?
@@ -1002,8 +1033,10 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
         let context = attachment?.1()
         var inventoryBatch = [LivePhotoAssetDescriptor]()
         var result = [PhotoKitCandidateAsset]()
+        var beforeObjects = [String: PHAsset]()
         for index in 0..<assets.count {
             let asset = assets.object(at: index)
+            beforeObjects[asset.localIdentifier] = asset
             let candidates = PHAssetResource.assetResources(for: asset).compactMap { resource -> MatchCandidate? in
                 guard !resource.originalFilename.isEmpty else { return nil }
                 return MatchCandidate(key: "photos:\(asset.localIdentifier):\(resource.originalFilename)", metadata: Self.metadata(asset: asset, filename: resource.originalFilename))
@@ -1018,6 +1051,7 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
             }
         }
         if let context, !inventoryBatch.isEmpty { try attachment?.0.enqueueLivePhotoCatalogAssets(context: context, assets: inventoryBatch) }
+        objectBaseline = .init(objects: beforeObjects)
         return result
     }
 
@@ -1042,19 +1076,18 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
                 return MatchCandidate(key: "photos:\(asset.localIdentifier):\(resource.originalFilename)", metadata: Self.metadata(asset: asset, filename: resource.originalFilename))
             })
         }
-        var removed = Set<String>(), inserted: [PhotoKitCandidateAsset] = [], changed: [PhotoKitCandidateAsset] = []
-        var beforeIDs = Set<String>(), incompleteObjectDetails = false
-        before.enumerateObjects { old, _, _ in
-            beforeIDs.insert(old.localIdentifier)
-            guard let object = change.changeDetails(for: old) else { return }
-            if object.objectWasDeleted { removed.insert(old.localIdentifier); return }
-            guard let current = object.objectAfterChanges else { incompleteObjectDetails = true; return }
+        let makeChanged: (PHAsset, PHAsset, Bool) -> PhotoKitCandidateAsset = { old, current, assetContentChanged in
             var candidate = makeCandidate(current)
             let beforeFacts = PhotoKitRepresentationAsset(asset: old), afterFacts = PhotoKitRepresentationAsset(asset: current)
             candidate.inputUnchanged = old.mediaType == current.mediaType && old.mediaSubtypes == current.mediaSubtypes &&
                 old.pixelWidth == current.pixelWidth && old.pixelHeight == current.pixelHeight &&
-                afterFacts.inputsUnchanged(from: beforeFacts, assetContentChanged: object.assetContentChanged)
-            candidate.assetContentChanged = object.assetContentChanged
+                afterFacts.inputsUnchanged(from: beforeFacts, assetContentChanged: assetContentChanged)
+            candidate.assetContentChanged = assetContentChanged
+            let comparisonContext = LibraryContext(id: UUID(), epoch: 0)
+            candidate.livePhotoInputsUnchanged = PhotoKitLivePhotoReader.inputsUnchanged(
+                before: PhotoKitLivePhotoReader.descriptor(old, context: comparisonContext),
+                after: PhotoKitLivePhotoReader.descriptor(current, context: comparisonContext),
+                assetContentChanged: assetContentChanged)
             var inputFields = PhotoKitCandidateAsset.changedRepresentationFields(before: beforeFacts, after: afterFacts)
             if old.mediaType != current.mediaType { inputFields.append("mediaType") }
             if old.mediaSubtypes != current.mediaSubtypes { inputFields.append("mediaSubtypes") }
@@ -1069,19 +1102,54 @@ private final class SystemPhotoKitLifecycle: @unchecked Sendable, PhotoKitLifecy
             if old.duration != current.duration { metadataFields.append("duration") }
             if old.location != current.location { metadataFields.append("location") }
             candidate.metadataFields = metadataFields.sorted()
-            changed.append(candidate)
+            return candidate
+        }
+        if details.hasIncrementalChanges {
+            let removed = details.removedObjects.map(\.localIdentifier)
+            guard objectBaseline.count == before.count, Set(removed).count == removed.count else {
+                diagnostics(["phase": "photos-fetch-details", "fallback": "object-baseline-mismatch"])
+                return .reload
+            }
+            let result = objectBaseline.apply(removed: Set(removed), inserted: details.insertedObjects,
+                changed: details.changedObjects.map(\.localIdentifier), afterCount: after.count,
+                identifier: { $0.localIdentifier }, candidate: makeCandidate, classify: { old in
+                    guard let object = change.changeDetails(for: old), !object.objectWasDeleted,
+                          let current = object.objectAfterChanges else { return nil }
+                    return (current, makeChanged(old, current, object.assetContentChanged))
+                })
+            guard case .incremental = result else {
+                diagnostics(["phase": "photos-fetch-details", "fallback": "incomplete-incremental-object-details"])
+                return .reload
+            }
+            fetchedAssets = after
+            diagnostics(["phase": "photos-fetch-details", "mode": "incremental",
+                "examinedObjects": String(removed.count + details.insertedObjects.count + details.changedObjects.count),
+                "libraryObjects": String(after.count)])
+            return result
+        }
+        // Nonincremental notifications retain full before/after membership checks.
+        var removed = Set<String>(), inserted: [PhotoKitCandidateAsset] = [], changed: [PhotoKitCandidateAsset] = []
+        var beforeIDs = Set<String>(), incompleteObjectDetails = false
+        before.enumerateObjects { old, _, _ in
+            beforeIDs.insert(old.localIdentifier)
+            guard let object = change.changeDetails(for: old) else { return }
+            if object.objectWasDeleted { removed.insert(old.localIdentifier); return }
+            guard let current = object.objectAfterChanges, current.localIdentifier == old.localIdentifier else { incompleteObjectDetails = true; return }
+            changed.append(makeChanged(old, current, object.assetContentChanged))
         }
         guard !incompleteObjectDetails else {
             diagnostics(["phase": "photos-fetch-details", "fallback": "missing-object-after-details"])
             return .reload
         }
+        var afterObjects = [String: PHAsset]()
         after.enumerateObjects { asset, _, _ in
+            afterObjects[asset.localIdentifier] = asset
             if !beforeIDs.contains(asset.localIdentifier) { inserted.append(makeCandidate(asset)) }
         }
-        // A complete after membership is authoritative even for nonincremental details.
-        let afterIDs = Set((0..<after.count).map { after.object(at: $0).localIdentifier })
-        removed.formUnion(beforeIDs.subtracting(afterIDs))
-        fetchedAssets = after
+        removed.formUnion(beforeIDs.subtracting(afterObjects.keys))
+        fetchedAssets = after; objectBaseline = .init(objects: afterObjects)
+        diagnostics(["phase": "photos-fetch-details", "mode": "full",
+            "examinedObjects": String(before.count + after.count), "libraryObjects": String(after.count)])
         return .incremental(removedAssetIDs: removed, insertedAssets: inserted, changedAssets: changed)
     }
 
@@ -1309,7 +1377,7 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
     func enqueueChange(_ change: PHChange?, recordChange: @Sendable () -> (generation: Int, context: LibraryContext), lifecycle: any PhotoKitLifecycle,
                        indexDiagnostics: IndexDiagnostics, diagnostic: IndexDiagnosticOperation,
                        didIndex: @escaping @Sendable (Int) -> Bool,
-                       onChange: @escaping @Sendable (PhotosIndexChange, Bool) -> Void,
+                       onChange: @escaping @Sendable (PhotosIndexChange, Bool, Set<String>) -> Void,
                        onContentChange: @escaping @Sendable ([String]) -> Void,
                        didFinishDetails: @escaping @Sendable () -> Void,
                        diagnostics: @escaping @Sendable ([String: String]) -> Void) {
@@ -1329,12 +1397,12 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
             guard let self else { return }
             guard case let .incremental(removed, inserted, changed) = (try? lifecycle.candidateIndexChange(for: change)) else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "missing-or-unclassified-fetch-details", "contentScope": "unknown"])
-                onChange(.fullReconcileRequired, false); return
+                onChange(.fullReconcileRequired, false, []); return
             }
             guard self.indexedGeneration == generation - 1 else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "candidate-baseline-gap", "contentScope": "unknown",
                     "expectedBaseline": String(generation - 1), "actualBaseline": self.indexedGeneration.map(String.init) ?? "none"])
-                onChange(.fullReconcileRequired, false); return
+                onChange(.fullReconcileRequired, false, []); return
             }
             let insertedIDs = Set(inserted.map(\.identifier))
             let changedIDs = Set(changed.map(\.identifier))
@@ -1347,7 +1415,7 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
                   inserted.allSatisfy({ self.byAsset[$0.identifier] == nil }),
                   changed.allSatisfy({ self.byAsset[$0.identifier] != nil }) else {
                 diagnostics(["phase": "photos-change-classification", "event": String(generation), "fallback": "malformed-membership-details", "contentScope": "unknown"])
-                onChange(.fullReconcileRequired, false); return
+                onChange(.fullReconcileRequired, false, []); return
             }
             for asset in changed {
                 indexDiagnostics.recordCause(context: context, assetID: asset.identifier, source: "live", generation: generation,
@@ -1368,13 +1436,15 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
             diagnostics(["phase": "photos-change-classification", "event": String(generation), "contentScope": "known",
                 "inserted": String(inserted.count), "deleted": String(removed.count),
                 "contentChanged": String(changed.filter { !$0.inputUnchanged }.count),
-                "inputUnchanged": String(changed.filter(\.inputUnchanged).count)])
+                "inputUnchanged": String(changed.filter(\.inputUnchanged).count),
+                "livePhotoUnchanged": String(changed.filter { $0.livePhotoInputsUnchanged && $0.assetContentChanged == false }.count)])
             indexDiagnostics.recordTiming(stage: "photos_notification_classification_wall", seconds: ProcessInfo.processInfo.systemUptime - classificationStart)
             classificationFinished = true
             onContentChange(changed.filter { !$0.inputUnchanged }.map(\.identifier) + removed.sorted())
             onChange(.incremental(.init(context: context, fromGeneration: generation - 1, toGeneration: generation,
                 changedAssetIDs: (inserted + changed).map(\.identifier).sorted(), deletedAssetIDs: removed.sorted())),
-                inserted.isEmpty && removed.isEmpty && changed.allSatisfy(\.inputUnchanged))
+                inserted.isEmpty && removed.isEmpty && changed.allSatisfy(\.inputUnchanged),
+                Set(changed.filter { $0.livePhotoInputsUnchanged && $0.assetContentChanged == false }.map(\.identifier)))
         }
         submissionLock.unlock()
         // Diagnostics may call injected hooks; admission is closed and ordered work
@@ -1543,11 +1613,11 @@ private final class PhotoKitState: @unchecked Sendable {
         lock.lock(); let store = store; lock.unlock()
         try store?.recordLivePhotoChanges(context: context, changed: changed, deleted: deleted)
     }
-    func recordCatalogChanges(_ delta: PhotosIndexDelta, capacity: Int) -> Bool {
+    func recordCatalogChanges(_ delta: PhotosIndexDelta, capacity: Int, livePhotoUnchanged: Set<String> = []) -> Bool {
         lock.lock(); let store = store; lock.unlock()
         do {
             try store?.recordPhotosChanges(context: delta.context, runID: runID, generation: delta.toGeneration,
-                changed: delta.changedAssetIDs, deleted: delta.deletedAssetIDs, content: [], batchSize: capacity)
+                changed: delta.changedAssetIDs, deleted: delta.deletedAssetIDs, content: [], batchSize: capacity, livePhotoUnchanged: livePhotoUnchanged)
             return true
         } catch { return false }
     }

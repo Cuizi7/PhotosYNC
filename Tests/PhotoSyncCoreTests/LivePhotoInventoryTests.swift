@@ -458,8 +458,13 @@ actor FixtureLivePhotoGateway: LivePhotoPhotosGateway {
     var nativeRead: (@Sendable (LivePhotoResourceRef, LivePhotoReadPurpose, LivePhotoResourceBudget) async throws -> LivePhotoResourceLease)?
     func useNativeRead(_ read: @escaping @Sendable (LivePhotoResourceRef, LivePhotoReadPurpose, LivePhotoResourceBudget) async throws -> LivePhotoResourceLease) { nativeRead = read }
     var admission: PhotosReaderAdmission = .available
+    var admissionGate: InventoryReadGate?
+    func holdReadAdmissionOnce(_ gate: InventoryReadGate) { admissionGate = gate }
     func setReadAdmission(_ value: PhotosReaderAdmission) { admission = value }
-    func livePhotoReadAdmission() async -> PhotosReaderAdmission { admission }
+    func livePhotoReadAdmission() async -> PhotosReaderAdmission {
+        if let gate = admissionGate { admissionGate = nil; await gate.hold() }
+        return admission
+    }
     var readGate: InventoryReadGate?
     var catalogBeginCount = 0
     var visualGate: InventoryReadGate?, liveCatalogGate: InventoryReadGate?
