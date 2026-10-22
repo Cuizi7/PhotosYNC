@@ -121,6 +121,7 @@ public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked
     private let mutationSlot = PhotoKitMutationSlot()
     private let livePhotoCatalog = PhotoKitLivePhotoCatalog()
     private let livePhotoRawReader: LivePhotoRawResourceReader
+    private var classificationSleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     private var livePhotoResourceIsCurrent: @Sendable (LivePhotoResourceRef) throws -> Bool = {
         _ = try PhotoKitLivePhotoReader.selected($0); return true
     }
@@ -157,7 +158,9 @@ public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked
          livePhotoResourceIsCurrent: @escaping @Sendable (LivePhotoResourceRef) throws -> Bool = { _ = try PhotoKitLivePhotoReader.selected($0); return true }, catalogBatchSize: Int = 0,
          indexDiagnostics: IndexDiagnostics? = nil, diagnostics: @escaping @Sendable ([String: String]) -> Void = { _ in },
          queueSubmissionProbe: (@Sendable (PhotoKitQueueSubmissionPhase) -> Void)? = nil,
-         historyNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         historyNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         classificationSleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
+        self.classificationSleep = classificationSleep
         self.livePhotoRawReader = livePhotoRawReader
         self.livePhotoResourceIsCurrent = livePhotoResourceIsCurrent
         historyRetry = PhotosHistoryRetry(now: historyNow)
@@ -232,22 +235,47 @@ public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked
         let before = state.snapshot()
         guard case .photos(let contextID, let assetID, _, _) = ref, contextID == before.context.id,
               lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else { throw PhotoKitGatewayError.libraryChanged }
-        guard try livePhotoResourceIsCurrent(ref) else { throw PhotoKitGatewayError.libraryChanged }
-        let ticket = try state.beginResourceRead(assetID: assetID, context: before.context)
+        let ticket = try await indexDiagnostics.measureLivePhoto(.admission, assetID: assetID, event: before.generation) {
+            try self.requireLivePhotoResource(ref)
+            return try self.state.beginResourceRead(assetID: assetID, context: before.context)
+        }
         var handedOff = false
         defer { if !handedOff { state.endRepresentationRead(ticket) } }
-        let lease = try await livePhotoRawReader.read(resource: ref, purpose: purpose, budget: budget)
-        guard state.resourceReadIsCurrent(ticket, context: before.context), lifecycle.currentAccess() == .authorized,
-              lifecycle.isAvailable(), try livePhotoResourceIsCurrent(ref) else { throw PhotoKitGatewayError.libraryChanged }
+        let lease: LivePhotoResourceLease
+        do { lease = try await indexDiagnostics.measureLivePhoto(.rawRead, assetID: assetID, event: before.generation, bytes: { $0.encodedBytes }) {
+            try await self.livePhotoRawReader.read(resource: ref, purpose: purpose, budget: budget)
+        } }
+        catch PhotoKitGatewayError.libraryChanged { throw LivePhotoReadDeferred.resourceChanged }
+        if state.livePhotoClassificationPending {
+            diagnostics(["phase": "live-photo-read", "event": "classification-pending", "assetHandle": indexDiagnostics.handle("asset", assetID), "generation": String(state.snapshot().generation)])
+            _ = try await indexDiagnostics.measureLivePhoto(.classification, assetID: assetID, event: state.snapshot().generation) {
+                do { return try await self.candidateIndex.awaitClassification(currentGeneration: { self.state.snapshot().generation }, sleep: self.classificationSleep) }
+                catch ReadExecutorError.timedOut { throw LivePhotoReadDeferred.classificationPending }
+            }
+        }
+        try Task.checkCancellation()
+        try state.requireLivePhotoReadCurrent(ticket, context: before.context)
+        guard lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else { throw PhotoKitGatewayError.libraryChanged }
+        try requireLivePhotoResource(ref)
         let state = state, lifecycle = lifecycle
-        let validity = LivePhotoResourceValidity(validate: {
-            state.resourceReadIsCurrent(ticket, context: before.context) && lifecycle.currentAccess() == .authorized && lifecycle.isAvailable()
+        let validity = LivePhotoResourceValidity(check: {
+            try state.requireLivePhotoReadCurrent(ticket, context: before.context)
+            guard lifecycle.currentAccess() == .authorized, lifecycle.isAvailable() else { throw PhotoKitGatewayError.libraryChanged }
         }, release: { state.endRepresentationRead(ticket) })
         handedOff = true
         return LivePhotoResourceLease(url: lease.url, bytes: lease.encodedBytes, retaining: lease, validity: validity)
     }
 
-    public func livePhotoReadAdmission() async -> PhotosReaderAdmission { await livePhotoRawReader.admission() }
+    private func requireLivePhotoResource(_ ref: LivePhotoResourceRef) throws {
+        do { guard try livePhotoResourceIsCurrent(ref) else { throw LivePhotoReadDeferred.resourceChanged } }
+        catch PhotoKitGatewayError.libraryChanged { throw LivePhotoReadDeferred.resourceChanged }
+    }
+
+    public func livePhotoReadAdmission() async -> PhotosReaderAdmission {
+        let physical = await livePhotoRawReader.admission()
+        if physical != .available { return physical }
+        return state.livePhotoClassificationPending ? .busy : .available
+    }
 
     public func livePhotoPreservationSnapshot(assetID: String, context: LibraryContext) async throws -> LivePhotoPreservationSnapshot {
         guard state.snapshot().context == context, lifecycle.currentAccess() == .authorized else { throw PhotoKitGatewayError.libraryChanged }
@@ -1231,6 +1259,24 @@ private final class PhotoKitCandidateIndex: @unchecked Sendable {
     private var byFilename: [String: [MatchCandidate]] = [:]
     private var indexedGeneration: Int?
 
+    /// A marker on the existing producer queue covers only events submitted before it.
+    /// The marker owns no resource lease and may finish harmlessly after logical cancellation.
+    func awaitClassification(currentGeneration: @escaping @Sendable () -> Int,
+                             sleep: @escaping @Sendable (Duration) async throws -> Void) async throws -> Int {
+        let waiter = ReadOperationState<Int>()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                waiter.install(continuation)
+                submissionLock.lock()
+                let watermark = currentGeneration()
+                queue.async { waiter.finish(.success(watermark)) }
+                submissionLock.unlock()
+                waiter.startTimeout(after: .seconds(5), sleep: sleep)
+            }
+        } onCancel: { waiter.finish(.failure(CancellationError())) }
+    }
+
     func snapshot(
         lifecycle: any PhotoKitLifecycle,
         currentGeneration: @escaping @Sendable () -> Int,
@@ -1510,16 +1556,28 @@ private final class PhotoKitState: @unchecked Sendable {
 
     private var reads: [UUID: (assetID: String, valid: Bool)] = [:]
     func beginRepresentationRead(_ descriptor: RepresentationDescriptor) throws -> UUID {
-        try beginResourceRead(assetID: descriptor.key.assetID, context: descriptor.context)
+        do { return try beginResourceRead(assetID: descriptor.key.assetID, context: descriptor.context) }
+        catch is LivePhotoReadDeferred { throw PhotoKitGatewayError.libraryChanged }
     }
     func beginResourceRead(assetID: String, context expected: LibraryContext) throws -> UUID {
         lock.lock(); defer { lock.unlock() }
-        guard available, context == expected, pendingChangeDetails == 0 else { throw PhotoKitGatewayError.libraryChanged }
+        guard available, context == expected else { throw PhotoKitGatewayError.libraryChanged }
+        guard pendingChangeDetails == 0 else { throw LivePhotoReadDeferred.classificationPending }
         let ticket = UUID(); reads[ticket] = (assetID, true); return ticket
     }
     func resourceReadIsCurrent(_ ticket: UUID, context expected: LibraryContext) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return available && context == expected && pendingChangeDetails == 0 && reads[ticket]?.valid == true
+    }
+    var livePhotoClassificationPending: Bool { lock.lock(); defer { lock.unlock() }; return pendingChangeDetails > 0 }
+    func requireLivePhotoReadCurrent(_ ticket: UUID, context expected: LibraryContext) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard available, context == expected else { throw PhotoKitGatewayError.libraryChanged }
+        guard pendingChangeDetails == 0 else { throw LivePhotoReadDeferred.classificationPending }
+        guard reads[ticket]?.valid == true else {
+            if inventoryUnverified { throw PhotoKitGatewayError.libraryChanged }
+            throw LivePhotoReadDeferred.resourceChanged
+        }
     }
     func endRepresentationRead(_ ticket: UUID) { lock.lock(); reads.removeValue(forKey: ticket); lock.unlock() }
     func representationReadIsCurrent(_ ticket: UUID, context expected: LibraryContext) -> Bool {

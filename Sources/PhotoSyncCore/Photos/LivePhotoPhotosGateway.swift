@@ -2,6 +2,12 @@ import Foundation
 
 public enum LivePhotoReadPurpose: Sendable { case inventory, completion }
 
+/// No observation was accepted; retry through ordinary scheduling, never a global failure cooldown.
+public enum LivePhotoReadDeferred: Error, Equatable, Sendable {
+    case classificationPending
+    case resourceChanged
+}
+
 public enum LivePhotoResourceReadError: Error, Equatable, Sendable {
     case requestTimedOut
     case resourceLimit(bytes: Int64)
@@ -46,10 +52,14 @@ public final class LivePhotoResourceBudget: @unchecked Sendable {
 
 /// An observation keeps its asset ticket through parsing/commit without retaining encoded bytes.
 final class LivePhotoResourceValidity: @unchecked Sendable {
-    private let validate: @Sendable () -> Bool
+    private let validate: @Sendable () throws -> Void
     private let release: @Sendable () -> Void
-    init(validate: @escaping @Sendable () -> Bool, release: @escaping @Sendable () -> Void) { self.validate = validate; self.release = release }
-    var isCurrent: Bool { validate() }
+    init(validate: @escaping @Sendable () -> Bool, release: @escaping @Sendable () -> Void) {
+        self.validate = { guard validate() else { throw PhotoKitGatewayError.libraryChanged } }; self.release = release
+    }
+    init(check: @escaping @Sendable () throws -> Void, release: @escaping @Sendable () -> Void) { validate = check; self.release = release }
+    func requireCurrent() throws { try validate() }
+    var isCurrent: Bool { (try? validate()) != nil }
     deinit { release() }
 }
 

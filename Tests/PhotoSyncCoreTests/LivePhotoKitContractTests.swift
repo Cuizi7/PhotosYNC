@@ -3,6 +3,144 @@ import Photos
 @testable import PhotoSyncCore
 
 final class LivePhotoKitContractTests: XCTestCase {
+    func testNewNotificationAfterClassificationMarkerDefersWithoutWaitingAgain() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let raw = expectation(description: "raw"), pending = expectation(description: "read waiting"), finished = expectation(description: "read deferred")
+        let gates = LivePhotoNotificationGates(first: expectation(description: "first event"), second: expectation(description: "second event"))
+        defer { gates.releaseFirst.signal(); gates.releaseSecond.signal() }
+        let requester = ControlledCloudRequester(started: raw), lifecycle = LivePhotoKitLifecycle()
+        let gateway = PhotoKitGateway(lifecycle: lifecycle,
+            livePhotoRawReader: .init(requester: requester, storage: .init(root: root.appendingPathComponent("raw"))),
+            livePhotoResourceIsCurrent: { _ in true }, diagnostics: { fields in
+                if fields["phase"] == "live-photo-read", fields["event"] == "classification-pending" { pending.fulfill() }
+                if fields["phase"] == "live-photo-stage", fields["stage"] == "classification", fields["result"] == "completed" { gates.injectSecond() }
+            })
+        gates.gateway = gateway
+        let context = try await gateway.livePhotoLibraryContext()
+        let task = Task { () -> Error? in
+            defer { finished.fulfill() }
+            do { _ = try await gateway.readLivePhotoResource(.photos(contextID: context.id, assetID: "target", resourceKey: "original", revision: "r1"), purpose: .inventory, budget: .init()); return nil }
+            catch { return error }
+        }
+        await fulfillment(of: [raw], timeout: 2)
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        lifecycle.changeHook = { gates.classify() }
+        gateway.recordLibraryChangeForTesting(); await fulfillment(of: [gates.first], timeout: 2)
+        requester.finish(); await fulfillment(of: [pending], timeout: 2)
+        gates.releaseFirst.signal()
+        await fulfillment(of: [gates.second, finished], timeout: 2)
+        gates.releaseSecond.signal()
+        let error = await task.value; XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending)
+        _ = try await gateway.candidateSnapshot()
+    }
+    func testClassificationWaitTimeoutAndCancellationReleaseCompletedRawLease() async throws {
+        for cancelled in [false, true] {
+            let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+            let raw = expectation(description: "raw"), entered = expectation(description: "classification"), deadline = expectation(description: "deadline installed"), finished = expectation(description: "logical read finished")
+            let release = DispatchSemaphore(value: 0); defer { release.signal() }
+            let expiry = InventoryReadGate(), requester = ControlledCloudRequester(started: raw), lifecycle = LivePhotoKitLifecycle()
+            lifecycle.initialAssets = [.init(identifier: "target", candidates: [cloudCandidate("target")])]
+            let gateway = PhotoKitGateway(lifecycle: lifecycle,
+                livePhotoRawReader: .init(requester: requester, storage: .init(root: root.appendingPathComponent("raw"))),
+                livePhotoResourceIsCurrent: { _ in true }, classificationSleep: { duration in
+                    XCTAssertEqual(duration, .seconds(5)); deadline.fulfill(); await expiry.hold()
+                })
+            let context = try await gateway.livePhotoLibraryContext(), budget = LivePhotoResourceBudget()
+            let task = Task { () -> Result<Data, Error> in
+                defer { finished.fulfill() }
+                do {
+                    let lease = try await gateway.readLivePhotoResource(.photos(contextID: context.id, assetID: "target", resourceKey: "original", revision: "r1"), purpose: .inventory, budget: budget)
+                    return .success(try Data(contentsOf: lease.url))
+                } catch { return .failure(error) }
+            }
+            await fulfillment(of: [raw], timeout: 2)
+            lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+            lifecycle.changeHook = { entered.fulfill(); _ = release.wait(timeout: .now() + 5) }
+            gateway.recordLibraryChangeForTesting(); await fulfillment(of: [entered], timeout: 2)
+            requester.finish(); await fulfillment(of: [deadline], timeout: 2)
+            if cancelled { task.cancel() } else { await expiry.release() }
+            await fulfillment(of: [finished], timeout: 2)
+            release.signal(); await expiry.release()
+            switch await task.value {
+            case .success: XCTFail("Timed out/cancelled classification accepted bytes")
+            case .failure(let error):
+                if cancelled { XCTAssertTrue(error is CancellationError) }
+                else { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+            }
+            _ = try await gateway.candidateSnapshot() // late marker cannot resume the completed waiter again
+            let freed = await engineEventually { budget.reservedBytes == 0 }; XCTAssertTrue(freed)
+        }
+    }
+    func testPendingClassificationPreventsNewPhysicalRead() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let lifecycle = LivePhotoKitLifecycle(), entered = expectation(description: "classification"), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let requester = BufferedLivePhotoRequester(chunks: [Data([1])], fileExtension: nil)
+        let gateway = PhotoKitGateway(lifecycle: lifecycle, livePhotoRawReader: .init(requester: requester, storage: .init(root: root.appendingPathComponent("raw"))), livePhotoResourceIsCurrent: { _ in true })
+        let context = try await gateway.livePhotoLibraryContext()
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [])
+        lifecycle.changeHook = { entered.fulfill(); _ = release.wait(timeout: .now() + 5) }
+        gateway.recordLibraryChangeForTesting(); await fulfillment(of: [entered], timeout: 2)
+        do {
+            _ = try await gateway.readLivePhotoResource(.photos(contextID: context.id, assetID: "target", resourceKey: "original", revision: "r1"), purpose: .inventory, budget: .init())
+            XCTFail("Read started with unclassified changes")
+        } catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+        XCTAssertTrue(requester.networkFlags.isEmpty)
+        release.signal(); _ = try await gateway.candidateSnapshot()
+    }
+    func testCloudReadDiagnosticsBoundDetailAndAggregateBytesWithoutPrivateIDs() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let rows = LivePhotoDiagnosticRows(), diagnostics = IndexDiagnostics(sink: { rows.append($0) })
+        let lifecycle = LivePhotoKitLifecycle(), gateway = PhotoKitGateway(lifecycle: lifecycle,
+            livePhotoRawReader: .init(requester: BufferedLivePhotoRequester(chunks: [Data([1, 2, 3])], fileExtension: nil), storage: .init(root: root.appendingPathComponent("raw"))),
+            livePhotoResourceIsCurrent: { _ in true }, indexDiagnostics: diagnostics)
+        let context = try await gateway.livePhotoLibraryContext()
+        for _ in 0..<10 {
+            let lease = try await gateway.readLivePhotoResource(.photos(contextID: context.id, assetID: "private-asset", resourceKey: "private-name.HEIC", revision: "private-revision"), purpose: .inventory, budget: LivePhotoResourceBudget())
+            XCTAssertEqual(try Data(contentsOf: lease.url), Data([1, 2, 3]))
+        }
+        diagnostics.flushObservations(force: true)
+        let values = rows.values
+        let summary = try XCTUnwrap(values.last { $0["phase"] == "live-photo-summary" })
+        XCTAssertEqual(summary["raw-read.completed"], "10"); XCTAssertEqual(summary["raw-read.bytes"], "30")
+        let details = values.filter { $0["phase"] == "live-photo-stage" && $0["stage"] == "raw-read" }
+        XCTAssertFalse(details.isEmpty); XCTAssertLessThanOrEqual(details.count, 2)
+        XCTAssertTrue(details.allSatisfy { $0["assetHandle"]?.hasPrefix("asset-") == true && $0["elapsedMS"] != nil })
+        XCTAssertFalse(String(describing: values).contains("private-"))
+    }
+    func testRawCompletionDuringClassificationWaitsWithoutDiscardingUnrelatedBytes() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "raw request"), classifying = expectation(description: "classification entered")
+        let readReachedFence = expectation(description: "read reached pending fence")
+        readReachedFence.assertForOverFulfill = false
+        let release = DispatchSemaphore(value: 0); defer { release.signal() }
+        let requester = ControlledCloudRequester(started: started), lifecycle = LivePhotoKitLifecycle()
+        lifecycle.initialAssets = [.init(identifier: "target", candidates: [cloudCandidate("target")])]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle,
+            livePhotoRawReader: .init(requester: requester, storage: .init(root: root.appendingPathComponent("raw"))),
+            livePhotoResourceIsCurrent: { _ in true }, diagnostics: { fields in
+                if fields["phase"] == "live-photo-read", fields["event"] == "classification-pending" { readReachedFence.fulfill() }
+            })
+        _ = try await gateway.candidateSnapshot()
+        let context = try await gateway.livePhotoLibraryContext(), budget = LivePhotoResourceBudget()
+        let task = Task {
+            do {
+                let lease = try await gateway.readLivePhotoResource(.photos(contextID: context.id, assetID: "target", resourceKey: "original", revision: "r1"), purpose: .inventory, budget: budget)
+                return try Data(contentsOf: lease.url)
+            } catch { readReachedFence.fulfill(); throw error }
+        }
+        await fulfillment(of: [started], timeout: 2)
+        lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [.init(identifier: "other", candidates: [cloudCandidate("other")])], changedAssets: [])
+        lifecycle.changeHook = { classifying.fulfill(); _ = release.wait(timeout: .now() + 5) }
+        gateway.recordLibraryChangeForTesting()
+        await fulfillment(of: [classifying], timeout: 2)
+        requester.finish()
+        await fulfillment(of: [readReachedFence], timeout: 2)
+        release.signal()
+        let data = try await task.value
+        XCTAssertEqual(data, Data([1, 2, 3]))
+        let freed = await engineEventually { budget.reservedBytes == 0 }; XCTAssertTrue(freed)
+    }
     func testUnknownCoverageWhileInspectingCannotSaveIdentityObservation() async throws {
         let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
         let started = expectation(description: "raw read"), requester = ControlledCloudRequester(started: started)
@@ -21,7 +159,7 @@ final class LivePhotoKitContractTests: XCTestCase {
         let summary = try await c.summary(); XCTAssertEqual(summary.identified, 0); XCTAssertEqual(summary.pending, 1)
     }
     func testCloudResourceReadAcceptsUnrelatedChangesAndRejectsInvalidation() async throws {
-        for mode in ["unrelated", "target", "deleted", "unknown", "revision", "permission"] {
+        for mode in ["unrelated", "neutral-target", "revision-neutral", "target", "deleted", "unknown", "revision", "permission"] {
             let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
             let started = expectation(description: "read " + mode)
             let requester = ControlledCloudRequester(started: started)
@@ -43,12 +181,16 @@ final class LivePhotoKitContractTests: XCTestCase {
             else {
                 if mode == "unrelated" { lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [.init(identifier: "other", candidates: [cloudCandidate("other")])], changedAssets: []) }
                 if mode == "target" { lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [.init(identifier: "target", candidates: [cloudCandidate("target")])]) }
+                if mode == "neutral-target" || mode == "revision-neutral" {
+                    lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: [.init(identifier: "target", candidates: [cloudCandidate("target")], inputUnchanged: true)])
+                    if mode == "revision-neutral" { validity.invalidate() }
+                }
                 if mode == "deleted" { lifecycle.nextChange = .incremental(removedAssetIDs: ["target"], insertedAssets: [], changedAssets: []) }
                 gateway.recordLibraryChangeForTesting()
                 _ = try await gateway.candidateSnapshot()
             }
             requester.finish()
-            if mode == "unrelated" {
+            if mode == "unrelated" || mode == "neutral-target" {
                 let bytes = try await task.value
                 XCTAssertEqual(bytes, Data([1,2,3]))
             } else {
@@ -253,6 +395,30 @@ final class LivePhotoKitContractTests: XCTestCase {
     }
 }
 
+private final class LivePhotoDiagnosticRows: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows = [[String: String]]()
+    var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return rows }
+    func append(_ fields: [String: String]) { lock.lock(); rows.append(fields); lock.unlock() }
+}
+private final class LivePhotoNotificationGates: @unchecked Sendable {
+    let first: XCTestExpectation, second: XCTestExpectation
+    let releaseFirst = DispatchSemaphore(value: 0), releaseSecond = DispatchSemaphore(value: 0)
+    weak var gateway: PhotoKitGateway?
+    private let lock = NSLock()
+    private var count = 0, injected = false
+    init(first: XCTestExpectation, second: XCTestExpectation) { self.first = first; self.second = second }
+    func classify() {
+        lock.lock(); count += 1; let initial = count == 1; lock.unlock()
+        (initial ? first : second).fulfill()
+        _ = (initial ? releaseFirst : releaseSecond).wait(timeout: .now() + 5)
+    }
+    func injectSecond() {
+        lock.lock(); let shouldInject = !injected; injected = true; lock.unlock()
+        if shouldInject { gateway?.recordLibraryChangeForTesting() }
+    }
+}
+
 final class LivePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
     let lock = NSLock()
     private(set) var commands = [PhotoKitCreateCommand]()
@@ -264,6 +430,7 @@ final class LivePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
     var access: PhotoKitAccess = .authorized
     var initialAssets: [PhotoKitCandidateAsset] = []
     var nextChange: PhotoKitCandidateIndexChange = .reload
+    var changeHook: (@Sendable () -> Void)?
     func currentAccess() -> PhotoKitAccess { access }
     func requestReadWriteAuthorization() async -> PhotoKitAccess { .authorized }
     func isAvailable() -> Bool { true }
@@ -278,7 +445,7 @@ final class LivePhotoKitLifecycle: PhotoKitLifecycle, @unchecked Sendable {
         }
         return initialAssets
     }
-    func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange { nextChange }
+    func candidateIndexChange(for change: PHChange?) throws -> PhotoKitCandidateIndexChange { changeHook?(); return nextChange }
     func fetch(identifier: String) throws -> Bool { !missingIDs.contains(identifier) }
     func submit(_ command: PhotoKitCreateCommand, beforeMutation: @escaping @Sendable () -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> PhotoKitSubmissionResult {
         guard beforeMutation() else { return .preventedBeforeMutation }

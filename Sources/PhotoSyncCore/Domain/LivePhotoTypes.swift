@@ -203,12 +203,13 @@ public struct LivePhotoAssetPage: Sendable {
     }
 }
 
-public enum IndexActivity: Equatable, Sendable { case idle, working, waiting }
+public enum IndexActivity: Equatable, Sendable { case idle, working, queued, waiting }
 public enum SourceActivity: Equatable, Sendable { case scanning, submitting, waiting }
 public enum LivePhotoActivityKind: Equatable, Sendable { case identification, completion }
 public enum LivePhotoActivity: Equatable, Sendable {
     case idle
     case working(LivePhotoActivityKind)
+    case queued(LivePhotoActivityKind)
     case waiting(nextRetryAt: Date?)
     case draining
     case requiresAttention(SourceIssue)

@@ -1,6 +1,11 @@
 import CryptoKit
 import Foundation
 
+public enum LivePhotoDiagnosticStage: String, Sendable {
+    case admission = "read-admission", rawRead = "raw-read", classification
+    case metadata, descriptorValidation = "descriptor-validation", observationCommit = "observation-commit", completion
+}
+
 private struct DiagnosticCauseEvent {
     let sequence: UInt64
     let generation: Int?
@@ -50,6 +55,10 @@ public final class IndexDiagnostics: @unchecked Sendable {
     private var causeCounts: [String: Int] = [:]
     private var causeDetails = 0
     private var windowTimings: [String: DiagnosticElapsed] = [:]
+    private var livePhotoTimings: [String: DiagnosticElapsed] = [:]
+    private var livePhotoCounts: [String: Int64] = [:]
+    private var livePhotoDetails: [LivePhotoDiagnosticStage: Int] = [:]
+    private var livePhotoReasons: [LivePhotoDiagnosticStage: String] = [:]
     private var windowStarted: TimeInterval
     private var readerCounts: [String: Int] = [:]
     private var states: [String: (value: String, suppressed: Int, start: TimeInterval)] = [:]
@@ -65,6 +74,56 @@ public final class IndexDiagnostics: @unchecked Sendable {
         return category + "-" + HMAC<SHA256>.authenticationCode(for: bytes, using: secret).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
     public func tokenHandle(_ value: Data) -> String { handle("range", value.base64EncodedString()) }
+    public func measureLivePhoto<Value>(_ stage: LivePhotoDiagnosticStage, assetID: String? = nil, event: Int? = nil,
+                                       bytes: (Value) -> Int64 = { _ in 0 },
+                                       _ operation: () async throws -> Value) async throws -> Value {
+        let started = monotonic()
+        do {
+            let value = try await operation()
+            recordLivePhoto(stage, assetID: assetID, event: event, seconds: monotonic() - started, bytes: bytes(value), error: nil)
+            return value
+        } catch {
+            recordLivePhoto(stage, assetID: assetID, event: event, seconds: monotonic() - started, bytes: 0, error: error)
+            throw error
+        }
+    }
+    private func recordLivePhoto(_ stage: LivePhotoDiagnosticStage, assetID: String?, event: Int?, seconds: TimeInterval, bytes: Int64, error: Error?) {
+        let reason: String
+        if let error {
+            switch error {
+            case is CancellationError: reason = "cancelled"
+            case let deferred as LivePhotoReadDeferred: reason = deferred == .classificationPending ? "classification-pending" : "resource-changed"
+            case let failure as PhotoKitGatewayError: reason = failure == .libraryChanged ? "library-changed" : "photos-failure"
+            case let failure as LivePhotoResourceReadError:
+                switch failure {
+                case .resourceLimit, .workingSetLimit: reason = "resource-limit"
+                case .budgetBusy: reason = "admission-deferred"
+                case .requestTimedOut: reason = "read-timeout"
+                }
+            case is ReadExecutorError, is PhotosAdmissionDeferred: reason = "admission-deferred"
+            default: reason = "failed"
+            }
+        } else { reason = "completed" }
+        let now = monotonic()
+        lock.lock()
+        livePhotoTimings[stage.rawValue, default: DiagnosticElapsed()].add(seconds)
+        livePhotoCounts[stage.rawValue + "." + reason, default: 0] += 1
+        livePhotoCounts[stage.rawValue + ".bytes", default: 0] += max(0, bytes)
+        let changed = livePhotoReasons[stage] != reason
+        let detailed = livePhotoDetails[stage, default: 0] < 2 || changed
+        livePhotoReasons[stage] = reason
+        if detailed { livePhotoDetails[stage, default: 0] += 1 }
+        let flush = now - windowStarted >= 30
+        lock.unlock()
+        if detailed {
+            var fields = ["phase": "live-photo-stage", "stage": stage.rawValue, "result": reason,
+                          "elapsedMS": String(max(0, seconds) * 1000), "resourceBytes": String(bytes)]
+            if let assetID { fields["assetHandle"] = handle("asset", assetID) }
+            if let event { fields["eventGeneration"] = String(event) }
+            emit(fields)
+        }
+        if flush { flushObservations() }
+    }
     public func operation(_ category: String, descriptor: RepresentationDescriptor? = nil) -> IndexDiagnosticOperation {
         lock.lock(); sequence &+= 1; let id = "\(category)-\(sequence)"; lock.unlock()
         return IndexDiagnosticOperation(context: self, id: id, identityBound: descriptor != nil,
@@ -255,12 +314,20 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let flushWindow = force || now - windowStarted >= 30
         let timings = flushWindow ? windowTimings : [:]
         let causal = flushWindow ? causeCounts : [:]
+        let lpTimings = flushWindow ? livePhotoTimings : [:], lpCounts = flushWindow ? livePhotoCounts : [:]
+        if flushWindow { livePhotoTimings.removeAll(); livePhotoCounts.removeAll(); livePhotoDetails.removeAll() }
         if flushWindow { windowTimings.removeAll(); causeCounts.removeAll(); causeDetails = 0; windowStarted = now }
         let readyStates = states.filter { force || now - $0.value.start >= 30 }
         let readyNeutral = neutral.filter { force || now - $0.value.start >= 30 }
         for (key, value) in readyStates { states[key] = (value.value, 0, now) }
         for (key, value) in readyNeutral { neutral[key] = (value.start, value.emitted, 0, 0, 0) }
         lock.unlock()
+        if !lpCounts.isEmpty {
+            var fields = lpCounts.mapValues(String.init)
+            fields["phase"] = "live-photo-summary"; fields["measurement"] = "monotonic-elapsed-wall"
+            for (stage, timing) in lpTimings { fields.merge(timing.fields(stage)) { _, new in new } }
+            emit(fields)
+        }
         if !timings.isEmpty || !causal.isEmpty {
             var fields = ["phase": "index-window-summary", "measurement": "monotonic-elapsed-wall", "scope": "run-window"]
             for (stage, timing) in timings { fields.merge(timing.fields(stage)) { _, new in new } }

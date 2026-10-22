@@ -6,6 +6,28 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testEachTaskHasItsOwnCaptionAlignedDetailsButton() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+        model.state.snapshot.indexProgress = .init(state: .updating, totalsKnown: true, totalAssets: 16000, readyAssets: 15716, totalRepresentations: 16000, readyRepresentations: 15716, excludedAssets: 0, issue: nil)
+        model.state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 45, pending: 16177)
+        model.state.snapshot.livePhotoActivities = [.working(.identification)]
+        _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: .darkAqua) { host, _ in
+            let buttons = self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }
+            // SwiftUI exposes identifiers through its remote AX bridge; its backing NSButtons
+            // do not carry them. This isolated fixture has exactly two task info controls.
+            XCTAssertEqual(buttons.count, 2)
+            let visual = try XCTUnwrap(buttons.first)
+            let live = try XCTUnwrap(buttons.last)
+            let texts = try self.recognizedText(in: host)
+            let visualText = try XCTUnwrap(texts.first { $0.text.contains("正在建立视觉索引") })
+            let liveText = try XCTUnwrap(texts.first { $0.text.contains("正在配对 Live Photo") })
+            XCTAssertEqual(host.convert(visual.bounds, from: visual).midY, visualText.frame.midY, accuracy: 4)
+            XCTAssertEqual(host.convert(live.bounds, from: live).midY, liveText.frame.midY, accuracy: 4)
+            XCTAssertEqual(texts.filter { $0.text.contains("正在建立视觉索引") }.count, 1)
+            XCTAssertEqual(texts.filter { $0.text.contains("正在配对 Live Photo") }.count, 1)
+        }
+    }
     func testConcurrentProgressIsConsistentAcrossMenuSettingsAndDetails() throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let model = try makeUIReviewModel(scenario: .analyzing, root: root)
@@ -57,7 +79,7 @@ final class AppViewTests: XCTestCase {
             _ = try measure(view, width: width, minimumHeight: 0) { host in
                 XCTAssertEqual(SyncStatusPresentation(snapshot: model.state.snapshot).progressRows.first?.progressText, "已分析 2192 / 15702 张")
                 let texts = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
-                XCTAssertTrue(texts.contains("已分析") && texts.contains("2192") && texts.contains("15702"), texts)
+                XCTAssertTrue(texts.contains("2192") && texts.contains("15702"), texts)
                 XCTAssertFalse(texts.contains("6789"), texts)
                 XCTAssertFalse(texts.contains("45000"), texts)
             }
@@ -93,24 +115,72 @@ final class AppViewTests: XCTestCase {
         }
     }
 
-    func testFeedbackAnalysisCountPrecedesBarAndHasAdjacentInfo() throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
+    func testKnownAndUnknownTracksHaveEqualWidthHeightAndSolidFill() throws {
+        let known = SyncStatusPresentation.PreparationProgress(id: "visualIndex", subtitle: "", progressText: nil,
+            fraction: 0.5, explanation: "", active: false)
+        let unknown = SyncStatusPresentation.PreparationProgress(id: "livePhoto", subtitle: "", progressText: nil,
+            fraction: nil, explanation: "", active: false)
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-            _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: appearance) { host, _ in
-                let texts = try self.recognizedText(in: host)
-                XCTAssertFalse(texts.contains { $0.text == "图库分析" })
-                let count = try XCTUnwrap(texts.first { $0.text.contains("已分析") })
-                let progress = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSProgressIndicator }
-                    .first { !$0.isIndeterminate })
-                let barFrame = host.convert(progress.bounds, from: progress)
-                XCTAssertLessThan(count.frame.maxY, barFrame.minY)
-                let info = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first)
-                let infoFrame = host.convert(info.bounds, from: info)
-                XCTAssertEqual(infoFrame.midY, count.frame.midY, accuracy: 4)
-                XCTAssertGreaterThan(infoFrame.minX, count.frame.maxX)
-                XCTAssertLessThan(infoFrame.minX - count.frame.maxX, 20)
+            let view = VStack(spacing: 20) { TaskProgressTrack(row: known); TaskProgressTrack(row: unknown) }
+                .padding(.horizontal, 14).frame(width: 320, height: 130)
+            _ = try UIReviewCapture.render(view, width: 320, appearance: appearance) { host, _ in
+                let image = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: image)
+                let scale = CGFloat(image.pixelsWide) / 320
+                let background = try XCTUnwrap(image.colorAt(x: image.pixelsWide / 2, y: 0)?.usingColorSpace(.deviceRGB))
+                func different(_ c: NSColor, _ b: NSColor) -> Bool {
+                    abs(c.redComponent - b.redComponent) + abs(c.greenComponent - b.greenComponent) + abs(c.blueComponent - b.blueComponent) > 0.04
+                }
+                var tracks: [[Int]] = []
+                for y in 0..<image.pixelsHigh {
+                    let occupied = (0..<image.pixelsWide).filter { x in
+                        guard let c = image.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
+                        return different(c, background)
+                    }
+                    if occupied.count > Int(285 * scale) { tracks.append([y, occupied.first!, occupied.last!]) }
+                }
+                let groups = tracks.reduce(into: [[[Int]]]()) { groups, line in
+                    if let last = groups.last?.last, line[0] == last[0] + 1 { groups[groups.count - 1].append(line) }
+                    else { groups.append([line]) }
+                }
+                XCTAssertEqual(groups.count, 2)
+                for group in groups {
+                    XCTAssertEqual(CGFloat(group.count) / scale, 5, accuracy: 1)
+                    let middle = group[group.count / 2]
+                    XCTAssertEqual(CGFloat(middle[2] - middle[1] + 1) / scale, 292, accuracy: 1)
+                    let blues = (middle[1]...middle[2]).compactMap { image.colorAt(x: $0, y: middle[0])?.usingColorSpace(.deviceRGB) }
+                        .filter { $0.blueComponent > $0.redComponent + 0.2 }
+                    XCTAssertGreaterThan(blues.count, Int(60 * scale))
+                    let interior = blues.dropFirst(3).dropLast(3)
+                    if let first = interior.first { XCTAssertTrue(interior.allSatisfy { !different($0, first) }, "Fill must be solid, without a gradient") }
+                }
+                if groups.count == 2 { XCTAssertEqual(groups[0][groups[0].count / 2][1...2], groups[1][groups[1].count / 2][1...2]) }
+            }
+        }
+    }
+
+    func testTaskCaptionsKeepNameInfoAndCountOnOneLine() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        for scenario in [UIReviewScenario.taskVisualUnknown, .taskLiveKnown, .tasksMixed, .tasksKnown, .tasksWaiting, .tasksPaused, .tasksAttention, .taskCompletion] {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: appearance) { host, _ in
+                    let rows = model.progressRows
+                    let buttons = self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }
+                    XCTAssertEqual(buttons.count, rows.count)
+                    let texts = try self.recognizedText(in: host)
+                    for (row, button) in zip(rows, buttons) {
+                        let frame = host.convert(button.bounds, from: button)
+                        let title = try XCTUnwrap(texts.first { $0.text.contains(row.id == "visualIndex" ? "索引" : "Live") }, "\(scenario.rawValue): \(texts)")
+                        XCTAssertEqual(frame.midY, title.frame.midY, accuracy: 4, scenario.rawValue)
+                        if let count = row.countText {
+                            let number = try XCTUnwrap(count.split(whereSeparator: { !$0.isNumber }).first)
+                            let visible = try XCTUnwrap(texts.first { $0.text.contains(number) }, "\(scenario.rawValue): \(texts)")
+                            XCTAssertEqual(visible.frame.midY, title.frame.midY, accuracy: 4, scenario.rawValue)
+                            XCTAssertLessThanOrEqual(visible.frame.maxX, 308, scenario.rawValue)
+                        }
+                    }
+                }
             }
         }
     }
@@ -605,34 +675,34 @@ final class AppViewTests: XCTestCase {
         }
     }
 
-    func testOpenDetailsUpdateAndRemainOpenWhenAnalysisBecomesReady() throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let model = try makeUIReviewModel(scenario: .analyzing, root: root)
-        _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: .aqua) { host, window in
-            let before = Set(NSApp.windows.map(\.windowNumber))
-            window.orderFront(nil)
-            defer { window.orderOut(nil) }
-            let button = try XCTUnwrap(self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first)
-            button.performClick(nil)
-            let popup = try XCTUnwrap(self.waitForWindow(excluding: before))
-            defer { popup.orderOut(nil); popup.close() }
-            let content = try XCTUnwrap(popup.contentView)
-            model.state.snapshot.indexActivity = .working
-            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
-                totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
-                readyRepresentations: 6789, excludedAssets: 99, issue: nil)
-            XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { $0.contains("2192") && $0.contains("15702") } ?? false })
-            model.state.snapshot.indexActivity = .working
-            model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
-                totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
-                readyRepresentations: 45000, excludedAssets: 99, issue: nil)
-            XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { !$0.contains("图库分析") && $0.contains("已导入") && $0.contains("本次扫描") } ?? false })
-            XCTAssertTrue(popup.isVisible)
-            XCTAssertTrue(NSApp.windows.contains { $0 === popup })
-            let updated = self.nativeAccessibility(in: host).compactMap { $0 as? NSButton }.first
-            XCTAssertTrue(updated === button, "The native trigger must retain its identity across ready")
-            XCTAssertEqual(SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel, "查看同步详情")
+    func testTaskDetailsStayAnchoredAcrossCountQueueWaitAndPauseChanges() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        for taskIndex in [0, 1] {
+            let model = try makeUIReviewModel(scenario: .tasksKnown, root: root)
+            _ = try UIReviewCapture.render(StatusMenu(model: model), width: 320, appearance: .aqua) { host, window in
+                let before = Set(NSApp.windows.map(\.windowNumber))
+                window.orderFront(nil); defer { window.orderOut(nil) }
+                @MainActor func buttons() -> [NSButton] { self.nativeAccessibility(in: host).compactMap { $0 as? NSButton } }
+                let button = try XCTUnwrap(buttons().dropFirst(taskIndex).first)
+                button.performClick(nil)
+                let popup = try XCTUnwrap(self.waitForWindow(excluding: before))
+                defer { popup.orderOut(nil); popup.close() }
+                let content = try XCTUnwrap(popup.contentView)
+                for stage in 0..<4 {
+                    model.state.snapshot.indexProgress = .init(state: .updating, totalsKnown: true, totalAssets: 16000, readyAssets: 15717, totalRepresentations: 16000, readyRepresentations: 15717, excludedAssets: 0, issue: nil)
+                    model.state.snapshot.livePhotoInventory?.identified = 46
+                    model.state.snapshot.indexActivity = stage < 2 ? .queued : .waiting
+                    model.state.snapshot.livePhotoActivities = stage < 2 ? [.queued(.identification)] : [.waiting(nextRetryAt: nil)]
+                    model.state.snapshot.isPaused = stage == 3
+                    XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { $0.contains(taskIndex == 0 ? "15717" : "46") } ?? false })
+                    XCTAssertTrue(popup.isVisible)
+                    XCTAssertTrue(buttons().dropFirst(taskIndex).first === button, "Trigger must survive ordinary task lifecycle gaps")
+                    XCTAssertEqual(model.progressRows.map(\.id), ["visualIndex", "livePhoto"])
+                }
+                // This non-key fixture verifies native click/popover identity. Escape and hover
+                // event delivery are recorded separately by the no-activation UIReview probe.
+
+            }
         }
     }
 

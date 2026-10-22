@@ -1390,10 +1390,16 @@ public final class SyncStore: @unchecked Sendable {
                try self.optionalDouble(previous[9]) == validDate { continue }
             // Pending target equality only preserves existing work/backoff. Two
             // unknown dates are never evidence for reusing a successful vector.
-            let sameTarget = try previous.map { row in
+            var sameTarget = try previous.map { row in
                 try !previouslyRemoved && self.text(row[6]) != "ready" && self.optionalDouble(row[9]) == validDate &&
                     (sameMetadata || (validDate != nil && self.text(row[5]) == version))
             } ?? false
+            if sameTarget, !sameMetadata,
+               try self.one("SELECT 1 FROM fingerprint_task WHERE context_id=? AND context_epoch=? AND asset_id=? AND kind=? AND failure_kind='photos_read' AND next_retry_at=?", key + [.double(Date.distantFuture.timeIntervalSince1970)]) != nil {
+                // A deterministic hold belongs to the exact resource/decoder input,
+                // unlike an ordinary transient retry retained by a stable observed date.
+                sameTarget = false
+            }
             let unchanged = reuseSuccess || sameTarget
             if previous == nil || previouslyRemoved { counts.added += 1 }
             else if !unchanged { counts.changed += 1 }
@@ -1689,10 +1695,11 @@ public final class SyncStore: @unchecked Sendable {
                 AND tombstoned = 0 GROUP BY asset_id HAVING MIN(state = 'ready' AND (vector IS NULL) = 0) = 1)
                 """, bindings)!
             let readErrors = try self.one("""
-                SELECT COUNT(*) FROM photos_representation r WHERE r.context_id = ? AND r.context_epoch = ?
+                SELECT COUNT(*), COUNT(DISTINCT CASE WHEN t.next_retry_at = ? THEN r.asset_id END)
+                FROM photos_representation r, fingerprint_task t WHERE r.context_id = ? AND r.context_epoch = ?
                 AND r.tombstoned = 0 AND r.state = 'failed'
-                AND EXISTS (SELECT 1 FROM fingerprint_task t WHERE
-                """ + " " + Self.readFailureMatch + ")", bindings + [.int64(try self.int64(state[2])), .text(try self.text(state[4]))])!
+                AND
+                """ + " " + Self.readFailureMatch, [.double(Date.distantFuture.timeIntervalSince1970)] + bindings + [.int64(try self.int64(state[2])), .text(try self.text(state[4]))])!
             let readErrorCount = Int(try self.int64(readErrors[0]))
             let blockingFailures = Int(try self.int64(row[2])) - readErrorCount
             let excludedRow = try self.one("SELECT excluded_assets FROM dedup_index_state WHERE id = 1", [])!
@@ -1701,7 +1708,8 @@ public final class SyncStore: @unchecked Sendable {
                 totalsKnown: try self.int64(state[7]) != 0, totalAssets: Int(try self.int64(row[3])) + excluded,
                 readyAssets: Int(try self.int64(ready[0])), totalRepresentations: Int(try self.int64(row[0])),
                 readyRepresentations: Int(try self.int64(row[1])), readErrorRepresentations: readErrorCount, excludedAssets: excluded,
-                issue: blockingFailures > 0 ? "部分图库图像暂时无法读取，正在等待重试。" : nil)
+                issue: blockingFailures > 0 ? "部分图库图像暂时无法读取，正在等待重试。" : nil,
+                requiresAttentionAssets: Int(try self.int64(readErrors[1])))
         }
     }
 
@@ -1738,7 +1746,7 @@ public final class SyncStore: @unchecked Sendable {
                 let keyClause = cursor == nil ? "" : (after
                     ? " AND (r.asset_id > ? OR (r.asset_id = ? AND r.kind > ?))"
                     : " AND (r.asset_id < ? OR (r.asset_id = ? AND r.kind <= ?))")
-                var bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .text(version), .int64(try self.int64(state[2])), .double(now.timeIntervalSince1970)]
+                var bindings: [Binding] = [.text(context.id.uuidString), .int64(context.epoch), .text(version), .int64(try self.int64(state[2])), .double(now.timeIntervalSince1970), .double(Date.distantFuture.timeIntervalSince1970)]
                 if let cursor { bindings += [.text(cursor.assetID), .text(cursor.assetID), .text(cursor.kind.rawValue)] }
                 bindings.append(.int64(Int64(limit)))
                 return try self.rows("""
@@ -1748,7 +1756,8 @@ public final class SyncStore: @unchecked Sendable {
                 AND r.revision = t.revision AND r.fingerprint_version = t.fingerprint_version
                 WHERE t.context_id = ? AND t.context_epoch = ? AND t.fingerprint_version = ?
                 AND r.tombstoned = 0 AND r.seen_generation = t.generation AND t.generation > 0 AND t.generation <= ? AND r.state <> 'ready'
-                AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?) \(keyClause) ORDER BY r.asset_id, r.kind LIMIT ?
+                AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?)
+                AND NOT (t.failure_kind IS 'photos_read' AND t.next_retry_at IS ?) \(keyClause) ORDER BY r.asset_id, r.kind LIMIT ?
                 """, bindings)
             }
             var rows = try select(after: true, limit: limit)
@@ -1763,6 +1772,43 @@ public final class SyncStore: @unchecked Sendable {
                     nextRetryAt: self.optionalDouble(row[8]).map(Date.init(timeIntervalSince1970:)),
                     fingerprintVersion: version, indexGeneration: try self.int64(row[9]), issuanceRevision: try self.text(row[10]))
             }
+        }
+    }
+
+    /// Only an explicit user retry rearms unchanged decoded-resource limits.
+    /// Keep the v11 photos_read CHECK and candidate exclusion proof unchanged.
+    @discardableResult
+    public func retryIndexReadLimits(now: Date) async throws -> Int {
+        try await perform {
+            guard let state = try self.indexStateRow() else { return 0 }
+            let context = try self.libraryContext(state)
+            try self.execute("""
+                UPDATE fingerprint_task AS t SET next_retry_at = ?
+                WHERE t.context_id = ? AND t.context_epoch = ? AND t.failure_kind = 'photos_read' AND t.next_retry_at = ?
+                AND EXISTS (SELECT 1 FROM photos_representation r WHERE
+                """ + " " + Self.readFailureMatch + ")", [.double(now.timeIntervalSince1970), .text(context.id.uuidString), .int64(context.epoch),
+                    .double(Date.distantFuture.timeIntervalSince1970), .int64(try self.int64(state[2])), .text(try self.text(state[4]))])
+            return Int(sqlite3_changes(self.database))
+        }
+    }
+
+    /// Metadata-only schedule for the same current issuances selected by nextRepresentationTasks.
+    public func indexWorkSchedule(now: Date) async throws -> (pending: Bool, due: Bool, nextRetryAt: Date?) {
+        try await perform {
+            guard let state = try self.indexStateRow() else { return (false, false, nil) }
+            let context = try self.libraryContext(state), hold = Date.distantFuture.timeIntervalSince1970
+            let row = try self.one("""
+                SELECT COUNT(*), COALESCE(SUM(CASE WHEN (t.next_retry_at IS NULL OR t.next_retry_at <= ?)
+                    AND NOT (t.failure_kind IS 'photos_read' AND t.next_retry_at IS ?) THEN 1 ELSE 0 END),0),
+                    MIN(CASE WHEN NOT (t.failure_kind IS 'photos_read' AND t.next_retry_at IS ?) THEN t.next_retry_at END)
+                FROM fingerprint_task t JOIN photos_representation r
+                ON r.context_id=t.context_id AND r.context_epoch=t.context_epoch AND r.asset_id=t.asset_id AND r.kind=t.kind
+                    AND r.revision=t.revision AND r.fingerprint_version=t.fingerprint_version
+                WHERE t.context_id=? AND t.context_epoch=? AND t.fingerprint_version=?
+                    AND r.tombstoned=0 AND r.seen_generation=t.generation AND t.generation>0 AND t.generation<=? AND r.state<>'ready'
+                """, [.double(now.timeIntervalSince1970), .double(hold), .double(hold), .text(context.id.uuidString), .int64(context.epoch),
+                    .text(try self.text(state[4])), .int64(try self.int64(state[2]))])!
+            return (try self.int64(row[0]) > 0, try self.int64(row[1]) > 0, self.optionalDouble(row[2]).map(Date.init(timeIntervalSince1970:)))
         }
     }
 
@@ -2385,10 +2431,10 @@ public final class SyncStore: @unchecked Sendable {
             return try self.decoder.decode(LivePhotoAssetDescriptor.self, from: self.blob(row[0]))
         }
     }
-    func recordLivePhotoInventoryResult(context: LibraryContext, assetID: String, revision: String, observations: [LivePhotoObservation], retryPolicy: LivePhotoInventoryRetryPolicy, observationsAreCurrent: @escaping @Sendable () -> Bool = { true }) async throws {
+    func recordLivePhotoInventoryResult(context: LibraryContext, assetID: String, revision: String, observations: [LivePhotoObservation], retryPolicy: LivePhotoInventoryRetryPolicy, observationsAreCurrent: @escaping @Sendable () throws -> Bool = { true }) async throws {
         try await perform { try self.transaction {
-            guard let row = try self.one("SELECT revision FROM live_photo_inventory_item WHERE context_id=? AND asset_id=? AND status IN ('queued','unresolved')", [.text(context.id.uuidString), .text(assetID)]), try self.text(row[0]) == revision else { throw PhotoKitGatewayError.libraryChanged }
-            guard observationsAreCurrent(), observations.allSatisfy({ $0.resource.assetID == assetID && $0.resource.revision == revision }) else { throw PhotoKitGatewayError.libraryChanged }
+            guard let row = try self.one("SELECT revision FROM live_photo_inventory_item WHERE context_id=? AND asset_id=? AND status IN ('queued','unresolved')", [.text(context.id.uuidString), .text(assetID)]), try self.text(row[0]) == revision else { throw LivePhotoReadDeferred.resourceChanged }
+            guard try observationsAreCurrent(), observations.allSatisfy({ $0.resource.assetID == assetID && $0.resource.revision == revision }) else { throw PhotoKitGatewayError.libraryChanged }
             let retryDate: Binding
             switch retryPolicy {
             case .automatic(let date): retryDate = .double(date.timeIntervalSince1970)

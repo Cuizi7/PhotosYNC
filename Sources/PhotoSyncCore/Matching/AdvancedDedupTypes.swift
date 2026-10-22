@@ -407,15 +407,17 @@ public struct IndexProgress: Codable, Equatable, Sendable {
     public let totalRepresentations: Int
     public let readyRepresentations: Int
     public let readErrorRepresentations: Int
+    public let requiresAttentionAssets: Int
     public let excludedAssets: Int
     public let issue: String?
     public init(state: IndexState, totalsKnown: Bool, totalAssets: Int, readyAssets: Int,
                 totalRepresentations: Int, readyRepresentations: Int, readErrorRepresentations: Int = 0,
-                excludedAssets: Int, issue: String?) {
+                excludedAssets: Int, issue: String?, requiresAttentionAssets: Int = 0) {
         self.state = state; self.totalsKnown = totalsKnown; self.totalAssets = totalAssets
         self.readyAssets = readyAssets; self.totalRepresentations = totalRepresentations
         self.readyRepresentations = readyRepresentations; self.excludedAssets = excludedAssets; self.issue = issue
         self.readErrorRepresentations = readErrorRepresentations
+        self.requiresAttentionAssets = requiresAttentionAssets
     }
 }
 public enum RepresentationFailureKind: String, Sendable { case photosRead = "photos_read" }

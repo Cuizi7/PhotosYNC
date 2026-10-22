@@ -304,7 +304,7 @@ final class AppModel: ObservableObject {
     }
 
     func authorize() { guard !demo else { return }; Task { await runtime?.requestAuthorization() } }
-    func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true, retryModel: true, retryLivePhoto: true) } }
+    func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true, retryModel: true, retryLivePhoto: true, retryIndexReadLimits: true) } }
     func togglePause() {
         guard canTogglePause else { return }
         Task {

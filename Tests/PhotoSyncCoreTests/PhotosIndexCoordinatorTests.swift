@@ -6,6 +6,49 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testQueueActivityRespectsRetryDeadlineEvenWhenHealthyIndexIsPublished() async throws {
+        let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+        await f.photos.setReadFailures(["asset": .imageReadFailed(domain: "test", code: 1, detail: "temporary")])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let published = await f.coordinator.progress(); XCTAssertEqual(published.state, .ready)
+        let waiting = await f.coordinator.activity(now: now); XCTAssertEqual(waiting, .waiting)
+        let queued = await f.coordinator.activity(now: now.addingTimeInterval(61)); XCTAssertEqual(queued, .queued)
+        await f.photos.setAdmission(.draining)
+        let blocked = await f.coordinator.activity(now: now.addingTimeInterval(61)); XCTAssertEqual(blocked, .waiting)
+    }
+    func testPresentationPollingDoesNotFetchPhotoKitButReadinessStillRevalidates() async throws {
+        let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let before = await f.photos.snapshotCount
+        for _ in 0..<10 { _ = await f.coordinator.progress(); _ = await f.coordinator.activity() }
+        let after = await f.photos.snapshotCount; XCTAssertEqual(after, before)
+        await f.photos.set([descriptor(f.photos.context, revision: "new", date: Date(timeIntervalSinceReferenceDate: 200))])
+        try await assertNil(try await f.coordinator.readyToken())
+        let verified = await f.photos.snapshotCount; XCTAssertGreaterThan(verified, after)
+    }
+    func testDecodedResourceLimitDoesNotAutomaticallyRereadUnchangedResource() async throws {
+        let f = try fixture(), limited = descriptor(f.photos.context, asset: "limited"), healthy = descriptor(f.photos.context, asset: "healthy")
+        await f.photos.set([limited, healthy])
+        await f.photos.setReadFailures(["limited": .unsupportedRepresentation(.decodedResourceLimit)])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        for seconds in [60.0, 120, 180, 3600] { await f.coordinator.processDueWork(now: now.addingTimeInterval(seconds)) }
+        let reads = await f.photos.readAssetIDs
+        XCTAssertEqual(reads.filter { $0 == "limited" }.count, 1)
+        XCTAssertEqual(reads.filter { $0 == "healthy" }.count, 1)
+        try await assertNotNil(try await f.coordinator.readyToken())
+        let due = try await f.store.nextRepresentationTasks(now: .distantFuture, limit: 10)
+        XCTAssertTrue(due.isEmpty, "Held resources must be excluded explicitly, not merely by wall clock")
+        let progress = await f.coordinator.progress(); XCTAssertEqual(progress.requiresAttentionAssets, 1)
+        try await f.coordinator.retryReadLimits(now: now.addingTimeInterval(3601))
+        await f.coordinator.processDueWork(now: now.addingTimeInterval(3601))
+        let retried = await f.photos.readAssetIDs; XCTAssertEqual(retried.filter { $0 == "limited" }.count, 2)
+        // A replacement locator with the same modification date must reopen only the exact hold.
+        await f.photos.set([descriptor(f.photos.context, asset: "limited", revision: "r2"), healthy])
+        await f.photos.setReadFailures([:])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now.addingTimeInterval(3602))
+        let recovered = await f.coordinator.progress()
+        XCTAssertEqual(recovered.readyAssets, 2); XCTAssertEqual(recovered.requiresAttentionAssets, 0)
+    }
     func testCompletedEmptyInventoryThenSameSuccessfulDateReturnDoesNoImageWork() async throws {
         let f = try fixture(), d = descriptor(f.photos.context)
         await f.photos.set([d]); try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
@@ -1858,7 +1901,8 @@ private actor CoordinatorPhotos: PhotosIndexGateway {
     private var resumeThrows = false
     private var readGate: CoordinatorGate?
     func gateNextRead(_ gate: CoordinatorGate) { readGate = gate }
-    private var snapshotCount = 0, snapshotGateAt: Int?, snapshotGate: CoordinatorGate?
+    private(set) var snapshotCount = 0
+    private var snapshotGateAt: Int?, snapshotGate: CoordinatorGate?
     private(set) var maxImagesObserved = 0
     private var checkpointCaptured = false
     private(set) var checkpointBeforeSnapshot = true

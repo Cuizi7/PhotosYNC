@@ -51,7 +51,8 @@ enum ReviewHost {
                     [($0, $0 == "dark" ? .darkAqua : .aqua)]
                 } ?? [("light", .aqua), ("dark", .darkAqua)]
                 for (look, appearance) in appearances {
-                    // Dynamic probes mutate their snapshot; each appearance starts fresh.
+                    // Each task gets a fresh model because probes mutate activity and counts.
+                    for taskIndex in (scenario == .tasksMixed || scenario == .tasksKnown ? [0, 1] : [0]) {
                     let model = try makeUIReviewModel(scenario: scenario, root: root)
                     // This process is a test-only host. Native alert/popover chrome must use
                     // the selected fixture appearance too, without changing the user's OS.
@@ -65,11 +66,12 @@ enum ReviewHost {
                     let staticName = "probe-\(scenario.rawValue)-\(look).png"
                     _ = try UIReviewCapture.write(host, to: output.appendingPathComponent(staticName))
                     observations.append(try probeDetails(host: host, window: window, model: model, scenario: scenario,
-                        appearance: look, output: output))
+                        appearance: look, output: output, taskIndex: taskIndex))
                     manifest["interactions"] = observations
                     try save(manifest, output: output, name: "probe-manifest.json")
                     window.contentView = nil
                     window.close()
+                    }
                 }
             }
             manifest["interactions"] = observations
@@ -185,6 +187,22 @@ enum ReviewHost {
                         }
                     }
                 }
+                if scenario.rawValue.hasPrefix("task") {
+                    for row in SyncStatusPresentation(snapshot: model.state.snapshot).progressRows {
+                        _ = try UIReviewCapture.render(TaskDetailsContent(row: row), width: 334, appearance: appearance) { host, window in
+                            for position in ["top", "bottom"] {
+                                if position == "bottom" { try UIReviewCapture.scrollToBottom(host, allowNoOverflow: true) }
+                                let surface = "task-details-\(row.id)-\(position)"
+                                let filename = "\(scenario.rawValue)-\(look)-\(surface).png"
+                                var item = try UIReviewCapture.write(host, to: output.appendingPathComponent(filename))
+                                item.merge(["scenario": scenario.rawValue, "appearance": look, "surface": surface,
+                                    "file": filename, "windowID": window.windowNumber, "input": inputs(model),
+                                    "limitation": "Standalone task details content; not an opened popover/material capture"], uniquingKeysWith: { _, b in b })
+                                captures.append(item)
+                            }
+                        }
+                    }
+                }
                 if [.mixedIssues, .longIssues, .analyzing, .preparing, .icloud, .analysisPaused, .analysisZero].contains(scenario) {
                     let sourceDetails = scenario == .mixedIssues || scenario == .longIssues
                     let details = sourceDetails
@@ -207,7 +225,7 @@ enum ReviewHost {
                 }
             }
         }
-        let expected = UIReviewScenario.allCases.count * 4 + 2 + 7 * 4
+        let expected = UIReviewScenario.allCases.count * 4 + 2 + 7 * 4 + 12 * 4
         guard captures.count == expected else { throw UIReviewError.invalid("Incomplete matrix: \(captures.count)/\(expected)") }
         manifest["captures"] = captures
         manifest["interactions"] = probes
@@ -397,7 +415,7 @@ enum ReviewHost {
     /// Opens the real production popover by a native button in this test host's view tree.
     /// No activation, global pointer, key event, permissions or production runtime are used.
     static func probeDetails(host: NSView, window: NSWindow, model: AppModel, scenario: UIReviewScenario,
-        appearance: String, output: URL) throws -> [String: Any] {
+        appearance: String, output: URL, taskIndex: Int = 0) throws -> [String: Any] {
         func buttons(_ view: NSView) -> [NSButton] {
             ((view as? NSButton).map { [$0] } ?? []) + view.subviews.flatMap(buttons)
         }
@@ -405,12 +423,16 @@ enum ReviewHost {
         let isSource = scenario == .mixedIssues || scenario == .longIssues
         // Menu content has one native info button followed by the single synthetic source's
         // summary button. Locate real controls, then use their actual native frames.
-        let candidateIndex = isSource ? 1 : 0
+        let taskRows = SyncStatusPresentation(snapshot: model.state.snapshot).progressRows
+        let taskRow = !isSource && taskRows.indices.contains(taskIndex) ? taskRows[taskIndex] : nil
+        let candidateIndex = isSource ? 1 : taskIndex
+        let captureName = scenario.rawValue + (taskRow.map { "-" + $0.id } ?? "")
         var result: [String: Any] = ["scenario": scenario.rawValue, "appearance": appearance,
             "pid": ProcessInfo.processInfo.processIdentifier, "hostWindowID": window.windowNumber,
             "applicationActive": NSApp.isActive, "hostKeyWindow": window.isKeyWindow,
             "activationRequested": false, "globalInputInjected": false,
-            "buttonDiscovery": "NSView tree native NSButton order in single-source synthetic menu; no hardcoded coordinate",
+            "buttonDiscovery": "NSView tree native NSButton order in synthetic menu; task order verified by rendered XCTest; no hardcoded coordinate",
+            "targetTaskID": taskRow?.id ?? "sourceOrSync",
             "nativeButtons": candidates.map { ["title": $0.title, "frame": String(describing: host.convert($0.bounds, from: $0))] },
             "input": inputs(model)]
         guard candidates.indices.contains(candidateIndex) else {
@@ -418,8 +440,14 @@ enum ReviewHost {
         }
         let trigger = candidates[candidateIndex]
         let before = Set(NSApp.windows.map(\.windowNumber))
-        trigger.performClick(nil)
         func presentations() -> [NSWindow] { NSApp.windows.filter { $0.isVisible && !before.contains($0.windowNumber) } }
+        window.acceptsMouseMovedEvents = true
+        let center = trigger.convert(NSPoint(x: trigger.bounds.midX, y: trigger.bounds.midY), to: nil)
+        if let movement = NSEvent.mouseEvent(with: .mouseMoved, location: center, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, eventNumber: 1, clickCount: 0, pressure: 0) { window.sendEvent(movement) }
+        result["processLocalHoverOpened"] = waitUntil { !presentations().isEmpty }
+        trigger.performClick(nil) // Pin the same popup, or verify click separately if hover was unavailable.
         result["nativeClickOpened"] = waitUntil { !presentations().isEmpty }
         guard let popup = presentations().first, let content = popup.contentView else {
             result["status"] = "unverified"; result["failure"] = "Native performClick produced no popup in non-key host"; return result
@@ -474,7 +502,7 @@ enum ReviewHost {
         }
         func capture(_ phase: String) throws {
             content.layoutSubtreeIfNeeded(); content.displayIfNeeded()
-            let filename = "popover-\(scenario.rawValue)-\(appearance)-\(phase).png"
+            let filename = "popover-\(captureName)-\(appearance)-\(phase).png"
             var entry: [String: Any] = ["phase": phase, "file": filename, "windowID": popup.windowNumber,
                 "visible": popup.isVisible, "keyWindow": popup.isKeyWindow, "input": inputs(model)]
             do {
@@ -490,7 +518,7 @@ enum ReviewHost {
             }
             if compositorAvailable {
                 let acquisition = try compositorCapture(window: popup, output: output,
-                    name: "compositor-\(scenario.rawValue)-\(appearance)-\(phase).png")
+                    name: "compositor-\(captureName)-\(appearance)-\(phase).png")
                 entry["compositor"] = acquisition
                 compositorAvailable = acquisition["status"] as? String == "captured"
             } else {
@@ -506,21 +534,32 @@ enum ReviewHost {
             try UIReviewCapture.scrollToBottom(content)
             try capture("bottom")
         }
-        if scenario == .analyzing {
-            model.state.snapshot.indexProgress = IndexProgress(state: .updating, totalsKnown: true,
-                totalAssets: 15702, readyAssets: 2192, totalRepresentations: 45000,
-                readyRepresentations: 6789, excludedAssets: 99, issue: "合成更新原因")
-            // Drain the same host's update; this does not reconstruct any views or popovers.
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
-            try capture("progress")
-            model.state.snapshot.indexProgress = IndexProgress(state: .ready, totalsKnown: true,
-                totalAssets: 15702, readyAssets: 15702, totalRepresentations: 45000,
-                readyRepresentations: 45000, excludedAssets: 99, issue: nil)
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
-            try capture("ready")
-            result["samePopupVisibleAfterReady"] = popup.isVisible
-            result["sameTriggerAfterReady"] = buttons(host).first === trigger
-            result["readyAccessibilityNameProjection"] = SyncDetailsButton(snapshot: model.state.snapshot).accessibilityLabel
+        if let taskRow {
+            var stages: [[String: Any]] = []
+            for (stage, activity) in [("queued", IndexActivity.queued), ("waiting", .waiting), ("paused", .waiting)] {
+                if model.state.snapshot.indexProgress != nil {
+                    model.state.snapshot.indexProgress = .init(state: .updating, totalsKnown: true,
+                        totalAssets: 16000, readyAssets: 15717, totalRepresentations: 16000,
+                        readyRepresentations: 15717, excludedAssets: 0, issue: nil)
+                    model.state.snapshot.indexActivity = activity
+                }
+                model.state.snapshot.livePhotoInventory?.identified = 46
+                if model.state.snapshot.livePhotoInventory != nil {
+                    model.state.snapshot.livePhotoActivities = stage == "queued" ? [.queued(.identification)] : [.waiting(nextRetryAt: nil)]
+                }
+                model.state.snapshot.isPaused = stage == "paused"
+                RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+                let rows = SyncStatusPresentation(snapshot: model.state.snapshot).progressRows
+                let sameTrigger = buttons(host).dropFirst(candidateIndex).first === trigger
+                stages.append(["stage": stage, "taskIDs": rows.map(\.id),
+                    "captions": rows.map { $0.subtitle + " · " + ($0.countText ?? "") },
+                    "sameTrigger": sameTrigger, "samePopupVisible": popup.isVisible])
+                guard sameTrigger, popup.isVisible, rows.contains(where: { $0.id == taskRow.id }) else {
+                    throw UIReviewError.invalid("Task hover lost its native anchor in \(stage)")
+                }
+                try capture(stage)
+            }
+            result["taskTransitions"] = stages
         }
         result["presentations"] = captures
         if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],

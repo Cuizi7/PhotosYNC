@@ -400,16 +400,18 @@ public actor PhotosIndexCoordinator {
                         } else {
                             let delays = configuration.resources.retryDelaysSeconds
                             let delay = underlying is ModelExecutionUnavailable ? 60 : delays[min(task.retryCount, delays.count - 1)]
-                            if try await store.failRepresentation(task, nextRetryAt: failureTime.addingTimeInterval(delay),
+                            let held = readFailure && underlying as? PhotosRepresentationError == .unsupportedRepresentation(.decodedResourceLimit)
+                            let deadline = held ? Date.distantFuture : failureTime.addingTimeInterval(delay)
+                            if try await store.failRepresentation(task, nextRetryAt: deadline,
                                 detail: String(describing: underlying), failureKind: readFailure ? .photosRead : nil) {
-                                diagnostic.record(["phase": "index-task", "event": "failure", "stage": stage, "failureAt": String(failureTime.timeIntervalSince1970), "deadline": String(failureTime.addingTimeInterval(delay).timeIntervalSince1970)], task: task)
+                                diagnostic.record(["phase": "index-task", "event": "failure", "stage": stage, "failureAt": String(failureTime.timeIntervalSince1970), "deadline": String(deadline.timeIntervalSince1970), "automaticRetry": String(!held)], task: task)
                                 failed += 1
                                 if readFailure { readErrors += 1 }
                                 diagnostics(["phase": "index-representation", "stage": stage,
                                     "result": readFailure ? "read-error" : "waiting",
                                     "representation": task.descriptor.key.kind.rawValue, "error": String(describing: underlying),
                                     "retryCount": String(task.retryCount + 1), "failureAt": String(failureTime.timeIntervalSince1970),
-                                    "nextRetryAt": String(failureTime.addingTimeInterval(delay).timeIntervalSince1970)])
+                                    "nextRetryAt": String(deadline.timeIntervalSince1970), "automaticRetry": String(!held)])
                                 if underlying is ModelExecutionUnavailable { modelWaiting[waitKey] = task.descriptor }
                                 else { modelWaiting.removeValue(forKey: waitKey) }
                                 if case .iCloudUnavailable = underlying as? PhotosRepresentationError { cloudWaiting[waitKey] = task.descriptor }
@@ -437,16 +439,42 @@ public actor PhotosIndexCoordinator {
 
     public func setPaused(_ paused: Bool) async { self.paused = paused }
 
-    public func activity() async -> IndexActivity {
+    public func retryReadLimits(now: Date) async throws {
+        guard !paused else { return }
+        _ = try await store.retryIndexReadLimits(now: now)
+    }
+
+    public func activity(now: Date? = nil) async -> IndexActivity {
         if reconciling || performingRead { return .working }
-        let progress = await progress()
-        return progress.state == .ready ? .idle : .waiting
+        guard !paused else { return .waiting }
+        guard let queue = try? await store.indexWorkSchedule(now: now ?? wallNow()) else { return .waiting }
+        let admission = await photos.representationReadAdmission()
+        if reconciling || performingRead { return .working }
+        if !paused, admission == .available, issue == nil,
+           needsReconciliation || pendingDelta != nil || queue.due { return .queued }
+        if queue.pending || needsReconciliation || pendingDelta != nil || acknowledgedGeneration == nil { return .waiting }
+        return .idle
+    }
+
+    public func hasDueWork(now: Date) async -> Bool {
+        guard !paused else { return false }
+        if needsReconciliation || pendingDelta != nil { return true }
+        guard let queue = try? await store.indexWorkSchedule(now: now) else { return true }
+        if queue.due { return true }
+        // A completed healthy batch may still need its publication acknowledgement.
+        if acknowledgedGeneration == nil { return (try? await store.indexReadiness()) != nil }
+        return false
     }
 
     public func progress() async -> IndexProgress {
         do {
             let stored = try await store.indexProgress()
-            let ready = try await readyToken() != nil
+            let publication = try await store.indexReadiness()
+            let published: Bool
+            if let publication { published = try await store.indexIsReady(token: publication.token) }
+            else { published = false }
+            let ready = published && !needsReconciliation && !reconciling && !applyingDelta && pendingDelta == nil &&
+                acknowledgedGeneration != nil && publication?.token.photosGeneration == acknowledgedGeneration
             let representationIssue: String?
             if stored.state != .waiting { representationIssue = nil }
             else if !modelWaiting.isEmpty { representationIssue = ModelExecutionUnavailable.summary }
@@ -465,7 +493,7 @@ public actor PhotosIndexCoordinator {
                 totalAssets: stored.totalAssets, readyAssets: stored.readyAssets,
                 totalRepresentations: stored.totalRepresentations, readyRepresentations: stored.readyRepresentations,
                 readErrorRepresentations: stored.readErrorRepresentations,
-                excludedAssets: stored.excludedAssets, issue: aggregateIssue)
+                excludedAssets: stored.excludedAssets, issue: aggregateIssue, requiresAttentionAssets: stored.requiresAttentionAssets)
         } catch {
             return IndexProgress(state: paused ? .paused : .waiting, totalsKnown: false, totalAssets: 0,
                 readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0,

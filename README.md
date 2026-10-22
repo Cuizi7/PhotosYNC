@@ -2,15 +2,15 @@
 
 PhotosYNC scans selected filesystem folders and saves eligible images and videos to the current macOS System Photo Library. Source files stay in place and are read-only. Precisely matched Live Photo components become one native Live Photo; replaced standalone assets can be removed only after their original content and protected information are verified as preserved.
 
-## 0.3.0 beta2 — Native Live Photo completion
+## 0.3.0 beta3 — Native Live Photo completion
 
 Live Photos use the original HEIC/JPEG and MOV together, including existing audio. Missing components are saved individually and completed when the exact partner becomes available, including components already in Photos. Each directory finishes enumerating and identifying its direct entries before admitting imports. This behavior has no setting.
 
 Schema v11 adds a resumable, one-time library identification task. Its completed marker survives restarts and normal upgrades; unresolved resources retry individually and may fetch iCloud originals within the existing resource budget. Historical work also runs without enabled sources and obeys Pause. Matching names or visual similarity do not establish a pair. Unknown submission results block all further Photos mutations.
 
-The menu, settings and details use the same six states: 正在准备, 正在同步, 等待恢复, 已暂停, 需要处理 and 同步完成. Visual indexing and Live Photo pairing have independent progress; cloud downloads are internal steps. Long Live Photo reads run independently of visual work. Existing completed identification results and successful import history remain intact.
+The menu, settings and details use the same six states: 正在准备, 正在同步, 等待恢复, 已暂停, 需要处理 and 同步完成. Visual indexing and Live Photo pairing have independent progress; cloud downloads are internal steps. Long Live Photo reads run independently of visual work. Existing completed identification results and successful import history remain intact. Each task uses one compact caption and its own equal-width solid progress track. Normal queued work keeps its activity state; notification classification no longer imposes a minute-long retry on the whole Live Photo queue. Deterministic decoding limits stop automatic rereads until an explicit scan or an exact input change.
 
-After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta2.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
+After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta3.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
 
 ## Previous stable: 0.2.9
 
@@ -44,8 +44,8 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh --scale-profile full
 ```
 
-Release configuration: **0.3.0 beta2 (build 19)**, targeting
-`outputs/releases/0.3.0-beta2/`; see [release notes](docs/release/0.3.0-beta2.md)
+Release configuration: **0.3.0 beta3 (build 20)**, targeting
+`outputs/releases/0.3.0-beta3/`; see [release notes](docs/release/0.3.0-beta3.md)
 and the [changelog](CHANGELOG.md).
 The release package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion

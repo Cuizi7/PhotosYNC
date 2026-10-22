@@ -141,7 +141,7 @@ public actor ReadExecutor {
     }
 }
 
-private final class ReadOperationState<Value>: @unchecked Sendable {
+final class ReadOperationState<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Value, Error>?
     private var terminalResult: Result<Value, Error>?
@@ -158,7 +158,7 @@ private final class ReadOperationState<Value>: @unchecked Sendable {
         lock.unlock()
     }
 
-    func startTimeout(after duration: Duration) {
+    func startTimeout(after duration: Duration, sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
         lock.lock()
         guard terminalResult == nil, timeoutTask == nil else {
             lock.unlock()
@@ -166,7 +166,7 @@ private final class ReadOperationState<Value>: @unchecked Sendable {
         }
         let task = Task { [weak self] in
             do {
-                try await Task.sleep(for: duration)
+                try await sleep(duration)
                 self?.finish(.failure(ReadExecutorError.timedOut))
             } catch is CancellationError {
             } catch {

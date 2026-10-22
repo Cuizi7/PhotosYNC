@@ -6,6 +6,7 @@ enum UIReviewScenario: String, CaseIterable {
     case syncing, analyzing, preparing, icloud, paused, pausing, completed, offline
     case fileIssue, unauthorized, unknown, summaryLoading, summaryStale, empty, single, many, longLeaf
     case mixedIssues, longIssues, recoveryPending, analysisPaused, analysisZero
+    case taskVisualUnknown, taskLiveKnown, tasksMixed, tasksKnown, tasksWaiting, tasksPaused, tasksAttention, taskCompletion
 }
 
 @MainActor
@@ -51,6 +52,31 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
             totalRepresentations: 150000, readyRepresentations: 64020, excludedAssets: 3,
             issue: scenario == .icloud ? "正在等待 iCloud 图像，连接恢复后自动继续" : nil)
         if let first { state.snapshot.advancedWaitingReasons[first] = "等待图库分析完成后继续" }
+    case .taskVisualUnknown, .taskLiveKnown, .tasksMixed, .tasksKnown, .tasksWaiting, .tasksPaused, .tasksAttention, .taskCompletion:
+        state.nextScan = nil
+        state.snapshot.summary = .init()
+        state.snapshot.activeWork = ![.tasksWaiting, .tasksPaused, .tasksAttention].contains(scenario)
+        if scenario != .taskLiveKnown && scenario != .taskCompletion {
+            let known = ![.taskVisualUnknown, .tasksMixed].contains(scenario)
+            state.snapshot.indexProgress = .init(state: .updating, totalsKnown: known,
+                totalAssets: 16000, readyAssets: 15716, totalRepresentations: 16000,
+                readyRepresentations: 15716, readErrorRepresentations: scenario == .tasksAttention ? 3 : 0,
+                excludedAssets: 0, issue: nil, requiresAttentionAssets: scenario == .tasksAttention ? 3 : 0)
+            state.snapshot.indexActivity = state.snapshot.activeWork ? .working : .waiting
+        }
+        if scenario != .taskVisualUnknown && scenario != .tasksAttention {
+            state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 45, pending: 16177)
+            state.snapshot.livePhotoActivities = [state.snapshot.activeWork ? .working(.identification) : .waiting(nextRetryAt: nil)]
+        }
+        if scenario == .tasksPaused { state.snapshot.isPaused = true }
+        if scenario == .tasksWaiting {
+            state.snapshot.livePhotoIssue = .init(summary: "部分项目暂时无法读取，稍后自动重试", detail: "合成读取等待", kind: .file)
+        }
+        if scenario == .taskCompletion {
+            state.snapshot.livePhotoInventory = .init(phase: .completed, inventoried: 16222, identified: 16222)
+            state.snapshot.livePhotoActivities = [.working(.completion)]
+            state.snapshot.livePhotoWork.activeGroups = 1
+        }
     case .paused, .pausing:
         state.snapshot.isPaused = true
         state.snapshot.activeWork = scenario == .pausing
@@ -213,11 +239,12 @@ enum UIReviewCapture {
         }
     }
 
-    static func scrollToBottom(_ host: NSView) throws {
+    static func scrollToBottom(_ host: NSView, allowNoOverflow: Bool = false) throws {
         func scrolls(_ v: NSView) -> [NSScrollView] {
             ((v as? NSScrollView).map { [$0] } ?? []) + v.subviews.flatMap(scrolls)
         }
         let overflowing = scrolls(host).filter { ($0.documentView?.bounds.height ?? 0) > $0.contentView.bounds.height + 1 }
+        if allowNoOverflow && overflowing.isEmpty { return }
         guard overflowing.count == 1, let list = overflowing.first else {
             throw UIReviewError.invalid("Expected one overflowing source list, got \(overflowing.count)")
         }

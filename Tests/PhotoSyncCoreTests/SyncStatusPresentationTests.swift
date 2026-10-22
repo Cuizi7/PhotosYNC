@@ -2,6 +2,89 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testTaskSpecificHoverExplainsSavedCountsCloudUseAndLivePhotoRetirement() throws {
+        var s = EngineSnapshot()
+        s.indexActivity = .working
+        s.indexProgress = .init(state: .updating, totalsKnown: false, totalAssets: 0, readyAssets: 15716,
+            totalRepresentations: 0, readyRepresentations: 15716, excludedAssets: 0, issue: nil)
+        s.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 45, pending: 16177)
+        s.livePhotoActivities = [.working(.identification)]
+        var rows = SyncStatusPresentation(snapshot: s).progressRows
+        XCTAssertEqual(rows.map(\.countText), ["已分析 15716 张", "45 / 16222 项"])
+        let visual = try XCTUnwrap(rows.first)
+        XCTAssertEqual(visual.details.first { $0.title == "进度含义" }?.text,
+            "已分析 15716 张，包含以前保存的结果，并非本次启动重新分析的数量。当前总量尚未确认，因此不显示百分比。")
+        let live = try XCTUnwrap(rows.last)
+        XCTAssertEqual(live.details.first { $0.title == "进度含义" }?.text,
+            "45 / 16222 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识的项目也计入，读取失败的项目不计入。")
+        XCTAssertEqual(live.details.first { $0.title == "对已有内容的影响" }?.text,
+            "完整 Live Photo 的原始内容及应保留的信息验证通过后，才移除被替代的单独照片或视频；旧标题可能丢失。不会改动源文件或清空“最近删除”。")
+        for row in rows {
+            XCTAssertEqual(row.details.first { $0.title == "iCloud 原件" }?.text,
+                "必要时会从 iCloud 获取原文件，可能产生网络流量并增加系统本地缓存。")
+            XCTAssertTrue(row.details.contains { $0.title == "暂停与重启" && $0.text.contains("继续未完成项") })
+        }
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 16222, identified: 16222)
+        s.livePhotoActivities = [.working(.completion)]
+        rows = SyncStatusPresentation(snapshot: s).progressRows
+        XCTAssertNil(rows.last?.fraction)
+        XCTAssertNil(rows.last?.countText)
+        XCTAssertEqual(rows.last?.details.first { $0.title == "进度含义" }?.text,
+            "配对信息已核对，正在补齐并验证完整 Live Photo。此阶段没有可靠的总百分比，显示活动进度。")
+    }
+
+    func testLivePhotoOnlyQueuedDiscoveryDoesNotDemandSourceConfiguration() {
+        var s = EngineSnapshot()
+        s.summary = .init(); s.latestScan = .init(state: .completed)
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 10, identified: 10)
+        for (activity, expected) in [(LivePhotoActivity.working(.identification), GlobalStatus.preparing),
+                                    (.queued(.identification), .preparing), (.queued(.completion), .running)] {
+            s.livePhotoActivities = [activity]
+            let p = SyncStatusPresentation(snapshot: s)
+            XCTAssertEqual(p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false), expected)
+            XCTAssertNil(p.statusReason(for: expected, enabledSourceIDs: []))
+            XCTAssertTrue(p.progressRows.allSatisfy(\.active))
+        }
+    }
+
+    func testNormalBatchGapsKeepBothTaskRowsAndPreparingHeadline() {
+        let id = UUID(); var s = EngineSnapshot()
+        s.summary = .init(pending: 1)
+        s.indexProgress = .init(state: .updating, totalsKnown: true, totalAssets: 16000, readyAssets: 15716, totalRepresentations: 16000, readyRepresentations: 15716, excludedAssets: 0, issue: nil)
+        s.livePhotoInventory = .init(phase: .identifying, inventoried: 16222, identified: 45, pending: 16177)
+        for (index, live) in [(IndexActivity.working, LivePhotoActivity.working(.identification)), (.working, .queued(.identification)), (.queued, .working(.identification)), (.queued, .queued(.identification))] {
+            s.indexActivity = index; s.livePhotoActivities = [live]
+            let p = SyncStatusPresentation(snapshot: s)
+            XCTAssertEqual(p.progressRows.map(\.id), ["visualIndex", "livePhoto"])
+            XCTAssertTrue(p.progressRows.allSatisfy(\.active))
+            XCTAssertEqual(p.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false), .preparing)
+        }
+        s.indexActivity = .waiting; s.livePhotoActivities = [.waiting(nextRetryAt: Date())]
+        let waiting = SyncStatusPresentation(snapshot: s)
+        XCTAssertEqual(waiting.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false), .waiting)
+        XCTAssertFalse(waiting.progressRows.contains(where: \.active))
+    }
+    func testUnfinishedTaskRowsPersistAcrossWaitingAndPause() {
+        var s = EngineSnapshot()
+        s.indexProgress = .init(state: .waiting, totalsKnown: true, totalAssets: 100, readyAssets: 90, totalRepresentations: 100, readyRepresentations: 90, excludedAssets: 0, issue: "稍后重试")
+        s.indexActivity = .waiting
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 200, identified: 100, unresolved: 100, retryWaiting: 100)
+        s.livePhotoActivities = [.waiting(nextRetryAt: Date())]
+        for paused in [false, true] {
+            s.isPaused = paused
+            let p = SyncStatusPresentation(snapshot: s)
+            XCTAssertEqual(p.progressRows.map(\.id), ["visualIndex", "livePhoto"])
+            XCTAssertEqual(p.progressRows.first?.fraction, 0.9)
+        }
+    }
+    func testReadyPublicationWithHeldAssetsStillNeedsAttention() {
+        let id = UUID(); var s = EngineSnapshot()
+        s.summary = .init(imported: 1); s.latestScan = .init(state: .completed)
+        s.indexProgress = .init(state: .ready, totalsKnown: true, totalAssets: 10, readyAssets: 7, totalRepresentations: 10, readyRepresentations: 7, readErrorRepresentations: 3, excludedAssets: 0, issue: nil, requiresAttentionAssets: 3)
+        let p = SyncStatusPresentation(snapshot: s)
+        XCTAssertEqual(p.globalStatus(enabledSourceIDs: [id], authorized: true, hasBlockingError: false), .error)
+        XCTAssertEqual(p.progressRows.map(\.id), ["visualIndex"])
+    }
     func testOwnedLivePhotoImportsDoNotHideOtherUnknownImports() {
         var snapshot = EngineSnapshot()
         snapshot.summary = SyncStatusSummary(importing: 2)
@@ -287,8 +370,10 @@ final class SyncStatusPresentationTests: XCTestCase {
         XCTAssertNil(rows[1].fraction); XCTAssertNil(rows[1].progressText)
         snapshot.indexProgress = .init(state: .preparing, totalsKnown: false, totalAssets: 0, readyAssets: 7, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
         XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).progressRows[0].progressText, "已分析 7 张")
-        snapshot.isPaused = true; XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).progressRows.isEmpty)
+        snapshot.isPaused = true; XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).progressRows.count, 2)
+        XCTAssertFalse(SyncStatusPresentation(snapshot: snapshot).progressRows.contains(where: \.active))
         snapshot.isPaused = false; snapshot.indexActivity = .waiting; snapshot.livePhotoActivities = [.waiting(nextRetryAt: nil)]
-        XCTAssertTrue(SyncStatusPresentation(snapshot: snapshot).progressRows.isEmpty)
+        XCTAssertEqual(SyncStatusPresentation(snapshot: snapshot).progressRows.count, 2)
+        XCTAssertFalse(SyncStatusPresentation(snapshot: snapshot).progressRows.contains(where: \.active))
     }
 }

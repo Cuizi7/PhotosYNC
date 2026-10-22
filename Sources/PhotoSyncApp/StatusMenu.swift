@@ -43,9 +43,6 @@ struct StatusMenu: View {
                     .font(.headline).accessibilityLabel(model.statusDescription)
                     .accessibilityIdentifier("photosync-status")
                 Spacer()
-                if model.status == .preparing || model.status == .running {
-                    ProgressView().controlSize(.small)
-                }
             }
             if model.isGUIQA {
                 Text(model.qaModeDescription).font(.caption).foregroundStyle(.orange)

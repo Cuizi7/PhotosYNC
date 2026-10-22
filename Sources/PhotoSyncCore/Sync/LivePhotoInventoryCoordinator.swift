@@ -7,6 +7,7 @@ public actor LivePhotoInventoryCoordinator {
     private let budget: LivePhotoResourceBudget
     private let batchSize: Int
     private let wallNow: @Sendable () -> Date
+    private let diagnostics: IndexDiagnostics
     private var context: LibraryContext?
     private var paused = false, working = false
     private var active = false
@@ -14,7 +15,8 @@ public actor LivePhotoInventoryCoordinator {
     private var offset = 0
 
     public init(store: SyncStore, photos: any LivePhotoPhotosGateway, metadata: any LivePhotoMetadataReading = LivePhotoMetadataReader(),
-                budget: LivePhotoResourceBudget = .shared, batchSize: Int = 128, wallNow: @escaping @Sendable () -> Date = { Date() }) {
+                budget: LivePhotoResourceBudget = .shared, batchSize: Int = 128, wallNow: @escaping @Sendable () -> Date = { Date() }, diagnostics: IndexDiagnostics? = nil) {
+        self.diagnostics = diagnostics ?? IndexDiagnostics(sink: { _ in })
         self.store = store; self.photos = photos; self.metadata = metadata; self.budget = budget; self.batchSize = max(1, batchSize); self.wallNow = wallNow
         photos.attachIndexStore(store)
     }
@@ -99,45 +101,59 @@ public actor LivePhotoInventoryCoordinator {
         }
         guard !paused, try await photos.livePhotoLibraryContext() == context else { return false }
         active = true; defer { active = false }
-        var requiresAttention = item.resources.isEmpty
-        var observations = [LivePhotoObservation]()
-        var validities = [LivePhotoResourceValidity]()
-        for (index, ref) in item.resources.enumerated() {
-            guard index < item.resourceKinds.count, let kind = item.resourceKinds[index] else { continue }
+        do {
+            var requiresAttention = item.resources.isEmpty
+            var observations = [LivePhotoObservation]()
+            var validities = [LivePhotoResourceValidity]()
+            for (index, ref) in item.resources.enumerated() {
+                guard index < item.resourceKinds.count, let kind = item.resourceKinds[index] else { continue }
+                guard !paused else { return false }
+                if !validities.isEmpty {
+                    try Task.checkCancellation()
+                    try validities.forEach { try $0.requireCurrent() }
+                }
+                do {
+                    let lease = try await photos.readLivePhotoResource(ref, purpose: .inventory, budget: budget)
+                    guard !paused else { return false }
+                    let result = try await diagnostics.measureLivePhoto(.metadata, assetID: item.assetID) {
+                        try await self.metadata.inspect(resource: lease, kind: kind)
+                    }
+                    try Task.checkCancellation()
+                    guard !paused else { return false }
+                    if let validity = lease.validity { try validity.requireCurrent(); validities.append(validity) }
+                    if case .unresolved = result { requiresAttention = true }
+                    observations.append(.init(resource: ref, inspection: result))
+                } catch {
+                    if error is ReadExecutorError || error is CancellationError || error is LivePhotoReadDeferred { throw error }
+                    if case .libraryChanged = error as? PhotoKitGatewayError { throw error }
+                    if case .budgetBusy = error as? LivePhotoResourceReadError { throw error }
+                    if case .resourceLimit = error as? LivePhotoResourceReadError { requiresAttention = true }
+                    if case .workingSetLimit = error as? LivePhotoResourceReadError { requiresAttention = true }
+                    observations.append(.init(resource: ref, inspection: .unresolved("原资源暂不可读：" + SourceIssueText.systemDiagnostic(error))))
+                }
+            }
+            guard !paused, try await photos.livePhotoLibraryContext() == context else { return false }
+            // The read already used its one bounded classification wait. A later pending
+            // event defers immediately; never enqueue another unbounded snapshot behind it.
+            try Task.checkCancellation()
+            try validities.forEach { try $0.requireCurrent() }
+            try await diagnostics.measureLivePhoto(.descriptorValidation, assetID: item.assetID) {
+                guard let current = try await self.photos.livePhotoAssets(assetIDs: [item.assetID], context: context).first,
+                      current == item else { throw LivePhotoReadDeferred.resourceChanged }
+                try validities.forEach { try $0.requireCurrent() }
+            }
+            try Task.checkCancellation()
             guard !paused else { return false }
-            if !validities.isEmpty {
-                _ = try await photos.candidateSnapshot()
-                guard !paused else { return false }
-                guard validities.allSatisfy(\.isCurrent) else { throw PhotoKitGatewayError.libraryChanged }
+            let tickets = validities
+            try await diagnostics.measureLivePhoto(.observationCommit, assetID: item.assetID) {
+                try await self.store.recordLivePhotoInventoryResult(context: context, assetID: item.assetID, revision: item.revision, observations: observations, retryPolicy: (requiresAttention || observations.isEmpty) ? .requiresAttention : .automatic(nextRetryAt: self.wallNow().addingTimeInterval(60)), observationsAreCurrent: { try tickets.forEach { try $0.requireCurrent() }; return true })
             }
-            do {
-                let lease = try await photos.readLivePhotoResource(ref, purpose: .inventory, budget: budget)
-                guard !paused else { return false }
-                let result = try await metadata.inspect(resource: lease, kind: kind)
-                if let validity = lease.validity { validities.append(validity) }
-                if case .unresolved = result { requiresAttention = true }
-                observations.append(.init(resource: ref, inspection: result))
-            } catch {
-                if error is ReadExecutorError || error is CancellationError { throw error }
-                if case .libraryChanged = error as? PhotoKitGatewayError { throw error }
-                if case .budgetBusy = error as? LivePhotoResourceReadError { throw error }
-                if case .resourceLimit = error as? LivePhotoResourceReadError { requiresAttention = true }
-                if case .workingSetLimit = error as? LivePhotoResourceReadError { requiresAttention = true }
-                observations.append(.init(resource: ref, inspection: .unresolved("原资源暂不可读：" + SourceIssueText.systemDiagnostic(error))))
-            }
+            try await finishIfReady(context: context)
+            return true
+        } catch LivePhotoReadDeferred.resourceChanged {
+            try store.recordLivePhotoChanges(context: context, changed: [item.assetID], deleted: [])
+            throw LivePhotoReadDeferred.resourceChanged
         }
-        guard !paused, try await photos.livePhotoLibraryContext() == context else { return false }
-        // Consume pending producer changes, then verify only the asset whose bytes were read.
-        // The store's transactional revision/status guard closes a later target delta.
-        _ = try await photos.candidateSnapshot()
-        guard !paused else { return false }
-        guard let current = try await photos.livePhotoAssets(assetIDs: [item.assetID], context: context).first,
-              current == item, validities.allSatisfy(\.isCurrent) else { throw PhotoKitGatewayError.libraryChanged }
-        guard !paused else { return false }
-        let tickets = validities
-        try await store.recordLivePhotoInventoryResult(context: context, assetID: item.assetID, revision: item.revision, observations: observations, retryPolicy: (requiresAttention || observations.isEmpty) ? .requiresAttention : .automatic(nextRetryAt: wallNow().addingTimeInterval(60)), observationsAreCurrent: { tickets.allSatisfy(\.isCurrent) })
-        try await finishIfReady(context: context)
-        return true
     }
 
     public func retryAttention(now: Date) async throws {
@@ -153,11 +169,18 @@ public actor LivePhotoInventoryCoordinator {
         try await store.finishLivePhotoEnumeration(context: context, generation: snapshot.generation)
         _ = try await store.completeLivePhotoInventory(context: context, expectedGeneration: snapshot.generation)
     }
-    public func activity() async -> LivePhotoActivity {
+    public func activity(now: Date? = nil, summary provided: LivePhotoInventorySummary? = nil) async -> LivePhotoActivity {
+        let summary: LivePhotoInventorySummary
+        if let provided { summary = provided }
+        else if let stored = try? await self.summary() { summary = stored }
+        else { return .waiting(nextRetryAt: nil) }
+        let unfinished = summary.phase != .completed || summary.pending > 0 || summary.unresolved > 0
+        if !unfinished && !active { return .idle }
         let admission = await photos.livePhotoReadAdmission()
         if admission == .draining || admission == .stalled { return .draining }
         if active { return .working(.identification) }
-        guard let summary = try? await summary() else { return .waiting(nextRetryAt: nil) }
+        let due = summary.phase != .completed || summary.pending > 0 || summary.nextRetryAt.map { $0 <= (now ?? wallNow()) } == true
+        if !paused, admission == .available, due { return .queued(.identification) }
         if summary.requiresAttention > 0 { return .requiresAttention(SourceIssue(summary: "部分 Live Photo 无法自动分析，请重新尝试或查看诊断。", detail: "Inventory has held unresolved resources", kind: .file)) }
         if summary.phase != .completed || summary.pending > 0 || summary.retryWaiting > 0 { return .waiting(nextRetryAt: summary.nextRetryAt) }
         return .idle

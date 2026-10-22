@@ -116,26 +116,31 @@ m = json.loads((out/'manifest.json').read_text())
 captures = m['captures']
 scenarios = ['syncing','analyzing','preparing','icloud','paused','pausing','completed','offline',
              'fileIssue','unauthorized','unknown','summaryLoading','summaryStale','empty','single','many','longLeaf',
-             'mixedIssues','longIssues','recoveryPending','analysisPaused','analysisZero']
+             'mixedIssues','longIssues','recoveryPending','analysisPaused','analysisZero',
+             'taskVisualUnknown','taskLiveKnown','tasksMixed','tasksKnown','tasksWaiting','tasksPaused','tasksAttention','taskCompletion']
 expected = {(s,a,v) for s in scenarios for a in ('light','dark') for v in ('menu','settings')}
 expected |= {('many', a, 'settings-bottom') for a in ('light','dark')}
 for s in ('mixedIssues','longIssues','analyzing','preparing','icloud','analysisPaused','analysisZero'):
     kind = 'source-details' if s in ('mixedIssues','longIssues') else 'sync-details'
     expected |= {(s,a,kind+'-'+position) for a in ('light','dark') for position in ('top','bottom')}
+for s in scenarios:
+    if not s.startswith('task'): continue
+    ids = ['visualIndex'] if s in ('taskVisualUnknown','tasksAttention') else (['livePhoto'] if s in ('taskLiveKnown','taskCompletion') else ['visualIndex','livePhoto'])
+    expected |= {(s,a,'task-details-'+task+'-'+position) for a in ('light','dark') for task in ids for position in ('top','bottom')}
 actual = {(c['scenario'],c['appearance'],c['surface']) for c in captures}
-if len(captures) != 118 or actual != expected:
+if len(captures) != len(expected) or actual != expected:
     raise SystemExit('Missing/duplicate matrix entries')
 for c in captures:
     p = out/c['file']
     if not p.is_file() or p.stat().st_size < 512: raise SystemExit('Missing/empty PNG: '+str(p))
-    width = 320 if c['surface']=='menu' else (360 if c['surface'].startswith('source-details') else (300 if c['surface'].startswith('sync-details') else 600))
+    width = 320 if c['surface']=='menu' else (360 if c['surface'].startswith('source-details') else (300 if c['surface'].startswith('sync-details') else (334 if c['surface'].startswith('task-details') else 600)))
     if abs(c['logicalWidth']-width)>1 or not 100<c['logicalHeight']<=681:
         raise SystemExit('Unexpected dimensions: '+str(c))
 esc = html.escape
 parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>PhotosYNC 原生 UI 待验收</title>',
  '<style>body{font:15px system-ui;margin:24px;background:#eceef0;color:#222}section{margin:30px 0;padding:20px;background:white;border-radius:12px}.pair{display:flex;gap:24px;align-items:start;flex-wrap:wrap}figure{margin:12px 0}img{display:block;max-width:100%;box-shadow:0 1px 8px #8888}pre{white-space:pre-wrap;font-size:12px}a{color:#175ba4}</style>',
  '<h1>PhotosYNC · 真实编译视图 · 候选证据 · 等待协调代理审阅</h1>',
- '<p>22 场景 × 浅/深外观 × 菜单/设置 + 2 张设置底部 + 28 张独立详情内容首尾，共 118 张原始 PNG。系统开关在隔离 injected 模型中禁用。</p>',
+ '<p>30 场景 × 浅/深外观 × 菜单/设置，另含详情首尾及设置底部，共 198 张原始 PNG。系统开关在隔离 injected 模型中禁用。</p>',
  '<p>菜单为真实 StatusMenu 的离屏原生绘制；不是系统 MenuBarExtra 弹出截图。图片按逻辑尺寸展示，原图链接保留像素。</p>',
  '<p><a href="manifest.json">完整清单与原生交互结果</a> · <a href="source.json">源码/环境/编译文件 SHA256</a></p>',
  '<pre>'+esc(json.dumps({k:m[k] for k in ('sourceCommit','sourceDiff','sourceStatus','os','xcode','hostBundle')},ensure_ascii=False,indent=2))+'</pre>',
@@ -153,5 +158,5 @@ for s in scenarios:
     parts.append('</section>')
 parts.append('</html>')
 (out/'index.html').write_text('\n'.join(parts))
-print('Validated 118-image matrix; gallery: '+str(out/'index.html'))
+print(f'Validated {len(captures)}-image matrix; gallery: '+str(out/'index.html'))
 PY

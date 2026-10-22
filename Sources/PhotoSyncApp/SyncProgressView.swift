@@ -25,6 +25,7 @@ struct SyncProgressMetrics {
 struct SyncProgressView: View {
     let summary: SyncStatusSummary?
     let stale: Bool
+    var showLegend = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -41,12 +42,12 @@ struct SyncProgressView: View {
                 }
                 .frame(height: 6)
                 .accessibilityLabel("已导入 \(summary.imported)，已跳过 \(summary.skipped)，未完成 \(metrics.incomplete)")
-                HStack(spacing: 12) {
+                if showLegend { HStack(spacing: 12) {
                     legend("已导入", color: .accentColor)
                     legend("已跳过", color: Color(nsColor: .secondaryLabelColor))
                     legend("未完成", color: Color(nsColor: .quaternaryLabelColor))
-                }
-                if stale {
+                } }
+                if stale && showLegend {
                     Text("统计暂未更新").font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -80,6 +81,9 @@ struct SyncDetailsContent: View {
                     Text(progress.subtitle).font(.headline)
                     if let text = progress.progressText { row("进度", text) }
                     Text(progress.explanation).font(.caption).foregroundStyle(.secondary)
+                    ForEach(progress.details.filter { $0.title == "当前状态" || $0.title == "需要处理" }) { detail in
+                        Text(detail.text).font(.caption).foregroundStyle(.secondary)
+                    }
                     Divider()
                 }
                 if presentation.progressRows.isEmpty, let p = snapshot.indexProgress, p.state != .ready {
@@ -172,36 +176,95 @@ struct SyncDetailsButton: View {
     }
 }
 
-/// Both surfaces consume the same rows. The details trigger retains identity through activity changes.
+struct TaskDetailsContent: View {
+    let row: SyncStatusPresentation.PreparationProgress
+    var body: some View {
+        DetailsScrollView(width: 334) {
+            VStack(alignment: .leading, spacing: 13) {
+                Text(row.title).font(.headline)
+                ForEach(row.details) { detail in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(detail.title).font(.caption).fontWeight(.semibold)
+                        Text(detail.text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .accessibilityIdentifier("task-details-content-\(row.id)")
+    }
+}
+
+/// One solid track for either a measured fraction or an explicitly unmeasured activity segment.
+struct TaskProgressTrack: View {
+    let row: SyncStatusPresentation.PreparationProgress
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: row.fraction != nil || !row.active || reduceMotion)) { context in
+            GeometryReader { proxy in
+                let width = proxy.size.width
+                let phase = row.active && !reduceMotion ? context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 2) / 2 : 0.5
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color(nsColor: .quaternaryLabelColor))
+                    if let fraction = row.fraction {
+                        if fraction > 0 { Capsule().fill(Color.accentColor).frame(width: max(1.5, width * min(1, fraction))) }
+                    } else {
+                        Capsule().fill(Color.accentColor).frame(width: width * 0.25).offset(x: width * 0.75 * phase)
+                    }
+                }
+                .opacity(row.active ? 1 : 0.6)
+            }
+        }
+        .frame(height: 5)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.progressText ?? row.subtitle)
+        .accessibilityValue(row.fraction == nil ? "总进度未确认" : row.active ? "进行中" : "已停止推进")
+        .accessibilityIdentifier("task-progress-\(row.id)")
+    }
+}
+
+struct TaskProgressRow: View {
+    let row: SyncStatusPresentation.PreparationProgress
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 4) {
+                Text(row.subtitle).lineLimit(1).fixedSize()
+                HoverDetailsButton(accessibilityLabel: "查看\(row.title)说明", accessibilityIdentifier: "task-details-\(row.id)") {
+                    Image(systemName: "info.circle")
+                } content: { TaskDetailsContent(row: row) }
+                Spacer(minLength: 6)
+                if let text = row.countText { Text(text).monospacedDigit().lineLimit(1).fixedSize() }
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            TaskProgressTrack(row: row)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("task-row-\(row.id)")
+    }
+}
+
+/// Both surfaces use stable task IDs; ordinary waits and pauses do not remove hover anchors.
 struct SyncWorkProgressView: View {
     let snapshot: EngineSnapshot
     let showSourceProgress: Bool
     let showActiveProgress: Bool
 
-    private var rows: [SyncStatusPresentation.PreparationProgress] { showActiveProgress ? SyncStatusPresentation(snapshot: snapshot).progressRows : [] }
+    private var rows: [SyncStatusPresentation.PreparationProgress] { SyncStatusPresentation(snapshot: snapshot).progressRows }
     private var sourceCount: String {
         guard let metrics = SyncProgressMetrics(summary: snapshot.summary) else { return snapshot.summaryError == nil ? "正在读取同步统计…" : "同步统计暂不可用" }
         return "已处理 \(metrics.processed) / 已发现 \(metrics.known)"
     }
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                if let text = rows.first?.progressText { StatusMenuSingleLine(text: text) }
-                else if showSourceProgress { StatusMenuSingleLine(text: sourceCount) }
-                SyncDetailsButton(snapshot: snapshot)
+        VStack(alignment: .leading, spacing: 18) {
+            ForEach(rows) { row in TaskProgressRow(row: row) }
+            if showSourceProgress && (rows.isEmpty || snapshot.sourceActivities.values.contains(where: { $0 != .waiting })) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        StatusMenuSingleLine(text: sourceCount)
+                        SyncDetailsButton(snapshot: snapshot)
+                    }
+                    if showActiveProgress { SyncProgressView(summary: snapshot.summary, stale: snapshot.summaryError != nil, showLegend: false) }
+                }
             }
-            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
-                if index > 0, let text = row.progressText { StatusMenuSingleLine(text: text) }
-                if let fraction = row.fraction {
-                    ProgressView(value: fraction).accessibilityLabel(row.progressText ?? row.subtitle)
-                } else { ProgressView().controlSize(.small).accessibilityLabel(row.subtitle) }
-                Text(row.subtitle).font(.caption).foregroundStyle(.secondary)
-            }
-            if showActiveProgress && showSourceProgress && (rows.isEmpty || snapshot.sourceActivities.values.contains(where: { $0 != .waiting })) {
-                if !rows.isEmpty { StatusMenuSingleLine(text: sourceCount) }
-                SyncProgressView(summary: snapshot.summary, stale: snapshot.summaryError != nil)
-            }
-            if showActiveProgress && rows.isEmpty && !showSourceProgress { ProgressView().controlSize(.small) }
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sync-work-progress")

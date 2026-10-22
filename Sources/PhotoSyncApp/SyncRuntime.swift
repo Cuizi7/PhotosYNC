@@ -31,11 +31,13 @@ struct AdvancedRuntimeGraph: Sendable {
     let coordinator: PhotosIndexCoordinator
     let service: AdvancedDedupService
     let legacy: LegacySkipReevaluation
+    let diagnostics: IndexDiagnostics
 
     init(store: SyncStore, photos: any PhotosIndexGateway, model: any ImageFingerprinting,
          configuration: DedupConfiguration, executor: ReadExecutor, budget: ImageWorkBudget,
          directory: @escaping SyncEngine.DirectoryFactory, now: @escaping @Sendable () -> Date, logger: RunLogger? = nil, indexDiagnostics: IndexDiagnostics? = nil) {
         self.configuration = configuration; self.photos = photos; self.model = model; self.budget = budget
+        diagnostics = indexDiagnostics ?? IndexDiagnostics(sink: { logger?.log($0) })
         logger?.log(["phase": "sqlite-vector-query", "backend": configuration.backend,
             "effectiveMmapBytes": String(store.vectorQueryMmapBytes), "ordinaryCacheKiB": "16384"])
         coordinator = PhotosIndexCoordinator(store: store, photos: photos, fingerprinter: model,
@@ -108,6 +110,7 @@ actor SyncRuntime {
     private var nextLivePhotoWorkAt: Date?
     private var livePhotoDeferrals = 0
     private var manualLivePhotoRetryPending = false
+    private var manualIndexReadRetryPending = false
     private var changeObserver: Task<Void, Never>?
     private var advancedLoadAttempted = false
     private var modelRetryAt: Date?
@@ -120,6 +123,7 @@ actor SyncRuntime {
     private var pendingAdvancedScan = false
     private var nextProgressAt: Date?
     private var publishedProgress: IndexProgress?
+    private var publishedIndexActivity: IndexActivity = .idle
     private var loggedProgress: IndexProgress?
     private let legacyFailureSummary = "无法读取历史同步记录，稍后会自动重试。"
     private var schedule = ScanSchedule()
@@ -268,13 +272,14 @@ actor SyncRuntime {
         if let graph = advancedGraph {
             // UI polling publishes aggregates at the profile cadence; transitions are also
             // published when an owned batch ends. No per-representation main-actor traffic.
-            let activity = eligibleForImageWork ? await graph.coordinator.activity() : .idle
-            if nextProgressAt == nil || now() >= nextProgressAt! || activity != state.snapshot.indexActivity {
+            let activity = eligibleForImageWork ? await graph.coordinator.activity(now: now()) : .idle
+            if nextProgressAt == nil || now() >= nextProgressAt! || activity != publishedIndexActivity {
                 publishedProgress = await graph.coordinator.progress()
                 nextProgressAt = now().addingTimeInterval(graph.configuration.resources.progressPublishIntervalSeconds)
             }
             state.snapshot.indexProgress = state.sources.contains(where: \.enabled) ? publishedProgress : nil
             state.snapshot.indexActivity = activity
+            publishedIndexActivity = activity
         }
         await publishLivePhotoProgress()
         state.nextScan = schedule.nextScanAt
@@ -401,12 +406,13 @@ actor SyncRuntime {
         // Do not cancel physical Photos submission: the engine persists its callback.
     }
 
-    func tick(force: Bool = false, includeAdvanced: Bool = true, retryModel: Bool = false, retryLivePhoto: Bool = false) async {
+    func tick(force: Bool = false, includeAdvanced: Bool = true, retryModel: Bool = false, retryLivePhoto: Bool = false, retryIndexReadLimits: Bool = false) async {
         guard !stopped else { return }
         refreshAuthorization()
         await applyAnalysisEligibility()
         guard eligibleForWork else { return }
         if retryLivePhoto { manualLivePhotoRetryPending = true; nextLivePhotoWorkAt = nil }
+        if retryIndexReadLimits { manualIndexReadRetryPending = true }
         if retryModel { manualModelRetryPending = true }
         if engine == nil { startAdvancedGraphIfNeeded(); return }
         if eligibleForImageWork, let model = advancedGraph?.model as? any ModelExecutionRecovering {
@@ -432,6 +438,12 @@ actor SyncRuntime {
             }
         }
         guard let engine else { return }
+        if manualIndexReadRetryPending, eligibleForImageWork, let graph = advancedGraph {
+            manualIndexReadRetryPending = false
+            do { try await graph.coordinator.retryReadLimits(now: now()) }
+            catch { state.message = "无法重新尝试图库分析，请稍后重试。"; state.messageDetail = error.localizedDescription; return }
+            guard eligibleForWork else { return }
+        }
         if includeAdvanced { scheduleAdvancedWork(force: force) }
         scheduleLivePhotoWork()
         let explicitForce = force
@@ -618,8 +630,8 @@ actor SyncRuntime {
         let executor = self.executor
         let engineReference = LivePhotoEngineReference()
         if let photos = graph.photos as? any LivePhotoPhotosGateway {
-            livePhotoInventory = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, wallNow: now)
-            livePhotoCompletion = LivePhotoCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, executor: executor, wallNow: now,
+            livePhotoInventory = LivePhotoInventoryCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, wallNow: now, diagnostics: graph.diagnostics)
+            livePhotoCompletion = LivePhotoCoordinator(store: store, photos: photos, metadata: livePhotoMetadata, executor: executor, wallNow: now, diagnostics: graph.diagnostics,
                 sourceAdmission: { engineReference.allows($0) })
             await livePhotoInventory?.setPaused(!eligibleForWork)
             await livePhotoCompletion?.setPaused(!eligibleForWork)
@@ -727,11 +739,16 @@ actor SyncRuntime {
                 try await inventory.retryAttention(now: now())
                 try await completion.retryAttention(now: now())
             }
-            _ = try await inventory.processNextInventoryItem(now: now())
+            let inventoryActivity = await inventory.activity(now: now())
+            let inventoried = inventoryActivity == .queued(.identification) ? try await inventory.processNextInventoryItem(now: now()) : false
             guard eligibleForWork else { return }
-            _ = try await completion.advanceNext(now: now())
+            let completionDue = try await completion.hasDueWork(now: now())
+            if inventoried || completionDue {
+                _ = try await completion.advanceNext(now: now(), refreshDiscovery: inventoried)
+            }
             livePhotoIssue = nil; livePhotoDeferrals = 0; nextLivePhotoWorkAt = nil
         } catch is CancellationError { }
+        catch is LivePhotoReadDeferred { livePhotoIssue = nil; nextLivePhotoWorkAt = nil }
         catch is ReadExecutorError { deferLivePhotoWork() }
         catch LivePhotoResourceReadError.budgetBusy { deferLivePhotoWork() }
         catch is PhotosAdmissionDeferred { deferLivePhotoWork() }
@@ -756,8 +773,13 @@ actor SyncRuntime {
             livePhotoIssue = SourceIssue(summary: "无法读取 Live Photo 处理进度，稍后继续。", detail: error.localizedDescription, kind: .file)
         }
         state.snapshot.livePhotoActivities = []
-        if let inventory = livePhotoInventory { state.snapshot.livePhotoActivities.append(await inventory.activity()) }
-        if let completion = livePhotoCompletion { state.snapshot.livePhotoActivities.append(await completion.activity()) }
+        if let inventory = livePhotoInventory { state.snapshot.livePhotoActivities.append(await inventory.activity(now: now(), summary: state.snapshot.livePhotoInventory)) }
+        if let completion = livePhotoCompletion { state.snapshot.livePhotoActivities.append(await completion.activity(now: now(), summary: state.snapshot.livePhotoWork)) }
+        if !eligibleForWork || nextLivePhotoWorkAt.map({ $0 > now() }) == true {
+            state.snapshot.livePhotoActivities = state.snapshot.livePhotoActivities.map {
+                if case .queued = $0 { return .waiting(nextRetryAt: nextLivePhotoWorkAt) }; return $0
+            }
+        }
         state.snapshot.livePhotoIssue = livePhotoIssue ?? state.snapshot.livePhotoWork.issue
     }
 
@@ -770,7 +792,9 @@ actor SyncRuntime {
                 catch is CancellationError { /* Paused before another catalog page. */ }
                 catch { logger?.log(["phase": "index-reconcile", "result": "waiting", "error": String(describing: error)]) }
             }
-            if eligibleForImageWork { await graph.coordinator.processDueWork(now: now()) }
+            if eligibleForImageWork, await graph.coordinator.hasDueWork(now: now()), eligibleForImageWork {
+                await graph.coordinator.processDueWork(now: now())
+            }
             // The gateway owns a single catalog session. Keep both enumerators here.
             if eligibleForWork {
                 do {

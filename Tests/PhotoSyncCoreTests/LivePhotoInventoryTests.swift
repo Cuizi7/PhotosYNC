@@ -2,7 +2,54 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoInventoryTests: XCTestCase {
-    func testPauseDuringTicketSnapshotDoesNotReadOrCommitNextPhase() async throws {
+    func testPendingAfterMetadataDefersWithoutEnteringAnotherSnapshotWait() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let gate = InventoryReadGate()
+        await f.photos.useNativeRead { _, _, _ in
+            let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
+            return .init(url: url, validity: .init(check: { throw LivePhotoReadDeferred.classificationPending }, release: {}))
+        }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos,
+            metadata: MutatingInventoryMetadata { await f.photos.holdNextSnapshot(gate) })
+        try await c.resumeInitialInventory()
+        let done = expectation(description: "Metadata pending defers immediately, without a second classifier wait")
+        let task = Task {
+            do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Pending bytes accepted") }
+            catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 1)
+        let waited = await gate.entered
+        await gate.release(); await task.value
+        XCTAssertFalse(waited, "A read ticket must reject pending metadata before querying the producer queue")
+        let summary = try await c.summary(); XCTAssertEqual(summary.identified, 0)
+        let reads = await f.photos.resourceReads; XCTAssertEqual(reads, 1)
+    }
+
+    func testInventoryBetweenItemsIsQueuedButFutureRetryAndDrainAreWaiting() async throws {
+        let f = try await inventoryFixture(count: 2); defer { try? FileManager.default.removeItem(at: f.root) }
+        let now = Date(), c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await c.resumeInitialInventory()
+        let first = await c.activity(); XCTAssertEqual(first, .queued(.identification))
+        _ = try await c.processNextInventoryItem(now: now)
+        let between = await c.activity(); XCTAssertEqual(between, .queued(.identification))
+        await f.photos.setReadAdmission(.draining)
+        let draining = await c.activity(); XCTAssertEqual(draining, .draining)
+    }
+    func testClassifiedTargetChangeDuringMetadataRefreshesInsteadOfGlobalFailure() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: MutatingInventoryMetadata {
+            try await f.store.applyLivePhotoDelta(.init(context: f.photos.context, fromGeneration: 0, toGeneration: 1, changedAssetIDs: ["asset-0"], deletedAssetIDs: []))
+        })
+        try await c.resumeInitialInventory()
+        do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Changed issuance accepted") }
+        catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .resourceChanged) }
+        let before = try await c.summary(); XCTAssertEqual(before.identified, 0); XCTAssertEqual(before.retryWaiting, 0)
+        let refreshed = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        _ = try await refreshed.processNextInventoryItem(now: Date())
+        let after = try await refreshed.summary(); XCTAssertEqual(after.identified, 1)
+    }
+    func testPauseDuringMetadataDoesNotReadOrCommitNextPhase() async throws {
         for resourceCount in [1, 2] {
             let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
             let context = f.photos.context, gate = InventoryReadGate()
@@ -12,7 +59,7 @@ final class LivePhotoInventoryTests: XCTestCase {
                 let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
                 return .init(url: url, validity: .init(validate: { true }, release: {}))
             }
-            let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: MutatingInventoryMetadata { await f.photos.holdNextSnapshot(gate) })
+            let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: MutatingInventoryMetadata { await gate.hold() })
             try await c.resumeInitialInventory()
             let task = Task { try await c.processNextInventoryItem(now: Date()) }
             let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)

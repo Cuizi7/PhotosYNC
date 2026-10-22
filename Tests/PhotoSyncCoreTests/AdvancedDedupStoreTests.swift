@@ -6,6 +6,42 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class AdvancedDedupStoreTests: XCTestCase {
+    func testDecodedReadHoldsSurviveReopenAndExplicitRetryDoesNotRearmOtherFailures() async throws {
+        let (root, db, store) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), now = Date(timeIntervalSince1970: 1000)
+        let photo = try datedDescriptor(context), current = try datedDescriptor(context, kind: .current), temporary = try datedDescriptor(context, asset: "temporary")
+        let generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([photo, current, temporary], generation: generation)
+        _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [photo.key, current.key, temporary.key])
+        let tasks = try await store.nextRepresentationTasks(now: now, limit: 10)
+        for task in tasks {
+            _ = try await store.failRepresentation(task, nextRetryAt: task.descriptor.key.assetID == "temporary" ? now.addingTimeInterval(60) : .distantFuture, detail: "typed failure", failureKind: .photosRead)
+        }
+        let reopened = try SyncStore(url: db)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        let held = try await reopened.indexProgress(); XCTAssertEqual(held.requiresAttentionAssets, 1); XCTAssertEqual(held.readErrorRepresentations, 3)
+        let rearmed = try await reopened.retryIndexReadLimits(now: now); XCTAssertEqual(rearmed, 2)
+        let due = try await reopened.nextRepresentationTasks(now: now, limit: 10)
+        XCTAssertEqual(Set(due.map(\.descriptor.key)), [photo.key, current.key])
+        let after = try await reopened.indexProgress(); XCTAssertEqual(after.requiresAttentionAssets, 0)
+        XCTAssertEqual(try engineSQLInteger("SELECT next_retry_at FROM fingerprint_task WHERE asset_id='temporary'", at: db), 1060)
+        let again = try await reopened.retryIndexReadLimits(now: now); XCTAssertEqual(again, 0)
+    }
+    func testChangedInputContractReopensHeldTaskAndRejectsOldFailure() async throws {
+        let (root, _, store) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+        let context = LibraryContext(id: UUID(), epoch: 1), d = try datedDescriptor(context)
+        var generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 1, fingerprintVersion: "v1")
+        try await store.upsertRepresentations([d], generation: generation)
+        _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [d.key])
+        let old = try await unwrap(try await store.nextRepresentationTasks(now: Date(), limit: 1).first)
+        _ = try await store.failRepresentation(old, nextRetryAt: .distantFuture, detail: "decoded limit", failureKind: .photosRead)
+        generation = try await store.beginIndexReconciliation(context: context, photosGeneration: 2, fingerprintVersion: "v2")
+        try await store.upsertRepresentations([d], generation: generation)
+        _ = try await store.finishIndexReconciliation(generation: generation, seenKeys: [d.key])
+        let due = try await store.nextRepresentationTasks(now: Date(), limit: 1)
+        XCTAssertEqual(due.first?.fingerprintVersion, "v2")
+        let accepted = try await store.failRepresentation(old, nextRetryAt: .distantFuture, detail: "late", failureKind: .photosRead); XCTAssertFalse(accepted)
+    }
     func testCompletedRemovalThenSameSuccessfulDateReturnReusesOnlyAfterMembershipFinish() async throws {
         for changedLocator in [false, true] {
             let (root, db, store) = try fixture()
