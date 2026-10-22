@@ -2,6 +2,58 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoCoordinatorTests: XCTestCase {
+    func testDeletedHeldGroupReleasesUnsubmittedSourceDespiteRetryOrProtectionHold() async throws {
+        for reason in [LivePhotoDeferralReason.workingSetLimit, .protectedInformation, .otherFailure] {
+            let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
+            try await completeEmptyInventory(f.store, f.photos.context)
+            let file = try await f.store.sourceFile(id: f.first)
+            var op = LivePhotoOperation(context: f.photos.context, contentIdentifier: "pair",
+                photo: .source(fileID: f.first, stamp: try XCTUnwrap(file).file.stamp),
+                motion: .photos(contextID: f.photos.context.id, assetID: "gone", resourceKey: "motion", revision: "r1"),
+                sourceFileIDs: [f.first], oldAssetIDs: ["gone"])
+            _ = try await f.store.reserveLivePhotoOperation(op)
+            op.deferralReason = reason; op.nextRetryAt = reason == .otherFailure ? Date().addingTimeInterval(60) : .distantFuture
+            _ = try await f.store.saveLivePhotoOperation(op, expectedStage: .planned)
+            try f.store.recordLivePhotoChanges(context: f.photos.context, changed: [], deleted: ["gone"])
+            let c = LivePhotoCoordinator(store: f.store, photos: f.photos, sourceAdmission: { _ in true })
+            _ = try await c.advanceNext(now: Date(), refreshDiscovery: false)
+            let reserved = try await f.store.livePhotoMemberIsReserved(id: f.first), state = try await f.store.state(of: f.first)
+            XCTAssertFalse(reserved, "Deletion must release the still-unsubmitted file even when held: \(reason)")
+            XCTAssertEqual(state, .pending)
+            let creates = await f.photos.creates, retires = await f.photos.retires
+            XCTAssertEqual(creates, 0); XCTAssertEqual(retires, 0)
+        }
+    }
+    func testDeletedGroupCannotHideUnknownSubmission() async throws {
+        let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+        let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+        try await c.recover()
+        // Discover a durable operation without starting its external mutation.
+        await c.setPaused(true)
+        let assets = try await f.photos.livePhotoAssets(assetIDs: ["old-photo", "old-motion"], context: f.photos.context)
+        let photo = try XCTUnwrap(assets.first { $0.assetID == "old-photo" }), motion = try XCTUnwrap(assets.first { $0.assetID == "old-motion" })
+        let op = LivePhotoOperation(context: f.photos.context, contentIdentifier: "pair", photo: photo.resources[0], motion: motion.resources[0], oldAssetIDs: ["old-photo", "old-motion"])
+        _ = try await f.store.reserveLivePhotoOperation(op)
+        try await f.store.beginLivePhotoCreation(operationID: op.id)
+        try f.store.recordLivePhotoChanges(context: f.photos.context, changed: [], deleted: ["old-photo"])
+        let summary = try await c.summary()
+        XCTAssertTrue(summary.unknownMutation); XCTAssertEqual(summary.stoppedGroups, 0)
+    }
+    func testDiscoveryRefreshDoesNotExecuteUnadmittedGroupsAndResumesWhenDependencyClears() async throws {
+        let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
+        let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+        try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [.init(context: f.photos.context,
+            assetID: "unknown-complete", revision: "r1", isLivePhoto: true, mediaKind: .image, resources: [])])
+        try await c.recover()
+        let before = await f.photos.snapshotCount
+        for _ in 0..<4 { _ = try await c.advanceNext(now: Date(), refreshDiscovery: true) }
+        let after = await f.photos.snapshotCount, reads = await f.photos.rawReadCount
+        XCTAssertEqual(after, before, "Discovery must not enter blocked planned operations or their Photos snapshot wait")
+        XCTAssertEqual(reads, 0)
+        try f.store.recordLivePhotoChanges(context: f.photos.context, changed: [], deleted: ["unknown-complete"])
+        _ = try await c.advanceNext(now: Date(), refreshDiscovery: false)
+        let created = await f.photos.creates; XCTAssertEqual(created, 1)
+    }
     func testDisabledReservedSourceWakesResolutionAfterDiscoveryHasDrained() async throws {
         let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
         try await completeEmptyInventory(f.store, f.photos.context)
@@ -502,6 +554,9 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let next = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata(), sourceAdmission: { _ in true }); try await next.recover()
         for _ in 0..<4 { _ = try await next.advanceNext(now: Date()) }
         let creates = await f.photos.creates, retires = await f.photos.retires; XCTAssertEqual(creates, 0); XCTAssertEqual(retires, 0)
+        let summary = try await next.summary()
+        XCTAssertEqual(summary.requiresAttentionGroups, 0); XCTAssertEqual(summary.activeGroups, 0)
+        XCTAssertEqual(summary.limitedGroups, 0); XCTAssertNil(summary.issue)
     }
     func testUnknownRetirementBlocksAndNeverRetriesMissingFetch() async throws {
         let f = try await completionFixture(photosOnly: true); defer { try? FileManager.default.removeItem(at: f.root) }
@@ -592,7 +647,7 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
     func setRawAdmission(_ value: PhotosReaderAdmission) { rawAdmission = value }
     func livePhotoReadAdmission() async -> PhotosReaderAdmission { rawAdmission }
     var encodedFixtureBytes: Int?
-    var rawReadCount = 0
+    var rawReadCount = 0, snapshotCount = 0
     var rawFailure: Error?
     var rejectSnapshotAfterRead = false, rawReadSinceTrap = false
     func rejectSnapshotsAfterRawRead() { rejectSnapshotAfterRead = true; rawReadSinceTrap = false }
@@ -623,6 +678,7 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
     }
     func addComplete() { assets.append(.init(context: context, assetID: "complete", revision: "r1", isLivePhoto: true, mediaKind: .image, resources: [.photos(contextID: context.id, assetID: "complete", resourceKey: "photo", revision: "r1"), .photos(contextID: context.id, assetID: "complete", resourceKey: "motion", revision: "r1")], resourceKinds: [.image, .video])) }
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        snapshotCount += 1
         if rejectSnapshotAfterRead && rawReadSinceTrap { throw PhotosRepresentationError.unavailable }
         return .init(generation: generation, candidates: [])
     }

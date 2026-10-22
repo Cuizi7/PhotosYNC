@@ -36,6 +36,7 @@ public actor LivePhotoInventoryCoordinator {
               try await photos.verifyLivePhotoContext(context: current, anchorAssetIDs: binding?.anchors ?? [], allowUnanchored: !(binding?.requiresProof ?? false)) else { throw PhotoKitGatewayError.libraryChanged }
         guard !paused else { throw CancellationError() }
         try await store.ensureLivePhotoInventory(context: current)
+        if context == nil { try await store.refreshLegacyLivePhotoVideoDescriptors(context: current) }
         context = current
         return current
     }
@@ -102,6 +103,15 @@ public actor LivePhotoInventoryCoordinator {
         guard !paused, try await photos.livePhotoLibraryContext() == context else { return false }
         active = true; defer { active = false }
         do {
+            if LivePhotoIdentificationPolicy.excludesVideo(kind: item.mediaKind, duration: item.duration, isLivePhoto: item.isLivePhoto), !item.resources.isEmpty,
+               try await !store.hasCurrentLivePhotoIdentity(context: context, assetID: item.assetID, revision: item.revision) {
+                guard !paused, try await photos.livePhotoAssets(assetIDs: [item.assetID], context: context).first == item else { throw LivePhotoReadDeferred.resourceChanged }
+                guard !paused else { return false }
+                try await store.recordLivePhotoInventoryResult(context: context, assetID: item.assetID, revision: item.revision,
+                    observations: item.resources.map { .init(resource: $0, inspection: .excludedByDuration) }, retryPolicy: .requiresAttention)
+                try await finishIfReady(context: context)
+                return true
+            }
             var requiresAttention = item.resources.isEmpty
             var observations = [LivePhotoObservation]()
             var validities = [LivePhotoResourceValidity]()
@@ -127,9 +137,11 @@ public actor LivePhotoInventoryCoordinator {
                     if error is ReadExecutorError || error is CancellationError || error is LivePhotoReadDeferred { throw error }
                     if case .libraryChanged = error as? PhotoKitGatewayError { throw error }
                     if case .budgetBusy = error as? LivePhotoResourceReadError { throw error }
-                    if case .resourceLimit = error as? LivePhotoResourceReadError { requiresAttention = true }
-                    if case .workingSetLimit = error as? LivePhotoResourceReadError { requiresAttention = true }
-                    observations.append(.init(resource: ref, inspection: .unresolved("原资源暂不可读：" + SourceIssueText.systemDiagnostic(error))))
+                    let limited: Bool
+                    switch error as? LivePhotoResourceReadError { case .resourceLimit, .workingSetLimit: limited = true; default: limited = false }
+                    if limited { requiresAttention = true }
+                    let detail = limited ? "资源读取超过 \(budget.limits.maxEncodedBytes / 1_048_576) MiB 上限，已停止自动重试。" : "原资源暂不可读：" + SourceIssueText.systemDiagnostic(error)
+                    observations.append(.init(resource: ref, inspection: .unresolved(detail), resourceLimitBytes: limited ? budget.limits.maxEncodedBytes : nil))
                 }
             }
             guard !paused, try await photos.livePhotoLibraryContext() == context else { return false }
@@ -181,7 +193,7 @@ public actor LivePhotoInventoryCoordinator {
         if active { return .working(.identification) }
         let due = summary.phase != .completed || summary.pending > 0 || summary.nextRetryAt.map { $0 <= (now ?? wallNow()) } == true
         if !paused, admission == .available, due { return .queued(.identification) }
-        if summary.requiresAttention > 0 { return .requiresAttention(SourceIssue(summary: "部分 Live Photo 无法自动分析，请重新尝试或查看诊断。", detail: "Inventory has held unresolved resources", kind: .file)) }
+        if summary.requiresAttention > 0 { return .requiresAttention(SourceIssue(summary: "部分项目无法自动识别配对关系，请查看任务说明。", detail: "Inventory has held unresolved resources", kind: .file)) }
         if summary.phase != .completed || summary.pending > 0 || summary.retryWaiting > 0 { return .waiting(nextRetryAt: summary.nextRetryAt) }
         return .idle
     }

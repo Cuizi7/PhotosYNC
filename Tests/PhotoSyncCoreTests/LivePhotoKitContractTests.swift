@@ -108,6 +108,16 @@ final class LivePhotoKitContractTests: XCTestCase {
         XCTAssertTrue(details.allSatisfy { $0["assetHandle"]?.hasPrefix("asset-") == true && $0["elapsedMS"] != nil })
         XCTAssertFalse(String(describing: values).contains("private-"))
     }
+    func testCompletionDiagnosticsDistinguishProgressFromNormalNoProgressReturn() async throws {
+        let rows = LivePhotoDiagnosticRows(), diagnostics = IndexDiagnostics(sink: { rows.append($0) })
+        _ = try await diagnostics.measureLivePhoto(.completion) { false }
+        _ = try await diagnostics.measureLivePhoto(.completion) { true }
+        diagnostics.flushObservations(force: true)
+        let summary = try XCTUnwrap(rows.values.last { $0["phase"] == "live-photo-summary" })
+        XCTAssertEqual(summary["completion.no-progress"], "1")
+        XCTAssertEqual(summary["completion.advanced"], "1")
+        XCTAssertNil(summary["completion.completed"])
+    }
     func testRawCompletionDuringClassificationWaitsWithoutDiscardingUnrelatedBytes() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let started = expectation(description: "raw request"), classifying = expectation(description: "classification entered")

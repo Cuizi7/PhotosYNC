@@ -225,7 +225,7 @@ enum ReviewHost {
                 }
             }
         }
-        let expected = UIReviewScenario.allCases.count * 4 + 2 + 7 * 4 + 12 * 4
+        let expected = UIReviewScenario.allCases.count * 4 + 2 + 7 * 4 + 17 * 4
         guard captures.count == expected else { throw UIReviewError.invalid("Incomplete matrix: \(captures.count)/\(expected)") }
         manifest["captures"] = captures
         manifest["interactions"] = probes

@@ -2009,6 +2009,20 @@ public final class SyncStore: @unchecked Sendable {
             try self.rows("SELECT asset_id FROM live_photo_inventory_item WHERE context_id=? AND (status='needsDescriptor' OR (status='unresolved' AND descriptor IS NULL AND next_retry_at <= ?)) ORDER BY asset_id LIMIT ?", [.text(context.id.uuidString), .double(now.timeIntervalSince1970), .int64(Int64(limit))]).map { try self.text($0[0]) }
         }
     }
+    func refreshLegacyLivePhotoVideoDescriptors(context: LibraryContext) async throws {
+        try await perform {
+            try self.execute("""
+                UPDATE live_photo_inventory_item SET status='needsDescriptor',next_retry_at=NULL
+                WHERE context_id=? AND status IN ('queued','unresolved') AND is_live_photo=0 AND descriptor IS NOT NULL
+                AND json_extract(descriptor,'$.mediaKind')='video' AND COALESCE(json_extract(descriptor,'$.descriptorVersion'),0)<2
+                """, [.text(context.id.uuidString)])
+        }
+    }
+    func hasCurrentLivePhotoIdentity(context: LibraryContext, assetID: String, revision: String) async throws -> Bool {
+        try await perform {
+            try self.one("SELECT 1 FROM live_photo_observation WHERE context_id=? AND asset_id=? AND revision=? AND current=1 AND content_identifier IS NOT NULL LIMIT 1", [.text(context.id.uuidString), .text(assetID), .text(revision)]) != nil
+        }
+    }
     func markLivePhotoDescriptorUnresolved(context: LibraryContext, assetID: String) async throws {
         try await perform {
             try self.execute("UPDATE live_photo_inventory_item SET status='unresolved',descriptor=NULL,retry_count=retry_count+1,next_retry_at=? WHERE context_id=? AND asset_id=? AND status!='deleted'", [.double(Date().addingTimeInterval(60).timeIntervalSince1970), .text(context.id.uuidString), .text(assetID)])
@@ -2019,6 +2033,9 @@ public final class SyncStore: @unchecked Sendable {
             guard let row = try self.one("SELECT id,target_id,deleted,completed FROM live_photo_group WHERE context_id=? AND content_identifier=?", [.text(context.id.uuidString), .text(contentIdentifier)]) else { return nil }
             return LivePhotoGroup(id: try self.uuid(row[0]), contextID: context.id, contentIdentifier: contentIdentifier, targetID: self.optionalText(row[1]), deleted: try self.int64(row[2]) != 0, completed: try self.int64(row[3]) != 0)
         }
+    }
+    func deletedLivePhotoGroupIDs() async throws -> Set<UUID> {
+        try await perform { Set(try self.rows("SELECT id FROM live_photo_group WHERE deleted=1", []).map { try self.uuid($0[0]) }) }
     }
     func livePhotoAssetDescriptor(context: LibraryContext, assetID: String) async throws -> LivePhotoAssetDescriptor? {
         try await perform {
@@ -2469,11 +2486,17 @@ public final class SyncStore: @unchecked Sendable {
         try await perform {
             let task = try self.one("SELECT phase,completed_at FROM live_photo_inventory WHERE context_id=? AND task_key=?", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
             let counts = try self.one("SELECT COUNT(*),COALESCE(SUM(status='checked'),0),COALESCE(SUM(status='unresolved'),0),COALESCE(SUM(status IN ('queued','needsDescriptor')),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NOT NULL),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NULL),0),MIN(CASE WHEN status='unresolved' THEN next_retry_at END) FROM live_photo_inventory_item WHERE context_id=? AND status!='deleted'", [.text(context.id.uuidString)])!
+            let limits = try self.one("""
+                SELECT COUNT(DISTINCT i.asset_id) FROM live_photo_inventory_item i
+                JOIN live_photo_observation o ON o.context_id=i.context_id AND o.asset_id=i.asset_id AND o.revision=i.revision
+                WHERE i.context_id=? AND i.status='unresolved' AND i.next_retry_at IS NULL AND o.current=1
+                AND json_extract(o.payload,'$.resourceLimitBytes') IS NOT NULL
+                """, [.text(context.id.uuidString)])!
             return LivePhotoInventorySummary(phase: task.flatMap { try? self.text($0[0]) }.flatMap(LivePhotoInventoryPhase.init(rawValue:)) ?? .enumerating,
                 inventoried: Int(try self.int64(counts[0])), identified: Int(try self.int64(counts[1])), unresolved: Int(try self.int64(counts[2])),
                 pending: Int(try self.int64(counts[3])), retryWaiting: Int(try self.int64(counts[4])), requiresAttention: Int(try self.int64(counts[5])),
                 nextRetryAt: self.optionalDouble(counts[6]).map(Date.init(timeIntervalSince1970:)),
-                completedAt: task.flatMap { self.optionalDouble($0[1]) }.map(Date.init(timeIntervalSince1970:)))
+                completedAt: task.flatMap { self.optionalDouble($0[1]) }.map(Date.init(timeIntervalSince1970:)), resourceLimited: Int(try self.int64(limits[0])))
         }
     }
 

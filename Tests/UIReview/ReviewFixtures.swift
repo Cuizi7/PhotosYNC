@@ -7,6 +7,7 @@ enum UIReviewScenario: String, CaseIterable {
     case fileIssue, unauthorized, unknown, summaryLoading, summaryStale, empty, single, many, longLeaf
     case mixedIssues, longIssues, recoveryPending, analysisPaused, analysisZero
     case taskVisualUnknown, taskLiveKnown, tasksMixed, tasksKnown, tasksWaiting, tasksPaused, tasksAttention, taskCompletion
+    case taskLiveAttention, taskLiveAttentionWaiting, taskLiveAttentionPaused, tasksLiveAttention
 }
 
 @MainActor
@@ -37,6 +38,19 @@ func makeUIReviewModel(scenario: UIReviewScenario, root: URL) throws -> AppModel
     state.snapshot.latestScan.newlyImported = 24
     state.nextScan = date.addingTimeInterval(1_800)
     switch scenario {
+    case .taskLiveAttention, .taskLiveAttentionWaiting, .taskLiveAttentionPaused, .tasksLiveAttention:
+        state.nextScan = nil; state.snapshot.summary = .init()
+        state.snapshot.livePhotoInventory = .init(phase: .completed, inventoried: 16224, identified: 1021, unresolved: 15203,
+            retryWaiting: 15202, requiresAttention: 1, resourceLimited: 1)
+        state.snapshot.livePhotoWork.stoppedGroups = 1
+        state.snapshot.isPaused = scenario == .taskLiveAttentionPaused
+        state.snapshot.activeWork = scenario == .taskLiveAttention || scenario == .tasksLiveAttention
+        state.snapshot.livePhotoActivities = [state.snapshot.activeWork ? .working(.identification) : .waiting(nextRetryAt: nil)]
+        if scenario == .tasksLiveAttention {
+            state.snapshot.indexActivity = .working
+            state.snapshot.indexProgress = .init(state: .updating, totalsKnown: false, totalAssets: 16000, readyAssets: 15716,
+                totalRepresentations: 16000, readyRepresentations: 15716, excludedAssets: 0, issue: nil)
+        }
     case .syncing:
         state.snapshot.activeWork = true
         state.snapshot.latestScan.state = .running

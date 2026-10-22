@@ -2,6 +2,30 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoDirectoryTests: XCTestCase {
+    func testLongVideoStillImportsWithoutLivePhotoReadAndKeepsKnownIdentity() async throws {
+        for knownIdentity in [false, true] {
+            let f = try await directoryFixture(makeSingle: false); defer { try? FileManager.default.removeItem(at: f.root) }
+            let url = f.source.appendingPathComponent("long.mov"); try Data([1, 2, 3]).write(to: url)
+            let metadata = LongVideoMetadata(), reader = DirectoryIdentificationCounter()
+            let file = SourceFile(sourceID: f.sourceID, relativePath: "long.mov", url: url,
+                stamp: try await DirectoryReader(sourceID: f.sourceID).stamp(of: url), metadata: try await metadata.read(url: url, filename: "long.mov"))
+            if knownIdentity {
+                let id = try await f.store.save(file, decision: .importNew)
+                try await f.store.saveLivePhotoObservation(.init(resource: .source(fileID: id, stamp: file.stamp), inspection: .identified(.init(contentIdentifier: "known", role: .motion))))
+            }
+            let engine = SyncEngine(store: f.store, photos: f.photos, metadata: { _ in metadata },
+                livePhotoDirectoryObserver: DirectoryObserverProbe(store: f.store), livePhotoMetadata: { _ in reader })
+            await engine.scanEnabledSources()
+            let reads = await reader.reads, imported = await f.photos.created
+            XCTAssertEqual(reads, 0); XCTAssertEqual(imported, ["long.mov"])
+            let stored = try await f.store.file(sourceID: f.sourceID, relativePath: "long.mov")
+            let id = try XCTUnwrap(stored).id
+            let observation = try await f.store.livePhotoObservation(for: .source(fileID: id, stamp: file.stamp))
+            if knownIdentity { XCTAssertEqual(observation?.identity?.contentIdentifier, "known") }
+            else { XCTAssertEqual(observation?.inspection, .excludedByDuration) }
+        }
+    }
+
     func testNoSubmissionBeforeDirectoryIdentificationCompletes() async throws {
         let f = try await directoryFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
         let entered = expectation(description: "directory identified"), gate = DirectoryTestGate()
@@ -115,6 +139,17 @@ final class LivePhotoDirectoryTests: XCTestCase {
         let created = await f.photos.created; XCTAssertTrue(created.isEmpty)
         let success = try await f.store.successIdentifier(of: first); XCTAssertEqual(success, "retained")
     }
+}
+
+private struct LongVideoMetadata: MetadataReading {
+    func read(url: URL, filename: String) async throws -> MediaMetadata {
+        .init(filename: filename, kind: .video, captureSecond: nil, rawCaptureTime: nil, rawCaptureOffset: nil,
+              make: nil, model: nil, width: 16, height: 16, duration: 60)
+    }
+}
+private actor DirectoryIdentificationCounter: LivePhotoMetadataReading {
+    var reads = 0
+    func inspect(url: URL, kind: MediaKind) async throws -> LivePhotoInspection { reads += 1; return .noIdentifier }
 }
 
 actor DirectoryTestGate {

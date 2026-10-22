@@ -876,7 +876,10 @@ public actor SyncEngine {
             else { needsRead = true }
             if needsRead {
                 do {
-                    let inspection = try await reader.inspect(url: record.file.url, kind: record.file.metadata.kind)
+                    let inspection: LivePhotoInspection
+                    if LivePhotoIdentificationPolicy.excludesVideo(kind: record.file.metadata.kind, duration: record.file.metadata.duration, hasIdentity: cached?.identity != nil) {
+                        inspection = .excludedByDuration
+                    } else { inspection = try await reader.inspect(url: record.file.url, kind: record.file.metadata.kind) }
                     guard canReadSource(sourceID), try await self.directory(sourceID).stamp(of: record.file.url) == record.file.stamp else { complete = false; continue }
                     try await store.saveLivePhotoObservation(.init(resource: ref, inspection: inspection))
                 } catch let error as SyncStoreError { throw error }

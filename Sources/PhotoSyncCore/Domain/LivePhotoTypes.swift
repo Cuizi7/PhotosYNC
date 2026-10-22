@@ -19,7 +19,15 @@ public struct LivePhotoIdentity: Codable, Equatable, Sendable {
 public enum LivePhotoInspection: Codable, Equatable, Sendable {
     case identified(LivePhotoIdentity)
     case noIdentifier
+    case excludedByDuration
     case unresolved(String)
+}
+
+public enum LivePhotoIdentificationPolicy {
+    public static func excludesVideo(kind: MediaKind, duration: Double?, isLivePhoto: Bool = false, hasIdentity: Bool = false) -> Bool {
+        guard kind == .video, !isLivePhoto, !hasIdentity, let duration, duration.isFinite else { return false }
+        return duration > 10
+    }
 }
 
 public enum LivePhotoResourceRef: Codable, Hashable, Sendable {
@@ -48,9 +56,11 @@ public struct LivePhotoObservation: Codable, Equatable, Sendable {
     public let inspection: LivePhotoInspection
     public let inspectionVersion: Int
     public let checkedAt: Date
+    public let resourceLimitBytes: Int64?
     public var identity: LivePhotoIdentity? { if case .identified(let value) = inspection { return value }; return nil }
-    public init(resource: LivePhotoResourceRef, inspection: LivePhotoInspection, inspectionVersion: Int = 1, checkedAt: Date = Date()) {
+    public init(resource: LivePhotoResourceRef, inspection: LivePhotoInspection, inspectionVersion: Int = 1, checkedAt: Date = Date(), resourceLimitBytes: Int64? = nil) {
         self.resource = resource; self.inspection = inspection; self.inspectionVersion = inspectionVersion; self.checkedAt = checkedAt
+        self.resourceLimitBytes = resourceLimitBytes
     }
 }
 
@@ -60,14 +70,23 @@ public struct LivePhotoAssetDescriptor: Codable, Equatable, Sendable {
     public let revision: String
     public let isLivePhoto: Bool
     public let mediaKind: MediaKind
+    public let duration: Double?
+    public let descriptorVersion: Int?
+    // The upgrade marker is bookkeeping, not evidence that encoded resources changed.
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.context == rhs.context && lhs.assetID == rhs.assetID && lhs.revision == rhs.revision &&
+        lhs.isLivePhoto == rhs.isLivePhoto && lhs.mediaKind == rhs.mediaKind && lhs.duration == rhs.duration &&
+        lhs.resources == rhs.resources && lhs.originalFilenames == rhs.originalFilenames && lhs.resourceKinds == rhs.resourceKinds
+    }
     public let resources: [LivePhotoResourceRef]
     public var originalFilenames: [String]
     public var resourceKinds: [MediaKind?]
     public init(context: LibraryContext, assetID: String, revision: String, isLivePhoto: Bool, mediaKind: MediaKind,
-                resources: [LivePhotoResourceRef], originalFilenames: [String] = [], resourceKinds: [MediaKind?] = []) {
+                resources: [LivePhotoResourceRef], originalFilenames: [String] = [], resourceKinds: [MediaKind?] = [], duration: Double? = nil, descriptorVersion: Int? = 2) {
         self.context = context; self.assetID = assetID; self.revision = revision; self.isLivePhoto = isLivePhoto
         self.mediaKind = mediaKind; self.resources = resources; self.originalFilenames = originalFilenames
         self.resourceKinds = resourceKinds.isEmpty ? Array(repeating: mediaKind, count: resources.count) : resourceKinds
+        self.duration = duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }; self.descriptorVersion = descriptorVersion
     }
 }
 
@@ -175,10 +194,12 @@ public struct LivePhotoInventorySummary: Equatable, Sendable {
     public var pending: Int
     public var retryWaiting: Int
     public var requiresAttention: Int
+    public var resourceLimited: Int
     public var nextRetryAt: Date?
     public var completedAt: Date?
-    public init(phase: LivePhotoInventoryPhase = .enumerating, inventoried: Int = 0, identified: Int = 0, unresolved: Int = 0, pending: Int = 0, retryWaiting: Int = 0, requiresAttention: Int = 0, nextRetryAt: Date? = nil, completedAt: Date? = nil) {
+    public init(phase: LivePhotoInventoryPhase = .enumerating, inventoried: Int = 0, identified: Int = 0, unresolved: Int = 0, pending: Int = 0, retryWaiting: Int = 0, requiresAttention: Int = 0, nextRetryAt: Date? = nil, completedAt: Date? = nil, resourceLimited: Int = 0) {
         self.pending = pending; self.retryWaiting = retryWaiting; self.requiresAttention = requiresAttention; self.nextRetryAt = nextRetryAt
+        self.resourceLimited = resourceLimited
         self.phase = phase; self.inventoried = inventoried; self.identified = identified; self.unresolved = unresolved; self.completedAt = completedAt
     }
 }
@@ -188,6 +209,7 @@ public struct LivePhotoWorkSummary: Equatable, Sendable {
     public var ownedImportingFiles = 0
     public var limitedGroups = 0
     public var retryWaitingGroups = 0, requiresAttentionGroups = 0
+    public var stoppedGroups = 0, resourceLimitedGroups = 0
     public var nextRetryAt: Date?
     public var issue: SourceIssue?
     public init() {}

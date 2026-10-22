@@ -80,14 +80,17 @@ public final class IndexDiagnostics: @unchecked Sendable {
         let started = monotonic()
         do {
             let value = try await operation()
-            recordLivePhoto(stage, assetID: assetID, event: event, seconds: monotonic() - started, bytes: bytes(value), error: nil)
+            let outcome: String
+            if stage == .completion, let advanced = value as? Bool { outcome = advanced ? "advanced" : "no-progress" }
+            else { outcome = "completed" }
+            recordLivePhoto(stage, assetID: assetID, event: event, seconds: monotonic() - started, bytes: bytes(value), error: nil, outcome: outcome)
             return value
         } catch {
             recordLivePhoto(stage, assetID: assetID, event: event, seconds: monotonic() - started, bytes: 0, error: error)
             throw error
         }
     }
-    private func recordLivePhoto(_ stage: LivePhotoDiagnosticStage, assetID: String?, event: Int?, seconds: TimeInterval, bytes: Int64, error: Error?) {
+    private func recordLivePhoto(_ stage: LivePhotoDiagnosticStage, assetID: String?, event: Int?, seconds: TimeInterval, bytes: Int64, error: Error?, outcome: String = "completed") {
         let reason: String
         if let error {
             switch error {
@@ -103,7 +106,7 @@ public final class IndexDiagnostics: @unchecked Sendable {
             case is ReadExecutorError, is PhotosAdmissionDeferred: reason = "admission-deferred"
             default: reason = "failed"
             }
-        } else { reason = "completed" }
+        } else { reason = outcome }
         let now = monotonic()
         lock.lock()
         livePhotoTimings[stage.rawValue, default: DiagnosticElapsed()].add(seconds)

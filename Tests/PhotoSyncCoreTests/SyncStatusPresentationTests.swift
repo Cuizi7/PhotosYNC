@@ -2,6 +2,26 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testPersistentLivePhotoAttentionSurvivesHealthyActivityAndPause() {
+        var s = EngineSnapshot()
+        s.summary = .init(); s.latestScan = .init(state: .completed)
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 100, identified: 10, unresolved: 90, retryWaiting: 89, requiresAttention: 1)
+        s.livePhotoWork.requiresAttentionGroups = 1
+        for paused in [false, true] {
+            s.isPaused = paused
+            for activity in [LivePhotoActivity.queued(.identification), .working(.completion), .waiting(nextRetryAt: nil), .draining] {
+                s.livePhotoActivities = [activity]
+                let p = SyncStatusPresentation(snapshot: s)
+                let status = p.globalStatus(enabledSourceIDs: [], authorized: true, hasBlockingError: false)
+                XCTAssertEqual(p.statusReason(for: status, enabledSourceIDs: []), "部分项目的 Live Photo 配对需要处理，请查看任务说明。")
+            }
+        }
+        s.isPaused = false; s.livePhotoWork.requiresAttentionGroups = 0
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 100, identified: 10, unresolved: 90, retryWaiting: 90)
+        s.livePhotoActivities = [.working(.identification)]
+        let resolved = SyncStatusPresentation(snapshot: s)
+        XCTAssertNil(resolved.statusReason(for: .preparing, enabledSourceIDs: []))
+    }
     func testTaskSpecificHoverExplainsSavedCountsCloudUseAndLivePhotoRetirement() throws {
         var s = EngineSnapshot()
         s.indexActivity = .working
@@ -16,7 +36,7 @@ final class SyncStatusPresentationTests: XCTestCase {
             "已分析 15716 张，包含以前保存的结果，并非本次启动重新分析的数量。当前总量尚未确认，因此不显示百分比。")
         let live = try XCTUnwrap(rows.last)
         XCTAssertEqual(live.details.first { $0.title == "进度含义" }?.text,
-            "45 / 16222 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识的项目也计入，读取失败的项目不计入。")
+            "45 / 16222 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识或按时长规则排除的项目也计入，读取失败的项目不计入。")
         XCTAssertEqual(live.details.first { $0.title == "对已有内容的影响" }?.text,
             "完整 Live Photo 的原始内容及应保留的信息验证通过后，才移除被替代的单独照片或视频；旧标题可能丢失。不会改动源文件或清空“最近删除”。")
         for row in rows {

@@ -21,7 +21,7 @@ struct PhotoKitLivePhotoReader: Sendable {
                          if resource.type == .photo { return .image }
                          if resource.type == .video || resource.type == .pairedVideo { return .video }
                          return nil
-                     })
+                     }, duration: asset.mediaType == .video ? asset.duration : nil)
     }
     static func resourceKey(_ resource: PHAssetResource, index: Int) -> String {
         "\(index):\(resource.type.rawValue):\(resource.originalFilename.utf8.count):\(resource.originalFilename):\(resource.uniformTypeIdentifier):\(resource.pixelWidth)x\(resource.pixelHeight)"

@@ -117,7 +117,7 @@ captures = m['captures']
 scenarios = ['syncing','analyzing','preparing','icloud','paused','pausing','completed','offline',
              'fileIssue','unauthorized','unknown','summaryLoading','summaryStale','empty','single','many','longLeaf',
              'mixedIssues','longIssues','recoveryPending','analysisPaused','analysisZero',
-             'taskVisualUnknown','taskLiveKnown','tasksMixed','tasksKnown','tasksWaiting','tasksPaused','tasksAttention','taskCompletion']
+             'taskVisualUnknown','taskLiveKnown','tasksMixed','tasksKnown','tasksWaiting','tasksPaused','tasksAttention','taskCompletion','taskLiveAttention','taskLiveAttentionWaiting','taskLiveAttentionPaused','tasksLiveAttention']
 expected = {(s,a,v) for s in scenarios for a in ('light','dark') for v in ('menu','settings')}
 expected |= {('many', a, 'settings-bottom') for a in ('light','dark')}
 for s in ('mixedIssues','longIssues','analyzing','preparing','icloud','analysisPaused','analysisZero'):
@@ -125,7 +125,7 @@ for s in ('mixedIssues','longIssues','analyzing','preparing','icloud','analysisP
     expected |= {(s,a,kind+'-'+position) for a in ('light','dark') for position in ('top','bottom')}
 for s in scenarios:
     if not s.startswith('task'): continue
-    ids = ['visualIndex'] if s in ('taskVisualUnknown','tasksAttention') else (['livePhoto'] if s in ('taskLiveKnown','taskCompletion') else ['visualIndex','livePhoto'])
+    ids = ['visualIndex'] if s in ('taskVisualUnknown','tasksAttention') else (['livePhoto'] if s in ('taskLiveKnown','taskCompletion','taskLiveAttention','taskLiveAttentionWaiting','taskLiveAttentionPaused') else ['visualIndex','livePhoto'])
     expected |= {(s,a,'task-details-'+task+'-'+position) for a in ('light','dark') for task in ids for position in ('top','bottom')}
 actual = {(c['scenario'],c['appearance'],c['surface']) for c in captures}
 if len(captures) != len(expected) or actual != expected:
@@ -140,7 +140,7 @@ esc = html.escape
 parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>PhotosYNC 原生 UI 待验收</title>',
  '<style>body{font:15px system-ui;margin:24px;background:#eceef0;color:#222}section{margin:30px 0;padding:20px;background:white;border-radius:12px}.pair{display:flex;gap:24px;align-items:start;flex-wrap:wrap}figure{margin:12px 0}img{display:block;max-width:100%;box-shadow:0 1px 8px #8888}pre{white-space:pre-wrap;font-size:12px}a{color:#175ba4}</style>',
  '<h1>PhotosYNC · 真实编译视图 · 候选证据 · 等待协调代理审阅</h1>',
- '<p>30 场景 × 浅/深外观 × 菜单/设置，另含详情首尾及设置底部，共 198 张原始 PNG。系统开关在隔离 injected 模型中禁用。</p>',
+ '<p>34 场景 × 浅/深外观 × 菜单/设置，另含详情首尾及设置底部，共 234 张原始 PNG。系统开关在隔离 injected 模型中禁用。</p>',
  '<p>菜单为真实 StatusMenu 的离屏原生绘制；不是系统 MenuBarExtra 弹出截图。图片按逻辑尺寸展示，原图链接保留像素。</p>',
  '<p><a href="manifest.json">完整清单与原生交互结果</a> · <a href="source.json">源码/环境/编译文件 SHA256</a></p>',
  '<pre>'+esc(json.dumps({k:m[k] for k in ('sourceCommit','sourceDiff','sourceStatus','os','xcode','hostBundle')},ensure_ascii=False,indent=2))+'</pre>',

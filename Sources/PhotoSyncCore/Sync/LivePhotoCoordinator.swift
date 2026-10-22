@@ -117,9 +117,11 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
     }
     public func summary() async throws -> LivePhotoWorkSummary {
         let operations = try await store.loadLivePhotoOperationsForRecovery()
+        let deleted = try await store.deletedLivePhotoGroupIDs()
         var value = LivePhotoWorkSummary()
         var active = Set<UUID>(), verify = Set<UUID>(), retire = Set<UUID>(), limited = Set<UUID>()
         for op in operations {
+            if deleted.contains(op.groupID), !op.holdsUnknownMutation { value.stoppedGroups += 1; continue }
             // A submitted request owned by this instance is normal work. Durable safety
             // admission still uses holdsUnknownMutation, including this same request.
             let recoveredSubmission = (op.creationEvidence == .submitted || op.retirementEvidence == .submitted) && activeOperationID != op.id
@@ -129,6 +131,7 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
                 if activeOperationID == op.id { value.ownedImportingFiles += count }
             }
             if op.deferralReason == .protectedInformation { continue }
+            if op.deferralReason == .workingSetLimit { value.resourceLimitedGroups += 1 }
             if let retry = op.nextRetryAt {
                 if retry == .distantFuture { value.requiresAttentionGroups += 1 }
                 else { value.retryWaitingGroups += 1; value.nextRetryAt = min(value.nextRetryAt ?? retry, retry) }
@@ -169,23 +172,32 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
     /// Uses durable operation state and metadata admission only; no filesystem/Photos reads.
     private func hasAdmittedOperation(now: Date) async throws -> Bool {
         let operations = try await store.loadLivePhotoOperationsForRecovery()
-        guard !operations.contains(where: \.holdsUnknownMutation) else { return false }
-        for op in operations where op.context == workContext && op.stage != .blocked && op.stage != .complete &&
-            op.deferralReason != .protectedInformation && (op.nextRetryAt == nil || op.nextRetryAt! <= now) {
+        return try await !admittedOperations(operations, now: now).isEmpty
+    }
+    private func admittedOperations(_ operations: [LivePhotoOperation], now: Date) async throws -> [LivePhotoOperation] {
+        guard let context = workContext, !operations.contains(where: \.holdsUnknownMutation) else { return [] }
+        let deleted = try await store.deletedLivePhotoGroupIDs()
+        let candidates = operations.filter { $0.context == context && $0.stage != .blocked && $0.stage != .complete &&
+            (deleted.contains($0.groupID) || ($0.deferralReason != .protectedInformation && ($0.nextRetryAt == nil || $0.nextRetryAt! <= now))) }
+        guard !candidates.isEmpty else { return [] }
+        let hasPlanned = candidates.contains { $0.stage == .planned && !deleted.contains($0.groupID) }
+        let inventoryReady = hasPlanned ? try await store.livePhotoInventorySummary(context: context).phase == .completed : false
+        let unresolvedTargets = hasPlanned && inventoryReady ? try await store.hasUnresolvedLivePhotoCandidates(context: context) : false
+        var admitted = [LivePhotoOperation]()
+        for op in candidates {
+            // A deletion must still reach the terminal transition and release reservations.
+            if deleted.contains(op.groupID) { admitted.append(op); continue }
             if op.stage == .planned {
-                guard try await store.livePhotoInventorySummary(context: op.context).phase == .completed else { continue }
-                if op.requiredTargetID == nil, try await store.hasUnresolvedLivePhotoCandidates(context: op.context) { continue }
-                var admitted = true
-                // Obsolete members must reach resolve(), which drops their reservations.
-                // Only still-participating sources can block new source reads.
+                guard inventoryReady, op.requiredTargetID != nil || !unresolvedTargets else { continue }
+                var sourcesReady = true
                 for id in op.sourceFileIDs where try await store.livePhotoSourceMayParticipate(id) {
-                    guard let file = try await store.sourceFile(id: id), sourceAdmission(file.file) else { admitted = false; break }
+                    guard let file = try await store.sourceFile(id: id), sourceAdmission(file.file) else { sourcesReady = false; break }
                 }
-                if !admitted { continue }
+                if !sourcesReady { continue }
             }
-            return true
+            admitted.append(op)
         }
-        return false
+        return admitted
     }
     public func retryAttention(now: Date) async throws {
         guard !paused else { return }
@@ -211,10 +223,11 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         }
         let operations = try await store.loadLivePhotoOperationsForRecovery()
         guard !operations.contains(where: \.holdsUnknownMutation), !paused else { return false }
-        for op in operations where op.deferralReason == .workingSetLimit && op.context == context {
+        let deleted = try await store.deletedLivePhotoGroupIDs()
+        for op in operations where op.deferralReason == .workingSetLimit && op.context == context && !deleted.contains(op.groupID) {
             if try await reopenChangedLimitedResources(op) { return true }
         }
-        let prioritized = operations.filter { $0.context == context && $0.stage != .blocked && ($0.nextRetryAt == nil || $0.nextRetryAt! <= now) }
+        let prioritized = try await admittedOperations(operations, now: now)
             .sorted { ($0.stage == .planned ? 1 : 0, $0.id.uuidString) < ($1.stage == .planned ? 1 : 0, $1.id.uuidString) }
         var ordered = prioritized
         if let operationCursor, let index = prioritized.firstIndex(where: { $0.id == operationCursor }) {

@@ -51,9 +51,7 @@ struct SyncStatusPresentation {
     func statusReason(for status: GlobalStatus, enabledSourceIDs: Set<UUID>) -> String? {
         if unknownMutation { return "等待‘照片’确认结果，新的保存已暂停" }
         if enabledSourceIDs.isEmpty && !snapshot.hasLivePhotoWork && !livePhotoRunnable(.identification) && !livePhotoRunnable(.completion) { return "请添加或启用来源目录" }
-        if let attention = snapshot.livePhotoActivities.compactMap({ activity -> SourceIssue? in
-            if case .requiresAttention(let issue) = activity { return issue }; return nil
-        }).first { return attention.summary }
+        if livePhotoNeedsAttention { return Self.livePhotoAttentionText }
         if status == .paused && snapshot.activeWork { return "当前操作结束后暂停，已完成的结果会保留。" }
         if status == .waiting {
             if enabledIssues(for: enabledSourceIDs).contains(where: \.isSourceAvailability) { return "来源目录暂不可用，连接恢复后自动继续" }
@@ -63,6 +61,11 @@ struct SyncStatusPresentation {
             return "仍有项目等待处理，稍后自动继续。"
         }
         return nil
+    }
+
+    private static let livePhotoAttentionText = "部分项目的 Live Photo 配对需要处理，请查看任务说明。"
+    private var livePhotoNeedsAttention: Bool {
+        (snapshot.livePhotoInventory?.requiresAttention ?? 0) > 0 || snapshot.livePhotoWork.requiresAttentionGroups > 0
     }
 
     private func enabledIssues(for enabledSourceIDs: Set<UUID>) -> [SourceIssue] {
@@ -142,13 +145,18 @@ struct SyncStatusPresentation {
             if text == nil {
                 progressMeaning = "配对信息已核对，正在补齐并验证完整 Live Photo。此阶段没有可靠的总百分比，显示活动进度。"
             } else {
-                progressMeaning = "\(inventory?.identified ?? 0)" + (known ? " / \(inventory?.inventoried ?? 0)" : "") + " 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识的项目也计入，读取失败的项目不计入。" + (known ? "" : "当前总量尚未确认，因此不显示百分比。")
+                progressMeaning = "\(inventory?.identified ?? 0)" + (known ? " / \(inventory?.inventoried ?? 0)" : "") + " 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识或按时长规则排除的项目也计入，读取失败的项目不计入。" + (known ? "" : "当前总量尚未确认，因此不显示百分比。")
             }
             var details = [ProgressDetail(title: "用途", text: "核对照片与视频原文件中的配对标识，确认它们属于同一张 Live Photo，补齐动态画面和原有声音。只有一半时先保存，发现另一半后再补齐。"),
                 ProgressDetail(title: "进度含义", text: progressMeaning),
                 ProgressDetail(title: "对已有内容的影响", text: "完整 Live Photo 的原始内容及应保留的信息验证通过后，才移除被替代的单独照片或视频；旧标题可能丢失。不会改动源文件或清空“最近删除”。")]
             if let issue = snapshot.livePhotoIssue ?? snapshot.livePhotoWork.issue { details.append(.init(title: "当前状态", text: issue.summary)) }
-            if (inventory?.requiresAttention ?? 0) > 0 { details.append(.init(title: "需要处理的项目", text: "\(inventory!.requiresAttention) 项无法自动分析。点击“立即扫描”可重新尝试，已完成的结果会保留。")) }
+            details.append(.init(title: "视频识别范围", text: "超过 10 秒的普通视频跳过 Live Photo 识别，仍正常导入为视频。已有明确配对身份或已标记为 Live Photo 的项目不受此规则影响；时长未知时继续识别。"))
+            if (inventory?.requiresAttention ?? 0) > 0 { details.append(.init(title: "需要处理的项目", text: "\(inventory!.requiresAttention) 项无法自动识别配对关系。点击“立即扫描”可重新尝试，已完成的结果会保留。")) }
+            if (inventory?.resourceLimited ?? 0) > 0 || snapshot.livePhotoWork.resourceLimitedGroups > 0 {
+                details.append(.init(title: "资源读取限制", text: "部分原文件或同时读取的资源超过当前 512 MiB 上限，已停止自动重试。点击“立即扫描”可重新尝试，但上限不变时仍可能受限。其他项目继续处理，原文件未被修改。"))
+            }
+            if snapshot.livePhotoWork.stoppedGroups > 0 { details.append(.init(title: "已停止补齐", text: "\(snapshot.livePhotoWork.stoppedGroups) 组关联项目已从图库删除，已停止补齐，不会重新创建这些项目。")) }
             details += Self.commonTaskDetails
             rows.append(.init(id: "livePhoto", subtitle: subtitle, progressText: text, fraction: fraction, explanation: Self.livePhotoExplanation, active: active, totalsKnown: known, details: details))
         }
@@ -194,7 +202,7 @@ struct SyncStatusPresentation {
 
     var summaryNotes: [String] {
         var notes: [String] = []
-        if (snapshot.livePhotoInventory?.requiresAttention ?? 0) > 0 || snapshot.livePhotoWork.requiresAttentionGroups > 0 { notes.append("部分 Live Photo 需要处理，请重新尝试或查看诊断。") }
+        if livePhotoNeedsAttention { notes.append(Self.livePhotoAttentionText) }
         if (snapshot.livePhotoInventory?.retryWaiting ?? 0) > 0 { notes.append("部分项目暂时无法读取，稍后自动重试") }
         if unknownMutation { notes.append("等待‘照片’确认结果，新的保存已暂停") }
         if let issue = snapshot.livePhotoIssue { notes.append(issue.summary) }

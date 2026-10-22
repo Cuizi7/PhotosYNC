@@ -2,6 +2,111 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoInventoryTests: XCTestCase {
+    func testLegacyVideoRefreshResumesAcrossFailureAndMultipleBatches() async throws {
+        let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+        try await completeEmptyInventory(f.store, f.photos.context)
+        for index in 0..<3 {
+            let base = livePhotoAsset(context: f.photos.context, id: "video-\(index)", kind: .video)
+            try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [try durationDescriptor(base, duration: nil, legacy: true)])
+            await f.photos.appendAsset(try durationDescriptor(base, duration: 60))
+        }
+        let first = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, batchSize: 1)
+        try await first.resumeInitialInventory(); await f.photos.failNextDescriptorLookup()
+        do { _ = try await first.processNextInventoryItem(now: Date()); XCTFail("Expected injected descriptor failure") }
+        catch { XCTAssertTrue(error is PhotosRepresentationError) }
+        let restarted = LivePhotoInventoryCoordinator(store: try SyncStore(url: f.db), photos: f.photos, batchSize: 1)
+        try await restarted.resumeInitialInventory()
+        for _ in 0..<4 { _ = try await restarted.processNextInventoryItem(now: Date()) }
+        let summary = try await restarted.summary(), reads = await f.photos.resourceReads, catalogs = await f.photos.catalogCalls
+        XCTAssertEqual(summary.identified, 3); XCTAssertEqual(summary.unresolved, 0); XCTAssertEqual(summary.pending, 0)
+        XCTAssertEqual(reads, 0); XCTAssertEqual(catalogs, 0)
+        let requests = await f.photos.descriptorRequestSizes; XCTAssertEqual(requests.count, 7); XCTAssertTrue(requests.allSatisfy { $0 == 1 })
+    }
+    func testLegacyPhotoDescriptorVersionDoesNotInvalidateReadResult() async throws {
+        for live in [false, true] {
+            let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+            let fresh = livePhotoAsset(context: f.photos.context, id: "photo", isLivePhoto: live)
+            let legacy = try durationDescriptor(fresh, duration: nil, legacy: true)
+            try await completeEmptyInventory(f.store, f.photos.context)
+            try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [legacy])
+            await f.photos.appendAsset(fresh)
+            let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+            do { _ = try await c.processNextInventoryItem(now: Date()) }
+            catch { XCTFail("Administrative descriptor version must not invalidate unchanged photo bytes: \(error)") }
+            let summary = try await c.summary(), reads = await f.photos.resourceReads
+            XCTAssertEqual(summary.identified, 1); XCTAssertEqual(reads, 1)
+        }
+    }
+    func testResourceLimitHasStructuredReasonAndReadableDiagnostic() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        await f.photos.setReadFailure(.resourceLimit(bytes: 600_000_000))
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await c.resumeInitialInventory(); _ = try await c.processNextInventoryItem(now: Date())
+        let assets = try await f.photos.livePhotoAssets(assetIDs: ["asset-0"], context: f.photos.context)
+        let asset = try XCTUnwrap(assets.first)
+        let saved = try await f.store.livePhotoObservation(for: asset.resources[0])
+        let observation = try XCTUnwrap(saved)
+        guard case .unresolved(let detail) = observation.inspection else { return XCTFail("Expected held limit") }
+        XCTAssertTrue(detail.contains("512 MiB")); XCTAssertTrue(detail.contains("停止自动重试"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(observation)) as? [String: Any])
+        XCTAssertEqual(json["resourceLimitBytes"] as? Int, 536_870_912)
+        let summary = try await c.summary(); XCTAssertEqual(summary.resourceLimited, 1)
+    }
+    func testUnknownAndNonfiniteDurationCannotExcludeAndCheckedLegacyVideoIsRetained() async throws {
+        for duration: Double? in [nil, .nan, .infinity, -.infinity] {
+            XCTAssertFalse(LivePhotoIdentificationPolicy.excludesVideo(kind: .video, duration: duration))
+        }
+        let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+        let asset = try durationDescriptor(livePhotoAsset(context: f.photos.context, id: "checked", kind: .video), duration: nil, legacy: true)
+        try await completeEmptyInventory(f.store, f.photos.context)
+        try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [asset])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: asset.assetID, revision: asset.revision,
+            observations: [.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "kept", role: .motion)))], retryPolicy: .requiresAttention)
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos)
+        try await c.resumeInitialInventory(); _ = try await c.processNextInventoryItem(now: Date())
+        let summary = try await c.summary(), saved = try await f.store.livePhotoObservation(for: asset.resources[0])
+        XCTAssertEqual(summary.identified, 1); XCTAssertEqual(summary.pending, 0)
+        XCTAssertEqual(saved?.identity?.contentIdentifier, "kept")
+        let reads = await f.photos.resourceReads; XCTAssertEqual(reads, 0)
+    }
+    func testVideoDurationPrefilterAvoidsOriginalReadWithIdentityExceptions() async throws {
+        for (duration, live, knownIdentity, expectedReads) in [(10.0, false, false, 1), (10.001, false, false, 0), (0.0, false, false, 1), (-1.0, false, false, 1), (11.0, true, false, 1), (11.0, false, true, 1)] {
+            let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+            let base = LivePhotoAssetDescriptor(context: f.photos.context, assetID: "video", revision: "r1", isLivePhoto: live, mediaKind: .video,
+                resources: [.photos(contextID: f.photos.context.id, assetID: "video", resourceKey: "motion", revision: "r1")])
+            let asset = try durationDescriptor(base, duration: duration)
+            await f.photos.appendAsset(asset)
+            if knownIdentity { try await f.store.saveLivePhotoObservation(.init(resource: asset.resources[0], inspection: .identified(.init(contentIdentifier: "known", role: .motion)))) }
+            let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+            try await c.resumeInitialInventory()
+            _ = try await c.processNextInventoryItem(now: Date())
+            let reads = await f.photos.resourceReads, summary = try await c.summary()
+            XCTAssertEqual(reads, expectedReads, "duration=\(duration), live=\(live), known=\(knownIdentity)")
+            XCTAssertEqual(summary.identified, 1); XCTAssertEqual(summary.requiresAttention, 0)
+        }
+    }
+
+    func testLegacyHeldLongVideoRefreshesMetadataOnceWithoutRepeatingCatalog() async throws {
+        let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+        let base = livePhotoAsset(context: f.photos.context, id: "legacy-video", kind: .video)
+        let legacy = try durationDescriptor(base, duration: nil, legacy: true)
+        try await completeEmptyInventory(f.store, f.photos.context)
+        try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [legacy])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: legacy.assetID, revision: legacy.revision,
+            observations: [.init(resource: legacy.resources[0], inspection: .unresolved("legacy failure"))], retryPolicy: .requiresAttention)
+        await f.photos.appendAsset(try durationDescriptor(base, duration: 60))
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await c.resumeInitialInventory()
+        _ = try await c.processNextInventoryItem(now: Date())
+        let result = try await c.summary()
+        XCTAssertEqual(result.identified, 1); XCTAssertEqual(result.requiresAttention, 0)
+        let restart = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await restart.resumeInitialInventory()
+        _ = try await restart.processNextInventoryItem(now: Date())
+        let reads = await f.photos.resourceReads, catalogs = await f.photos.catalogCalls
+        XCTAssertEqual(reads, 0); XCTAssertEqual(catalogs, 0)
+    }
+
     func testPendingAfterMetadataDefersWithoutEnteringAnotherSnapshotWait() async throws {
         let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
         let gate = InventoryReadGate()
@@ -327,6 +432,13 @@ struct InventoryMetadata: LivePhotoMetadataReading {
     func inspect(url: URL, kind: MediaKind) async throws -> LivePhotoInspection { .noIdentifier }
 }
 
+func durationDescriptor(_ descriptor: LivePhotoAssetDescriptor, duration: Double?, legacy: Bool = false) throws -> LivePhotoAssetDescriptor {
+    var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(descriptor)) as? [String: Any])
+    json["duration"] = duration
+    json["descriptorVersion"] = legacy ? nil : 2
+    return try JSONDecoder().decode(LivePhotoAssetDescriptor.self, from: JSONSerialization.data(withJSONObject: json))
+}
+
 func inventoryFixture(count: Int) async throws -> (root: URL, db: URL, store: SyncStore, photos: FixtureLivePhotoGateway) {
     let root = try temporaryDirectory(), db = root.appendingPathComponent("state.sqlite")
     let context = LibraryContext(id: UUID(), epoch: 0)
@@ -364,6 +476,9 @@ actor FixtureLivePhotoGateway: LivePhotoPhotosGateway {
     var changesDuringCatalog = [String]()
     var catalogFailureAt: Int?
     var contextAccepted = true
+    var failDescriptorLookup = false
+    var descriptorRequestSizes = [Int]()
+    func failNextDescriptorLookup() { failDescriptorLookup = true }
     func setContextAccepted(_ value: Bool) { contextAccepted = value }
     func verifyLivePhotoContext(context: LibraryContext, anchorAssetIDs: [String], allowUnanchored: Bool) async throws -> Bool { contextAccepted && context == self.context }
     func failCatalogOnce(at call: Int) { catalogFailureAt = call }
@@ -386,7 +501,11 @@ actor FixtureLivePhotoGateway: LivePhotoPhotosGateway {
         let end = min(old.count, offset + limit)
         return .init(context: context, generation: session.baselineGeneration, assets: Array(old[offset..<end]), nextOffset: end < old.count ? end : nil)
     }
-    func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor] { assets.filter { assetIDs.contains($0.assetID) } }
+    func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor] {
+        descriptorRequestSizes.append(assetIDs.count)
+        if failDescriptorLookup { failDescriptorLookup = false; throw PhotosRepresentationError.unavailable }
+        return assets.filter { assetIDs.contains($0.assetID) }
+    }
     func catalogChanges(baselineGeneration: Int, throughGeneration: Int, afterAssetID: String?, limit: Int) async throws -> PhotosCatalogChangeBatch {
         .init(changedAssetIDs: changesDuringCatalog.filter { $0 > (afterAssetID ?? "") }, deletedAssetIDs: [], nextAssetID: nil)
     }
