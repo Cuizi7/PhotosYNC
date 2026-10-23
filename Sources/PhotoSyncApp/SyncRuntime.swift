@@ -128,6 +128,7 @@ actor SyncRuntime {
     private var committedLivePhotoProgressGeneration: UInt64 = 0
     private var nextWorkerProgressUptime: TimeInterval = 0
     private var nextLivePhotoWorkAt: Date?
+    private var livePhotoFailureRetry = false
     private var livePhotoDeferrals = 0
     private var manualLivePhotoRetryPending = false
     private var manualIndexReadRetryPending = false
@@ -807,7 +808,7 @@ actor SyncRuntime {
                         advancedGraph?.diagnostics.recordTiming(stage: "live_photo_completion_advance_wall", seconds: ProcessInfo.processInfo.systemUptime - started)
                     }
                 }
-                livePhotoIssue = nil; livePhotoDeferrals = 0; nextLivePhotoWorkAt = nil
+                livePhotoIssue = nil; livePhotoDeferrals = 0; nextLivePhotoWorkAt = nil; livePhotoFailureRetry = false
                 guard inventoried || advanced else { exitReason = "no-progress"; break }
                 let uptime = ProcessInfo.processInfo.systemUptime
                 if uptime >= nextWorkerProgressUptime {
@@ -822,7 +823,9 @@ actor SyncRuntime {
             livePhotoIssue = nil; nextLivePhotoWorkAt = nil
             exitReason = deferred == .resourceChanged ? "resource-changed" : "classification-deferred"
         }
-        catch is ReadExecutorError { deferLivePhotoWork(); exitReason = "read-deferred" }
+        catch let error as ReadExecutorError {
+            deferLivePhotoWork(); livePhotoFailureRetry = error == .timedOut; exitReason = "read-deferred"
+        }
         catch LivePhotoResourceReadError.budgetBusy { deferLivePhotoWork(); exitReason = "budget-busy" }
         catch is PhotosAdmissionDeferred { deferLivePhotoWork(); exitReason = "admission-deferred" }
         catch LivePhotoResourceReadError.resourceLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil; exitReason = "resource-limit" }
@@ -830,12 +833,14 @@ actor SyncRuntime {
         catch {
             exitReason = "retry-wait"
             nextLivePhotoWorkAt = now().addingTimeInterval(60)
+            livePhotoFailureRetry = true
             livePhotoIssue = SourceIssue(summary: "部分 Live Photo 暂时无法处理，稍后自动重试。", detail: error.localizedDescription, kind: .file)
             logger?.log(["phase": "live-photo-work", "result": "waiting", "error": String(describing: error)])
         }
         if !continueImmediately { await publishLivePhotoProgress() }
     }
     private func deferLivePhotoWork() {
+        livePhotoFailureRetry = false
         livePhotoDeferrals += 1
         nextLivePhotoWorkAt = now().addingTimeInterval(sourceDeferralDelay(count: livePhotoDeferrals))
     }
@@ -856,7 +861,7 @@ actor SyncRuntime {
         var activities = [LivePhotoActivity]()
         if let inventory = livePhotoInventory { activities.append(await inventory.activity(now: now(), summary: inventorySummary)) }
         if let completion = livePhotoCompletion { activities.append(await completion.activity(now: now(), summary: completionSummary)) }
-        if !eligibleForWork || nextLivePhotoWorkAt.map({ $0 > now() }) == true {
+        if !eligibleForWork || (livePhotoFailureRetry && nextLivePhotoWorkAt.map({ $0 > now() }) == true) {
             activities = activities.map {
                 if case .queued = $0 { return .waiting(nextRetryAt: nextLivePhotoWorkAt) }; return $0
             }

@@ -2,6 +2,59 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoResourceTests: XCTestCase {
+    func testSystemProgressIsBoundedTelemetryAndNeverCompletesTheRead() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let rows = ResourceTraceRows(), clock = ResourceTraceClock(), began = expectation(description: "request installed")
+        let diagnostics = IndexDiagnostics(sink: { rows.append($0) }, monotonic: { clock.now })
+        let requester = ProgressResourceRequester(clock: clock, began: began), executor = ReadExecutor()
+        let reader = LivePhotoRawResourceReader(requester: requester, storage: .init(root: root.appendingPathComponent("raw")), executor: executor)
+        let budget = LivePhotoResourceBudget(), ref = resource()
+        let task = Task { try await reader.read(resource: ref, purpose: .inventory, budget: budget, trace: diagnostics.livePhotoResourceTrace(ref, purpose: .inventory)) }
+        await fulfillment(of: [began], timeout: 2)
+        clock.set(102)
+        for invalid in [Double.nan, .infinity, -0.1, 1.1] { requester.progress(invalid) }
+        for _ in 0..<1000 { requester.progress(0.1) }
+        clock.set(105); requester.progress(0.6); requester.progress(1)
+        XCTAssertFalse(rows.values.contains { $0["event"] == "terminal" })
+        XCTAssertLessThanOrEqual(rows.values.count, 2, "Progress callbacks must not create unbounded detail logs")
+        let physical = await executor.snapshot(); XCTAssertEqual(physical.physicalOccupancy, 1)
+        clock.set(107); requester.finish()
+        var lease: LivePhotoResourceLease? = try await task.value
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(lease).url), Data([1,2,3]))
+        requester.progress(0.5)
+        let row = try XCTUnwrap(rows.values.last { $0["event"] == "terminal" })
+        XCTAssertEqual(row["downloadProgressUpdates"], "1002")
+        XCTAssertEqual(Double(row["downloadProgress"] ?? ""), 1)
+        XCTAssertEqual(Double(row["firstDownloadProgressMS"] ?? ""), 1000)
+        XCTAssertEqual(Double(row["downloadProgressSpanMS"] ?? ""), 3000)
+        XCTAssertEqual(Double(row["requestSetupMS"] ?? ""), 1000)
+        XCTAssertEqual(Double(row["firstDataMS"] ?? ""), 6000)
+        diagnostics.flushObservations(force: true)
+        let summary = try XCTUnwrap(rows.values.last { $0["phase"] == "live-photo-summary" })
+        XCTAssertEqual(summary["resource-read.downloadProgressUpdates"], "1002")
+        XCTAssertEqual(summary["resource-read.withDownloadProgress"], "1")
+        lease = nil
+    }
+
+    func testRetainedRawSlotExpiresAndCannotBeRepopulatedAfterDiscard() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let clock = ResourceTraceClock(), slot = LivePhotoPendingRead(now: { clock.now }), budget = LivePhotoResourceBudget()
+        let raw = LivePhotoRawResourceReader(requester: BufferedLivePhotoRequester(chunks: [Data([1,2,3])]), storage: .init(root: root.appendingPathComponent("raw")))
+        var lease: LivePhotoResourceLease? = try await raw.read(resource: resource(), purpose: .inventory, budget: budget)
+        let ref = resource(), generation = slot.generation
+        let url = try XCTUnwrap(lease).url
+        slot.retain(.init(ref: ref, lease: try XCTUnwrap(lease), budget: budget, expiresAt: 130), generation: generation)
+        lease = nil
+        XCTAssertEqual(budget.reservedBytes, 3)
+        clock.set(130); slot.expire()
+        XCTAssertEqual(budget.reservedBytes, 0); XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        var next: LivePhotoResourceLease? = try await raw.read(resource: ref, purpose: .inventory, budget: budget)
+        slot.discard()
+        XCTAssertFalse(slot.retain(.init(ref: ref, lease: try XCTUnwrap(next), budget: budget, expiresAt: 160), generation: generation))
+        next = nil
+        XCTAssertEqual(budget.reservedBytes, 0)
+    }
+
     func testPhysicalReadTraceSeparatesDeliveryAndCallbackWaitWithoutChangingBytes() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let rows = ResourceTraceRows(), clock = ResourceTraceClock(), logger = try RunLogger(directory: root.appendingPathComponent("logs"))
@@ -20,6 +73,10 @@ final class LivePhotoResourceTests: XCTestCase {
         }
         XCTAssertEqual(row["receivedBytes"], "5"); XCTAssertEqual(row["writtenBytes"], "5"); XCTAssertEqual(row["chunks"], "2")
         XCTAssertEqual(row["resourceKind"], "video"); XCTAssertEqual(row["durationSeconds"], "3.0")
+        XCTAssertEqual(Double(row["queueWaitMS"] ?? ""), 0)
+        XCTAssertEqual(Double(row["requestSetupMS"] ?? ""), 0)
+        XCTAssertEqual(row["downloadProgressUpdates"], "0")
+        XCTAssertEqual(row["firstDownloadProgressMS"], "unavailable")
         lease = nil; XCTAssertEqual(budget.reservedBytes, 0)
         logger.flushForTesting()
         let journal = try String(contentsOf: root.appendingPathComponent("logs/photo-sync.jsonl"), encoding: .utf8)
@@ -282,11 +339,15 @@ final class ControlledCloudRequester: LivePhotoResourceRequesting, @unchecked Se
     private var completion: (@Sendable (Error?) -> Void)?
     private var receive: (@Sendable (Data) -> Void)?
     private var cancellations = 0
+    private var requests = 0
+    private let completeRepeated: Bool
     var cancelCount: Int { lock.lock(); defer { lock.unlock() }; return cancellations }
-    init(started: XCTestExpectation, cancelled: XCTestExpectation? = nil, returnGate: DispatchSemaphore? = nil) { self.started = started; self.cancelled = cancelled; self.returnGate = returnGate }
-    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+    var requestCount: Int { lock.lock(); defer { lock.unlock() }; return requests }
+    init(started: XCTestExpectation, cancelled: XCTestExpectation? = nil, returnGate: DispatchSemaphore? = nil, completeRepeated: Bool = false) { self.started = started; self.cancelled = cancelled; self.returnGate = returnGate; self.completeRepeated = completeRepeated }
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
-        lock.lock(); self.completion = completion; self.receive = receive; lock.unlock()
+        lock.lock(); requests += 1; let repeated = requests > 1 && completeRepeated; self.completion = completion; self.receive = receive; lock.unlock()
+        if repeated { receive(Data([1,2,3])); completion(nil); return {} }
         receive(Data([1,2,3])); started.fulfill()
         if let returnGate { _ = returnGate.wait(timeout: .now() + 5) }
         return { [self] in
@@ -313,7 +374,7 @@ final class BufferedLivePhotoRequester: LivePhotoResourceRequesting, @unchecked 
     private(set) var networkFlags = [Bool]()
     init(chunks: [Data], fileExtension: String? = nil) { self.chunks = chunks; self.fileExtension = fileExtension }
     func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo { .init(fileExtension: fileExtension) }
-    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
         networkFlags.append(allowNetwork)
         chunks.forEach(receive); completion(nil)
@@ -326,7 +387,7 @@ final class HeldLivePhotoRequester: LivePhotoResourceRequesting, @unchecked Send
     private let lock = NSLock()
     private var done: (@Sendable (Error?) -> Void)?
     init(started: XCTestExpectation) { self.started = started }
-    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
         lock.lock(); done = completion; lock.unlock()
         receive(Data([1,2,3])); started.fulfill(); return {}
@@ -351,7 +412,7 @@ private struct TimedResourceRequester: LivePhotoResourceRequesting {
     func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo {
         .init(assetKind: .video, resourceKind: .video, resourceType: 2, duration: 3)
     }
-    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
         clock.set(102); receive(Data([1, 2]))
         clock.set(105); receive(Data([3, 4, 5]))
@@ -359,4 +420,22 @@ private struct TimedResourceRequester: LivePhotoResourceRequesting {
         receive(Data([6])); completion(nil)
         return {}
     }
+}
+
+private final class ProgressResourceRequester: LivePhotoResourceRequesting, @unchecked Sendable {
+    private let lock = NSLock()
+    private let clock: ResourceTraceClock
+    private let began: XCTestExpectation
+    private var report: (@Sendable (Double) -> Void)?
+    private var receive: (@Sendable (Data) -> Void)?
+    private var done: (@Sendable (Error?) -> Void)?
+    init(clock: ResourceTraceClock, began: XCTestExpectation) { self.clock = clock; self.began = began }
+    func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo { clock.set(101); return .init() }
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void,
+                 receive: @escaping @Sendable (Data) -> Void, completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
+        lock.lock(); report = progress; self.receive = receive; done = completion; lock.unlock()
+        began.fulfill(); return {}
+    }
+    func progress(_ value: Double) { lock.lock(); let callback = report; lock.unlock(); callback?(value) }
+    func finish() { lock.lock(); let receive = receive, done = done; self.done = nil; lock.unlock(); receive?(Data([1,2,3])); done?(nil) }
 }

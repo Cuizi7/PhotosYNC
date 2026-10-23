@@ -2,6 +2,192 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoInventoryTests: XCTestCase {
+    func testNativeInventoryGetsPriorityWithOrdinaryWorkAfterEightItems() async throws {
+        let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+        await f.photos.appendAsset(livePhotoAsset(context: f.photos.context, id: "a-ordinary"))
+        for index in 0..<10 { await f.photos.appendAsset(livePhotoAsset(context: f.photos.context, id: "n-\(index)", isLivePhoto: true)) }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await c.resumeInitialInventory()
+        for _ in 0..<9 { _ = try await c.processNextInventoryItem(now: Date()) }
+        let order = await f.photos.readAssetIDs
+        XCTAssertEqual(order, ["n-0", "n-1", "n-2", "n-3", "n-4", "n-5", "n-6", "n-7", "a-ordinary"])
+        let restart = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await restart.resumeInitialInventory()
+        _ = try await restart.processNextInventoryItem(now: Date())
+        let resumed = await f.photos.readAssetIDs, calls = await f.photos.catalogCalls
+        XCTAssertEqual(resumed.last, "n-8"); XCTAssertEqual(calls, 1)
+    }
+
+    func testNativeRetryPreferenceNeverPullsFutureRetryForward() async throws {
+        for due in [false, true] {
+            let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+            let native = livePhotoAsset(context: f.photos.context, id: "z-native", isLivePhoto: true), now = Date()
+            await f.photos.appendAsset(livePhotoAsset(context: f.photos.context, id: "a-ordinary")); await f.photos.appendAsset(native)
+            let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+            try await c.resumeInitialInventory()
+            try await f.store.recordLivePhotoInventoryResult(context: native.context, assetID: native.assetID, revision: native.revision,
+                observations: [.init(resource: native.resources[0], inspection: .unresolved("fixture"))],
+                retryPolicy: .automatic(nextRetryAt: now.addingTimeInterval(due ? -1 : 60)))
+            _ = try await c.processNextInventoryItem(now: now)
+            let order = await f.photos.readAssetIDs
+            XCTAssertEqual(order, [due ? "z-native" : "a-ordinary"])
+        }
+    }
+
+    func testBusyInventoryWithHeldFailuresRemainsQueuedButDrainWaits() async throws {
+        let f = try await inventoryFixture(count: 2); defer { try? FileManager.default.removeItem(at: f.root) }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await c.resumeInitialInventory()
+        let held = livePhotoAsset(context: f.photos.context, id: "asset-0")
+        try await f.store.recordLivePhotoInventoryResult(context: held.context, assetID: held.assetID, revision: held.revision,
+            observations: [.init(resource: held.resources[0], inspection: .unresolved("fixture"))], retryPolicy: .requiresAttention)
+        await f.photos.setReadAdmission(.busy)
+        let busy = await c.activity(); XCTAssertEqual(busy, .queued(.identification))
+        for value in [PhotosReaderAdmission.draining, .stalled] {
+            await f.photos.setReadAdmission(value)
+            let draining = await c.activity(); XCTAssertEqual(draining, .draining)
+        }
+        let reads = await f.photos.resourceReads; XCTAssertEqual(reads, 0)
+    }
+
+    func testParsedInventoryObservationSurvivesClassificationGapWithoutReadingAgain() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let state = InventoryContinuationState()
+        await f.photos.useNativeRead { _, _, _ in
+            let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
+            return .init(url: url, validity: .init(check: { try state.validate() }, release: {}))
+        }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos,
+            metadata: MutatingInventoryMetadata { state.parsedThenWait() })
+        try await c.resumeInitialInventory()
+        do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Unclassified observation accepted") }
+        catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+        let before = try await c.summary(); XCTAssertEqual(before.identified, 0)
+        state.classified()
+        let progressed = try await c.processNextInventoryItem(now: Date())
+        let after = try await c.summary(), reads = await f.photos.resourceReads
+        XCTAssertTrue(progressed); XCTAssertEqual(after.identified, 1)
+        XCTAssertEqual(reads, 1); XCTAssertEqual(state.parses, 1)
+    }
+
+    func testPendingObservationExpiresWithoutAnotherWorkerCall() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let state = InventoryContinuationState(), timer = InventoryReadGate()
+        let scheduled = expectation(description: "independent expiry scheduled")
+        let released = expectation(description: "validity released without another worker call")
+        await f.photos.useNativeRead { _, _, _ in
+            let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
+            return .init(url: url, validity: .init(check: { try state.validate() }, release: { released.fulfill() }))
+        }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos,
+            metadata: MutatingInventoryMetadata { state.parsedThenWait() }, uptime: { state.now }, retentionSleep: { seconds in
+                XCTAssertEqual(seconds, 30); scheduled.fulfill(); await timer.hold()
+            })
+        try await c.resumeInitialInventory()
+        do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Unclassified observation accepted") }
+        catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+        await fulfillment(of: [scheduled], timeout: 1)
+        state.advance(30); await timer.release()
+        await fulfillment(of: [released], timeout: 1)
+        let summary = try await c.summary(), reads = await f.photos.resourceReads
+        XCTAssertEqual(summary.identified, 0); XCTAssertEqual(summary.pending, 1)
+        XCTAssertEqual(reads, 1, "Expiry must release ownership without starting more work")
+    }
+
+    func testPauseCancelsPendingExpiryAndReleasesValidity() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let state = InventoryContinuationState(), timer = InventoryReadGate()
+        let scheduled = expectation(description: "expiry scheduled")
+        let cancelled = expectation(description: "expiry cancelled on pause")
+        let released = expectation(description: "validity released on pause")
+        await f.photos.useNativeRead { _, _, _ in
+            let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
+            return .init(url: url, validity: .init(check: { try state.validate() }, release: { released.fulfill() }))
+        }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos,
+            metadata: MutatingInventoryMetadata { state.parsedThenWait() }, uptime: { state.now }, retentionSleep: { _ in
+                await withTaskCancellationHandler {
+                    scheduled.fulfill(); await timer.hold()
+                } onCancel: { cancelled.fulfill() }
+            })
+        try await c.resumeInitialInventory()
+        do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Unclassified observation accepted") }
+        catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+        await fulfillment(of: [scheduled], timeout: 1)
+        await c.setPaused(true)
+        await fulfillment(of: [cancelled, released], timeout: 1)
+        state.advance(30); await timer.release()
+        let summary = try await c.summary(), reads = await f.photos.resourceReads
+        XCTAssertEqual(summary.identified, 0); XCTAssertEqual(summary.pending, 1); XCTAssertEqual(reads, 1)
+    }
+
+    func testRetainedObservationCannotSurvivePauseExpiryOrTargetChange() async throws {
+        for interruption in ["pause", "expiry", "changed"] {
+            let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+            let state = InventoryContinuationState()
+            await f.photos.useNativeRead { _, _, _ in
+                let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
+                return .init(url: url, validity: .init(check: { try state.validate() }, release: {}))
+            }
+            let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos,
+                metadata: MutatingInventoryMetadata { state.parsedThenWait() }, uptime: { state.now })
+            try await c.resumeInitialInventory()
+            do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Accepted pending observation") }
+            catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+            if interruption == "pause" { await c.setPaused(true); await c.setPaused(false) }
+            if interruption == "expiry" { state.advance(30) }
+            if interruption == "changed" {
+                state.changed()
+                do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Accepted changed observation") }
+                catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .resourceChanged) }
+                let stale = try await c.summary(); XCTAssertEqual(stale.identified, 0)
+            }
+            state.classified()
+            let progressed = try await c.processNextInventoryItem(now: Date())
+            let after = try await c.summary(), reads = await f.photos.resourceReads
+            XCTAssertTrue(progressed); XCTAssertEqual(after.identified, 1)
+            XCTAssertEqual(reads, 2, interruption); XCTAssertEqual(state.parses, 2, interruption)
+        }
+    }
+
+    func testTwoResourceInventoryResumesAfterParsedPhotoWithoutReadingItAgain() async throws {
+        let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
+        let state = InventoryContinuationState(), context = f.photos.context
+        let refs = ["photo", "motion"].map { LivePhotoResourceRef.photos(contextID: context.id, assetID: "paired", resourceKey: $0, revision: "r1") }
+        await f.photos.appendAsset(.init(context: context, assetID: "paired", revision: "r1", isLivePhoto: true, mediaKind: .image, resources: refs, resourceKinds: [.image, .video]))
+        await f.photos.useNativeRead { _, _, _ in
+            let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url)
+            return .init(url: url, validity: .init(check: { try state.validate() }, release: {}))
+        }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: MutatingInventoryMetadata { state.parsedThenWait() })
+        try await c.resumeInitialInventory()
+        do { _ = try await c.processNextInventoryItem(now: Date()); XCTFail("Unclassified photo accepted") }
+        catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+        state.classified()
+        let progressed = try await c.processNextInventoryItem(now: Date())
+        let result = try await c.summary(), reads = await f.photos.resourceReads
+        XCTAssertTrue(progressed); XCTAssertEqual(result.identified, 1)
+        XCTAssertEqual(reads, 2); XCTAssertEqual(state.parses, 2)
+    }
+
+    func testClassificationArrivingAtObservationCommitRollsBackUntilRevalidated() async throws {
+        let f = try await inventoryFixture(count: 1); defer { try? FileManager.default.removeItem(at: f.root) }
+        let c = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await c.resumeInitialInventory()
+        let next = try await f.store.nextLivePhotoInventoryItem(context: f.photos.context, now: Date())
+        let item = try XCTUnwrap(next)
+        do {
+            try await f.store.recordLivePhotoInventoryResult(context: item.context, assetID: item.assetID, revision: item.revision,
+                observations: [.init(resource: item.resources[0], inspection: .noIdentifier)], retryPolicy: .requiresAttention,
+                observationsAreCurrent: { throw LivePhotoReadDeferred.classificationPending })
+            XCTFail("Unverified identity committed")
+        } catch { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
+        let pending = try await c.summary(); XCTAssertEqual(pending.identified, 0); XCTAssertEqual(pending.pending, 1)
+        try await f.store.recordLivePhotoInventoryResult(context: item.context, assetID: item.assetID, revision: item.revision,
+            observations: [.init(resource: item.resources[0], inspection: .noIdentifier)], retryPolicy: .requiresAttention)
+        let accepted = try await c.summary(); XCTAssertEqual(accepted.identified, 1); XCTAssertEqual(accepted.pending, 0)
+    }
+
     func testLegacyVideoRefreshResumesAcrossFailureAndMultipleBatches() async throws {
         let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
         try await completeEmptyInventory(f.store, f.photos.context)
@@ -432,6 +618,23 @@ struct InventoryMetadata: LivePhotoMetadataReading {
     func inspect(url: URL, kind: MediaKind) async throws -> LivePhotoInspection { .noIdentifier }
 }
 
+final class InventoryContinuationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failure: LivePhotoReadDeferred?
+    private var count = 0
+    private var time: TimeInterval = 100
+    var parses: Int { lock.lock(); defer { lock.unlock() }; return count }
+    var now: TimeInterval { lock.lock(); defer { lock.unlock() }; return time }
+    func advance(_ duration: TimeInterval) { lock.lock(); time += duration; lock.unlock() }
+    func parsedThenWait() { lock.lock(); count += 1; if count == 1 { failure = .classificationPending }; lock.unlock() }
+    func classified() { lock.lock(); failure = nil; lock.unlock() }
+    func changed() { lock.lock(); failure = .resourceChanged; lock.unlock() }
+    func validate() throws {
+        lock.lock(); defer { lock.unlock() }
+        if let failure { throw failure }
+    }
+}
+
 func durationDescriptor(_ descriptor: LivePhotoAssetDescriptor, duration: Double?, legacy: Bool = false) throws -> LivePhotoAssetDescriptor {
     var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(descriptor)) as? [String: Any])
     json["duration"] = duration
@@ -453,6 +656,7 @@ actor FixtureLivePhotoGateway: LivePhotoPhotosGateway {
     let root: URL
     var catalogCalls = 0, resourceReads = 0, generation = 0, contextReads = 0
     var readKinds = [MediaKind]()
+    var readAssetIDs = [String]()
     var snapshotGate: InventoryReadGate?
     func holdNextSnapshot(_ gate: InventoryReadGate) { snapshotGate = gate }
     var nativeRead: (@Sendable (LivePhotoResourceRef, LivePhotoReadPurpose, LivePhotoResourceBudget) async throws -> LivePhotoResourceLease)?
@@ -518,6 +722,7 @@ actor FixtureLivePhotoGateway: LivePhotoPhotosGateway {
     func catalogCoverage(session: PhotosCatalogSession) async throws -> Int { generation }
     func readLivePhotoResource(_ ref: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease {
         resourceReads += 1
+        if let id = ref.assetID { readAssetIDs.append(id) }
         if let gate = readGate { readGate = nil; await gate.hold() }
         if let readFailure { throw readFailure }
         if let nativeRead { return try await nativeRead(ref, purpose, budget) }

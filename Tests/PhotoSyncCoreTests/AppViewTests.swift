@@ -185,6 +185,9 @@ final class AppViewTests: XCTestCase {
                             XCTAssertLessThanOrEqual(visible.frame.maxX, 308, scenario.rawValue)
                         }
                     }
+                    if let folder = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] {
+                        _ = try UIReviewCapture.write(host, to: URL(fileURLWithPath: folder).appendingPathComponent("task-\(scenario.rawValue)-\(appearance.rawValue).png"))
+                    }
                 }
             }
         }
@@ -703,6 +706,22 @@ final class AppViewTests: XCTestCase {
                     XCTAssertTrue(popup.isVisible)
                     XCTAssertTrue(buttons().dropFirst(taskIndex).first === button, "Trigger must survive ordinary task lifecycle gaps")
                     XCTAssertEqual(model.progressRows.map(\.id), ["visualIndex", "livePhoto"])
+                    if let folder = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] {
+                        do {
+                            // The native popover bitmap has transparent monochrome text.
+                            // Its content is verified by OCR above; the opaque-host image
+                            // validator is inappropriate for this unmodified native capture.
+                            let bitmap = try XCTUnwrap(content.bitmapImageRepForCachingDisplay(in: content.bounds))
+                            content.cacheDisplay(in: content.bounds, to: bitmap)
+                            XCTAssertGreaterThan(bitmap.pixelsWide, 0)
+                            XCTAssertGreaterThan(bitmap.pixelsHigh, 0)
+                            let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                            let directory = URL(fileURLWithPath: folder)
+                            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                            try data.write(to: directory.appendingPathComponent("task-details-\(taskIndex)-stage-\(stage).png"), options: .atomic)
+                        }
+                        catch { XCTFail("Native popover image capture failed: \(error)"); return }
+                    }
                 }
                 // This non-key fixture verifies native click/popover identity. Escape and hover
                 // event delivery are recorded separately by the no-activation UIReview probe.
@@ -982,11 +1001,17 @@ extension AppViewTests {
         XCTAssertEqual(model.counterNotes.count, 4)
         let details = NSHostingView(rootView: SyncDetailsContent(snapshot: model.state.snapshot))
         XCTAssertLessThanOrEqual(details.fittingSize.width, 320)
+        // The counter fixture above intentionally contains unknown imports. Task
+        // activity scenes must not inherit that independent submission barrier.
+        model.state.snapshot.summary?.importing = 0
         for state in [IndexState.preparing, .updating, .waiting, .paused, .ready] {
-            model.state.snapshot.indexActivity = state == .ready ? .idle : .working
+            model.state.snapshot.isPaused = state == .paused
+            model.state.snapshot.indexActivity = state == .ready ? .idle : (state == .waiting || state == .paused) ? .waiting : .working
             model.state.snapshot.indexProgress = IndexProgress(state: state, totalsKnown: state != .preparing,
                 totalAssets: 100000, readyAssets: 50000, totalRepresentations: 200000,
                 readyRepresentations: 100000, excludedAssets: 0, issue: state == .waiting ? cloud : nil)
+            let expected = state == .ready ? nil : state == .paused ? "视觉索引已暂停" : state == .waiting ? "视觉索引等待恢复" : "正在建立视觉索引"
+            XCTAssertEqual(model.progressRows.first?.subtitle, expected)
             for appearance in [NSAppearance.Name.aqua, .darkAqua] {
                 let size = try measure(StatusMenu(model: model), width: 320, appearance: appearance)
                 XCTAssertEqual(size.width, 320, accuracy: 1)

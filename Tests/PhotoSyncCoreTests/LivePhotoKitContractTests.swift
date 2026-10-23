@@ -3,6 +3,88 @@ import Photos
 @testable import PhotoSyncCore
 
 final class LivePhotoKitContractTests: XCTestCase {
+    func testCompletedInventoryBytesSurviveClassificationTimeoutAndAreReused() async throws {
+        try await assertRetainedReadAfterClassification("neutral")
+    }
+    func testRetainedRawResultRejectsKnownAndUnknownChanges() async throws {
+        for change in ["changed", "unknown"] { try await assertRetainedReadAfterClassification(change) }
+    }
+    func testRetainedRawResultCannotBypassAnotherCallersSmallerBudget() async throws {
+        try await assertRetainedReadAfterClassification("neutral", smallerBudget: true)
+    }
+    func testCancellationWhileTakingRetainedRawResultDoesNotReturnBytes() async throws {
+        try await assertRetainedReadAfterClassification("neutral", cancelReuse: true)
+    }
+    private func assertRetainedReadAfterClassification(_ change: String, smallerBudget: Bool = false, cancelReuse: Bool = false) async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let diagnosticRows = LivePhotoDiagnosticRows(), diagnostics = IndexDiagnostics(sink: { diagnosticRows.append($0) })
+        let cancellation = RetainedReadCancellationProbe()
+        let raw = expectation(description: "physical read"), entered = expectation(description: "classification"), deadline = expectation(description: "classification deadline")
+        let release = DispatchSemaphore(value: 0); defer { release.signal() }
+        let expiry = InventoryReadGate(), requester = ControlledCloudRequester(started: raw, completeRepeated: true), lifecycle = LivePhotoKitLifecycle()
+        lifecycle.initialAssets = [.init(identifier: "target", candidates: [cloudCandidate("target")])]
+        let gateway = PhotoKitGateway(lifecycle: lifecycle,
+            livePhotoRawReader: .init(requester: requester, storage: .init(root: root.appendingPathComponent("raw"))),
+            livePhotoResourceIsCurrent: { _ in cancellation.check(); return true }, indexDiagnostics: diagnostics, classificationSleep: { _ in deadline.fulfill(); await expiry.hold() })
+        _ = try await gateway.candidateSnapshot()
+        let context = try await gateway.livePhotoLibraryContext(), budget = LivePhotoResourceBudget()
+        let ref = LivePhotoResourceRef.photos(contextID: context.id, assetID: "target", resourceKey: "original", revision: "r1")
+        let task = Task { () -> Error? in
+            do { _ = try await gateway.readLivePhotoResource(ref, purpose: .inventory, budget: budget); return nil }
+            catch { return error }
+        }
+        await fulfillment(of: [raw], timeout: 2)
+        if change == "unknown" { lifecycle.nextChange = .reload }
+        else { lifecycle.nextChange = .incremental(removedAssetIDs: [], insertedAssets: [], changedAssets: change == "changed" ? [.init(identifier: "target", candidates: [cloudCandidate("target")])] : []) }
+        lifecycle.changeHook = { entered.fulfill(); _ = release.wait(timeout: .now() + 5) }
+        gateway.recordLibraryChangeForTesting(); await fulfillment(of: [entered], timeout: 2)
+        requester.finish(); await fulfillment(of: [deadline], timeout: 2)
+        await expiry.release()
+        let failure = await task.value
+        XCTAssertEqual(failure as? LivePhotoReadDeferred, .classificationPending)
+        XCTAssertEqual(budget.reservedBytes, 3, "Completed bytes stay owned while awaiting a bounded continuation")
+        release.signal(); _ = try await gateway.candidateSnapshot()
+        if cancelReuse {
+            cancellation.arm()
+            let cancelled = Task { () -> Error? in
+                do { _ = try await gateway.readLivePhotoResource(ref, purpose: .inventory, budget: budget); return nil }
+                catch { return error }
+            }
+            let failure = await cancelled.value
+            XCTAssertTrue(failure is CancellationError)
+            XCTAssertEqual(budget.reservedBytes, 0)
+            return
+        }
+        if smallerBudget {
+            let other = LivePhotoResourceBudget(maxBytes: 2)
+            do { _ = try await gateway.readLivePhotoResource(ref, purpose: .inventory, budget: other); XCTFail("Retained bytes bypassed the caller's budget") }
+            catch { XCTAssertEqual(error as? LivePhotoResourceReadError, .resourceLimit(bytes: 3)) }
+            XCTAssertEqual(requester.requestCount, 2)
+            XCTAssertEqual(budget.reservedBytes, 0); XCTAssertEqual(other.reservedBytes, 0)
+            return
+        }
+        if change != "neutral" {
+            do { _ = try await gateway.readLivePhotoResource(ref, purpose: .inventory, budget: budget); XCTFail("Invalid retained result reused") }
+            catch {
+                if change == "changed" { XCTAssertEqual(error as? LivePhotoReadDeferred, .resourceChanged) }
+                else { XCTAssertEqual(error as? PhotoKitGatewayError, .libraryChanged) }
+            }
+            XCTAssertEqual(requester.requestCount, 1)
+            XCTAssertEqual(budget.reservedBytes, 0)
+            return
+        }
+        var lease: LivePhotoResourceLease? = try await gateway.readLivePhotoResource(ref, purpose: .inventory, budget: budget)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(lease).url), Data([1,2,3]))
+        XCTAssertEqual(requester.requestCount, 1, "A neutral classification must not request the same resource again")
+        lease = nil
+        XCTAssertEqual(budget.reservedBytes, 0)
+        diagnostics.flushObservations(force: true)
+        let summary = try XCTUnwrap(diagnosticRows.values.last { $0["phase"] == "live-photo-summary" })
+        XCTAssertEqual(summary["resource-read.completed"], "1")
+        XCTAssertEqual(summary["retention.raw-retained"], "1")
+        XCTAssertEqual(summary["retention.raw-reused"], "1")
+    }
+
     func testNeutralObserverPreservesInventoryCommitWhileMixedChangedItemIsInvalidated() async throws {
         let f = try await inventoryFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.root) }
@@ -63,7 +145,7 @@ final class LivePhotoKitContractTests: XCTestCase {
         let error = await task.value; XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending)
         _ = try await gateway.candidateSnapshot()
     }
-    func testClassificationWaitTimeoutAndCancellationReleaseCompletedRawLease() async throws {
+    func testClassificationTimeoutRetainsButCancellationReleasesCompletedRawLease() async throws {
         for cancelled in [false, true] {
             let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
             let raw = expectation(description: "raw"), entered = expectation(description: "classification"), deadline = expectation(description: "deadline installed"), finished = expectation(description: "logical read finished")
@@ -98,6 +180,10 @@ final class LivePhotoKitContractTests: XCTestCase {
                 else { XCTAssertEqual(error as? LivePhotoReadDeferred, .classificationPending) }
             }
             _ = try await gateway.candidateSnapshot() // late marker cannot resume the completed waiter again
+            if !cancelled {
+                XCTAssertEqual(budget.reservedBytes, 3)
+                await gateway.discardPendingLivePhotoReads()
+            }
             let freed = await engineEventually { budget.reservedBytes == 0 }; XCTAssertTrue(freed)
         }
     }
@@ -445,6 +531,16 @@ private final class LivePhotoDiagnosticRows: @unchecked Sendable {
     private var rows = [[String: String]]()
     var values: [[String: String]] { lock.lock(); defer { lock.unlock() }; return rows }
     func append(_ fields: [String: String]) { lock.lock(); rows.append(fields); lock.unlock() }
+}
+
+private final class RetainedReadCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    func arm() { lock.lock(); armed = true; lock.unlock() }
+    func check() {
+        lock.lock(); let shouldCancel = armed; lock.unlock()
+        if shouldCancel { withUnsafeCurrentTask { $0?.cancel() } }
+    }
 }
 private final class LivePhotoNotificationGates: @unchecked Sendable {
     let first: XCTestExpectation, second: XCTestExpectation

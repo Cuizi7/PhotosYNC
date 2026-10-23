@@ -106,6 +106,10 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
         _ = try await c.advanceNext(now: Date())
         let queued = await c.activity(); XCTAssertEqual(queued, .queued(.completion))
+        await f.photos.setRawAdmission(.busy)
+        let classified = await c.activity(); XCTAssertEqual(classified, .queued(.completion))
+        await f.photos.setRawAdmission(.draining)
+        let draining = await c.activity(); XCTAssertEqual(draining, .draining)
     }
     func testReusingExistingTargetRequiresFreshResourceTicketsBeforeSavingObservations() async throws {
         let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }

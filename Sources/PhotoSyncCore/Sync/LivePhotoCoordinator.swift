@@ -156,7 +156,7 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         let unfinished = s.unknownMutation || s.activeGroups > 0 || s.awaitingVerification > 0 || s.awaitingRetirement > 0 || s.retryWaitingGroups > 0 || s.requiresAttentionGroups > 0
         if (active || unfinished), admission == .draining || admission == .stalled { return .draining }
         if active { return .working(.completion) }
-        if !paused, !s.unknownMutation, admission == .available {
+        if !paused, !s.unknownMutation, admission == .available || admission == .busy {
             if (try? await hasAdmittedOperation(now: now ?? wallNow())) == true, !paused { return .queued(.completion) }
             if discoveryPending, recovered, !paused { return .queued(.identification) }
         }

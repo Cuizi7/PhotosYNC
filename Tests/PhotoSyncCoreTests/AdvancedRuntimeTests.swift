@@ -5,6 +5,31 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testCapacityDeferralKeepsQueuedPresentationWithoutRetryingEarly() async throws {
+        let f = try await inventoryFixture(count: 1), config = try p8Configuration(), clock = P12Clock()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        await f.photos.useNativeRead { _, _, _ in throw ReadExecutorError.resourceExhausted }
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, livePhotoMetadata: InventoryMetadata(), now: { clock.value }, authorized: { true })
+        try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true); await runtime.waitForRound()
+        let busy = await runtime.current()
+        XCTAssertTrue(busy.snapshot.livePhotoActivities.contains(.queued(.identification)))
+        let row = try XCTUnwrap(SyncStatusPresentation(snapshot: busy.snapshot).progressRows.first { $0.id == "livePhoto" })
+        XCTAssertTrue(row.active); XCTAssertEqual(row.subtitle, "正在配对 Live Photo")
+        let before = await f.photos.resourceReads
+        await runtime.tick(); await runtime.waitForRound()
+        let early = await f.photos.resourceReads; XCTAssertEqual(early, before)
+        await f.photos.useNativeRead { _, _, _ in
+            let url = f.root.appendingPathComponent("bytes"); try Data([1]).write(to: url); return .init(url: url)
+        }
+        clock.advance(5); await runtime.tick(); await runtime.waitForRound()
+        let resumed = try await f.store.livePhotoInventorySummary(context: f.photos.context)
+        XCTAssertEqual(resumed.identified, 1)
+        await runtime.stop(); await runtime.waitForRound()
+    }
+
     func testEngineRefreshCannotUndoRuntimePauseOrClearUnfinishedTasks() {
         for paused in [true, false] {
             var state = RuntimeState()

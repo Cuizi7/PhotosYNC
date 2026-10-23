@@ -6,6 +6,11 @@ public enum LivePhotoDiagnosticStage: String, Sendable {
     case metadata, descriptorValidation = "descriptor-validation", observationCommit = "observation-commit", completion
 }
 
+enum LivePhotoRetentionEvent: String, Sendable {
+    case rawRetained = "raw-retained", rawReused = "raw-reused", rawDiscarded = "raw-discarded", rawExpired = "raw-expired"
+    case parsedRetained = "parsed-retained", parsedResumed = "parsed-resumed", parsedDiscarded = "parsed-discarded"
+}
+
 private struct DiagnosticCauseEvent {
     let sequence: UInt64
     let generation: Int?
@@ -75,6 +80,16 @@ public final class IndexDiagnostics: @unchecked Sendable {
         return category + "-" + HMAC<SHA256>.authenticationCode(for: bytes, using: secret).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
     public func tokenHandle(_ value: Data) -> String { handle("range", value.base64EncodedString()) }
+    func recordLivePhotoRetention(_ event: LivePhotoRetentionEvent) {
+        let key = "retention." + event.rawValue, now = monotonic()
+        lock.lock()
+        livePhotoCounts[key, default: 0] += 1
+        let detailed = livePhotoCounts[key, default: 0] <= 2
+        let flush = now - windowStarted >= 30
+        lock.unlock()
+        if detailed { emit(["phase": "live-photo-retention", "event": event.rawValue]) }
+        if flush { flushObservations() }
+    }
     func livePhotoResourceTrace(_ resource: LivePhotoResourceRef, purpose: LivePhotoReadPurpose) -> LivePhotoResourceTrace {
         lock.lock(); sequence &+= 1
         let request = "resource-\(sequence)", sampled = livePhotoResourceDetails < 2
@@ -87,8 +102,11 @@ public final class IndexDiagnostics: @unchecked Sendable {
             lock.lock()
             livePhotoCounts["resource-read." + result, default: 0] += 1
             if event == "terminal" {
-                for key in ["receivedBytes", "writtenBytes"] {
+                for key in ["receivedBytes", "writtenBytes", "downloadProgressUpdates"] {
                     livePhotoCounts["resource-read." + key, default: 0] += Int64(fields[key] ?? "0") ?? 0
+                }
+                if (Int(fields["downloadProgressUpdates"] ?? "0") ?? 0) > 0 {
+                    livePhotoCounts["resource-read.withDownloadProgress", default: 0] += 1
                 }
                 for (name, seconds) in timings { livePhotoTimings["resource-" + name, default: DiagnosticElapsed()].add(seconds) }
             }
@@ -478,6 +496,10 @@ final class LivePhotoResourceTrace: @unchecked Sendable {
     private let sink: @Sendable ([String: String], [String: TimeInterval]) -> Void
     private var fields: [String: String]
     private var started: TimeInterval?, firstData: TimeInterval?, lastData: TimeInterval?, lastHeartbeat: TimeInterval?
+    private var enqueuedAt: TimeInterval?, admittedAt: TimeInterval?
+    private var firstDownloadProgressAt: TimeInterval?, lastDownloadProgressAt: TimeInterval?
+    private var downloadProgressUpdates = 0
+    private var lastDownloadProgress: Double?, maxDownloadProgress: Double?
     private var receivedBytes: Int64 = 0, writtenBytes: Int64 = 0, chunks = 0
     private var writeSum: TimeInterval = 0, writeMax: TimeInterval = 0
     private var finished = false, cancelling = false
@@ -488,6 +510,19 @@ final class LivePhotoResourceTrace: @unchecked Sendable {
     }
     deinit { heartbeatTask?.cancel() }
     func now() -> TimeInterval { monotonic() }
+    func enqueued() { lock.lock(); if enqueuedAt == nil { enqueuedAt = monotonic() }; lock.unlock() }
+    func admitted() { lock.lock(); if admittedAt == nil { admittedAt = monotonic() }; lock.unlock() }
+    /// PhotoKit reports download progress independently of data delivery and completion.
+    /// Keep constant-size counters; never emit one log line per callback.
+    func downloadProgress(_ value: Double) {
+        guard value.isFinite, (0...1).contains(value) else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard !finished, started != nil else { return }
+        let now = monotonic()
+        firstDownloadProgressAt = firstDownloadProgressAt ?? now; lastDownloadProgressAt = now
+        downloadProgressUpdates += 1; lastDownloadProgress = value
+        maxDownloadProgress = max(maxDownloadProgress ?? 0, value)
+    }
     func start(_ metadata: LivePhotoResourceInfo?) {
         lock.lock()
         guard started == nil, !finished else { lock.unlock(); return }
@@ -551,6 +586,10 @@ final class LivePhotoResourceTrace: @unchecked Sendable {
         }
         row["result"] = result
         var timings: [String: TimeInterval] = ["total": max(0, end - start), "write": writeSum, "finalize": max(0, finalizeSeconds)]
+        if let enqueuedAt, let admittedAt { timings["queue-wait"] = max(0, admittedAt - enqueuedAt) }
+        if let admittedAt { timings["request-setup"] = max(0, start - admittedAt) }
+        if let firstDownloadProgressAt { timings["download-first-progress"] = max(0, firstDownloadProgressAt - start) }
+        if let firstDownloadProgressAt, let lastDownloadProgressAt { timings["download-progress-span"] = max(0, lastDownloadProgressAt - firstDownloadProgressAt) }
         if let firstData { timings["first-data"] = max(0, firstData - start) }
         if let firstData, let lastData { timings["delivery"] = max(0, lastData - firstData) }
         if let lastData { timings["completion-gap"] = max(0, callbackAt - lastData) }
@@ -568,6 +607,13 @@ final class LivePhotoResourceTrace: @unchecked Sendable {
         row["sinceLastDataMS"] = lastData.map { String(max(0, now - $0) * 1000) } ?? "unavailable"
         row["receivedBytes"] = String(receivedBytes); row["writtenBytes"] = String(writtenBytes); row["chunks"] = String(chunks)
         row["writeSumMS"] = String(writeSum * 1000); row["writeMaxMS"] = String(writeMax * 1000)
+        row["queueWaitMS"] = enqueuedAt.flatMap { queued in admittedAt.map { String(max(0, $0 - queued) * 1000) } } ?? "unavailable"
+        row["requestSetupMS"] = admittedAt.flatMap { admitted in started.map { String(max(0, $0 - admitted) * 1000) } } ?? "unavailable"
+        row["downloadProgressUpdates"] = String(downloadProgressUpdates)
+        row["downloadProgress"] = lastDownloadProgress.map(String.init(describing:)) ?? "unavailable"
+        row["downloadProgressMax"] = maxDownloadProgress.map(String.init(describing:)) ?? "unavailable"
+        row["firstDownloadProgressMS"] = firstDownloadProgressAt.flatMap { first in started.map { String(max(0, first - $0) * 1000) } } ?? "unavailable"
+        row["downloadProgressSpanMS"] = firstDownloadProgressAt.flatMap { first in lastDownloadProgressAt.map { String(max(0, $0 - first) * 1000) } } ?? "unavailable"
         return row
     }
 }

@@ -28,8 +28,17 @@ public protocol LivePhotoPhotosGateway: PhotosIndexGateway {
     func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor]
     func readLivePhotoResource(_ ref: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget) async throws -> LivePhotoResourceLease
     func livePhotoReadAdmission() async -> PhotosReaderAdmission
+    /// Releases completed inventory results retained for continuation and invalidates
+    /// in-flight attempts to retain them later. Active physical requests keep ownership
+    /// until their terminal callback; this hook must not release that ownership early.
+    func discardPendingLivePhotoReads() async
     func livePhotoPreservationSnapshot(assetID: String, context: LibraryContext) async throws -> LivePhotoPreservationSnapshot
     func resourcesEqual(_ lhs: LivePhotoResourceRef, _ rhs: LivePhotoResourceRef, budget: LivePhotoResourceBudget) async throws -> Bool
+}
+
+extension LivePhotoPhotosGateway {
+    /// Gateways that never retain completed inventory reads need no cleanup.
+    public func discardPendingLivePhotoReads() async {}
 }
 
 public final class LivePhotoResourceBudget: @unchecked Sendable {
@@ -88,6 +97,64 @@ public final class LivePhotoResourceLease: @unchecked Sendable {
     }
 }
 
+/// One completed inventory read may wait for notification classification. Its
+/// lease still owns the real bytes/budget; it is never a persistent content cache.
+final class LivePhotoPendingRead: @unchecked Sendable {
+    struct Value: Sendable {
+        let id = UUID()
+        let ref: LivePhotoResourceRef
+        let lease: LivePhotoResourceLease
+        let budget: LivePhotoResourceBudget
+        let expiresAt: TimeInterval
+        var discarded: @Sendable (LivePhotoRetentionEvent) -> Void = { _ in }
+    }
+    private let lock = NSLock()
+    private let now: @Sendable () -> TimeInterval
+    private var value: Value?
+    private var revision: UInt64 = 0
+    init(now: @escaping @Sendable () -> TimeInterval) { self.now = now }
+    var generation: UInt64 { lock.lock(); defer { lock.unlock() }; return revision }
+    func take(_ ref: LivePhotoResourceRef, budget: LivePhotoResourceBudget) -> Value? {
+        lock.lock(); let previous = value; value = nil; lock.unlock()
+        guard let previous else { return nil }
+        guard previous.ref == ref, previous.budget === budget, previous.expiresAt > now() else {
+            previous.discarded(previous.expiresAt <= now() ? .rawExpired : .rawDiscarded); return nil
+        }
+        return previous
+    }
+    @discardableResult
+    func retain(_ candidate: Value, generation: UInt64) -> Bool {
+        let remaining = candidate.expiresAt - now()
+        guard remaining > 0 else { candidate.discarded(.rawExpired); return false }
+        lock.lock()
+        guard generation == revision else { lock.unlock(); candidate.discarded(.rawDiscarded); return false }
+        let previous = value; value = candidate
+        lock.unlock()
+        if let previous, previous.id != candidate.id { previous.discarded(.rawDiscarded) }
+        withExtendedLifetime(previous) {}
+        let id = candidate.id
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + remaining) { [weak self] in
+            self?.expire(id: id)
+        }
+        return true
+    }
+    func expire(id: UUID? = nil) {
+        lock.lock()
+        let previous: Value?
+        if let current = value, (id == nil || current.id == id), current.expiresAt <= now() {
+            previous = current; value = nil
+        } else { previous = nil }
+        lock.unlock()
+        previous?.discarded(.rawExpired)
+        withExtendedLifetime(previous) {}
+    }
+    func discard() {
+        lock.lock(); revision &+= 1; let previous = value; value = nil; lock.unlock()
+        previous?.discarded(.rawDiscarded)
+        withExtendedLifetime(previous) {}
+    }
+}
+
 struct LivePhotoResourceInfo: Sendable {
     var fileExtension: String?
     var assetKind: MediaKind?
@@ -98,7 +165,7 @@ struct LivePhotoResourceInfo: Sendable {
 
 protocol LivePhotoResourceRequesting: Sendable {
     func resourceInfo(_ ref: LivePhotoResourceRef) throws -> LivePhotoResourceInfo
-    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool,
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void,
                  receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void
 }
@@ -122,8 +189,10 @@ struct LivePhotoRawResourceReader: Sendable {
     func admission() async -> PhotosReaderAdmission { tracker.admission() }
     func read(resource: LivePhotoResourceRef, purpose: LivePhotoReadPurpose, budget: LivePhotoResourceBudget, trace: LivePhotoResourceTrace? = nil) async throws -> LivePhotoResourceLease {
         let cancellation = LivePhotoReadCancellation()
+        trace?.enqueued()
         return try await withTaskCancellationHandler {
             do { return try await executor.executeAsync(sourceID: sourceID, timeout: logicalTimeout) {
+                trace?.admitted()
                 let info = try requester.resourceInfo(resource)
                 let owner = try storage.create(limits: budget.limits, fileExtension: info.fileExtension)
                 let stream = LivePhotoResourceStream(owner: owner, budget: budget, trace: trace)
@@ -135,7 +204,7 @@ struct LivePhotoRawResourceReader: Sendable {
                     // Reuse the same resource lookup that supplies the container hint.
                     trace?.start(info)
                     do {
-                        let cancel = try requester.request(resource, allowNetwork: true,
+                        let cancel = try requester.request(resource, allowNetwork: true, progress: { trace?.downloadProgress($0) },
                             receive: { stream.receive($0) }, completion: { stream.complete($0) })
                         stream.installCancel(cancel)
                     } catch { stream.complete(error) }

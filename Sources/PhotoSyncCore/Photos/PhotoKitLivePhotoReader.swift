@@ -76,10 +76,11 @@ final class SystemLivePhotoResourceRequester: LivePhotoResourceRequesting, @unch
                      resourceKind: resourceKind, resourceType: resource.type.rawValue,
                      duration: asset.mediaType == .video ? asset.duration : nil)
     }
-    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, receive: @escaping @Sendable (Data) -> Void,
+    func request(_ ref: LivePhotoResourceRef, allowNetwork: Bool, progress: @escaping @Sendable (Double) -> Void, receive: @escaping @Sendable (Data) -> Void,
                  completion: @escaping @Sendable (Error?) -> Void) throws -> @Sendable () -> Void {
         let (_, selected) = try PhotoKitLivePhotoReader.selected(ref)
         let options = PHAssetResourceRequestOptions(); options.isNetworkAccessAllowed = allowNetwork
+        options.progressHandler = progress
         let id = manager.requestData(for: selected, options: options, dataReceivedHandler: receive) { error in
             if let error { completion(error); return }
             do { _ = try PhotoKitLivePhotoReader.selected(ref); completion(nil) }

@@ -2447,9 +2447,9 @@ public final class SyncStore: @unchecked Sendable {
             try self.execute("UPDATE live_photo_inventory SET phase=CASE WHEN phase='completed' THEN phase ELSE 'identifying' END,enumeration_generation=? WHERE context_id=? AND task_key=?", [.int64(Int64(generation)), .text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
         }
     }
-    func nextLivePhotoInventoryItem(context: LibraryContext, now: Date) async throws -> LivePhotoAssetDescriptor? {
+    func nextLivePhotoInventoryItem(context: LibraryContext, now: Date, preferNative: Bool = true) async throws -> LivePhotoAssetDescriptor? {
         try await perform {
-            guard let row = try self.one("SELECT descriptor FROM live_photo_inventory_item WHERE context_id=? AND descriptor IS NOT NULL AND (status='queued' OR (status='unresolved' AND next_retry_at <= ?)) ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,asset_id LIMIT 1", [.text(context.id.uuidString), .double(now.timeIntervalSince1970)]) else { return nil }
+            guard let row = try self.one("SELECT descriptor FROM live_photo_inventory_item WHERE context_id=? AND descriptor IS NOT NULL AND (status='queued' OR (status='unresolved' AND next_retry_at <= ?)) ORDER BY CASE WHEN is_live_photo=? THEN 0 ELSE 1 END,CASE status WHEN 'queued' THEN 0 ELSE 1 END,asset_id LIMIT 1", [.text(context.id.uuidString), .double(now.timeIntervalSince1970), .int64(preferNative ? 1 : 0)]) else { return nil }
             return try self.decoder.decode(LivePhotoAssetDescriptor.self, from: self.blob(row[0]))
         }
     }

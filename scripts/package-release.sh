@@ -19,7 +19,7 @@ case $# in
 esac
 
 cd "${0:A:h:h}"
-release_name=0.3.0-beta5
+release_name=0.3.0-beta6
 release_root="$PWD/outputs/releases"
 final_release_dir="$release_root/$release_name"
 
@@ -155,8 +155,8 @@ codesign --force --sign - --timestamp=none "$app_path"
 codesign --verify --deep --strict --all-architectures "$app_path"
 [[ -s "$app_path/Contents/Resources/Assets.car" && -s "$app_path/Contents/Resources/PhotosYNC.icns" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" == '0.3.0' ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '22' ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :PhotoSyncReleaseChannel' "$app_path/Contents/Info.plist")" == 'beta5' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" == '23' ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :PhotoSyncReleaseChannel' "$app_path/Contents/Info.plist")" == 'beta6' ]]
 for architecture in arm64 x86_64; do
   lipo "$app_path/Contents/MacOS/PhotosYNC" -verify_arch "$architecture"
   lipo "$app_path/Contents/Frameworks/PhotoSyncCore.framework/Versions/A/PhotoSyncCore" -verify_arch "$architecture"
@@ -164,7 +164,7 @@ done
 scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg"
 hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg"
 
-cp docs/release/0.3.0-beta5.md "$release_dir/RELEASE-NOTES.md"
+cp docs/release/0.3.0-beta6.md "$release_dir/RELEASE-NOTES.md"
 cp CHANGELOG.md "$release_dir/CHANGELOG.md"
 ditto "$validation_dir" "$release_dir/validation"
 cp "$build_dir/validate.log" "$release_dir/validate.log"
@@ -177,7 +177,7 @@ continuation_result_hash=$(shasum -a 256 "$release_dir/validation/continuation-r
 {
   print "release=$release_name"
   print "source_commit=$source_commit"
-  print 'build_number=22'
+  print 'build_number=23'
   print 'signing=ad-hoc; notarized=no'
   print 'architectures=arm64 x86_64'
   print 'minimum_macos=13.0'
