@@ -121,7 +121,7 @@ struct SyncStatusPresentation {
             let subtitle = snapshot.isPaused ? "视觉索引已暂停" : active ? "正在建立视觉索引" : p.requiresAttentionAssets > 0 ? "视觉索引" : "视觉索引等待恢复"
             var details = [ProgressDetail(title: "用途", text: "分析图库中的照片，建立用于视觉判重的索引，帮助避免重复导入。此任务只读取照片，不修改或删除图库内容。"),
                 ProgressDetail(title: "进度含义", text: "已分析 \(p.readyAssets) 张，包含以前保存的结果，并非本次启动重新分析的数量。" + (p.totalsKnown ? "当前需分析的总量为 \(p.totalAssets) 张。" : "当前总量尚未确认，因此不显示百分比。"))]
-            if p.requiresAttentionAssets > 0 { details.append(.init(title: "需要处理", text: "有 \(p.requiresAttentionAssets) 张照片解码后的图像超出当前内存上限，已停止自动重试。点击“立即扫描”可重新尝试。其他照片会继续处理，原文件未被修改。")) }
+            if p.requiresAttentionAssets > 0 { details.append(.init(title: "需要处理", text: "有 \(p.requiresAttentionAssets) 张照片解码后的图像超出当前内存上限，已停止自动重试。可在设置中提高“图像处理内存峰值上限”，或点击“立即扫描”重新尝试。其他照片会继续处理，原文件未被修改。")) }
             if let issue = p.issue { details.append(.init(title: "当前状态", text: issue)) }
             details += Self.commonTaskDetails
             rows.append(.init(id: "visualIndex", subtitle: subtitle,

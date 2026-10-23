@@ -3,12 +3,21 @@ import Photos
 import UserNotifications
 import PhotoSyncCore
 
+enum ImageMemoryLimit: Int, CaseIterable, Hashable, Sendable {
+    case mib512 = 512, gib1 = 1024, gib2 = 2048, gib4 = 4096, gib8 = 8192
+    static let preferenceKey = "imageMemoryLimitMiB"
+    static let handledKey = "imageMemoryHandledLimitMiB"
+    var bytes: Int64 { Int64(rawValue) * 1_048_576 }
+    var label: String { self == .mib512 ? "512 MiB" : "\(rawValue / 1024) GiB" }
+}
+
 enum RuntimeSourceOperationError: Error, LocalizedError {
     case sourceRemoved
     var errorDescription: String? { "该来源已移除，请重新添加来源目录。" }
 }
 
 struct RuntimeState: Sendable {
+    var imageMemoryLimit: ImageMemoryLimit = .gib2
     var snapshot = EngineSnapshot()
     var sources: [RegisteredSource] = []
     var authorized = false
@@ -105,6 +114,11 @@ struct AdvancedRuntimeGraph: Sendable {
 
 /// Owns one engine and gateway for the entire process. A poisoned gateway is never replaced.
 actor SyncRuntime {
+    private let imageMemoryPreferences: UserDefaults?
+    private var handledImageMemoryLimit: ImageMemoryLimit = .mib512
+    private var appliedImageMemoryLimit: ImageMemoryLimit?
+    private var applyingImageMemoryLimit = false
+    private let imageMemoryFailureSummary = "无法重新安排超限照片的分析，稍后会自动重试。"
     private var engine: SyncEngine?
     private var store: SyncStore?
     private var logger: RunLogger?
@@ -176,8 +190,12 @@ actor SyncRuntime {
         authorized: @escaping @Sendable () -> Bool,
         requestAuthorization: @escaping @Sendable () async -> Bool = { false },
         notificationsEnabled: @escaping @Sendable () -> Bool = { false },
-        notification: (@Sendable (String, String) -> Void)? = nil
+        notification: (@Sendable (String, String) -> Void)? = nil,
+        imageMemoryPreferences: UserDefaults? = nil
     ) {
+        self.imageMemoryPreferences = imageMemoryPreferences
+        state.imageMemoryLimit = ImageMemoryLimit(rawValue: imageMemoryPreferences?.integer(forKey: ImageMemoryLimit.preferenceKey) ?? 0) ?? .gib2
+        handledImageMemoryLimit = ImageMemoryLimit(rawValue: imageMemoryPreferences?.integer(forKey: ImageMemoryLimit.handledKey) ?? 0) ?? .mib512
         self.store = store; self.engine = engine
         self.livePhotoMetadata = livePhotoMetadata ?? LivePhotoMetadataReader(executor: executor)
         self.executor = executor; self.advancedFactory = advancedFactory; self.notification = notification
@@ -206,6 +224,9 @@ actor SyncRuntime {
     }
 
     init() {
+        imageMemoryPreferences = .standard
+        state.imageMemoryLimit = ImageMemoryLimit(rawValue: UserDefaults.standard.integer(forKey: ImageMemoryLimit.preferenceKey)) ?? .gib2
+        handledImageMemoryLimit = ImageMemoryLimit(rawValue: UserDefaults.standard.integer(forKey: ImageMemoryLimit.handledKey)) ?? .mib512
         let sharedExecutor = ReadExecutor()
         executor = sharedExecutor
         livePhotoMetadata = LivePhotoMetadataReader(executor: sharedExecutor)
@@ -223,6 +244,52 @@ actor SyncRuntime {
             .appendingPathComponent("PhotoSync", isDirectory: true)
         logsURL = support.appendingPathComponent("Logs", isDirectory: true)
         databaseURL = support.appendingPathComponent("sync.sqlite")
+    }
+
+    func setImageMemoryLimit(_ limit: ImageMemoryLimit) async {
+        guard !stopped else { return }
+        state.imageMemoryLimit = limit
+        imageMemoryPreferences?.set(limit.rawValue, forKey: ImageMemoryLimit.preferenceKey)
+        await tick()
+    }
+
+    /// Handle the setting before scheduling another index batch. A raised budget
+    /// must also rearm a failure delivered late by an old-budget physical read.
+    private var imageMemoryLimitIsCurrent: Bool {
+        !applyingImageMemoryLimit && appliedImageMemoryLimit == state.imageMemoryLimit && handledImageMemoryLimit == state.imageMemoryLimit
+    }
+
+    private func applyImageMemoryLimitIfReady() async {
+        guard let graph = advancedGraph, let store else { return }
+        guard !applyingImageMemoryLimit else { return }
+        applyingImageMemoryLimit = true
+        defer { applyingImageMemoryLimit = false }
+        let selected = state.imageMemoryLimit
+        if appliedImageMemoryLimit != selected {
+            await graph.budget.setMaximumBytes(selected.bytes)
+            appliedImageMemoryLimit = selected
+            logger?.log(["phase": "image-memory-limit", "event": "applied", "maximumMiB": String(selected.rawValue)])
+        }
+        guard state.imageMemoryLimit == selected, eligibleForWork else { return }
+        if selected.rawValue > handledImageMemoryLimit.rawValue {
+            guard advancedWork == nil, await graph.budget.snapshot().images == 0 else { return }
+            guard state.imageMemoryLimit == selected, eligibleForWork, advancedWork == nil else { return }
+            do {
+                let count = try await store.retryIndexReadLimits(now: now())
+                logger?.log(["phase": "image-memory-limit", "event": "retry-rearmed", "items": String(count)])
+            } catch {
+                state.message = imageMemoryFailureSummary; state.messageDetail = error.localizedDescription
+                return
+            }
+        }
+        guard state.imageMemoryLimit == selected else { return }
+        // Marker follows successful rearm and precedes new work, so a new failure
+        // at this limit is not retried again on every launch or UI refresh.
+        if handledImageMemoryLimit != selected {
+            handledImageMemoryLimit = selected
+            imageMemoryPreferences?.set(selected.rawValue, forKey: ImageMemoryLimit.handledKey)
+        }
+        if state.message == imageMemoryFailureSummary { state.message = nil; state.messageDetail = nil }
     }
 
     func bootstrap() async {
@@ -435,6 +502,8 @@ actor SyncRuntime {
         if retryLivePhoto { manualLivePhotoRetryPending = true; nextLivePhotoWorkAt = nil }
         if retryIndexReadLimits { manualIndexReadRetryPending = true }
         if retryModel { manualModelRetryPending = true }
+        await applyImageMemoryLimitIfReady()
+        guard eligibleForWork else { return }
         if engine == nil { startAdvancedGraphIfNeeded(); return }
         if eligibleForImageWork, let model = advancedGraph?.model as? any ModelExecutionRecovering {
             // Coalesce ticks while the single physical queue is loading/validating.
@@ -459,7 +528,7 @@ actor SyncRuntime {
             }
         }
         guard let engine else { return }
-        if manualIndexReadRetryPending, eligibleForImageWork, let graph = advancedGraph {
+        if manualIndexReadRetryPending, eligibleForImageWork, imageMemoryLimitIsCurrent, let graph = advancedGraph {
             manualIndexReadRetryPending = false
             do { try await graph.coordinator.retryReadLimits(now: now()) }
             catch { state.message = "无法重新尝试图库分析，请稍后重试。"; state.messageDetail = error.localizedDescription; return }
@@ -887,6 +956,7 @@ actor SyncRuntime {
 
     private func runAdvancedWork(_ graph: AdvancedRuntimeGraph, reconcile: Bool) async {
         let previousReady = publishedProgress?.state == .ready
+        let memoryLimitWasCurrent = imageMemoryLimitIsCurrent
         if eligibleForWork {
             if reconcile {
                 logger?.log(["phase": "index-trigger", "trigger": "runtime-reconcile"])
@@ -894,7 +964,10 @@ actor SyncRuntime {
                 catch is CancellationError { /* Paused before another catalog page. */ }
                 catch { logger?.log(["phase": "index-reconcile", "result": "waiting", "error": String(describing: error)]) }
             }
-            if eligibleForImageWork, await graph.coordinator.hasDueWork(now: now()), eligibleForImageWork {
+            // A memory change waits only for image analysis. Catalog and source
+            // recovery keep progressing even if an old physical reader is stalled.
+            if eligibleForImageWork, imageMemoryLimitIsCurrent,
+               await graph.coordinator.hasDueWork(now: now()), eligibleForImageWork, imageMemoryLimitIsCurrent {
                 await graph.coordinator.processDueWork(now: now())
             }
             // The gateway owns a single catalog session. Keep both enumerators here.
@@ -935,10 +1008,15 @@ actor SyncRuntime {
         if !previousReady && publishedProgress?.state == .ready { pendingAdvancedScan = true }
         await consumeCoveredFullChange()
         if reconcile { schedule.finishedPhotosReconciliation() }
+        var memoryChangeCanResume = false
+        if memoryLimitWasCurrent, state.imageMemoryLimit.rawValue > handledImageMemoryLimit.rawValue {
+            memoryChangeCanResume = await graph.budget.snapshot().images == 0
+        }
         advancedWork = nil
         // A change delivered while busy is coalesced into one fresh batch. Zero legacy
         // reopens never marks that durable queue complete; the next existing tick retries it.
-        if changePending || pendingFullChangeSerial != nil || indexEventPending { await tick() }
+        // Metadata-only drain passes do not schedule themselves again while waiting.
+        if memoryChangeCanResume || changePending || pendingFullChangeSerial != nil || indexEventPending { await tick() }
         else if pendingAdvancedScan && round == nil { await tick(includeAdvanced: false) }
     }
 }

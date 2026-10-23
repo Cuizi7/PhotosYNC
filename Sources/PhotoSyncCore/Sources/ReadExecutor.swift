@@ -70,6 +70,18 @@ public actor ReadExecutor {
         }
     }
 
+    /// The decoder uses its lease's frozen allowance even if settings change.
+    public func executeImage<Value: Sendable>(
+        sourceID: UUID, budget: ImageWorkBudget, limits: ResourceLimits,
+        operation: @escaping @Sendable (Int64) throws -> Value
+    ) async throws -> ImageWorkResult<Value> {
+        let lease = try await budget.acquireMaximum()
+        return try await executeReserved(sourceID: sourceID, timeout: .seconds(limits.requestTimeoutSeconds),
+                                         imageDecodeLimit: limits.decodeConcurrency) {
+            ImageWorkResult(value: try operation(lease.reservedBytes), lease: lease)
+        }
+    }
+
     private func executeReserved<Value: Sendable>(
         sourceID: UUID, timeout: Duration?, imageDecodeLimit: Int?,
         operation: @escaping @Sendable () throws -> Value

@@ -52,9 +52,8 @@ public struct MetadataReader: MetadataReading {
     /// stretch/orientation/color pipeline. Reserve the full allowance first;
     /// original-backing preflight still decides conservative oversize admission.
     func readForFingerprint(url: URL, configuration: DedupConfiguration, budget: ImageWorkBudget) async throws -> ImageWorkResult<SourceImage> {
-        let allowance = configuration.resources.maxDecodedBytes
         return try await executor.executeImage(sourceID: sourceID, budget: budget,
-            bytes: allowance, limits: configuration.resources) {
+            limits: configuration.resources) { allowance in
             _ = try SourceRegistry.normalizedURL(url.deletingLastPathComponent())
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             guard attributes[.type] as? FileAttributeType == .typeRegular else { throw MetadataError.unreadable }

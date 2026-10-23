@@ -16,6 +16,7 @@ final class AppModel: ObservableObject {
     @Published var changingLogin = false
     @Published private(set) var changingSources: Set<UUID> = []
     @Published var notificationsEnabled = false
+    @Published private(set) var changingImageMemoryLimit = false
     @Published private(set) var notificationIssue: NotificationPermissionWarning?
     @Published var ready = false
     @Published var demoStatus: GlobalStatus = .error
@@ -278,13 +279,6 @@ final class AppModel: ObservableObject {
         }
         return "需要“照片”的完整读写权限，才能核对重复、保存完整 Live Photo，并在验证后清理可安全替代的单项。请主动授权后开始同步。"
     }
-    var syncBoundaryDescription: String {
-        if isReadOnlyGUIQA {
-            return "GUI QA 只读验证：来源文件和 Photos 仅供读取；所有 Photos 写入请求都会被测试构建拒绝。"
-        }
-        return "只读取来源文件，向“照片”保存内容。Live Photo 验证通过后，仅清理原资源与受保护信息均已保留的被替代单项。停用来源会保留同步记录。"
-    }
-
     func openSettingsWindow() {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0,
@@ -304,6 +298,17 @@ final class AppModel: ObservableObject {
     }
 
     func authorize() { guard !demo else { return }; Task { await runtime?.requestAuthorization() } }
+    func setImageMemoryLimit(_ limit: ImageMemoryLimit) {
+        guard !demo, ready, !changingImageMemoryLimit, let runtime else { return }
+        state.imageMemoryLimit = limit
+        changingImageMemoryLimit = true
+        Task { [weak self] in
+            await runtime.setImageMemoryLimit(limit)
+            guard let self else { return }
+            self.state = await runtime.current()
+            self.changingImageMemoryLimit = false
+        }
+    }
     func scan() { guard !demo else { return }; Task { await runtime?.tick(force: true, retryModel: true, retryLivePhoto: true, retryIndexReadLimits: true) } }
     func togglePause() {
         guard canTogglePause else { return }

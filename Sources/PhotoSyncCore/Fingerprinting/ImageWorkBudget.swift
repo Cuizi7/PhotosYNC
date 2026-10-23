@@ -13,7 +13,7 @@ public actor ImageWorkBudget {
         public let bytes: Int64
     }
     private let maxImages: Int
-    private let maxBytes: Int64
+    private var maxBytes: Int64
     private var reservations: [UUID: Int64] = [:]
     private var bytes: Int64 = 0
 
@@ -26,6 +26,15 @@ public actor ImageWorkBudget {
     public init(limits: ResourceLimits) {
         self.init(maxImages: limits.maxInFlightTasks, maxBytes: limits.maxDecodedBytes)
     }
+
+    /// Existing physical owners keep their original allowance after a reduction.
+    /// New reservations wait until they fit inside the new aggregate budget.
+    public func setMaximumBytes(_ value: Int64) {
+        precondition(value > 0)
+        maxBytes = value
+    }
+    public func acquireMaximum() async throws -> ImageLease { try await acquire(bytes: maxBytes) }
+    public func canAcquireMaximum() -> Bool { canAcquire(bytes: maxBytes) }
 
     public func acquire(bytes requested: Int64) async throws -> ImageLease {
         try Task.checkCancellation()

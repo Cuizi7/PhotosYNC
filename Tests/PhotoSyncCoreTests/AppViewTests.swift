@@ -6,6 +6,26 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testSettingsShowsImagePeakBudgetPurposeAndDefaultAndCustomValues() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            for value in [ImageMemoryLimit.gib2, .gib4] {
+                let model = try makeUIReviewModel(scenario: .completed, root: root)
+                model.state.imageMemoryLimit = value
+                _ = try measure(SourceSettings(model: model), width: 600, appearance: appearance) { host in
+                    let text = try self.recognizedText(in: host).map(\.text).joined(separator: " ")
+                    XCTAssertTrue(text.contains("图像处理内存峰值上限"), text)
+                    XCTAssertTrue(text.contains("解码") && text.contains("视觉判重") && text.contains("按需"), text)
+                    XCTAssertTrue(text.contains("模型") && text.contains("系统缓存"), text)
+                    // SwiftUI's picker need not use NSPopUpButton as its backing class.
+                    // Verify the value actually drawn for the user instead.
+                    XCTAssertTrue(text.replacingOccurrences(of: " ", with: "").contains(value.label.replacingOccurrences(of: " ", with: "")), text)
+                    XCTAssertEqual(text.contains("默认"), value == .gib2, text)
+                    try self.capture(host, name: "memory-settings-\(value.rawValue)-\(appearance.rawValue)")
+                }
+            }
+        }
+    }
     func testEachTaskHasItsOwnCaptionAlignedDetailsButton() throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let model = try makeUIReviewModel(scenario: .analyzing, root: root)

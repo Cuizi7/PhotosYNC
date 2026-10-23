@@ -151,9 +151,6 @@ struct SourceSettings: View {
             }
             SyncWorkProgressView(snapshot: model.state.snapshot, showSourceProgress: model.hasEnabledSources,
                 showActiveProgress: model.status == .preparing || model.status == .running)
-            Text(model.syncBoundaryDescription)
-                .font(.callout).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
             if !model.state.authorized {
                 Text(model.photosAuthorizationDescription)
                     .font(.callout).foregroundStyle(.secondary)
@@ -217,6 +214,26 @@ struct SourceSettings: View {
             }
             Text("启动后扫描，每 30 分钟自动扫描；来源不可用时自动等待恢复。")
                 .font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("图像处理内存峰值上限")
+                    Spacer()
+                    Picker("图像处理内存峰值上限", selection: Binding(
+                        get: { model.state.imageMemoryLimit }, set: model.setImageMemoryLimit)) {
+                        ForEach(ImageMemoryLimit.allCases, id: \.self) { limit in
+                            Text(limit.label + (limit == .gib2 ? "（默认）" : "")).tag(limit)
+                        }
+                    }
+                    .labelsHidden().frame(width: 150)
+                    .accessibilityIdentifier("image-memory-limit")
+                    .disabled(model.demo || !model.ready || model.changingImageMemoryLimit)
+                    .help("新上限用于后续图像任务；正在进行的任务沿用原额度。提高上限后，会自动重试此前因解码内存超限而未能分析的照片。")
+                }
+                Text("用于照片解码和视觉判重，按需占用内存；所选值为图像处理的峰值预算。模型、图库和系统缓存还会额外占用内存。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 4)
         }
         .accessibilityIdentifier("settings-sync-options")
     }

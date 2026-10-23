@@ -3,6 +3,17 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testMemorySettingForwardsToIsolatedRuntimeAndRefreshesSelection() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = SyncRuntime(store: try SyncStore(url: root.appendingPathComponent("test.sqlite")),
+            now: { Date() }, authorized: { false })
+        let model = AppModel(runtime: runtime, initialState: await runtime.current())
+        model.setImageMemoryLimit(.gib4)
+        let updated = await engineEventually { await MainActor.run { model.state.imageMemoryLimit == .gib4 && !model.changingImageMemoryLimit } }
+        XCTAssertTrue(updated)
+        let state = await runtime.current(); XCTAssertEqual(state.imageMemoryLimit, .gib4)
+        XCTAssertFalse(model.allowsSystemIntegrations)
+    }
     func testUnknownSubmissionWithoutSpecializedHintStillWaitsSafely() async throws {
         let fixture = try await makeAppModelFixture()
         let model = fixture.model

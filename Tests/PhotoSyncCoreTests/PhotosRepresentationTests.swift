@@ -7,6 +7,43 @@ import Darwin
 @testable import PhotoSyncCore
 
 final class PhotosRepresentationTests: XCTestCase {
+    func testChangingImageBudgetDoesNotReleaseExistingPhysicalOwnership() async throws {
+        let budget = ImageWorkBudget(maxImages: 2, maxBytes: 128)
+        let old = try await budget.acquireMaximum()
+        await budget.setMaximumBytes(64)
+        let held = await budget.snapshot(), admission = await budget.canAcquireMaximum()
+        XCTAssertEqual(held.bytes, 128); XCTAssertEqual(old.reservedBytes, 128); XCTAssertFalse(admission)
+        do { _ = try await budget.acquireMaximum(); XCTFail("Old physical owner must block a new reservation") }
+        catch { XCTAssertEqual(error as? ImageWorkBudgetError, .exhausted) }
+        await old.finishPhysicalWork()
+        let reduced = try await budget.acquireMaximum()
+        XCTAssertEqual(reduced.reservedBytes, 64)
+        await reduced.finishPhysicalWork()
+        await budget.setMaximumBytes(256)
+        let increased = try await budget.acquireMaximum()
+        XCTAssertEqual(increased.reservedBytes, 256)
+        await increased.finishPhysicalWork()
+    }
+
+    func testPhotoAndSourceDecodingUseTheSharedCurrentBudget() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("fixture.png"), config = try configuration()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(file as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try bitmap(), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        let budget = ImageWorkBudget(maxImages: 2, maxBytes: 1024)
+        let source = try await MetadataReader(executor: ReadExecutor()).readForFingerprint(url: file, configuration: config, budget: budget)
+        XCTAssertEqual(source.lease.reservedBytes, 1024); XCTAssertEqual(source.value.eligibility, .safeSingleFrame)
+        await source.lease.finishPhysicalWork()
+        let requester = ControlledRepresentationRequester()
+        requester.immediateEvent = .image(try bitmap(), orientation: .up, eligibility: .safeSingleFrame)
+        let reader = PhotosRepresentationReader(requester: requester, budget: budget, configuration: config,
+            storage: PhotosResourceStorage(root: root.appendingPathComponent("raw")))
+        let result = try await reader.read(descriptor(), isCurrent: { true })
+        XCTAssertEqual(result.lease.reservedBytes, 1024)
+        await result.lease.finishPhysicalWork()
+    }
+
     func testDescriptorCarriesExactModificationDateAndRejectsNonfiniteDate() throws {
         let date = Date(timeIntervalSince1970: 123.125)
         for value in [date, nil, Date(timeIntervalSince1970: .infinity), Date(timeIntervalSince1970: .nan)] {

@@ -71,7 +71,7 @@ public actor PhotosRepresentationReader {
     /// stalled after 60 monotonic seconds, without forced release or a recovery
     /// guarantee. Callers must still handle a racing capacity error from `read`.
     public func admission() async -> PhotosReaderAdmission {
-        let capacity = await budget.canAcquire(bytes: configuration.resources.maxDecodedBytes)
+        let capacity = await budget.canAcquireMaximum()
         // Recheck physical ownership after the budget actor suspension. Active can
         // become empty before cleanup releases its reservation, so both must agree.
         if let state = active.values.first { return state.admission(now: monotonic()) }
@@ -84,7 +84,7 @@ public actor PhotosRepresentationReader {
         guard active.isEmpty else { throw ReadExecutorError.resourceExhausted }
         let diagnostic = indexDiagnostics?.operation("request", descriptor: descriptor)
         diagnostic?.record(["phase": "photos-reader", "event": "admission"], descriptor: descriptor)
-        let lease = try await budget.acquire(bytes: configuration.resources.maxDecodedBytes)
+        let lease = try await budget.acquireMaximum()
         lease.setIndexDiagnostic(diagnostic, descriptor: descriptor)
         guard active.isEmpty else { await lease.finishPhysicalWork(); throw ReadExecutorError.resourceExhausted }
         guard !Task.isCancelled, isCurrent() else {

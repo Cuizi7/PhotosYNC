@@ -5,6 +5,160 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    private func memoryPreferences() -> UserDefaults {
+        let suite = "PhotosYNC.MemoryTest.\(UUID().uuidString)"
+        let preferences = UserDefaults(suiteName: suite)!
+        preferences.removePersistentDomain(forName: suite)
+        addTeardownBlock { preferences.removePersistentDomain(forName: suite) }
+        return preferences
+    }
+
+    func testImageMemoryPreferenceDefaultsPersistsAndRejectsUnknownValues() async throws {
+        let preferences = memoryPreferences(), f = try await fixture(imageMemoryPreferences: preferences)
+        let initial = await f.runtime.current(); XCTAssertEqual(initial.imageMemoryLimit, .gib2)
+        await f.runtime.setImageMemoryLimit(.gib4)
+        let changed = await f.runtime.current(); XCTAssertEqual(changed.imageMemoryLimit, .gib4)
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.preferenceKey), 4096)
+        let restored = SyncRuntime(store: f.store, now: { Date() }, authorized: { true }, imageMemoryPreferences: preferences)
+        let saved = await restored.current(); XCTAssertEqual(saved.imageMemoryLimit, .gib4)
+        preferences.set(13, forKey: ImageMemoryLimit.preferenceKey)
+        let invalid = SyncRuntime(store: f.store, now: { Date() }, authorized: { true }, imageMemoryPreferences: preferences)
+        let fallback = await invalid.current(); XCTAssertEqual(fallback.imageMemoryLimit, .gib2)
+    }
+
+    func testHigherImageBudgetReopensHeldItemsOnceAndSameBudgetRestartDoesNot() async throws {
+        let preferences = memoryPreferences(), f = try await fixture(taskCount: 1, imageMemoryPreferences: preferences)
+        await f.photos.failRepresentation(.unsupportedRepresentation(.decodedResourceLimit))
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let first = await f.photos.representationReads; XCTAssertEqual(first, 1)
+        await f.runtime.setImageMemoryLimit(.gib4); await f.runtime.waitForRound()
+        let raised = await f.photos.representationReads; XCTAssertEqual(raised, 2)
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 4096)
+        for _ in 0..<3 { await f.runtime.tick(force: true); await f.runtime.waitForRound() }
+        let repeated = await f.photos.representationReads; XCTAssertEqual(repeated, 2)
+        await f.runtime.stop(); await f.runtime.waitForRound()
+        let restarted = SyncRuntime(store: f.store, advancedFactory: f.factory, now: { Date(timeIntervalSince1970: 1000) },
+            authorized: { true }, imageMemoryPreferences: preferences)
+        try await restarted.prepareInjectedRuntime()
+        await restarted.tick(force: true); await restarted.waitForRound()
+        let afterRestart = await f.photos.representationReads; XCTAssertEqual(afterRestart, 2)
+        await restarted.setImageMemoryLimit(.gib1); await restarted.waitForRound()
+        let lower = await f.photos.representationReads; XCTAssertEqual(lower, 2)
+        await restarted.stop(); await restarted.waitForRound()
+    }
+
+    func testImageBudgetIncreaseWaitsForOldReadFailureBeforeRearming() async throws {
+        let preferences = memoryPreferences(), gate = P8Gate()
+        let f = try await fixture(taskCount: 1, imageMemoryPreferences: preferences)
+        await f.photos.failRepresentation(.unsupportedRepresentation(.decodedResourceLimit))
+        await f.photos.holdNextRepresentation(gate)
+        await f.runtime.tick(force: true); await gate.waitUntilEntered()
+        await f.runtime.setImageMemoryLimit(.gib4)
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 2048)
+        await gate.release(); await f.runtime.waitForRound()
+        await f.runtime.tick(); await f.runtime.waitForRound()
+        let reads = await f.photos.representationReads; XCTAssertEqual(reads, 2, "Late old-budget failure must also be retried")
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 4096)
+    }
+
+    func testDefaultTwoGiBUpgradeReopensLegacyReadHold() async throws {
+        let preferences = memoryPreferences()
+        preferences.set(512, forKey: ImageMemoryLimit.preferenceKey)
+        let f = try await fixture(taskCount: 1, imageMemoryPreferences: preferences)
+        await f.photos.failRepresentation(.unsupportedRepresentation(.decodedResourceLimit))
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let first = await f.photos.representationReads; XCTAssertEqual(first, 1)
+        await f.runtime.stop(); await f.runtime.waitForRound()
+        // Older app versions had neither preference key; keep their held DB item.
+        preferences.removeObject(forKey: ImageMemoryLimit.preferenceKey)
+        preferences.removeObject(forKey: ImageMemoryLimit.handledKey)
+        let upgraded = SyncRuntime(store: f.store, advancedFactory: f.factory, now: { Date(timeIntervalSince1970: 1000) },
+            authorized: { true }, imageMemoryPreferences: preferences)
+        try await upgraded.prepareInjectedRuntime()
+        await upgraded.tick(force: true); await upgraded.waitForRound()
+        let reads = await f.photos.representationReads; XCTAssertEqual(reads, 2)
+        let lease = try await f.photos.holdBudget(); XCTAssertEqual(lease.reservedBytes, ImageMemoryLimit.gib2.bytes)
+        await lease.finishPhysicalWork()
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 2048)
+        await upgraded.stop(); await upgraded.waitForRound()
+    }
+
+    func testImageBudgetRearmWaitsForPhysicalOwnerAfterWorkerReturns() async throws {
+        let preferences = memoryPreferences(), f = try await fixture(taskCount: 1, imageMemoryPreferences: preferences)
+        await f.photos.failRepresentation(.unsupportedRepresentation(.decodedResourceLimit))
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let oldLease = try await f.photos.holdBudget()
+        await f.runtime.setImageMemoryLimit(.gib4)
+        // Metadata-only work is allowed while the physical image owner remains.
+        await f.runtime.waitForRound()
+        let held = await f.photos.representationReads; XCTAssertEqual(held, 1)
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 2048)
+        XCTAssertEqual(oldLease.reservedBytes, ImageMemoryLimit.gib2.bytes)
+        await oldLease.finishPhysicalWork()
+        await f.runtime.tick(); await f.runtime.waitForRound()
+        let retried = await f.photos.representationReads; XCTAssertEqual(retried, 2)
+        let newLease = try await f.photos.holdBudget(); XCTAssertEqual(newLease.reservedBytes, ImageMemoryLimit.gib4.bytes)
+        await newLease.finishPhysicalWork()
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 4096)
+    }
+
+    func testImageBudgetDrainDoesNotBlockCatalogOrSourceScans() async throws {
+        let preferences = memoryPreferences(), f = try await fixture(taskCount: 1, imageMemoryPreferences: preferences)
+        await f.photos.failRepresentation(.unsupportedRepresentation(.decodedResourceLimit))
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let initial = await f.runtime.current()
+        let databaseURL = try XCTUnwrap(initial.sources.first?.url).deletingLastPathComponent().appendingPathComponent("test.sqlite")
+        let scans = try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL)
+        let catalogs = await f.photos.catalogCount
+        let oldLease = try await f.photos.holdBudget()
+        await f.runtime.setImageMemoryLimit(.gib4)
+        await f.photos.advanceGeneration(); await f.runtime.libraryChanged(.fullReconcileRequired)
+        await f.runtime.waitForRound()
+        let reconciled = await f.photos.catalogCount
+        XCTAssertEqual(reconciled, catalogs + 1, "Image memory drain must not block metadata-only catalog reconciliation")
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        XCTAssertGreaterThan(try engineSQLInteger("SELECT COUNT(*) FROM scan_run", at: databaseURL), scans,
+            "Source scans and recovery must remain schedulable while an old image owner drains")
+        let reads = await f.photos.representationReads
+        XCTAssertEqual(reads, 1); XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 2048)
+        await oldLease.finishPhysicalWork()
+        await f.runtime.tick(); await f.runtime.waitForRound()
+        let resumed = await f.photos.representationReads
+        XCTAssertEqual(resumed, 2); XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 4096)
+    }
+
+    func testImageMemoryChangesRespectPauseAndAuthorization() async throws {
+        for paused in [true, false] {
+            let preferences = memoryPreferences(), f = try await fixture(taskCount: 1, imageMemoryPreferences: preferences)
+            await f.photos.failRepresentation(.unsupportedRepresentation(.decodedResourceLimit))
+            await f.runtime.tick(force: true); await f.runtime.waitForRound()
+            if paused { await f.runtime.pause() }
+            else { f.authorization.value = false; await f.runtime.tick() }
+            await f.runtime.setImageMemoryLimit(.gib4)
+            XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.preferenceKey), 4096)
+            XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 2048)
+            let held = await f.photos.representationReads; XCTAssertEqual(held, 1)
+            if paused { await f.runtime.resume() }
+            else { f.authorization.value = true; await f.runtime.tick() }
+            await f.runtime.waitForRound()
+            let resumed = await f.photos.representationReads; XCTAssertEqual(resumed, 2)
+            XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 4096)
+        }
+    }
+
+    func testLatestImageMemorySelectionWinsDuringGraphStartup() async throws {
+        let preferences = memoryPreferences(), gate = P8Gate()
+        let f = try await fixture(gate: gate, imageMemoryPreferences: preferences)
+        await f.runtime.tick(force: true); await gate.waitUntilEntered()
+        await f.runtime.setImageMemoryLimit(.gib4)
+        await f.runtime.setImageMemoryLimit(.gib1)
+        await gate.release(); await f.runtime.waitForRound()
+        let lease = try await f.photos.holdBudget()
+        XCTAssertEqual(lease.reservedBytes, ImageMemoryLimit.gib1.bytes)
+        await lease.finishPhysicalWork()
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.preferenceKey), 1024)
+        XCTAssertEqual(preferences.integer(forKey: ImageMemoryLimit.handledKey), 1024)
+    }
     func testCapacityDeferralKeepsQueuedPresentationWithoutRetryingEarly() async throws {
         let f = try await inventoryFixture(count: 1), config = try p8Configuration(), clock = P12Clock()
         defer { try? FileManager.default.removeItem(at: f.root) }
@@ -736,8 +890,10 @@ final class AdvancedRuntimeTests: XCTestCase {
         let runtime: SyncRuntime, photos: P8Photos, sourceID: UUID
         let loads: P8Counter, notifications: P8Counter, authorization: P8Authorization
         let model: P8Model
+        let store: SyncStore
+        let factory: SyncRuntime.AdvancedFactory
     }
-    private func fixture(taskCount: Int = 0, authorized: Bool = true, gate: P8Gate? = nil, resourceDirectory: URL? = nil, modelUnavailable: Bool = false, now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }) async throws -> Fixture {
+    private func fixture(taskCount: Int = 0, authorized: Bool = true, gate: P8Gate? = nil, resourceDirectory: URL? = nil, modelUnavailable: Bool = false, imageMemoryPreferences: UserDefaults? = nil, now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1000) }) async throws -> Fixture {
         let root = try temporaryDirectory(), source = root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         let executor = ReadExecutor()
@@ -745,8 +901,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         let sourceID = try await store.registerSource(url: source)
         let c = try p8Configuration(), photos = P8Photos(), loads = P8Counter(), notifications = P8Counter(), model = P8Model()
         let auth = P8Authorization(authorized)
-        let runtime = SyncRuntime(store: store, executor: executor,
-            advancedFactory: { store, executor, directory, now, _ in
+        let factory: SyncRuntime.AdvancedFactory = { store, executor, directory, now, _ in
                 loads.increment()
                 if modelUnavailable { throw ModelExecutionUnavailable(detail: "test runtime") }
                 if let gate { await gate.hold() }
@@ -759,12 +914,13 @@ final class AdvancedRuntimeTests: XCTestCase {
                 return AdvancedRuntimeGraph(store: store, photos: photos,
                     model: model, configuration: c, executor: executor,
                     budget: budget, directory: directory, now: now)
-            }, now: now, authorized: { auth.value },
-            notificationsEnabled: { true }, notification: { _, _ in notifications.increment() })
+            }
+        let runtime = SyncRuntime(store: store, executor: executor, advancedFactory: factory, now: now, authorized: { auth.value },
+            notificationsEnabled: { true }, notification: { _, _ in notifications.increment() }, imageMemoryPreferences: imageMemoryPreferences)
         try await runtime.prepareInjectedRuntime()
         addTeardownBlock { await runtime.stop(); await runtime.waitForRound(); try? FileManager.default.removeItem(at: root) }
         return Fixture(runtime: runtime, photos: photos, sourceID: sourceID, loads: loads,
-                       notifications: notifications, authorization: auth, model: model)
+                       notifications: notifications, authorization: auth, model: model, store: store, factory: factory)
     }
 }
 
@@ -796,6 +952,8 @@ private actor P8Model: ImageFingerprinting, ModelExecutionRecovering {
     }
 }
 private actor P8Photos: PhotosIndexGateway {
+    private var representationGate: P8Gate?
+    func holdNextRepresentation(_ gate: P8Gate) { representationGate = gate }
     private var representationFailure: PhotosRepresentationError?
     private(set) var representationReads = 0
     func failRepresentation(_ error: PhotosRepresentationError?) { representationFailure = error }
@@ -812,16 +970,14 @@ private actor P8Photos: PhotosIndexGateway {
     func representationReadAdmission() async -> PhotosReaderAdmission {
         if let gate = admissionGate { admissionGate = nil; await gate.hold() }
         guard admission == .available, let budget else { return admission }
-        return await budget.canAcquire(bytes: reservationBytes) ? .available : .busy
+        return await budget.canAcquireMaximum() ? .available : .busy
     }
-    private var reservationBytes: Int64 = 0
     func holdBudget() async throws -> ImageLease {
         guard let budget else { throw PhotosRepresentationError.unavailable }
-        return try await budget.acquire(bytes: reservationBytes)
+        return try await budget.acquireMaximum()
     }
     func setWork(_ count: Int, budget: ImageWorkBudget) async {
         taskCount = count; self.budget = budget
-        reservationBytes = (try? p8Configuration().resources.maxDecodedBytes) ?? 1
     }
     nonisolated let subscribers = P8Counter()
     nonisolated let channel = PhotosIndexChangeChannel(capacity: 8)
@@ -885,6 +1041,7 @@ private actor P8Photos: PhotosIndexGateway {
     }
     func readRepresentation(_ descriptor: RepresentationDescriptor) async throws -> LoadedRepresentation {
         representationReads += 1
+        if let gate = representationGate { representationGate = nil; await gate.hold() }
         if let representationFailure { throw representationFailure }
         guard let budget else { throw PhotosRepresentationError.unavailable }
         let lease = try await budget.acquire(bytes: 256)
