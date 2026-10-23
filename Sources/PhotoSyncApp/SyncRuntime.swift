@@ -20,6 +20,22 @@ struct RuntimeState: Sendable {
     /// global sync status an error or stop the engine.
     var warning: String?
     var warningDetail: String?
+
+    /// Source scans do not own analysis state. Keep the last complete publication
+    /// across awaits rather than exposing the engine's default analysis fields.
+    mutating func acceptEngineSnapshot(_ engineSnapshot: EngineSnapshot) {
+        var combined = engineSnapshot
+        // Pause/resume is a runtime command; an engine scan may predate it.
+        combined.isPaused = snapshot.isPaused
+        combined.indexProgress = snapshot.indexProgress
+        combined.indexActivity = snapshot.indexActivity
+        combined.livePhotoInventory = snapshot.livePhotoInventory
+        combined.livePhotoWork = snapshot.livePhotoWork
+        combined.livePhotoActivities = snapshot.livePhotoActivities
+        combined.livePhotoIssue = snapshot.livePhotoIssue
+        snapshot = combined
+    }
+
 }
 
 /// Immutable ownership graph; test factories inject only its physical boundaries.
@@ -109,6 +125,8 @@ actor SyncRuntime {
     private var livePhotoWorkTask: Task<Void, Never>?
     private var livePhotoSourceReadyPending = false
     private var livePhotoProgressGeneration: UInt64 = 0
+    private var committedLivePhotoProgressGeneration: UInt64 = 0
+    private var nextWorkerProgressUptime: TimeInterval = 0
     private var nextLivePhotoWorkAt: Date?
     private var livePhotoDeferrals = 0
     private var manualLivePhotoRetryPending = false
@@ -262,7 +280,7 @@ actor SyncRuntime {
 
     func current() async -> RuntimeState {
         refreshAuthorization()
-        if let engine { state.snapshot = await engine.snapshot() }
+        if let engine { state.acceptEngineSnapshot(await engine.snapshot()) }
         else if let store {
             do {
                 state.snapshot.summary = try await store.activeSourceSummary()
@@ -522,7 +540,7 @@ actor SyncRuntime {
     }
 
     private func finishedRound(ids: [UUID], snapshot: EngineSnapshot) async {
-        state.snapshot = snapshot
+        state.acceptEngineSnapshot(snapshot)
         let enabled = Set(state.sources.filter(\.enabled).map(\.id))
         // Count failures once per attempted round, never once per UI polling tick.
         for id in ids where enabled.contains(id) {
@@ -732,46 +750,90 @@ actor SyncRuntime {
         livePhotoWorkTask = Task { await self.runLivePhotoWork() }
     }
     private func runLivePhotoWork() async {
+        let sliceStarted = ProcessInfo.processInfo.systemUptime
+        var continueImmediately = false
+        var exitReason = "ineligible"
+        var inventoryItems = 0, completionAdvances = 0
         defer {
+            let elapsed = ProcessInfo.processInfo.systemUptime - sliceStarted
+            if inventoryItems > 0 || completionAdvances > 0 {
+                advancedGraph?.diagnostics.recordTiming(stage: "live_photo_worker_slice_wall", seconds: elapsed)
+            }
+            advancedGraph?.diagnostics.state("live-photo-worker", value: exitReason, fields: [
+                "inventoryItems": String(inventoryItems), "completionAdvances": String(completionAdvances),
+                "elapsedMS": String(elapsed * 1000)])
             livePhotoWorkTask = nil
-            if livePhotoSourceReadyPending { scheduleLivePhotoWork() }
+            if continueImmediately || livePhotoSourceReadyPending { scheduleLivePhotoWork() }
         }
         guard eligibleForWork, let inventory = livePhotoInventory, let completion = livePhotoCompletion,
               let photos = advancedGraph?.photos as? any LivePhotoPhotosGateway else { return }
-        let admission = await photos.livePhotoReadAdmission()
-        guard eligibleForWork, admission == .available else { return }
         do {
-            // Catalog enumeration belongs exclusively to runAdvancedWork's serial entry.
-            let summary = try await inventory.summary()
-            guard summary.phase != .enumerating else { return }
-            if !livePhotoRecoveryReady { try await completion.recover(); livePhotoRecoveryReady = true }
-            guard eligibleForWork else { return }
-            if manualLivePhotoRetryPending {
-                manualLivePhotoRetryPending = false
-                try await inventory.retryAttention(now: now())
-                try await completion.retryAttention(now: now())
+            // Bound each slice and yield between items. Only proven progress schedules
+            // a successor; waiting/no-progress still uses the normal wake/retry path.
+            for index in 0..<16 {
+                refreshAuthorization()
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                let admission = await photos.livePhotoReadAdmission()
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                guard admission == .available else { exitReason = "reader-unavailable"; break }
+                let summary = try await inventory.summary()
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                guard summary.phase != .enumerating else { exitReason = "enumerating"; break }
+                if !livePhotoRecoveryReady { try await completion.recover(); livePhotoRecoveryReady = true }
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                if manualLivePhotoRetryPending {
+                    manualLivePhotoRetryPending = false
+                    try await inventory.retryAttention(now: now())
+                    try await completion.retryAttention(now: now())
+                }
+                let inventoryActivity = await inventory.activity(now: now())
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                let itemStarted = ProcessInfo.processInfo.systemUptime
+                let inventoried = inventoryActivity == .queued(.identification) ? try await inventory.processNextInventoryItem(now: now()) : false
+                if inventoried {
+                    inventoryItems += 1
+                    advancedGraph?.diagnostics.recordTiming(stage: "live_photo_inventory_item_wall", seconds: ProcessInfo.processInfo.systemUptime - itemStarted)
+                }
+                refreshAuthorization()
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                let completionDue = try await completion.hasDueWork(now: now())
+                guard eligibleForWork else { exitReason = "ineligible"; break }
+                var advanced = false
+                if inventoried || completionDue {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    advanced = try await completion.advanceNext(now: now(), refreshDiscovery: inventoried)
+                    if advanced {
+                        completionAdvances += 1
+                        advancedGraph?.diagnostics.recordTiming(stage: "live_photo_completion_advance_wall", seconds: ProcessInfo.processInfo.systemUptime - started)
+                    }
+                }
+                livePhotoIssue = nil; livePhotoDeferrals = 0; nextLivePhotoWorkAt = nil
+                guard inventoried || advanced else { exitReason = "no-progress"; break }
+                let uptime = ProcessInfo.processInfo.systemUptime
+                if uptime >= nextWorkerProgressUptime {
+                    nextWorkerProgressUptime = uptime + (advancedGraph?.configuration.resources.progressPublishIntervalSeconds ?? 1)
+                    await publishLivePhotoProgress()
+                }
+                await Task.yield()
+                if index == 15 { continueImmediately = true; exitReason = "slice-limit" }
             }
-            let inventoryActivity = await inventory.activity(now: now())
-            let inventoried = inventoryActivity == .queued(.identification) ? try await inventory.processNextInventoryItem(now: now()) : false
-            guard eligibleForWork else { return }
-            let completionDue = try await completion.hasDueWork(now: now())
-            if inventoried || completionDue {
-                _ = try await completion.advanceNext(now: now(), refreshDiscovery: inventoried)
-            }
-            livePhotoIssue = nil; livePhotoDeferrals = 0; nextLivePhotoWorkAt = nil
-        } catch is CancellationError { }
-        catch is LivePhotoReadDeferred { livePhotoIssue = nil; nextLivePhotoWorkAt = nil }
-        catch is ReadExecutorError { deferLivePhotoWork() }
-        catch LivePhotoResourceReadError.budgetBusy { deferLivePhotoWork() }
-        catch is PhotosAdmissionDeferred { deferLivePhotoWork() }
-        catch LivePhotoResourceReadError.resourceLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil }
-        catch LivePhotoResourceReadError.workingSetLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil }
+        } catch is CancellationError { exitReason = "cancelled" }
+        catch let deferred as LivePhotoReadDeferred {
+            livePhotoIssue = nil; nextLivePhotoWorkAt = nil
+            exitReason = deferred == .resourceChanged ? "resource-changed" : "classification-deferred"
+        }
+        catch is ReadExecutorError { deferLivePhotoWork(); exitReason = "read-deferred" }
+        catch LivePhotoResourceReadError.budgetBusy { deferLivePhotoWork(); exitReason = "budget-busy" }
+        catch is PhotosAdmissionDeferred { deferLivePhotoWork(); exitReason = "admission-deferred" }
+        catch LivePhotoResourceReadError.resourceLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil; exitReason = "resource-limit" }
+        catch LivePhotoResourceReadError.workingSetLimit { livePhotoIssue = nil; nextLivePhotoWorkAt = nil; exitReason = "resource-limit" }
         catch {
+            exitReason = "retry-wait"
             nextLivePhotoWorkAt = now().addingTimeInterval(60)
             livePhotoIssue = SourceIssue(summary: "部分 Live Photo 暂时无法处理，稍后自动重试。", detail: error.localizedDescription, kind: .file)
             logger?.log(["phase": "live-photo-work", "result": "waiting", "error": String(describing: error)])
         }
-        await publishLivePhotoProgress()
+        if !continueImmediately { await publishLivePhotoProgress() }
     }
     private func deferLivePhotoWork() {
         livePhotoDeferrals += 1
@@ -799,13 +861,23 @@ actor SyncRuntime {
                 if case .queued = $0 { return .waiting(nextRetryAt: nextLivePhotoWorkAt) }; return $0
             }
         }
-        // A newer publisher may have read newer durable facts while this one
-        // awaited activity. Do not roll its counters or attention state back.
-        guard generation == livePhotoProgressGeneration else { return }
+        // Only a completed newer publication supersedes this one. A newer call
+        // still awaiting its data cannot leave the older caller without a result.
+        guard generation > committedLivePhotoProgressGeneration else { return }
+        committedLivePhotoProgressGeneration = generation
         state.snapshot.livePhotoInventory = inventorySummary
         state.snapshot.livePhotoWork = completionSummary
         state.snapshot.livePhotoActivities = activities
         state.snapshot.livePhotoIssue = progressIssue ?? livePhotoIssue ?? completionSummary.issue
+        let visible = state.snapshot.hasLivePhotoWork || activities.contains { $0 != .idle }
+        let phase = activities.contains(.working(.completion)) || activities.contains(.queued(.completion)) ? "completion" :
+            activities.contains(.working(.identification)) || activities.contains(.queued(.identification)) ? "identification" :
+            activities.contains(.draining) ? "draining" : visible ? "waiting" : "idle"
+        let attention = (inventorySummary?.requiresAttention ?? 0) + completionSummary.requiresAttentionGroups
+        advancedGraph?.diagnostics.state("live-photo-task", value: "\(phase):paused=\(state.snapshot.isPaused):attention=\(attention > 0)", fields: [
+            "visible": String(visible), "publication": String(generation),
+            "identified": String(inventorySummary?.identified ?? 0), "pending": String(inventorySummary?.pending ?? 0),
+            "unresolved": String(inventorySummary?.unresolved ?? 0), "requiresAttention": String(attention)])
     }
 
     private func runAdvancedWork(_ graph: AdvancedRuntimeGraph, reconcile: Bool) async {

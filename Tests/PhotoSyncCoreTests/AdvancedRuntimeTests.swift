@@ -5,6 +5,27 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testEngineRefreshCannotUndoRuntimePauseOrClearUnfinishedTasks() {
+        for paused in [true, false] {
+            var state = RuntimeState()
+            state.snapshot.isPaused = paused
+            state.snapshot.livePhotoInventory = .init(phase: .identifying, inventoried: 35, identified: 1, pending: 34)
+            state.snapshot.livePhotoActivities = [.queued(.identification)]
+            state.snapshot.indexActivity = .waiting
+            var engine = EngineSnapshot()
+            engine.isPaused = !paused // A scan captured before the user's latest action.
+            engine.summary = .init(imported: 12)
+            engine.latestScan = .init(state: .completed)
+            state.acceptEngineSnapshot(engine)
+            XCTAssertEqual(state.snapshot.isPaused, paused, "Engine refresh must not undo the user's pause/resume command")
+            XCTAssertEqual(state.snapshot.summary?.imported, 12)
+            XCTAssertEqual(state.snapshot.latestScan.state, .completed)
+            XCTAssertEqual(state.snapshot.indexActivity, .waiting)
+            XCTAssertEqual(state.snapshot.livePhotoInventory?.pending, 34)
+            XCTAssertTrue(SyncStatusPresentation(snapshot: state.snapshot).progressRows.contains { $0.id == "livePhoto" })
+        }
+    }
+
     func testConcurrentProgressPublicationDoesNotInterleaveActivityArrays() async throws {
         let f = try await inventoryFixture(count: 0), config = try p8Configuration()
         let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
@@ -27,6 +48,96 @@ final class AdvancedRuntimeTests: XCTestCase {
         XCTAssertEqual(resumed.snapshot.livePhotoInventory?.requiresAttention, 1, "An older publisher cannot erase a newly published problem")
         await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
     }
+    func testOlderCurrentDoesNotHideLivePhotoRowWhileNewerPublicationIsHeld() async throws {
+        let f = try await inventoryFixture(count: 0), config = try p8Configuration()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, now: { Date() }, authorized: { true })
+        try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true); await runtime.waitForRound()
+        await runtime.pause()
+
+        // Model an already persisted, attention-held inventory item. It must stay visible
+        // while UI polling publications overlap, even though automatic work is paused.
+        let held = livePhotoAsset(context: f.photos.context, id: "durable-unresolved")
+        try await f.store.enqueueLivePhotoAssets(context: f.photos.context, assets: [held])
+        try await f.store.recordLivePhotoInventoryResult(context: f.photos.context, assetID: held.assetID, revision: held.revision,
+            observations: [.init(resource: held.resources[0], inspection: .unresolved("held"))], retryPolicy: .requiresAttention)
+
+        let firstGate = InventoryReadGate(); await f.photos.holdReadAdmissionOnce(firstGate)
+        let first = Task { await runtime.current() }
+        let firstEntered = await engineEventually { await firstGate.entered }; XCTAssertTrue(firstEntered)
+
+        let secondGate = InventoryReadGate(); await f.photos.holdReadAdmissionOnce(secondGate)
+        let second = Task { await runtime.current() }
+        let secondEntered = await engineEventually { await secondGate.entered }; XCTAssertTrue(secondEntered)
+
+        // The older call resumes while the newer call is still suspended. The UI must not
+        // observe the temporary engine snapshot that has no Live Photo summary yet.
+        await firstGate.release()
+        let olderResult = await first.value
+        XCTAssertTrue(SyncStatusPresentation(snapshot: olderResult.snapshot).progressRows.contains { $0.id == "livePhoto" },
+            "The Live Photo row must remain visible while a newer current() publication is in flight")
+
+        await secondGate.release()
+        let newerResult = await second.value
+        XCTAssertTrue(SyncStatusPresentation(snapshot: newerResult.snapshot).progressRows.contains { $0.id == "livePhoto" },
+            "The Live Photo row must be present after the newer publication completes")
+        await runtime.stop(); await runtime.waitForRound()
+    }
+    func testOneWakeDrainsLivePhotoBacklogAndStopsAtIdleOrHeldItems() async throws {
+        for held in [false, true] {
+            let f = try await inventoryFixture(count: 35), config = try p8Configuration(), clock = P12Clock()
+            let events = RuntimeDiagnosticRows(), diagnostics = IndexDiagnostics(sink: { events.append($0) })
+            let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+                AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                    budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now, indexDiagnostics: diagnostics)
+            }, livePhotoMetadata: held ? UnresolvableInventoryMetadata() : InventoryMetadata(), now: { clock.value }, authorized: { true })
+            try await runtime.prepareInjectedRuntime()
+            await runtime.tick(force: true); await runtime.waitForRound()
+            let summary = try await f.store.livePhotoInventorySummary(context: f.photos.context)
+            XCTAssertEqual(held ? summary.requiresAttention : summary.identified, 35,
+                "A backlog must advance across bounded slices without another UI tick or clock advance")
+            let reads = await f.photos.resourceReads
+            XCTAssertEqual(reads, 35)
+            await runtime.tick(); await runtime.waitForRound()
+            let afterIdle = await f.photos.resourceReads
+            XCTAssertEqual(afterIdle, reads, "Idle or attention-held work must not spin or reread")
+            diagnostics.flushObservations(force: true)
+            let rows = events.rows
+            XCTAssertTrue(rows.contains { $0["category"] == "live-photo-worker" && $0["state"] == "slice-limit" && $0["inventoryItems"] == "16" })
+            XCTAssertTrue(rows.contains { $0["category"] == "live-photo-worker" && $0["state"] == "no-progress" })
+            XCTAssertTrue(rows.contains { $0["category"] == "live-photo-task" && $0["visible"] == "true" })
+            XCTAssertEqual(rows.compactMap { Int($0["timing.live_photo_inventory_item_wall.count"] ?? "") }.reduce(0, +), 35)
+            await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
+        }
+    }
+
+    func testContinuousWorkerRechecksStopAuthorizationAndPhysicalAdmission() async throws {
+        for stopReason in ["stop", "authorization", "draining"] {
+            let f = try await inventoryFixture(count: 3), config = try p8Configuration(), authorization = P8Authorization(true)
+            let gate = InventoryReadGate(); await f.photos.holdNextRead(gate)
+            let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+                AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                    budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+            }, livePhotoMetadata: InventoryMetadata(), now: { Date() }, authorized: { authorization.value })
+            try await runtime.prepareInjectedRuntime(); await runtime.tick(force: true)
+            let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+            for _ in 0..<3 { await runtime.tick() }
+            let heldReads = await f.photos.resourceReads; XCTAssertEqual(heldReads, 1, "Ticks must not start a competing worker")
+            switch stopReason {
+            case "stop": await runtime.stop()
+            case "authorization": authorization.value = false
+            default: await f.photos.setReadAdmission(.draining)
+            }
+            await gate.release(); await runtime.waitForRound()
+            let after = await f.photos.resourceReads
+            XCTAssertEqual(after, 1, "A completed item must not admit the next read after \(stopReason)")
+            await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
+        }
+    }
+
     func testFinishedLivePhotoInventoryDoesNotPollPhotoContextOnIdleTicks() async throws {
         let f = try await inventoryFixture(count: 0), config = try p8Configuration(), clock = P12Clock()
         defer { try? FileManager.default.removeItem(at: f.root) }
@@ -109,7 +220,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         }
     }
     func testHeldLivePhotoReadDoesNotBlockReconciliationOrSourceScan() async throws {
-        let f = try await inventoryFixture(count: 1), config = try p8Configuration(), gate = InventoryReadGate()
+        let f = try await inventoryFixture(count: 3), config = try p8Configuration(), gate = InventoryReadGate()
         let source = f.root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         _ = try await f.store.registerSource(url: source)
@@ -130,6 +241,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         let state = await runtime.current(); XCTAssertEqual(state.snapshot.latestScan.state, .completed)
         await runtime.pause(); await gate.release(); await runtime.waitForRound()
         let final = await runtime.current(); XCTAssertEqual(final.snapshot.livePhotoInventory?.identified, 0, "Pause cannot publish a late result as new progress")
+        let pausedReads = await f.photos.resourceReads; XCTAssertEqual(pausedReads, 1, "Pause must keep the remaining two items unread")
         await runtime.stop(); try FileManager.default.removeItem(at: f.root)
     }
     func testNativeSourceDirectoryPairUsesRuntimeGroupAndNeverSingleImport() async throws {
@@ -171,6 +283,28 @@ final class AdvancedRuntimeTests: XCTestCase {
         XCTAssertEqual(after, catalogs); XCTAssertEqual(afterCreates, 1)
         await restarted.stop(); await restarted.waitForRound(); try FileManager.default.removeItem(at: root)
     }
+    func testCompletionOnlyWorkerWaitsForRetryDeadlineThenFinishesInOneWake() async throws {
+        let f = try await completionFixture(photosOnly: true), config = try p8Configuration(), clock = P12Clock()
+        try await f.store.disableSource(id: f.sourceID)
+        await f.photos.failRawRead(PhotosRepresentationError.unavailable)
+        let runtime = SyncRuntime(store: f.store, advancedFactory: { store, executor, directory, now, _ in
+            AdvancedRuntimeGraph(store: store, photos: f.photos, model: P8Model(), configuration: config, executor: executor,
+                budget: ImageWorkBudget(limits: config.resources), directory: directory, now: now)
+        }, livePhotoMetadata: CompletionMetadata(), now: { clock.value }, authorized: { true })
+        try await runtime.prepareInjectedRuntime(); await runtime.tick(); await runtime.waitForRound()
+        let waiting = await runtime.current(), attempts = await f.photos.rawReadCount
+        XCTAssertEqual(waiting.snapshot.livePhotoWork.retryWaitingGroups, 1)
+        XCTAssertEqual(attempts, 1)
+        await runtime.tick(); await runtime.waitForRound()
+        let beforeDeadline = await f.photos.rawReadCount
+        XCTAssertEqual(beforeDeadline, attempts, "Future retry must exit without rereading or spinning")
+        await f.photos.failRawRead(nil); clock.advance(61)
+        await runtime.tick(); await runtime.waitForRound()
+        let events = await f.photos.events
+        XCTAssertEqual(events, ["create", "verify", "retire"], "Completion-only work must finish without UI ticks between its stages")
+        await runtime.stop(); await runtime.waitForRound(); try FileManager.default.removeItem(at: f.root)
+    }
+
     func testPhotosOnlyRuntimeInventoriesCompletesRetiresAndRestartsOnce() async throws {
         let f = try await inventoryFixture(count: 0), context = f.photos.context
         let photos = CompletionPhotos(context: context, root: f.root), config = try p8Configuration()
@@ -182,7 +316,7 @@ final class AdvancedRuntimeTests: XCTestCase {
         }
         let runtime = SyncRuntime(store: f.store, advancedFactory: factory, livePhotoMetadata: CompletionMetadata(), now: { Date() }, authorized: { true })
         try await runtime.prepareInjectedRuntime()
-        for _ in 0..<8 { await runtime.tick(); await runtime.waitForRound() }
+        await runtime.tick(); await runtime.waitForRound()
         let events = await photos.events, state = await runtime.current()
         XCTAssertEqual(events, ["create", "verify", "retire"])
         XCTAssertEqual(state.snapshot.livePhotoInventory?.phase, .completed); XCTAssertEqual(state.snapshot.summary?.imported, 0)
@@ -975,4 +1109,11 @@ extension AdvancedRuntimeTests {
         XCTAssertEqual(calls.value, 0)
         await f.runtime.stop()
     }
+}
+
+private final class RuntimeDiagnosticRows: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values = [[String: String]]()
+    func append(_ value: [String: String]) { lock.lock(); values.append(value); lock.unlock() }
+    var rows: [[String: String]] { lock.lock(); defer { lock.unlock() }; return values }
 }
