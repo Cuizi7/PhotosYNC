@@ -195,17 +195,23 @@ public struct LivePhotoInventorySummary: Equatable, Sendable {
     public var retryWaiting: Int
     public var requiresAttention: Int
     public var resourceLimited: Int
+    public var skipped: Int
+    /// A policy skip is processed work, never proof of absent pairing metadata.
+    public var processed: Int { identified + skipped }
     public var nextRetryAt: Date?
     public var completedAt: Date?
-    public init(phase: LivePhotoInventoryPhase = .enumerating, inventoried: Int = 0, identified: Int = 0, unresolved: Int = 0, pending: Int = 0, retryWaiting: Int = 0, requiresAttention: Int = 0, nextRetryAt: Date? = nil, completedAt: Date? = nil, resourceLimited: Int = 0) {
+    public init(phase: LivePhotoInventoryPhase = .enumerating, inventoried: Int = 0, identified: Int = 0, unresolved: Int = 0, pending: Int = 0, retryWaiting: Int = 0, requiresAttention: Int = 0, nextRetryAt: Date? = nil, completedAt: Date? = nil, resourceLimited: Int = 0, skipped: Int = 0) {
         self.pending = pending; self.retryWaiting = retryWaiting; self.requiresAttention = requiresAttention; self.nextRetryAt = nextRetryAt
         self.resourceLimited = resourceLimited
+        self.skipped = skipped
         self.phase = phase; self.inventoried = inventoried; self.identified = identified; self.unresolved = unresolved; self.completedAt = completedAt
     }
 }
 public struct LivePhotoWorkSummary: Equatable, Sendable {
     public var activeGroups = 0, awaitingVerification = 0, awaitingRetirement = 0
     public var unknownMutation = false
+    /// This instance still owns a submitted create or retirement callback, including Photos-only work.
+    public var hasOwnedSubmission = false
     public var ownedImportingFiles = 0
     public var limitedGroups = 0
     public var retryWaitingGroups = 0, requiresAttentionGroups = 0

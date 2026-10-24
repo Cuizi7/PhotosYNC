@@ -20,6 +20,7 @@ public actor PhotosIndexCoordinator {
     private let configuration: DedupConfiguration
     private var observer: Task<Void, Never>?
     private var started = false, paused = false, reconciling = false, processing = false
+    private var reconciliationSerial: UInt64 = 0
     private var pendingDelta: PhotosIndexDelta?
     private var pendingReinsertedIDs = Set<String>()
     private var reconciledContext: LibraryContext?
@@ -53,9 +54,38 @@ public actor PhotosIndexCoordinator {
 
     deinit { observer?.cancel() }
 
+    public func reconcileIfNeeded() async throws {
+        guard !paused, !Task.isCancelled else { throw CancellationError() }
+        let serial = changeSerial, reconciliation = reconciliationSerial
+        if started, !needsReconciliation, !requiresMetadataVerification, !reconciling, !processing,
+           !applyingDelta, pendingDelta == nil, issue == nil,
+           let context = reconciledContext, let generation = acknowledgedGeneration,
+           reconciledGeneration == generation,
+           let publication = try await store.indexReadiness(), publication.token.context == context,
+           publication.token.photosGeneration == generation,
+           try await store.indexIsReady(token: publication.token) {
+            let checkpoint = try await store.libraryResumeCheckpoint()
+            // The final await checks the gateway's active observer, including
+            // permission/classification gaps that have not reached this actor yet.
+            let continuous = try await photos.hasContinuousObservation(context: context,
+                expectedGeneration: generation, checkpoint: checkpoint)
+            guard !paused, !Task.isCancelled else { throw CancellationError() }
+            if continuous, started, !needsReconciliation, !requiresMetadataVerification,
+               !reconciling, !processing, !applyingDelta, pendingDelta == nil, issue == nil,
+               serial == changeSerial, reconciliation == reconciliationSerial,
+               context == reconciledContext, generation == acknowledgedGeneration, generation == reconciledGeneration {
+                diagnostics(["phase": "index-reconcile-check", "result": "unchanged", "photosGeneration": String(generation), "catalogPages": "0"])
+                return
+            }
+        }
+        diagnostics(["phase": "index-reconcile-check", "result": "full-reconciliation-required"])
+        try await reconcile()
+    }
+
     public func reconcile() async throws {
         guard !paused, !Task.isCancelled else { throw CancellationError() }
         guard !reconciling else { throw PhotoKitGatewayError.libraryChanged }
+        reconciliationSerial &+= 1
         reconciling = true; acknowledgedGeneration = nil; pendingDelta = nil; pendingReinsertedIDs.removeAll()
         let startChangeSerial = changeSerial
         let diagnostic = indexDiagnostics.operation("reconcile")

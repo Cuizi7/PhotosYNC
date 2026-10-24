@@ -81,9 +81,6 @@ struct SyncDetailsContent: View {
                     Text(progress.subtitle).font(.headline)
                     if let text = progress.progressText { row("进度", text) }
                     Text(progress.explanation).font(.caption).foregroundStyle(.secondary)
-                    ForEach(progress.details.filter { $0.title == "当前状态" || $0.title == "需要处理" }) { detail in
-                        Text(detail.text).font(.caption).foregroundStyle(.secondary)
-                    }
                     Divider()
                 }
                 if presentation.progressRows.isEmpty, let p = snapshot.indexProgress, p.state != .ready {
@@ -91,14 +88,6 @@ struct SyncDetailsContent: View {
                     row("进度", p.totalsKnown ? "已分析 \(p.readyAssets) / \(p.totalAssets) 张" : "已分析 \(p.readyAssets) 张")
                     if let issue = p.issue { Text(issue).font(.caption).foregroundStyle(.secondary) }
                     Text(SyncStatusPresentation.indexExplanation).font(.caption).foregroundStyle(.secondary)
-                    Divider()
-                }
-                if let inventory = snapshot.livePhotoInventory, !presentation.progressRows.contains(where: { $0.id == "livePhoto" }) {
-                    Text("Live Photo").font(.headline)
-                    row("进度", inventory.phase == .enumerating ? "已处理 \(inventory.identified) 项" : "已处理 \(inventory.identified) / \(inventory.inventoried) 项")
-                    if inventory.retryWaiting > 0 { row("等待重试", "\(inventory.retryWaiting)") }
-                    if inventory.requiresAttention > 0 { row("需要处理", "\(inventory.requiresAttention)") }
-                    Text(SyncStatusPresentation.livePhotoExplanation).font(.caption).foregroundStyle(.secondary)
                     Divider()
                 }
                 ForEach(presentation.summaryNotes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
@@ -179,18 +168,22 @@ struct SyncDetailsButton: View {
 struct TaskDetailsContent: View {
     let row: SyncStatusPresentation.PreparationProgress
     var body: some View {
-        DetailsScrollView(width: 334) {
-            VStack(alignment: .leading, spacing: 13) {
-                Text(row.title).font(.headline)
-                ForEach(row.details) { detail in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(detail.title).font(.caption).fontWeight(.semibold)
-                        Text(detail.text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
+        ShortExplanationContent(title: row.title, text: row.explanation)
+            .accessibilityIdentifier("task-details-content-\(row.id)")
+    }
+}
+
+struct ShortExplanationContent: View {
+    let title: String
+    let text: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.headline)
+            Text(text).font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .accessibilityIdentifier("task-details-content-\(row.id)")
+        .padding(14).frame(width: 284, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -228,7 +221,7 @@ struct TaskProgressRow: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 4) {
                 Text(row.subtitle).lineLimit(1).fixedSize()
-                HoverDetailsButton(accessibilityLabel: "查看\(row.title)说明", accessibilityIdentifier: "task-details-\(row.id)") {
+                HoverDetailsButton(accessibilityLabel: "查看\(row.taskTitle)说明", accessibilityIdentifier: "task-details-\(row.id)") {
                     Image(systemName: "info.circle")
                 } content: { TaskDetailsContent(row: row) }
                 Spacer(minLength: 6)

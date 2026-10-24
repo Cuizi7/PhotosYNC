@@ -6,6 +6,57 @@ import Photos
 @testable import PhotoSyncCore
 
 final class PhotosIndexCoordinatorTests: XCTestCase {
+    func testUnchangedPeriodicMaintenanceKeepsPublicationAndSkipsCatalog() async throws {
+        let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let before = try await f.coordinator.readyToken()
+        XCTAssertNotNil(before)
+        await f.photos.setContinuousObservation(true)
+        await f.photos.resetReads()
+        try await f.coordinator.reconcileIfNeeded()
+        let after = try await f.coordinator.readyToken()
+        let pages = await f.photos.requestedLimits, reads = await f.photos.readCount
+        XCTAssertEqual(after, before)
+        XCTAssertTrue(pages.isEmpty, "An unchanged periodic check must not enumerate the catalog")
+        XCTAssertEqual(reads, 0)
+        let progress = await f.coordinator.progress(), activity = await f.coordinator.activity(now: now)
+        XCTAssertEqual(progress.state, .ready); XCTAssertTrue(progress.totalsKnown); XCTAssertEqual(activity, .idle)
+    }
+
+    func testPeriodicMaintenanceWithoutObserverProofStillReconciles() async throws {
+        let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+        try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+        let before = try await f.coordinator.readyToken()
+        await f.photos.resetReads()
+        try await f.coordinator.reconcileIfNeeded()
+        let after = try await f.coordinator.readyToken(), pages = await f.photos.requestedLimits
+        XCTAssertNotEqual(after, before); XCTAssertFalse(pages.isEmpty)
+    }
+
+    func testPeriodicProofKeepsProgressStableAndRejectsReentrantPauseOrChange() async throws {
+        for action in ["pause", "change", "reconcile"] {
+            let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
+            try await f.coordinator.reconcile(); await f.coordinator.processDueWork(now: now)
+            await f.photos.setContinuousObservation(true); await f.photos.resetReads()
+            let gate = CoordinatorGate(); await f.photos.gateContinuity(gate)
+            let work = Task { try await f.coordinator.reconcileIfNeeded() }
+            await gate.waitUntilEntered()
+            let progress = await f.coordinator.progress(), activity = await f.coordinator.activity(now: now)
+            XCTAssertEqual(progress.state, .ready); XCTAssertTrue(progress.totalsKnown); XCTAssertEqual(activity, .idle)
+            if action == "pause" { await f.coordinator.setPaused(true) }
+            else if action == "change" {
+                await f.photos.set([descriptor(f.photos.context, revision: "r2", date: Date(timeIntervalSinceReferenceDate: 200))])
+                await f.coordinator.libraryChanged(.fullReconcileRequired)
+            } else { try await f.coordinator.reconcile(); await f.photos.resetReads() }
+            await gate.release()
+            do { try await work.value; XCTAssertNotEqual(action, "pause") }
+            catch is CancellationError { XCTAssertEqual(action, "pause") }
+            let pages = await f.photos.requestedLimits
+            XCTAssertEqual(pages.isEmpty, action == "pause", action)
+            if action == "change" { try await assertNil(try await f.coordinator.readyToken()) }
+        }
+    }
+
     func testQueueActivityRespectsRetryDeadlineEvenWhenHealthyIndexIsPublished() async throws {
         let f = try fixture(); await f.photos.set([descriptor(f.photos.context)])
         await f.photos.setReadFailures(["asset": .imageReadFailed(domain: "test", code: 1, detail: "temporary")])
@@ -1861,6 +1912,15 @@ private actor CoordinatorModel: ImageFingerprinting {
 }
 
 private actor CoordinatorPhotos: PhotosIndexGateway {
+    private var continuousObservation = false
+    private var continuityGate: CoordinatorGate?
+    func setContinuousObservation(_ value: Bool) { continuousObservation = value }
+    func gateContinuity(_ gate: CoordinatorGate) { continuityGate = gate }
+    func hasContinuousObservation(context expectedContext: LibraryContext, expectedGeneration: Int, checkpoint: LibraryResumeCheckpoint?) async throws -> Bool {
+        let captured = continuousObservation && expectedContext == (replacementContext ?? context) && expectedGeneration == generation && checkpoint?.context == expectedContext
+        if let gate = continuityGate { continuityGate = nil; await gate.hold() }
+        return captured
+    }
     private let limits: ResourceLimits
     nonisolated let context = LibraryContext(id: UUID(), epoch: 1)
     nonisolated let budget: ImageWorkBudget

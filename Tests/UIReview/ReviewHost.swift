@@ -189,7 +189,7 @@ enum ReviewHost {
                 }
                 if scenario.rawValue.hasPrefix("task") {
                     for row in SyncStatusPresentation(snapshot: model.state.snapshot).progressRows {
-                        _ = try UIReviewCapture.render(TaskDetailsContent(row: row), width: 334, appearance: appearance) { host, window in
+                        _ = try UIReviewCapture.render(TaskDetailsContent(row: row), width: 284, appearance: appearance, minimumHeight: 40) { host, window in
                             for position in ["top", "bottom"] {
                                 if position == "bottom" { try UIReviewCapture.scrollToBottom(host, allowNoOverflow: true) }
                                 let surface = "task-details-\(row.id)-\(position)"

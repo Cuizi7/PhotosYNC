@@ -50,13 +50,22 @@ struct StatusMenu: View {
             if let detail = model.syncDetail {
                 Group {
                     if model.status == .error {
-                        Label(detail, systemImage: "exclamationmark.triangle")
+                        HStack(alignment: .top, spacing: 4) {
+                            Label(detail, systemImage: "exclamationmark.triangle")
+                            if model.needsPhotosAuthorization {
+                                HoverDetailsButton(accessibilityLabel: "查看照片权限说明", accessibilityIdentifier: "photos-authorization-details") {
+                                    Image(systemName: "info.circle")
+                                } content: {
+                                    ShortExplanationContent(title: "需要照片访问权限", text: "请打开设置，点击“授权访问照片”。")
+                                }
+                            }
+                        }
                     } else {
                         Text(detail)
                     }
                 }
                 .font(.caption).lineLimit(3)
-                .help(model.syncDetailHelp ?? detail)
+                .help(model.needsPhotosAuthorization ? "请打开设置，点击“授权访问照片”。" : model.syncDetailHelp ?? detail)
             }
             if let hint = model.recoveryAdvice {
                 Text(hint).font(.caption).foregroundStyle(.secondary)

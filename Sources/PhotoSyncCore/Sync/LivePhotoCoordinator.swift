@@ -144,6 +144,9 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
             if op.stage == .readyToRetire || op.stage == .retiring { retire.insert(op.groupID) }
             if op.stage != .blocked && op.error == nil { active.insert(op.groupID) }
         }
+        value.hasOwnedSubmission = operations.contains {
+            $0.id == activeOperationID && ($0.creationEvidence == .submitted || $0.retirementEvidence == .submitted)
+        }
         value.activeGroups = active.count; value.awaitingVerification = verify.count; value.awaitingRetirement = retire.count; value.limitedGroups = limited.count
         return value
     }

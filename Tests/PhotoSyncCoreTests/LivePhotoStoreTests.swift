@@ -208,15 +208,15 @@ final class LivePhotoStoreTests: XCTestCase {
         let migrated = try SyncStore(url: db)
         let success = try await migrated.successIdentifier(of: id)
         XCTAssertEqual(success, "retained")
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
     }
 
     func testMigrationRetainsSuccessAndRejectsFutureVersion() async throws {
         let f = try await makeLivePhotoStoreFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: f.db), 11)
-        try injectEngineSQL("PRAGMA user_version = 12", at: f.db)
-        XCTAssertThrowsError(try SyncStore(url: f.db))
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: f.db), 12)
+        try injectEngineSQL("PRAGMA user_version = 13", at: f.db)
+        XCTAssertThrowsError(try SyncStore(url: f.db))
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: f.db), 13)
     }
 }
 

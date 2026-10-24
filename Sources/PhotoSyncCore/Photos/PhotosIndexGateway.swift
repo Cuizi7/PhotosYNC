@@ -143,6 +143,9 @@ public protocol PhotosIndexGateway: PhotosGateway {
     /// Synchronously revoke active observer continuity when the runtime observes
     /// a permission gap, including while no Photos request is being issued.
     func invalidateObservationContinuity()
+    /// Read-only proof for an already-published periodic inventory. Persistent
+    /// recovery coverage alone does not establish an active observer session.
+    func hasContinuousObservation(context: LibraryContext, expectedGeneration: Int, checkpoint: LibraryResumeCheckpoint?) async throws -> Bool
     /// Continuous observer sessions retain the last recovered durable token.
     /// Startup and actual coverage gaps use conservative persistent recovery.
     func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity
@@ -311,6 +314,7 @@ public struct LibraryResumeCheckpoint: Codable, Equatable, Sendable {
 public extension PhotosIndexGateway {
     func restoreInventoryContext(_ context: LibraryContext) async throws {}
     func invalidateObservationContinuity() {}
+    func hasContinuousObservation(context: LibraryContext, expectedGeneration: Int, checkpoint: LibraryResumeCheckpoint?) async throws -> Bool { false }
     func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
         let checkpoint = try await contextCheckpoint()
         let covered: Bool

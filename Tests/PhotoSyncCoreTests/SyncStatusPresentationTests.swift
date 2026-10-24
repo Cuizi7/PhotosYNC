@@ -2,6 +2,30 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class SyncStatusPresentationTests: XCTestCase {
+    func testActiveLivePhotoTaskExplainsConcurrentAttentionInsteadOfGenericPurpose() throws {
+        for inventoryHold in [true, false] {
+            var s = EngineSnapshot()
+            s.summary = .init(); s.latestScan = .init(state: .completed)
+            let issue = SourceIssue(summary: "部分项目需要重新核实配对信息。", detail: "synthetic", kind: .file)
+            if inventoryHold {
+                s.livePhotoInventory = .init(phase: .identifying, inventoried: 3, identified: 1, unresolved: 1, pending: 1, requiresAttention: 1)
+                s.livePhotoIssue = issue
+            } else {
+                s.livePhotoWork.activeGroups = 1
+                s.livePhotoWork.requiresAttentionGroups = 1
+                s.livePhotoWork.issue = issue
+            }
+            for activity in [LivePhotoActivity.queued(.identification), .working(.completion)] {
+                s.livePhotoActivities = [activity]
+                let p = SyncStatusPresentation(snapshot: s)
+                let row = try XCTUnwrap(p.progressRows.first)
+                XCTAssertTrue(row.active, "Healthy work continues beside a held item")
+                XCTAssertEqual(row.title, "Live Photo 需处理")
+                XCTAssertEqual(row.explanation, issue.summary)
+                XCTAssertEqual(p.statusReason(for: .error, enabledSourceIDs: []), "部分项目的 Live Photo 配对需要处理，请查看任务说明。")
+            }
+        }
+    }
     func testPersistentLivePhotoAttentionSurvivesHealthyActivityAndPause() {
         var s = EngineSnapshot()
         s.summary = .init(); s.latestScan = .init(state: .completed)
@@ -22,7 +46,7 @@ final class SyncStatusPresentationTests: XCTestCase {
         let resolved = SyncStatusPresentation(snapshot: s)
         XCTAssertNil(resolved.statusReason(for: .preparing, enabledSourceIDs: []))
     }
-    func testTaskSpecificHoverExplainsSavedCountsCloudUseAndLivePhotoRetirement() throws {
+    func testTaskHoverUsesApprovedSingleBodyWithoutSupplementalLines() throws {
         var s = EngineSnapshot()
         s.indexActivity = .working
         s.indexProgress = .init(state: .updating, totalsKnown: false, totalAssets: 0, readyAssets: 15716,
@@ -31,26 +55,50 @@ final class SyncStatusPresentationTests: XCTestCase {
         s.livePhotoActivities = [.working(.identification)]
         var rows = SyncStatusPresentation(snapshot: s).progressRows
         XCTAssertEqual(rows.map(\.countText), ["已分析 15716 张", "45 / 16222 项"])
-        let visual = try XCTUnwrap(rows.first)
-        XCTAssertEqual(visual.details.first { $0.title == "进度含义" }?.text,
-            "已分析 15716 张，包含以前保存的结果，并非本次启动重新分析的数量。当前总量尚未确认，因此不显示百分比。")
-        let live = try XCTUnwrap(rows.last)
-        XCTAssertEqual(live.details.first { $0.title == "进度含义" }?.text,
-            "45 / 16222 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识或按时长规则排除的项目也计入，读取失败的项目不计入。")
-        XCTAssertEqual(live.details.first { $0.title == "对已有内容的影响" }?.text,
-            "完整 Live Photo 的原始内容及应保留的信息验证通过后，才移除被替代的单独照片或视频；旧标题可能丢失。不会改动源文件或清空“最近删除”。")
-        for row in rows {
-            XCTAssertEqual(row.details.first { $0.title == "iCloud 原件" }?.text,
-                "必要时会从 iCloud 获取原文件，可能产生网络流量并增加系统本地缓存。")
-            XCTAssertTrue(row.details.contains { $0.title == "暂停与重启" && $0.text.contains("继续未完成项") })
-        }
+        XCTAssertEqual(rows.first?.explanation, "分析照片内容，帮助避免重复导入。")
+        XCTAssertEqual(rows.last?.explanation, "识别照片与视频的配对关系，找到另一半后自动补齐。")
         s.livePhotoInventory = .init(phase: .completed, inventoried: 16222, identified: 16222)
         s.livePhotoActivities = [.working(.completion)]
         rows = SyncStatusPresentation(snapshot: s).progressRows
-        XCTAssertNil(rows.last?.fraction)
-        XCTAssertNil(rows.last?.countText)
-        XCTAssertEqual(rows.last?.details.first { $0.title == "进度含义" }?.text,
-            "配对信息已核对，正在补齐并验证完整 Live Photo。此阶段没有可靠的总百分比，显示活动进度。")
+        XCTAssertNil(rows.last?.fraction); XCTAssertNil(rows.last?.countText)
+        XCTAssertEqual(rows.last?.explanation, "正在补齐包含动态画面和声音的 Live Photo。")
+        s.isPaused = true; s.indexActivity = .waiting; s.livePhotoActivities = [.waiting(nextRetryAt: nil)]
+        rows = SyncStatusPresentation(snapshot: s).progressRows
+        XCTAssertEqual(rows.first?.title, "已暂停"); XCTAssertEqual(rows.first?.explanation, "已完成的结果会保留。")
+        XCTAssertEqual(rows.map(\.taskTitle), ["视觉索引", "Live Photo 配对"], "Paused hover titles must not erase the task identity")
+        s.isPaused = false; s.livePhotoWork.unknownMutation = true
+        rows = SyncStatusPresentation(snapshot: s).progressRows
+        XCTAssertEqual(rows.last?.title, "等待“照片”确认")
+        XCTAssertEqual(rows.last?.explanation, "保存结果尚未确认，新的保存已暂停。")
+        s.livePhotoWork.unknownMutation = false
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 100, identified: 90, unresolved: 10, retryWaiting: 10)
+        rows = SyncStatusPresentation(snapshot: s).progressRows
+        XCTAssertEqual(rows.last?.title, "Live Photo 等待恢复")
+        XCTAssertEqual(rows.last?.explanation, "部分原文件暂时无法读取，稍后自动重试。")
+        s.indexProgress = .init(state: .waiting, totalsKnown: true, totalAssets: 100, readyAssets: 97,
+            totalRepresentations: 100, readyRepresentations: 97, readErrorRepresentations: 3, excludedAssets: 0, issue: nil, requiresAttentionAssets: 3)
+        rows = SyncStatusPresentation(snapshot: s).progressRows
+        XCTAssertEqual(rows.first?.title, "需要提高内存上限")
+        XCTAssertEqual(rows.first?.explanation, "3 张照片超出图像处理内存上限。")
+    }
+
+    func testNormalLivePhotoSkipsFinishWithoutTaskButPreserveIndependentSourceIssue() throws {
+        var s = EngineSnapshot(); let sourceID = UUID()
+        s.summary = .init(); s.latestScan = .init(state: .completed)
+        s.livePhotoInventory = .init(phase: .completed, inventoried: 100, identified: 95, resourceLimited: 5, skipped: 5)
+        s.livePhotoActivities = [.idle]
+        var presentation = SyncStatusPresentation(snapshot: s)
+        XCTAssertTrue(presentation.progressRows.isEmpty)
+        XCTAssertNil(presentation.statusReason(for: .completed, enabledSourceIDs: [sourceID]))
+        XCTAssertEqual(presentation.globalStatus(enabledSourceIDs: [sourceID], authorized: true, hasBlockingError: false), .completed)
+        s.waitingSources[sourceID] = SourceIssue(summary: "来源目录不可用", detail: "fixture", kind: .sourceAvailability)
+        presentation = SyncStatusPresentation(snapshot: s)
+        XCTAssertTrue(presentation.progressRows.isEmpty)
+        XCTAssertEqual(presentation.globalStatus(enabledSourceIDs: [sourceID], authorized: true, hasBlockingError: false), .waiting)
+        s.livePhotoInventory = .init(phase: .identifying, inventoried: 100, identified: 80, pending: 15, resourceLimited: 5, skipped: 5)
+        s.livePhotoActivities = [.working(.identification)]
+        let row = try XCTUnwrap(SyncStatusPresentation(snapshot: s).progressRows.first)
+        XCTAssertEqual(row.countText, "85 / 100 项"); XCTAssertEqual(row.fraction, 0.85)
     }
 
     func testLivePhotoOnlyQueuedDiscoveryDoesNotDemandSourceConfiguration() {

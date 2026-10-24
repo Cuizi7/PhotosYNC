@@ -6,6 +6,77 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testAttentionAndSubmittedPauseHelpFitCompactNativePopover() throws {
+        for submittedPause in [false, true] {
+            var snapshot = EngineSnapshot()
+            snapshot.isPaused = submittedPause
+            snapshot.livePhotoActivities = [.working(.completion)]
+            snapshot.livePhotoWork.activeGroups = 1
+            snapshot.livePhotoWork.requiresAttentionGroups = submittedPause ? 0 : 1
+            snapshot.livePhotoWork.hasOwnedSubmission = submittedPause
+            let row = try XCTUnwrap(SyncStatusPresentation(snapshot: snapshot).progressRows.first)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                let size = try UIReviewCapture.render(TaskDetailsContent(row: row), width: 284, appearance: appearance, minimumHeight: 40) { host, _ in
+                    let text = try self.recognizedText(in: host).map(\.text).joined(separator: "")
+                    XCTAssertTrue(text.contains(submittedPause ? "当前操作" : "需处理"), text)
+                    if let folder = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] {
+                        let output = URL(fileURLWithPath: folder); try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+                        _ = try UIReviewCapture.write(host, to: output.appendingPathComponent("review-priority-\(submittedPause)-\(appearance.rawValue).png"))
+                    }
+                }
+                XCTAssertEqual(size.width, 284, accuracy: 1)
+                XCTAssertGreaterThan(size.height, 40); XCTAssertLessThanOrEqual(size.height, 150)
+            }
+        }
+    }
+    func testTaskHoverNativeLayoutIsCompactWithoutScrolling() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        func hasScrollView(_ view: NSView) -> Bool { view is NSScrollView || view.subviews.contains(where: hasScrollView) }
+        for scenario in [UIReviewScenario.taskVisualUnknown, .taskLiveKnown, .tasksMixed, .tasksKnown,
+                         .tasksWaiting, .tasksPaused, .tasksAttention, .taskCompletion] {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                for row in model.progressRows {
+                    let size = try UIReviewCapture.render(TaskDetailsContent(row: row), width: 284, appearance: appearance, minimumHeight: 40) { host, _ in
+                        XCTAssertFalse(hasScrollView(host), scenario.rawValue)
+                        XCTAssertFalse(row.explanation.contains("\n"))
+                        if let folder = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] {
+                            let output = URL(fileURLWithPath: folder); try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+                            _ = try UIReviewCapture.write(host, to: output.appendingPathComponent("compact-\(scenario.rawValue)-\(row.id)-\(appearance.rawValue).png"))
+                        }
+                    }
+                    XCTAssertEqual(size.width, 284, accuracy: 1)
+                    XCTAssertGreaterThan(size.height, 40); XCTAssertLessThanOrEqual(size.height, 150, scenario.rawValue)
+                }
+            }
+        }
+    }
+
+    func testNormalLivePhotoSkipsDoNotReappearInMenuOrSyncHover() throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        for scenario in [UIReviewScenario.completed, .offline] {
+            let model = try makeUIReviewModel(scenario: scenario, root: root)
+            model.state.snapshot.summary = .init(imported: 120, skipped: 30)
+            model.state.snapshot.activeWork = false
+            model.state.snapshot.sourceActivities = [:]; model.state.snapshot.sourcePhases = [:]
+            model.state.snapshot.livePhotoInventory = .init(phase: .completed, inventoried: 16233, identified: 16228, resourceLimited: 5, skipped: 5)
+            model.state.snapshot.livePhotoActivities = [.idle]
+            XCTAssertTrue(model.progressRows.isEmpty)
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                for (surface, view, width) in [("menu", AnyView(StatusMenu(model: model)), CGFloat(320)),
+                                              ("sync-details", AnyView(SyncDetailsContent(snapshot: model.state.snapshot)), CGFloat(300))] {
+                    _ = try UIReviewCapture.render(view, width: width, appearance: appearance) { host, _ in
+                        let text = try self.allScrolledText(in: host)
+                        XCTAssertFalse(text.contains("Live Photo"), text)
+                        if let folder = ProcessInfo.processInfo.environment["P8_NATIVE_OUTPUT"] {
+                            let output = URL(fileURLWithPath: folder); try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+                            _ = try UIReviewCapture.write(host, to: output.appendingPathComponent("normal-skip-\(scenario.rawValue)-\(surface)-\(appearance.rawValue).png"))
+                        }
+                    }
+                }
+            }
+        }
+    }
     func testSettingsShowsImagePeakBudgetPurposeAndDefaultAndCustomValues() throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
@@ -680,10 +751,10 @@ final class AppViewTests: XCTestCase {
                 XCTAssertTrue(text.contains("统计当前启用来源") && text.contains("记录") && text.contains("此前扫描"), text)
                 XCTAssertTrue(text.contains("仅统计本轮扫描事件"), text)
                 if state != .ready {
-                    XCTAssertTrue(text.contains("避免重复导入"), text)
+                    XCTAssertTrue(text.contains("已完成") && text.contains("保留"), text)
                     XCTAssertTrue((text.contains("已分析") && text.contains("0")), text)
                 }
-                if state == .waiting { XCTAssertTrue(text.contains("iCloud"), text) }
+                if state == .waiting { XCTAssertFalse(text.contains("iCloud"), "Paused task help should show only its current pause explanation") }
                 XCTAssertFalse(text.contains("888"), text)
             }
         }
@@ -722,7 +793,8 @@ final class AppViewTests: XCTestCase {
                     model.state.snapshot.indexActivity = stage < 2 ? .queued : .waiting
                     model.state.snapshot.livePhotoActivities = stage < 2 ? [.queued(.identification)] : [.waiting(nextRetryAt: nil)]
                     model.state.snapshot.isPaused = stage == 3
-                    XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { $0.contains(taskIndex == 0 ? "15717" : "46") } ?? false })
+                    let expected = stage == 3 ? "保留" : taskIndex == 0 ? "照片" : "Live Photo"
+                    XCTAssertTrue(self.waitUntil { (try? self.recognizedText(in: content).map(\.text).joined()).map { $0.contains(expected) } ?? false })
                     XCTAssertTrue(popup.isVisible)
                     XCTAssertTrue(buttons().dropFirst(taskIndex).first === button, "Trigger must survive ordinary task lifecycle gaps")
                     XCTAssertEqual(model.progressRows.map(\.id), ["visualIndex", "livePhoto"])
@@ -751,7 +823,9 @@ final class AppViewTests: XCTestCase {
     }
 
     private func allScrolledText(in host: NSView) throws -> String {
-        let scroll = try XCTUnwrap(scrollViews(in: host).first)
+        guard let scroll = scrollViews(in: host).first else {
+            return try recognizedText(in: host).map(\.text).joined(separator: "\n")
+        }
         let maximum = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
         var text: [String] = []
         var offset: CGFloat = 0

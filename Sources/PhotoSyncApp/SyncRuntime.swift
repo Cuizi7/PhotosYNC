@@ -801,6 +801,7 @@ actor SyncRuntime {
     private func scheduleAdvancedWork(force: Bool) {
         guard let graph = advancedGraph else { return }
         if force { changePending = true }
+        let reason = changePending ? "forced" : pendingFullChangeSerial != nil ? "photos-change" : "periodic"
         let reconcile = schedule.requestPhotosReconciliation(now: now(), force: changePending || pendingFullChangeSerial != nil)
         guard advancedWork == nil else {
             // A due-work-only batch can be busy when a periodic reconcile becomes due.
@@ -810,7 +811,7 @@ actor SyncRuntime {
         }
         if reconcile { changePending = false; pendingFullChangeSerial = nil }
         indexEventPending = false
-        advancedWork = Task { await self.runAdvancedWork(graph, reconcile: reconcile) }
+        advancedWork = Task { await self.runAdvancedWork(graph, reconcile: reconcile, reconciliationReason: reason) }
     }
 
     private func scheduleLivePhotoWork() {
@@ -950,17 +951,21 @@ actor SyncRuntime {
         let attention = (inventorySummary?.requiresAttention ?? 0) + completionSummary.requiresAttentionGroups
         advancedGraph?.diagnostics.state("live-photo-task", value: "\(phase):paused=\(state.snapshot.isPaused):attention=\(attention > 0)", fields: [
             "visible": String(visible), "publication": String(generation),
-            "identified": String(inventorySummary?.identified ?? 0), "pending": String(inventorySummary?.pending ?? 0),
+            "identified": String(inventorySummary?.identified ?? 0), "skipped": String(inventorySummary?.skipped ?? 0),
+            "processed": String(inventorySummary?.processed ?? 0), "pending": String(inventorySummary?.pending ?? 0),
             "unresolved": String(inventorySummary?.unresolved ?? 0), "requiresAttention": String(attention)])
     }
 
-    private func runAdvancedWork(_ graph: AdvancedRuntimeGraph, reconcile: Bool) async {
+    private func runAdvancedWork(_ graph: AdvancedRuntimeGraph, reconcile: Bool, reconciliationReason: String) async {
         let previousReady = publishedProgress?.state == .ready
         let memoryLimitWasCurrent = imageMemoryLimitIsCurrent
         if eligibleForWork {
             if reconcile {
-                logger?.log(["phase": "index-trigger", "trigger": "runtime-reconcile"])
-                do { try await graph.coordinator.reconcile() }
+                logger?.log(["phase": "index-trigger", "trigger": "runtime-reconcile", "reason": reconciliationReason])
+                do {
+                    if reconciliationReason == "periodic" { try await graph.coordinator.reconcileIfNeeded() }
+                    else { try await graph.coordinator.reconcile() }
+                }
                 catch is CancellationError { /* Paused before another catalog page. */ }
                 catch { logger?.log(["phase": "index-reconcile", "result": "waiting", "error": String(describing: error)]) }
             }

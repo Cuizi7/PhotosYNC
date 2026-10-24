@@ -133,8 +133,10 @@ if len(captures) != len(expected) or actual != expected:
 for c in captures:
     p = out/c['file']
     if not p.is_file() or p.stat().st_size < 512: raise SystemExit('Missing/empty PNG: '+str(p))
-    width = 320 if c['surface']=='menu' else (360 if c['surface'].startswith('source-details') else (300 if c['surface'].startswith('sync-details') else (334 if c['surface'].startswith('task-details') else 600)))
-    if abs(c['logicalWidth']-width)>1 or not 100<c['logicalHeight']<=681:
+    short_explanation = c['surface'].startswith('task-details')
+    width = 320 if c['surface']=='menu' else (360 if c['surface'].startswith('source-details') else (300 if c['surface'].startswith('sync-details') else (284 if short_explanation else 600)))
+    minimum_height, maximum_height = (40, 150) if short_explanation else (100, 681)
+    if abs(c['logicalWidth']-width)>1 or not minimum_height<c['logicalHeight']<=maximum_height:
         raise SystemExit('Unexpected dimensions: '+str(c))
 esc = html.escape
 parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>PhotosYNC 原生 UI 待验收</title>',

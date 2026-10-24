@@ -2462,13 +2462,15 @@ public final class SyncStore: @unchecked Sendable {
             case .automatic(let date): retryDate = .double(date.timeIntervalSince1970)
             case .requiresAttention: retryDate = .null
             }
-            var unresolved = observations.isEmpty
+            let failures = observations.filter { if case .unresolved = $0.inspection { return true }; return false }
+            let resourceLimitSkipped = !failures.isEmpty && failures.allSatisfy { ($0.resourceLimitBytes ?? 0) > 0 }
+            let unresolved = observations.isEmpty || (!failures.isEmpty && !resourceLimitSkipped)
             try self.establishLivePhotoAnchors(context: context, assetIDs: [assetID])
             for observation in observations {
-                if case .unresolved = observation.inspection { unresolved = true }
                 try self.saveLivePhotoObservationSync(observation)
             }
-            try self.execute("UPDATE live_photo_inventory_item SET status=?,retry_count=retry_count+?,next_retry_at=? WHERE context_id=? AND asset_id=? AND revision=?", [.text(unresolved ? "unresolved" : "checked"), .int64(unresolved ? 1 : 0), unresolved ? retryDate : .null, .text(context.id.uuidString), .text(assetID), .text(revision)])
+            let status = resourceLimitSkipped ? "resourceLimitSkipped" : unresolved ? "unresolved" : "checked"
+            try self.execute("UPDATE live_photo_inventory_item SET status=?,retry_count=retry_count+?,next_retry_at=? WHERE context_id=? AND asset_id=? AND revision=?", [.text(status), .int64(unresolved ? 1 : 0), unresolved ? retryDate : .null, .text(context.id.uuidString), .text(assetID), .text(revision)])
         } }
     }
     func retryLivePhotoInventoryAttention(context: LibraryContext, now: Date) async throws -> Int {
@@ -2490,32 +2492,49 @@ public final class SyncStore: @unchecked Sendable {
     func livePhotoInventorySummary(context: LibraryContext) async throws -> LivePhotoInventorySummary {
         try await perform {
             let task = try self.one("SELECT phase,completed_at FROM live_photo_inventory WHERE context_id=? AND task_key=?", [.text(context.id.uuidString), .text(Self.livePhotoInventoryKey)])
-            let counts = try self.one("SELECT COUNT(*),COALESCE(SUM(status='checked'),0),COALESCE(SUM(status='unresolved'),0),COALESCE(SUM(status IN ('queued','needsDescriptor')),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NOT NULL),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NULL),0),MIN(CASE WHEN status='unresolved' THEN next_retry_at END) FROM live_photo_inventory_item WHERE context_id=? AND status!='deleted'", [.text(context.id.uuidString)])!
+            let counts = try self.one("SELECT COUNT(*),COALESCE(SUM(status='checked'),0),COALESCE(SUM(status='unresolved'),0),COALESCE(SUM(status IN ('queued','needsDescriptor')),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NOT NULL),0),COALESCE(SUM(status='unresolved' AND next_retry_at IS NULL),0),MIN(CASE WHEN status='unresolved' THEN next_retry_at END),COALESCE(SUM(status='resourceLimitSkipped'),0) FROM live_photo_inventory_item WHERE context_id=? AND status!='deleted'", [.text(context.id.uuidString)])!
             let limits = try self.one("""
                 SELECT COUNT(DISTINCT i.asset_id) FROM live_photo_inventory_item i
                 JOIN live_photo_observation o ON o.context_id=i.context_id AND o.asset_id=i.asset_id AND o.revision=i.revision
-                WHERE i.context_id=? AND i.status='unresolved' AND i.next_retry_at IS NULL AND o.current=1
+                WHERE i.context_id=? AND i.status IN ('unresolved','resourceLimitSkipped') AND i.next_retry_at IS NULL AND o.current=1
                 AND json_extract(o.payload,'$.resourceLimitBytes') IS NOT NULL
                 """, [.text(context.id.uuidString)])!
             return LivePhotoInventorySummary(phase: task.flatMap { try? self.text($0[0]) }.flatMap(LivePhotoInventoryPhase.init(rawValue:)) ?? .enumerating,
                 inventoried: Int(try self.int64(counts[0])), identified: Int(try self.int64(counts[1])), unresolved: Int(try self.int64(counts[2])),
                 pending: Int(try self.int64(counts[3])), retryWaiting: Int(try self.int64(counts[4])), requiresAttention: Int(try self.int64(counts[5])),
                 nextRetryAt: self.optionalDouble(counts[6]).map(Date.init(timeIntervalSince1970:)),
-                completedAt: task.flatMap { self.optionalDouble($0[1]) }.map(Date.init(timeIntervalSince1970:)), resourceLimited: Int(try self.int64(limits[0])))
+                completedAt: task.flatMap { self.optionalDouble($0[1]) }.map(Date.init(timeIntervalSince1970:)), resourceLimited: Int(try self.int64(limits[0])), skipped: Int(try self.int64(counts[7])))
         }
     }
 
     private func migrate() throws {
         let originalVersion = try pragmaUserVersion()
-        guard originalVersion <= 11 else { throw SyncStoreError.unsupportedSchema(originalVersion) }
-        if originalVersion == 11 { return }
+        guard originalVersion <= 12 else { throw SyncStoreError.unsupportedSchema(originalVersion) }
+        if originalVersion == 12 { return }
         try transaction {
-            try migrateThroughV10()
-            if !(try rows("PRAGMA table_info(file_record)", []).map { try text($0[1]) }).contains("live_photo_operation_id") {
-                try execute("ALTER TABLE file_record ADD COLUMN live_photo_operation_id TEXT")
+            if originalVersion < 11 {
+                try migrateThroughV10()
+                if !(try rows("PRAGMA table_info(file_record)", []).map { try text($0[1]) }).contains("live_photo_operation_id") {
+                    try execute("ALTER TABLE file_record ADD COLUMN live_photo_operation_id TEXT")
+                }
+                try execute(Self.livePhotoSchema)
             }
-            try execute(Self.livePhotoSchema)
-            try execute("PRAGMA user_version = 11")
+            // Only current cap-only evidence can become a terminal policy skip.
+            // Keep its unresolved observation: this is not negative identity proof.
+            // No media, inventory enumeration, successful history or operation is touched.
+            try execute("""
+                UPDATE live_photo_inventory_item AS i SET status='resourceLimitSkipped',next_retry_at=NULL
+                WHERE status='unresolved' AND descriptor IS NOT NULL
+                AND EXISTS (SELECT 1 FROM live_photo_observation o
+                    WHERE o.context_id=i.context_id AND o.asset_id=i.asset_id AND o.revision=i.revision AND o.current=1
+                    AND json_type(o.payload,'$.inspection.unresolved') IS NOT NULL
+                    AND json_extract(o.payload,'$.resourceLimitBytes') > 0)
+                AND NOT EXISTS (SELECT 1 FROM live_photo_observation o
+                    WHERE o.context_id=i.context_id AND o.asset_id=i.asset_id AND o.revision=i.revision AND o.current=1
+                    AND json_type(o.payload,'$.inspection.unresolved') IS NOT NULL
+                    AND COALESCE(json_extract(o.payload,'$.resourceLimitBytes'),0) <= 0)
+                """)
+            try execute("PRAGMA user_version = 12")
         }
     }
 

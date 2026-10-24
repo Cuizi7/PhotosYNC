@@ -4,7 +4,7 @@
 <key>CFBundleDisplayName</key><string>$(PRODUCT_NAME)</string>
 <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
 <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
-<key>PhotoSyncReleaseChannel</key><string>beta7</string>
+<key>PhotoSyncReleaseChannel</key><string>beta8</string>
 <key>LSUIElement</key><true/>
 <key>NSPhotoLibraryUsageDescription</key><string>$(PHOTO_LIBRARY_USAGE_DESCRIPTION)</string>
 </dict></plist>

@@ -167,7 +167,7 @@ enum UIReviewError: Error { case invalid(String) }
 
 @MainActor
 enum UIReviewCapture {
-    static func render<V: View>(_ view: V, width: CGFloat, appearance: NSAppearance.Name,
+    static func render<V: View>(_ view: V, width: CGFloat, appearance: NSAppearance.Name, minimumHeight: CGFloat = 100,
         inspect: (NSHostingView<AnyView>, NSWindow) throws -> Void) throws -> NSSize {
         let host = NSHostingView(rootView: AnyView(view
             .environment(\.colorScheme, appearance == .darkAqua ? .dark : .light)
@@ -179,12 +179,12 @@ enum UIReviewCapture {
         window.isReleasedWhenClosed = false
         window.contentView = host
         defer { window.contentView = nil; window.close() }
-        let size = try converge(host: host, window: window, width: width)
+        let size = try converge(host: host, window: window, width: width, minimumHeight: minimumHeight)
         try inspect(host, window)
         return size
     }
 
-    static func converge(host: NSHostingView<AnyView>, window: NSWindow, width: CGFloat) throws -> NSSize {
+    static func converge(host: NSHostingView<AnyView>, window: NSWindow, width: CGFloat, minimumHeight: CGFloat = 100) throws -> NSSize {
         var previous = NSSize.zero
         var stable = 0
         for _ in 0..<100 {
@@ -193,7 +193,7 @@ enum UIReviewCapture {
             window.displayIfNeeded()
             let size = host.fittingSize
             stable = abs(size.width - previous.width) < 0.5 && abs(size.height - previous.height) < 0.5
-                && size.height > 100 ? stable + 1 : 0
+                && size.height > minimumHeight ? stable + 1 : 0
             previous = size
             if stable >= 4 {
                 guard abs(size.width - width) <= 1, size.height <= 681 else {

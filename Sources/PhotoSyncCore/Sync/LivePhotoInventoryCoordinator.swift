@@ -203,7 +203,7 @@ public actor LivePhotoInventoryCoordinator {
                     let limited: Bool
                     switch error as? LivePhotoResourceReadError { case .resourceLimit, .workingSetLimit: limited = true; default: limited = false }
                     if limited { work.requiresAttention = true }
-                    let detail = limited ? "资源读取超过 \(budget.limits.maxEncodedBytes / 1_048_576) MiB 上限，已停止自动重试。" : "原资源暂不可读：" + SourceIssueText.systemDiagnostic(error)
+                    let detail = limited ? "资源读取超过 \(budget.limits.maxEncodedBytes / 1_048_576) MiB 上限，已跳过 Live Photo 识别。" : "原资源暂不可读：" + SourceIssueText.systemDiagnostic(error)
                     work.observations.append(.init(resource: ref, inspection: .unresolved(detail), resourceLimitBytes: limited ? budget.limits.maxEncodedBytes : nil))
                     work.nextResource = index + 1
                 }

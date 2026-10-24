@@ -18,7 +18,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
             _ = try await store.failRepresentation(task, nextRetryAt: task.descriptor.key.assetID == "temporary" ? now.addingTimeInterval(60) : .distantFuture, detail: "typed failure", failureKind: .photosRead)
         }
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         let held = try await reopened.indexProgress(); XCTAssertEqual(held.requiresAttentionAssets, 1); XCTAssertEqual(held.readErrorRepresentations, 3)
         let rearmed = try await reopened.retryIndexReadLimits(now: now); XCTAssertEqual(rearmed, 2)
         let due = try await reopened.nextRepresentationTasks(now: now, limit: 10)
@@ -321,7 +321,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         _ = try await store.completeRepresentation(task, result: digestResult(input))
         try injectEngineSQL("ALTER TABLE photos_representation DROP COLUMN input_vector_version; PRAGMA user_version=9", at: db)
         let upgraded = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready' AND length(vector)=4096 AND input_vector_version IS NULL", at: db), 1)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task", at: db), 0)
         try assertBaseline(input, at: db)
@@ -502,7 +502,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("PRAGMA user_version=8", at: db)
         let upgraded = try SyncStore(url: db)
         withExtendedLifetime(upgraded) {}
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('photos_representation') WHERE name IN ('input_digest','input_digest_contract')", at: db), 2)
         XCTAssertEqual(try facts(at: db), historyBefore)
         for table in tables {
@@ -571,7 +571,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         let before = try facts(at: db)
         try injectEngineSQL("CREATE TABLE preserved_vectors AS SELECT * FROM file_fingerprint; PRAGMA user_version=7", at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         XCTAssertEqual(try facts(at: db), before)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM preserved_vectors EXCEPT SELECT * FROM file_fingerprint)", at: db), 0)
         try await assertNil(try await reopened.indexReadiness())
@@ -599,7 +599,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("CREATE TABLE preserved_source AS SELECT file_id,size,modified_ns,purpose,width,height,hex(vector) AS bytes,attempt_id FROM file_fingerprint WHERE fingerprint_version='\(oldVersion)'", at: db)
         try injectEngineSQL("PRAGMA user_version=7", at: db)
         let upgraded = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         try await assertNil(try await upgraded.indexReadiness())
         try await upgraded.rebindEquivalentSourceFingerprints(to: config.fingerprint)
         XCTAssertEqual(try facts(at: db), before)
@@ -1215,7 +1215,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint WHERE attempt_id = ''", at: db), 2)
             }
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM file_fingerprint", at: db), 2)
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 11)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 4 : 12)
         }
     }
 
@@ -1376,7 +1376,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try makeV3(at: db)
         let before = try facts(at: db)
         let store = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         XCTAssertEqual(try facts(at: db), before)
         let generation = try await store.beginIndexReconciliation(context: LibraryContext(id: UUID(), epoch: 1), photosGeneration: 4, fingerprintVersion: "new-model")
         try await store.finishIndexReconciliation(generation: generation, seenKeys: [])
@@ -1395,9 +1395,9 @@ final class AdvancedDedupStoreTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 3)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM sqlite_master WHERE name = 'dedup_index_state'", at: db), 0)
         XCTAssertEqual(try facts(at: db), before)
-        try injectEngineSQL("PRAGMA user_version = 12", at: db)
+        try injectEngineSQL("PRAGMA user_version = 13", at: db)
         XCTAssertThrowsError(try SyncStore(url: db))
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 13)
     }
 
     func testStaleTaskCannotPublish() async throws {
@@ -1835,7 +1835,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
                 try await assertNil(try await reopened.indexPublication())
                 XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM fingerprint_task WHERE failure_kind IS NULL", at: db), 1)
             }
-            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 11)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), fail ? 6 : 12)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM pragma_table_info('fingerprint_task') WHERE name='failure_kind'", at: db), fail ? 0 : 1)
             XCTAssertEqual(try facts(at: db), before)
             XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM vectors_before EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
@@ -1876,7 +1876,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
             PRAGMA user_version=5;
             """, at: db)
         let reopened = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_vectors EXCEPT SELECT asset_id,vector FROM photos_representation)", at: db), 0)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM (SELECT * FROM before_tasks EXCEPT SELECT asset_id,revision,generation,retry_count,next_retry_at,last_error FROM fingerprint_task)", at: db), 0)
         let publication = try await reopened.indexPublication(); XCTAssertNil(publication)
@@ -2029,7 +2029,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         try injectEngineSQL("UPDATE photos_representation SET tombstoned=0; PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS photos_representation_readiness", at: db)
         let upgraded = try SyncStore(url: db)
         XCTAssertEqual(try engineSQLInteger(indexSQL, at: db), 1)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         let after = try await upgraded.indexReadiness(); XCTAssertNil(after)
         let publication = try await upgraded.indexPublication()
         XCTAssertEqual(try photosVector(at: db), vector)
@@ -2058,7 +2058,7 @@ final class AdvancedDedupStoreTests: XCTestCase {
         // Reproduce the previous unreleased integration-v4 shape without its reverse index.
         try injectEngineSQL("PRAGMA user_version=4; DROP TABLE photos_index_exclusion; DROP INDEX IF EXISTS dedup_dependency_candidate;", at: db)
         let migrated = try SyncStore(url: db)
-        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 11)
+        XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: db), 12)
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM dedup_dependency", at: db), 1)
         try await assertEqual(try await migrated.state(of: dependent.fileID), .skipped)
         try assertReverseDependencyLookup(at: db)

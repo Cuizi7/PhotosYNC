@@ -168,6 +168,7 @@ final class LivePhotoCoordinatorTests: XCTestCase {
         let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
         let task = Task { try await c.advanceNext(now: Date()) }
         let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
+        let reading = try await c.summary(); XCTAssertFalse(reading.hasOwnedSubmission)
         await c.setPaused(true); await gate.release(); _ = try await task.value
         let reads = await f.photos.rawReadCount; XCTAssertEqual(reads, 1)
         let creates = await f.photos.creates; XCTAssertEqual(creates, 0)
@@ -181,8 +182,17 @@ final class LivePhotoCoordinatorTests: XCTestCase {
             let task = Task { try await c.advanceNext(now: Date()) }
             let entered = await engineEventually { await gate.entered }; XCTAssertTrue(entered)
             let summary = try await c.summary(); XCTAssertFalse(summary.unknownMutation)
+            XCTAssertTrue(summary.hasOwnedSubmission)
+            XCTAssertEqual(summary.ownedImportingFiles, 0)
             let activity = await c.activity(); XCTAssertEqual(activity, .working(.completion))
+            await c.setPaused(true)
+            var snapshot = EngineSnapshot()
+            snapshot.isPaused = true; snapshot.livePhotoWork = summary; snapshot.livePhotoActivities = [activity]
+            let row = try XCTUnwrap(SyncStatusPresentation(snapshot: snapshot).progressRows.first)
+            XCTAssertEqual(row.title, "正在结束当前操作", "Photos-only creates and retirement both own a submitted request")
+            XCTAssertEqual(row.explanation, "已提交给“照片”的操作会继续收尾，之后暂停。")
             await gate.release(); _ = try await task.value
+            let finished = try await c.summary(); XCTAssertFalse(finished.hasOwnedSubmission)
         }
     }
     func testChangedRevisionReopensWorkingSetLimitWithoutExplicitRetry() async throws {

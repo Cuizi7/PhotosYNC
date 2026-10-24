@@ -656,6 +656,29 @@ final class PhotoKitContractTests: XCTestCase {
         XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM photos_representation WHERE state='ready'", at: f.db), 4)
     }
 
+    func testPeriodicObserverProofRejectsPermissionGapEvenWithRecoveredHistory() async throws {
+        let f = try continuityFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try await f.coordinator.reconcile()
+        let snapshot = try await f.gateway.candidateSnapshot(), checkpoint = try await f.store.libraryResumeCheckpoint()
+        let initial = try await f.gateway.hasContinuousObservation(context: f.context, expectedGeneration: snapshot.generation, checkpoint: checkpoint)
+        XCTAssertTrue(initial)
+        let before = f.lifecycle.catalogOffsets.count
+        try await f.coordinator.reconcileIfNeeded()
+        XCTAssertEqual(f.lifecycle.catalogOffsets.count, before)
+        f.gateway.invalidateObservationContinuity()
+        let recovery = try await f.gateway.prepareInventoryReconciliation(previousCheckpoint: checkpoint)
+        let invalid = try await f.gateway.hasContinuousObservation(context: f.context, expectedGeneration: snapshot.generation, checkpoint: recovery.checkpoint)
+        XCTAssertFalse(invalid, "Persistent history coverage/fence presence is not active observer proof")
+        try await f.coordinator.reconcileIfNeeded()
+        XCTAssertGreaterThan(f.lifecycle.catalogOffsets.count, before)
+        let current = try await f.gateway.candidateSnapshot(), restored = try await f.store.libraryResumeCheckpoint()
+        let accepted = try await f.gateway.hasContinuousObservation(context: f.context, expectedGeneration: current.generation, checkpoint: restored)
+        XCTAssertTrue(accepted)
+        let wrongContext = try await f.gateway.hasContinuousObservation(context: .init(id: UUID(), epoch: f.context.epoch), expectedGeneration: current.generation, checkpoint: restored)
+        XCTAssertFalse(wrongContext)
+    }
+
     func testSharedAnonymousContextLinksHistoryLiveAndMetadataReuse() async throws {
         let rows = HistoryPendingTrace(), diagnostic = IndexDiagnostics(sink: { rows.append($0) })
         let f = try continuityFixture(indexDiagnostics: diagnostic)

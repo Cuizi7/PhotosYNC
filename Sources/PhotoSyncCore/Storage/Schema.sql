@@ -147,4 +147,4 @@ CREATE INDEX IF NOT EXISTS live_photo_unknown_descriptor ON live_photo_inventory
 CREATE INDEX IF NOT EXISTS live_photo_complete_candidates ON live_photo_inventory_item(context_id,asset_id,status) WHERE is_live_photo=1 AND status!='deleted';
 CREATE INDEX IF NOT EXISTS file_live_photo_owner ON file_record(live_photo_operation_id);
 
-PRAGMA user_version = 11;
+PRAGMA user_version = 12;

@@ -478,6 +478,11 @@ public final class PhotoKitGateway: NSObject, LivePhotoPhotosGateway, @unchecked
         state.attach(store)
         lifecycle.attachLivePhotoInventory(store: store, context: { [state] in state.snapshot().context })
     }
+    public func hasContinuousObservation(context: LibraryContext, expectedGeneration: Int, checkpoint: LibraryResumeCheckpoint?) async throws -> Bool {
+        let snapshot = try await candidateSnapshot()
+        guard snapshot.generation == expectedGeneration else { return false }
+        return state.hasContinuousObservation(context: context, expectedGeneration: expectedGeneration, checkpoint: checkpoint)
+    }
     public func prepareInventoryReconciliation(previousCheckpoint: LibraryResumeCheckpoint?) async throws -> PhotosInventoryContinuity {
         try historyRetry.check()
         // Drain the ordered classifier before deciding whether the observer session
@@ -1568,6 +1573,12 @@ private final class PhotoKitState: @unchecked Sendable {
         // Filename-only gateways have no inventory acknowledgement cycle. Their
         // candidate index remains valid after a classified membership change.
         if store != nil { historyAdmissionBlocked = true }
+    }
+    func hasContinuousObservation(context expectedContext: LibraryContext, expectedGeneration: Int, checkpoint: LibraryResumeCheckpoint?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return available && context == expectedContext && generation == expectedGeneration && pendingChangeDetails == 0 &&
+            observerContinuous && !inventoryUnverified && !historyAdmissionBlocked && store != nil &&
+            checkpoint == observerCheckpoint
     }
     func continuousInventory(previousCheckpoint: LibraryResumeCheckpoint?, expectedGeneration: Int) throws -> PhotosInventoryContinuity? {
         lock.lock(); defer { lock.unlock() }

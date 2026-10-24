@@ -5,6 +5,22 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testPeriodicMaintenanceRetainsIndexButExplicitForceStillReconciles() async throws {
+        let clock = P12Clock(), f = try await fixture(taskCount: 1, now: { clock.value })
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        await f.photos.setContinuousObservation(true)
+        let before = await f.photos.catalogCount
+        clock.advance(1801); await f.runtime.tick(); await f.runtime.waitForRound()
+        let periodic = await f.photos.catalogCount, state = await f.runtime.current()
+        XCTAssertEqual(periodic, before); XCTAssertEqual(state.snapshot.indexProgress?.state, .ready)
+        XCTAssertEqual(state.snapshot.indexProgress?.totalsKnown, true)
+        await f.runtime.tick(force: true); await f.runtime.waitForRound()
+        let forced = await f.photos.catalogCount; XCTAssertEqual(forced, before + 1)
+        await f.photos.setContinuousObservation(false)
+        clock.advance(1801); await f.runtime.tick(); await f.runtime.waitForRound()
+        let lost = await f.photos.catalogCount; XCTAssertEqual(lost, forced + 1)
+        await f.runtime.stop(); await f.runtime.waitForRound()
+    }
     private func memoryPreferences() -> UserDefaults {
         let suite = "PhotosYNC.MemoryTest.\(UUID().uuidString)"
         let preferences = UserDefaults(suiteName: suite)!
@@ -952,6 +968,11 @@ private actor P8Model: ImageFingerprinting, ModelExecutionRecovering {
     }
 }
 private actor P8Photos: PhotosIndexGateway {
+    private var continuousObservation = false
+    func setContinuousObservation(_ value: Bool) { continuousObservation = value }
+    func hasContinuousObservation(context expected: LibraryContext, expectedGeneration: Int, checkpoint: LibraryResumeCheckpoint?) async throws -> Bool {
+        continuousObservation && expected == context && expectedGeneration == generation
+    }
     private var representationGate: P8Gate?
     func holdNextRepresentation(_ gate: P8Gate) { representationGate = gate }
     private var representationFailure: PhotosRepresentationError?

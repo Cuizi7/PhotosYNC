@@ -118,6 +118,13 @@ struct SourceIssuesContent: View {
     }
 
     var body: some View {
+        if !issues.isEmpty, issues.allSatisfy({ $0.kind == .sourceAvailability && $0.path == sourceURL.path }) {
+            ShortExplanationContent(title: "来源目录不可用", text: "请检查来源磁盘或网络连接。")
+                .accessibilityIdentifier("source-issues-content")
+        } else { detailedContent }
+    }
+
+    private var detailedContent: some View {
         DetailsScrollView(width: 360) {
             VStack(alignment: .leading, spacing: 12) {
                 Text(sourceURL.path).font(.headline)

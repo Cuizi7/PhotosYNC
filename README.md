@@ -2,9 +2,11 @@
 
 PhotosYNC scans selected filesystem folders and saves eligible images and videos to the current macOS System Photo Library. Source files stay in place and are read-only. Precisely matched Live Photo components become one native Live Photo; replaced standalone assets can be removed only after their original content and protected information are verified as preserved.
 
-## 0.3.0 beta7 — Native Live Photo completion
+## 0.3.0 beta8 — Native Live Photo completion
 
-Settings now exposes the image-processing peak memory budget, defaulting to 2 GiB. Higher limits automatically rearm held image decode-limit results once old work drains; catalog, source recovery and Live Photo work continue independently. The setting describes its decoding/visual-matching purpose and additional model/system memory. The redundant sync-boundary paragraph has been removed from Settings.
+Live Photo identity reads exceeding the fixed encoded-resource limit now finish as normal skips without a warning or held task. Unchanged periodic index maintenance reuses a valid continuously observed publication instead of traversing the entire catalog. Task help contains one title and one body paragraph; completed/skipped work does not leave a Live Photo help entry.
+
+Settings exposes the image-processing peak memory budget, defaulting to 2 GiB. Higher limits automatically rearm held image decode-limit results once old work drains; catalog, source recovery and Live Photo work continue independently. The setting describes its decoding/visual-matching purpose and additional model/system memory. The redundant sync-boundary paragraph has been removed from Settings.
 
 Live Photo processing retains completed reads across short notification-classification gaps, prioritizes due native Live Photo candidates with ordinary-work fairness, and keeps normal queued work in its running state. Retention is limited to one raw resource and one partial asset for 30 seconds, inside the existing resource budget. Anonymous diagnostics distinguish queue time, system download progress and reused work. Unknown historical changes still require revalidation; production reads remain serial.
 
@@ -14,7 +16,7 @@ Schema v11 adds a resumable, one-time library identification task. Its completed
 
 The menu, settings and details use the same six states: 正在准备, 正在同步, 等待恢复, 已暂停, 需要处理 and 同步完成. Visual indexing and Live Photo pairing have independent progress; cloud downloads are internal steps. Long Live Photo reads run independently of visual work. Existing completed identification results and successful import history remain intact. Each task uses one compact caption and its own equal-width solid progress track. Normal queued work keeps its activity state; notification classification no longer imposes a minute-long retry on the whole Live Photo queue. Deterministic decoding limits stop automatic rereads until the image memory limit is raised, an explicit scan is requested, or an exact input change is confirmed.
 
-After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta7.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
+After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta8.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
 
 ## Previous stable: 0.2.9
 
@@ -48,8 +50,8 @@ For a local build on macOS 13 or later with Xcode installed:
 scripts/package-release.sh --scale-profile full
 ```
 
-Release configuration: **0.3.0 beta7 (build 24)**, targeting
-`outputs/releases/0.3.0-beta7/`; see [release notes](docs/release/0.3.0-beta7.md)
+Release configuration: **0.3.0 beta8 (build 25)**, targeting
+`outputs/releases/0.3.0-beta8/`; see [release notes](docs/release/0.3.0-beta8.md)
 and the [changelog](CHANGELOG.md).
 The release package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
@@ -70,7 +72,7 @@ build 6 notes remain [historical release evidence](docs/release/0.1.0.md).
 
 Before first launch after upgrading, quit PhotosYNC normally and back up the complete
 `~/Library/Application Support/PhotoSync/` directory, including any SQLite WAL/SHM
-files. The development app transactionally migrates supported schemas v3–v10 to v11; older apps reject the upgraded database on reopening.
+files. The development app transactionally migrates supported schemas v3–v11 to v12; older apps reject the upgraded database on reopening.
 Direct downgrade is not supported. Restoring an old database after new imports can
 lose success evidence and cause duplicate additions; see the release notes for the
 backup and downgrade boundary. Packaging does not back up or migrate production data.
@@ -122,6 +124,6 @@ For a full-profile release, run `scripts/package-release.sh --scale-profile full
 
 Routine beta iterations reuse established real-Photos integration evidence and require the automated gates. Changes to actual PhotoKit/authorization/media/platform boundaries need targeted system acceptance. The automation does not use personal Photos, production database snapshots or system-permission changes. See [agent acceptance rules](AGENTS.md) and [validation history](Design/Validation.md) for the distinction between automated, historical and current system evidence.
 
-The current cloud/status repair keeps schema v11 and the one-time historical inventory marker. Live Photo identification can fetch required iCloud originals within the shared 512 MiB budget and 128 MiB disk reserve. Requests cancel after 600 seconds, with a 610-second logical bound; physical ownership remains until the terminal callback. Temporary failures retry per item, while deterministic parsing/resource limits require changed resources or an explicit scan. Launch and wake do not re-open held failures. One independent Live Photo task handles one asset and one group per batch; visual and Live Photo catalog enumeration remains serialized.
+Schema v12 retains the one-time historical inventory marker and transactionally reclassifies exact-current resource-limit-only identity holds as normal skips, without reading media or enumerating the library again. Live Photo identification can fetch required iCloud originals within the shared 512 MiB budget and 128 MiB disk reserve. Requests cancel after 600 seconds, with a 610-second logical bound; physical ownership remains until the terminal callback. Temporary failures retry per item; fixed resource-limit identity skips remain terminal until the resource changes, while other held parsing failures retain explicit retry. Existing native candidates remain uncertain for duplicate-prevention admission when their identity could not be read. Known-pair creation and verification limits keep their existing conservative handling. Launch and wake do not re-open held failures. One independent Live Photo task continues bounded serial slices of identity and completion work; visual and Live Photo catalog enumeration remains serialized.
 
-Menu and Settings share six status headlines: 正在准备 / 正在同步 / 等待恢复 / 已暂停 / 需要处理 / 同步完成. Preparation tasks have separate counts; failed reads do not count as processed. Cloud acquisition and Photos save steps stay internal. Details explain purpose, possible traffic/system caching and restart continuation. See the [repair contract](docs/superpowers/specs/2026-10-21-cloud-livephoto-status-repair-design.md). This source change does not itself establish a required-network iCloud test or a new release.
+Menu and Settings share six status headlines: 正在准备 / 正在同步 / 等待恢复 / 已暂停 / 需要处理 / 同步完成. Preparation tasks have separate counts; normal identity skips count as processed without claiming identity was read, while unresolved reads remain unfinished. Cloud acquisition and Photos save steps stay internal. Task help is a title and one body paragraph; completed/skipped tasks do not leave their own warning or help entry. See the [current design](docs/superpowers/specs/2026-10-24-beta8-task-state-hover-design.md). This source change does not itself establish a required-network iCloud test or a new release.

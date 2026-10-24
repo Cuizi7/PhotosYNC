@@ -2,6 +2,104 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoInventoryTests: XCTestCase {
+    func testFixedResourceLimitEndsNormallyAcrossManualRetryAndRestart() async throws {
+        let f = try await inventoryFixture(count: 1)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        await f.photos.setReadFailure(.resourceLimit(bytes: 600_000_000))
+        let task = LivePhotoInventoryCoordinator(store: f.store, photos: f.photos, metadata: InventoryMetadata())
+        try await task.resumeInitialInventory()
+        _ = try await task.processNextInventoryItem(now: Date())
+        let first = try await task.summary()
+        XCTAssertEqual(first.phase, .completed)
+        XCTAssertEqual(first.identified, 0, "Uninspected bytes must not become identified evidence")
+        XCTAssertEqual(first.unresolved, 0)
+        XCTAssertEqual(first.requiresAttention, 0)
+        XCTAssertEqual(first.skipped, 1); XCTAssertEqual(first.processed, 1)
+        let activity = await task.activity(); XCTAssertEqual(activity, .idle)
+        try await task.retryAttention(now: Date())
+        let retried = try await task.processNextInventoryItem(now: .distantFuture)
+        XCTAssertFalse(retried)
+        let reopened = try SyncStore(url: f.db)
+        let restarted = LivePhotoInventoryCoordinator(store: reopened, photos: f.photos, metadata: InventoryMetadata())
+        let catalogBefore = await f.photos.catalogCalls
+        try await restarted.resumeInitialInventory()
+        try await restarted.retryAttention(now: Date())
+        let advanced = try await restarted.processNextInventoryItem(now: .distantFuture)
+        XCTAssertFalse(advanced)
+        let reads = await f.photos.resourceReads, catalogAfter = await f.photos.catalogCalls
+        XCTAssertEqual(reads, 1); XCTAssertEqual(catalogAfter, catalogBefore)
+        let replacement = livePhotoAsset(context: f.photos.context, id: "asset-0", revision: "r2")
+        try await reopened.enqueueLivePhotoAssets(context: f.photos.context, assets: [replacement])
+        let pending = try await reopened.nextLivePhotoInventoryItem(context: f.photos.context, now: Date())
+        XCTAssertEqual(pending, replacement)
+    }
+
+    func testV11UpgradeOnlyConvertsCurrentCapOnlyInventoryHolds() async throws {
+        let f = try await makeLivePhotoStoreFixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let context = f.context
+        let cap = livePhotoAsset(context: context, id: "cap", isLivePhoto: true)
+        let assets = [cap] + ["cap-retry", "generic", "mixed", "stale", "inactive", "missing"].map {
+            livePhotoAsset(context: context, id: $0)
+        }
+        try await f.store.ensureLivePhotoInventory(context: context)
+        try await f.store.enqueueLivePhotoAssets(context: context, assets: assets)
+        for asset in assets {
+            var observations = [LivePhotoObservation(resource: asset.resources[0], inspection: .unresolved("fixture"),
+                resourceLimitBytes: asset.assetID == "generic" ? nil : 536_870_912)]
+            if asset.assetID == "mixed" {
+                observations.append(.init(resource: .photos(contextID: context.id, assetID: asset.assetID, resourceKey: "other", revision: asset.revision), inspection: .unresolved("independent failure")))
+            }
+            try await f.store.recordLivePhotoInventoryResult(context: context, assetID: asset.assetID, revision: asset.revision,
+                observations: observations, retryPolicy: .requiresAttention)
+        }
+        try await f.store.finishLivePhotoEnumeration(context: context, generation: 1)
+        _ = try await f.store.completeLivePhotoInventory(context: context, expectedGeneration: 1)
+        let before = try await f.store.livePhotoInventorySummary(context: context)
+        let attempt = UUID()
+        try await f.store.beginAttempt(fileID: f.first, attemptID: attempt)
+        try await f.store.markImported(fileID: f.first, attemptID: attempt, identifier: "existing-success")
+        let op = livePhotoOperation(context: context, photoID: f.first, motionID: f.second)
+        let reserved = try await f.store.reserveLivePhotoOperation(op); XCTAssertTrue(reserved)
+        try await f.store.beginLivePhotoCreation(operationID: op.id)
+        try f.store.checkpointLivePhotoPlaceholder(operationID: op.id, identifier: "unconfirmed-target")
+        try await f.store.deferLivePhotoCreation(operationID: op.id, detail: "synthetic unknown callback", definite: false)
+        let operationsBefore = try await f.store.loadLivePhotoOperationsForRecovery()
+        // Seed the old persistent representation independently of the new result writer.
+        try injectEngineSQL("""
+            UPDATE live_photo_inventory_item SET status='unresolved',next_retry_at=NULL;
+            UPDATE live_photo_inventory_item SET next_retry_at=1000 WHERE asset_id='cap-retry';
+            UPDATE live_photo_inventory_item SET revision='newer' WHERE asset_id='stale';
+            UPDATE live_photo_observation SET current=0 WHERE asset_id='inactive';
+            UPDATE live_photo_inventory_item SET descriptor=NULL WHERE asset_id='missing';
+            PRAGMA user_version=11;
+            """, at: f.db)
+        let migrated = try SyncStore(url: f.db)
+        let after = try await migrated.livePhotoInventorySummary(context: context)
+        XCTAssertEqual(after.requiresAttention, 5); XCTAssertEqual(after.unresolved, 5)
+        XCTAssertEqual(after.identified, 0); XCTAssertEqual(after.completedAt, before.completedAt)
+        XCTAssertEqual(after.skipped, 2); XCTAssertEqual(after.processed, 2)
+        XCTAssertEqual(after.retryWaiting, 0)
+        for asset in assets {
+            let status = ["cap", "cap-retry"].contains(asset.assetID) ? "resourceLimitSkipped" : "unresolved"
+            XCTAssertEqual(try engineSQLInteger("SELECT COUNT(*) FROM live_photo_inventory_item WHERE asset_id='\(asset.assetID)' AND status='\(status)'", at: f.db), 1, asset.assetID)
+        }
+        let success = try await migrated.successIdentifier(of: f.first)
+        XCTAssertEqual(success, "existing-success")
+        let operationsAfter = try await migrated.loadLivePhotoOperationsForRecovery()
+        XCTAssertEqual(operationsAfter, operationsBefore)
+        XCTAssertEqual(operationsAfter.first?.creationEvidence, .unknown)
+        XCTAssertTrue(operationsAfter.first?.holdsUnknownMutation == true)
+        let uncertainNative = try await migrated.hasUnresolvedLivePhotoCandidates(context: context)
+        XCTAssertTrue(uncertainNative, "Skipping cannot prove an existing native candidate is unrelated")
+        let retryCount = try await migrated.retryLivePhotoInventoryAttention(context: context, now: Date())
+        XCTAssertEqual(retryCount, 5)
+        let twice = try SyncStore(url: f.db)
+        let again = try await twice.livePhotoInventorySummary(context: context)
+        XCTAssertEqual(again.unresolved, 5); XCTAssertEqual(again.identified, 0)
+        XCTAssertEqual(again.skipped, 2)
+    }
+
     func testNativeInventoryGetsPriorityWithOrdinaryWorkAfterEightItems() async throws {
         let f = try await inventoryFixture(count: 0); defer { try? FileManager.default.removeItem(at: f.root) }
         await f.photos.appendAsset(livePhotoAsset(context: f.photos.context, id: "a-ordinary"))
@@ -233,7 +331,7 @@ final class LivePhotoInventoryTests: XCTestCase {
         let saved = try await f.store.livePhotoObservation(for: asset.resources[0])
         let observation = try XCTUnwrap(saved)
         guard case .unresolved(let detail) = observation.inspection else { return XCTFail("Expected held limit") }
-        XCTAssertTrue(detail.contains("512 MiB")); XCTAssertTrue(detail.contains("停止自动重试"))
+        XCTAssertTrue(detail.contains("512 MiB")); XCTAssertTrue(detail.contains("已跳过"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(observation)) as? [String: Any])
         XCTAssertEqual(json["resourceLimitBytes"] as? Int, 536_870_912)
         let summary = try await c.summary(); XCTAssertEqual(summary.resourceLimited, 1)

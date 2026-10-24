@@ -95,8 +95,9 @@ struct SyncStatusPresentation {
         var active: Bool = false
         var totalsKnown = false
         var requiresAttentionAssets = 0
-        var details: [ProgressDetail] = []
-        var title: String { id == "visualIndex" ? "视觉索引" : "Live Photo 配对" }
+        var explanationTitle: String?
+        var taskTitle: String { id == "visualIndex" ? "视觉索引" : "Live Photo 配对" }
+        var title: String { explanationTitle ?? taskTitle }
         var countText: String? {
             guard var text = progressText else { return nil }
             if totalsKnown {
@@ -106,29 +107,26 @@ struct SyncStatusPresentation {
             return text
         }
     }
-    struct ProgressDetail: Identifiable {
-        let title: String
-        let text: String
-        var id: String { title }
-    }
-    static let indexExplanation = "视觉索引用于避免重复导入。必要时会从 iCloud 获取原文件并产生流量，系统可能保留本地缓存。分析结果会保存，重启后继续未完成项，不会重复分析未变化的成功结果。"
-    static let livePhotoExplanation = "核对原文件中的配对关系，并补齐包含动态画面和声音的 Live Photo。必要时会从 iCloud 获取原文件并产生流量，系统可能保留本地缓存。结果会保存，重启后继续未完成项，不会重复分析未变化的成功结果。"
+    static let indexExplanation = "分析照片内容，帮助避免重复导入。"
+    static let livePhotoExplanation = "识别照片与视频的配对关系，找到另一半后自动补齐。"
 
     var progressRows: [PreparationProgress] {
         var rows = [PreparationProgress]()
         if let p = snapshot.indexProgress, p.state != .ready || p.readErrorRepresentations > 0 || snapshot.indexActivity != .idle {
             let active = !snapshot.isPaused && !unknownMutation && (snapshot.indexActivity == .working || snapshot.indexActivity == .queued)
             let subtitle = snapshot.isPaused ? "视觉索引已暂停" : active ? "正在建立视觉索引" : p.requiresAttentionAssets > 0 ? "视觉索引" : "视觉索引等待恢复"
-            var details = [ProgressDetail(title: "用途", text: "分析图库中的照片，建立用于视觉判重的索引，帮助避免重复导入。此任务只读取照片，不修改或删除图库内容。"),
-                ProgressDetail(title: "进度含义", text: "已分析 \(p.readyAssets) 张，包含以前保存的结果，并非本次启动重新分析的数量。" + (p.totalsKnown ? "当前需分析的总量为 \(p.totalAssets) 张。" : "当前总量尚未确认，因此不显示百分比。"))]
-            if p.requiresAttentionAssets > 0 { details.append(.init(title: "需要处理", text: "有 \(p.requiresAttentionAssets) 张照片解码后的图像超出当前内存上限，已停止自动重试。可在设置中提高“图像处理内存峰值上限”，或点击“立即扫描”重新尝试。其他照片会继续处理，原文件未被修改。")) }
-            if let issue = p.issue { details.append(.init(title: "当前状态", text: issue)) }
-            details += Self.commonTaskDetails
+            let title: String, body: String
+            if snapshot.isPaused { title = "已暂停"; body = "已完成的结果会保留。" }
+            else if p.requiresAttentionAssets > 0 {
+                title = "需要提高内存上限"; body = "\(p.requiresAttentionAssets) 张照片超出图像处理内存上限。"
+            } else if !active, let issue = p.issue {
+                title = "视觉索引等待恢复"; body = issue
+            } else { title = "视觉索引"; body = Self.indexExplanation }
             rows.append(.init(id: "visualIndex", subtitle: subtitle,
                 progressText: p.totalsKnown ? "已分析 \(p.readyAssets) / \(p.totalAssets) 张" : "已分析 \(p.readyAssets) 张",
                 fraction: p.totalsKnown ? (p.totalAssets > 0 ? min(1, Double(p.readyAssets) / Double(p.totalAssets)) : 0) : nil,
-                explanation: Self.indexExplanation, active: active, totalsKnown: p.totalsKnown,
-                requiresAttentionAssets: p.requiresAttentionAssets, details: details))
+                explanation: body, active: active, totalsKnown: p.totalsKnown,
+                requiresAttentionAssets: p.requiresAttentionAssets, explanationTitle: title))
         }
         let identifying = livePhotoRunnable(.identification)
         let completing = livePhotoRunnable(.completion)
@@ -136,35 +134,34 @@ struct SyncStatusPresentation {
             let inventory = snapshot.livePhotoInventory
             let known = inventory?.phase != .enumerating
             let stillIdentifying = identifying || inventory.map { $0.phase != .completed || $0.pending > 0 || $0.unresolved > 0 } == true
-            let text = stillIdentifying && (!completing || identifying) ? inventory.map { known ? "已处理 \($0.identified) / \($0.inventoried) 项" : "已处理 \($0.identified) 项" } : nil
-            let fraction = stillIdentifying && !completing && known ? ((inventory?.inventoried ?? 0) > 0 ? min(1, Double(inventory!.identified) / Double(inventory!.inventoried)) : 0) : nil
+            let text = stillIdentifying && (!completing || identifying) ? inventory.map { known ? "已处理 \($0.processed) / \($0.inventoried) 项" : "已处理 \($0.processed) 项" } : nil
+            let fraction = stillIdentifying && !completing && known ? ((inventory?.inventoried ?? 0) > 0 ? min(1, Double(inventory!.processed) / Double(inventory!.inventoried)) : 0) : nil
             let active = !snapshot.isPaused && !unknownMutation && (identifying || completing)
             let attention = (inventory?.requiresAttention ?? 0) > 0 || snapshot.livePhotoWork.requiresAttentionGroups > 0
-            let subtitle = snapshot.isPaused ? "Live Photo 已暂停" : active ? "正在配对 Live Photo" : attention ? "Live Photo 需处理" : "Live Photo 等待恢复"
-            let progressMeaning: String
-            if text == nil {
-                progressMeaning = "配对信息已核对，正在补齐并验证完整 Live Photo。此阶段没有可靠的总百分比，显示活动进度。"
+            let subtitle = snapshot.isPaused ? "Live Photo 已暂停" : unknownMutation ? "Live Photo 等待确认" : active ? "正在配对 Live Photo" : attention ? "Live Photo 需处理" : "Live Photo 等待恢复"
+            let title: String, body: String
+            if unknownMutation {
+                title = "等待“照片”确认"; body = "保存结果尚未确认，新的保存已暂停。"
+            } else if snapshot.isPaused {
+                if snapshot.livePhotoWork.hasOwnedSubmission {
+                    title = "正在结束当前操作"; body = "已提交给“照片”的操作会继续收尾，之后暂停。"
+                } else { title = "已暂停"; body = "已完成的结果会保留。" }
+            } else if attention {
+                title = "Live Photo 需处理"
+                body = snapshot.livePhotoIssue?.summary ?? snapshot.livePhotoWork.issue?.summary ?? "部分项目无法自动识别配对关系，请在设置中查看诊断。"
+            } else if active {
+                title = "Live Photo 配对"
+                body = completing && !identifying ? "正在补齐包含动态画面和声音的 Live Photo。" : Self.livePhotoExplanation
             } else {
-                progressMeaning = "\(inventory?.identified ?? 0)" + (known ? " / \(inventory?.inventoried ?? 0)" : "") + " 是已核对配对信息的图库项目数；完整 Live Photo 按一项计数，不代表已补齐的数量。确定不含配对标识或按时长规则排除的项目也计入，读取失败的项目不计入。" + (known ? "" : "当前总量尚未确认，因此不显示百分比。")
+                title = "Live Photo 等待恢复"
+                if snapshot.livePhotoActivities.contains(.draining) { body = "正在等待系统结束资源读取，完成后自动继续。" }
+                else { body = snapshot.livePhotoIssue?.summary ?? snapshot.livePhotoWork.issue?.summary ?? "部分原文件暂时无法读取，稍后自动重试。" }
             }
-            var details = [ProgressDetail(title: "用途", text: "核对照片与视频原文件中的配对标识，确认它们属于同一张 Live Photo，补齐动态画面和原有声音。只有一半时先保存，发现另一半后再补齐。"),
-                ProgressDetail(title: "进度含义", text: progressMeaning),
-                ProgressDetail(title: "对已有内容的影响", text: "完整 Live Photo 的原始内容及应保留的信息验证通过后，才移除被替代的单独照片或视频；旧标题可能丢失。不会改动源文件或清空“最近删除”。")]
-            if let issue = snapshot.livePhotoIssue ?? snapshot.livePhotoWork.issue { details.append(.init(title: "当前状态", text: issue.summary)) }
-            details.append(.init(title: "视频识别范围", text: "超过 10 秒的普通视频跳过 Live Photo 识别，仍正常导入为视频。已有明确配对身份或已标记为 Live Photo 的项目不受此规则影响；时长未知时继续识别。"))
-            if (inventory?.requiresAttention ?? 0) > 0 { details.append(.init(title: "需要处理的项目", text: "\(inventory!.requiresAttention) 项无法自动识别配对关系。点击“立即扫描”可重新尝试，已完成的结果会保留。")) }
-            if (inventory?.resourceLimited ?? 0) > 0 || snapshot.livePhotoWork.resourceLimitedGroups > 0 {
-                details.append(.init(title: "资源读取限制", text: "部分原文件或同时读取的资源超过当前 512 MiB 上限，已停止自动重试。点击“立即扫描”可重新尝试，但上限不变时仍可能受限。其他项目继续处理，原文件未被修改。"))
-            }
-            if snapshot.livePhotoWork.stoppedGroups > 0 { details.append(.init(title: "已停止补齐", text: "\(snapshot.livePhotoWork.stoppedGroups) 组关联项目已从图库删除，已停止补齐，不会重新创建这些项目。")) }
-            details += Self.commonTaskDetails
-            rows.append(.init(id: "livePhoto", subtitle: subtitle, progressText: text, fraction: fraction, explanation: Self.livePhotoExplanation, active: active, totalsKnown: known, details: details))
+            rows.append(.init(id: "livePhoto", subtitle: subtitle, progressText: text, fraction: fraction,
+                explanation: body, active: active, totalsKnown: known, explanationTitle: title))
         }
         return rows
     }
-    private static let commonTaskDetails = [
-        ProgressDetail(title: "iCloud 原件", text: "必要时会从 iCloud 获取原文件，可能产生网络流量并增加系统本地缓存。"),
-        ProgressDetail(title: "暂停与重启", text: "已有分析结果会保留，恢复或重启后继续未完成项。图库变化时会重新核对受影响的项目。")]
 
     private func livePhotoRunnable(_ kind: LivePhotoActivityKind) -> Bool {
         snapshot.livePhotoActivities.contains(.working(kind)) || snapshot.livePhotoActivities.contains(.queued(kind))
