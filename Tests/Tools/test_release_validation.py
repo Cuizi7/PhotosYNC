@@ -133,7 +133,7 @@ class ReleaseFixture:
         return self.root / "outputs" / "releases" / "0.3.0-beta9"
 
     def _write_repository(self) -> None:
-        for relative in ("scripts", "Tests/Tools", "Tests/Support", "docs/release", "PhotoSync.xcodeproj"):
+        for relative in ("scripts", "Tests/Tools", "Tests/Support", "PhotoSync.xcodeproj"):
             (self.root / relative).mkdir(parents=True, exist_ok=True)
         shutil.copy2(VALIDATOR, self.root / "scripts" / "validate.py")
         shutil.copy2(PACKAGER, self.root / "scripts" / "package-release.sh")
@@ -166,7 +166,6 @@ class ReleaseFixture:
         (self.root / "PhotoSync.xcodeproj" / "project.pbxproj").write_text("fixture project\n")
         (self.root / "Sources").mkdir()
         (self.root / "Sources" / "fixture.swift").write_text("let fixture = true\n")
-        (self.root / "docs/release/0.3.0-beta9.md").write_text("fixture release notes\n")
         (self.root / "CHANGELOG.md").write_text("fixture changelog\n")
         (self.root / "Tests/Tools/test_fixture.py").write_text(
             "import unittest\n\n"
@@ -501,7 +500,7 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertTrue((release / "validation" / "validation.json").is_file())
         self.assertTrue((release / "validation" / "validation-report.md").is_file())
         self.assertEqual((release / "CHANGELOG.md").read_text(), "fixture changelog\n")
-        self.assertEqual((release / "RELEASE-NOTES.md").read_text(), "fixture release notes\n")
+        self.assertEqual((release / "RELEASE-NOTES.md").read_text(), "fixture changelog\n")
         self.assertTrue((release / "PhotosYNC-0.3.0-beta9.dmg").is_file())
         provenance = (release / "PhotosYNC.provenance").read_text().splitlines()
         self.assertIn("release=0.3.0-beta9", provenance)
@@ -620,7 +619,7 @@ class ReleaseValidationTests(unittest.TestCase):
                 try:
                     release = fixture.release_path()
                     if case == "dirty":
-                        (fixture.root / "docs/release/0.3.0-beta9.md").write_text("changed\n")
+                        (fixture.root / "CHANGELOG.md").write_text("changed\n")
                     elif case == "untracked":
                         (fixture.root / "untracked.txt").write_text("untracked\n")
                     elif case == "file":

@@ -184,7 +184,7 @@ done
 bounded_package scripts/build-dmg.sh "$app_path" "$release_dir/PhotosYNC-$release_name.dmg" || exit $?
 bounded_package hdiutil verify "$release_dir/PhotosYNC-$release_name.dmg" || exit $?
 
-cp docs/release/0.3.0-beta9.md "$release_dir/RELEASE-NOTES.md"
+cp CHANGELOG.md "$release_dir/RELEASE-NOTES.md"
 cp CHANGELOG.md "$release_dir/CHANGELOG.md"
 ditto "$validation_dir" "$release_dir/validation"
 cp "$build_dir/validate.log" "$release_dir/validate.log"
