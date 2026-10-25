@@ -1,66 +1,52 @@
-# 可复现测试
+# 验证与发布
 
-默认测试只读仓库内登记的素材，使用 UUID 临时 SQLite 和 fake Photos。它不读取生产图库、生产数据库或历史生产副本，也不启动已安装的 PhotosYNC。系统 PhotoKit/iCloud、另一台机器和最低系统版本的验收分别记录，不能用这些自动测试替代。
+测试应可在新 clone 重现，耗时有上限。默认只用仓库登记素材、UUID 临时 SQLite 和 fake Photos，不读个人图库、生产数据库或其副本，不启动已安装 App。
 
-## 准备一次
+## 运行入口
 
-在新 checkout 的根目录执行。需要完整 Xcode、Python 3.10+、Git LFS、`rg` 和 macOS 自带工具；参考环境是 macOS 27.0.1 / arm64、Xcode 27.1 / Swift 6.4。此版本号是已测环境，不表示其他版本已验证。
+需要完整 Xcode（图标编译需 26+）、Python 3.10+、Git LFS、`rg`。参考机为 macOS 27.0.1 arm64 / Xcode 27.1 / Swift 6.4，不等于其他平台已测。
 
 ```sh
+# 首次准备：独立 venv、固定 wheel/素材/模型校验；最多 10 分钟
 python3 scripts/test-environment.py --prepare --root "$PWD/work/test-environment"
-```
 
-准备过程最多 10 分钟：获取当前提交所需的 LFS 对象，检查固定媒体、模型及授权清单的 SHA256，建立独立 venv，以固定 wheel 哈希安装 Pillow 12.3.0。它不安装 Xcode，不改全局 Python/Git 设置，不覆盖已被修改的模型。失败后查看输出，选择新的 work 目录显式重试。
-
-后续命令都使用刚创建的 Python。`--check` 与所有测试默认不安装依赖、不下载素材：
-
-```sh
-work/test-environment/venv/bin/python scripts/test-environment.py \
-  --check --output "$PWD/work/environment-check.json"
-```
-
-提交了少量 CC0 自制 HEIC/JPEG/MOV（含 10 秒边界和损坏文件）、12 份 Git 提交固定的历史 DDL、生成方法和预期元数据。已有 33 例图片及其项目测试授权保持原样；授权不推广到用户的其他照片。模型保留 Git LFS，不提交机器编译缓存、个人数据库或截图。
-
-## 开发时只跑相关检查
-
-```sh
+# 开发：startup / recovery / ui / tools，最多 8 分钟
 work/test-environment/venv/bin/python scripts/run-focused-tests.py \
   --suite startup --output-dir "$PWD/work/focus-startup" \
   --derived-data "$PWD/work/focus-startup-derived"
-```
 
-可选 `startup`、`recovery`、`ui`、`tools`。每次使用新的输出和 DerivedData 路径；上限 8 分钟。结果是 `focused.json`，不能冒充完整验收。直接调用底层 XCTest 可用于热构建诊断，但也不是 canonical 证据。
-
-## 完整验收
-
-```sh
+# 完整验收：每次使用新的输出和 DerivedData 路径
 work/test-environment/venv/bin/python scripts/validate.py \
   --scale-profile full --ui-profile none \
   --output-dir "$PWD/work/validation-full" \
   --derived-data "$PWD/work/validation-full-derived"
 ```
 
-`release` 默认跑 200k 表示 + 100k 成功历史，上限 25 分钟；`full` 跑原有四档，上限 35 分钟。本轮修改启动、SQLite 和测试资源行为，必须选择 `full`。两档都保留完整 XCTest、Tools、实际模型 33 例、两种续体 RED/GREEN，以及最大混合规模档的真实 60 秒空闲检查。原性能阈值不变。
+准备后用 `test-environment.py --check --output <路径>` 核查；检查/测试不会自动下载、安装或改全局环境。模型和媒体清单是硬输入，见 [test-environment.json](../../Tests/Support/test-environment.json)。
 
-R01–R16 的对应测试记录在 `Tests/Support/RuntimeScenarios.json`。结果同时核验三进程冷启动、六处崩溃边界和 20 个种子 × 40 个合法事件的独立报告；仅有“总测试数大于零”不能替代这些场景。默认入口清除私有复放和内部子进程环境变量；外部 corpus 路径必须被素材门槛拒绝。`CI=true` 使用同一门槛。
+| 选择 | 范围与上限 |
+| --- | --- |
+| `release`（默认） | 20 万表示 + 10 万成功历史；验收 25 分钟，含包装总上限 35 分钟 |
+| `full` | 10/15/20 万表示 + 最大混合历史档；验收 35 分钟，含包装总上限 40 分钟 |
+| `native` UI | 真实窗口阶段最多 8 分钟，计入验收总期限；需要已获焦点授权 |
 
-超时、取消、未知跳过、缺场景或旧报告均失败，不自动重跑至通过。取消会通知有独立 session 的嵌套 runner，再清理本轮拥有的进程组；QA 使用可撤销启动租约及独立寿命上限，并按本轮精确可执行路径清理。强制收尾最多额外 8 秒。只读复核不要求重复跑同一快照。
+索引、候选查询、缓存、SQLite、预处理/模型、资源或规模门槛变更选 full；普通迭代可用 release。前三档分别覆盖 0%/50%/100% 编辑比例，最大混合档不能替代这三种形态。
 
-## UI 改动的真实窗口验收
+## 什么算通过
 
-本轮及后续 UI 改动必须把上述命令改为 `--ui-profile native --ui-allow-focus`。这是显式允许测试应用短暂取得焦点；不应在未获许可时使用。原生阶段在 Debug 构建后、昂贵规模测试前执行，上限 8 分钟，计入总截止时间。
+两档均执行完整 XCTest、Tools、33 例实际模型回归、[R01–R16](../../Tests/Support/RuntimeScenarios.json)、跨进程恢复/崩溃/固定事件序列、两种续体 GREEN/预期 RED、规定规模档及真实 60 秒空闲检查。所有报告必须绑定同一源码；零测试、未知跳过、缺场景、缺/旧/错哈希报告、超时均失败，不自动重跑直到通过。
 
-需要登录桌面及执行器已有的辅助功能/输入/窗口读取能力。脚本不请求或更改系统权限；缺能力就报 `blocked_environment`。前台 QA 使用独立 app/UI-test target，由 XCUITest 启动并驱动真实 `PhotoSyncApp` 的 Settings/MenuBarExtra scene，保持菜单栏应用的激活策略。Xcode 的系统认证和 Xcode Helper 权限必须由用户处理；脚本不自动启用开发者模式或修改 TCC。macOS 13 设置回退仍需另行 smoke，当前原生 runner 只支持 macOS 14+。
+- 聚焦测试或直接 `xctest` 用于诊断，不能冒充 canonical。只读 review 不要求重跑同一未变快照。
+- 取消仅收尾本轮拥有的进程，最多额外 8 秒；不降低阈值、放宽授权或读生产数据换取通过。
+- 场景名不是覆盖证明。共享逻辑改动要从真实业务路径注入系统边界事件；[当前缺口](../README.md#当前未解决)不可因现有总测试通过而抹掉。
 
-U01–U06 在浅/深两种外观下执行：一项/两项任务、已知/未知进度、双错误与恢复、等待/暂停、任务 hover、五次重开、文字选择/滚动和内存档持久化。注入的系统调用均由 fake 拒绝。XCTest 只查询本轮唯一 QA bundle 的控件，普通点击拒绝被遮挡或未激活的窗口；状态栏只点击该 app 的唯一可命中 status item。真实遮挡负对照也必须通过。内存档在两种外观下均经过 QA 进程终止/重启，不能用同进程替换 runtime 冒充。
+## UI 验收
 
-Xcode 的 UI runner 保持系统沙盒：读取本轮请求，通过只监听 `127.0.0.1` 的临时通道回复；协调器校验随机令牌及当前请求 ID 后只写固定回复文件。主程序和嵌入 Core 在启动前冻结哈希，运行后及复制证据后再次核对。测试不会为写入 checkout 放宽沙盒。
+UI 改动把完整命令改为 `--ui-profile native --ui-allow-focus`；没有本次焦点授权时不能使用该开关。需已登录桌面和执行器所需权限；脚本不改系统权限，缺能力报 `blocked_environment`。XCUITest 只操作独立 QA bundle、fake Photos 和真实 Settings/MenuBarExtra scene；目前 runner 支持 macOS 14+。
 
-hover 必须实际打开浮层并在指针移出后关闭，不能用点击补过。浮层展开期间，WindowServer 可能先给出极小的动画帧；驱动有界等待原生窗口与合成像素尺寸一致（最多40次、间隔50毫秒，截图调用仍受总截止约束），再检查实际文案。单独的 `--matrix smoke --allow-focus` 只验证少量设置场景和菜单开关，报告标为 smoke，不能满足 native 完整门槛。
+U01–U06 覆盖浅深色、单/双任务、已知/未知进度、错误/恢复/暂停、真实 hover、五次重开、文字选择/滚动及跨进程内存档持久化。只截 QA 自己的窗口；hover 必须由悬停打开并离开关闭，不能用点击补过；方向检查含翻转负对照，OCR 自动纠正不是证明。
 
-每张 PNG 来自 QA 自己的 WindowServer 窗口，记录尺寸、倍率及任务身份。方向检查比较文字几何，不用会自动纠正倒字的 OCR 作为方向证明。自制上下翻转/180 度负对照必须失败。
-
-捕捉后 runner 输出 `NATIVE_REVIEW_PENDING`，生成 `native/index.html` 和 `review-decisions.json`。审阅者须在 180 秒内查看实际图片，逐帧填写 reviewer、pass/fail 和观察，再执行：
+出现 `NATIVE_REVIEW_PENDING` 后查看 `native/index.html`，在 180 秒内逐帧填写 `review-decisions.json` 的 reviewer、pass/fail 与观察，再记录：
 
 ```sh
 work/test-environment/venv/bin/python Tests/UIReview/run-native-scenes.py \
@@ -68,16 +54,31 @@ work/test-environment/venv/bin/python Tests/UIReview/run-native-scenes.py \
   --manifest "$PWD/work/validation-full/native/native-scenes.json"
 ```
 
-缺帧、拒绝、过期、变化后的像素/二进制或另一轮记录不能通过。完整本轮审阅通过后，同一 canonical 进程继续后续检查。`--settings-only --allow-focus` 只是前台设置专项，仍使用 XCUITest，不能满足完整菜单矩阵的 native 门槛。另有既存离屏工具用于快速布局诊断，但不会被此入口接受为原生证据。
+可在捕捉时提前看已完成的帧。缺帧、过期、像素/二进制变化或他轮记录不接受。smoke、settings-only、离屏渲染不满足完整 native 门槛；人工验收只能覆盖明确看过的场景。
 
-可在捕捉过程中先查看已经写完的 PNG；最终仍须对本轮清单中的每一帧核验哈希并明确审阅，避免把全部阅读挤到最后 180 秒。窗口宽度由产品固定，调整大小的尝试不等于已验证任意宽度布局。方向回归通过也不能代替尚未复现的间歇性倒置问题的直接修复证据。
+## 打包与升级
 
-## 新机器和发布边界
+```sh
+# profile 按改动选择；UI 参数仅在该轮已获授权时添加
+PATH="$PWD/work/test-environment/venv/bin:$PATH" \
+  scripts/package-release.sh --scale-profile full --ui-profile native --ui-allow-focus
+```
 
-从新 clone、全新 venv 和 DerivedData 运行以上命令，不复制旧 work、成功标记或模型编译缓存。默认 fake 测试不需要 Photos 授权或 Apple ID。没有第二台 Mac 时记录“跨机未测”，同机新 clone 不称为跨机验证；Intel、macOS 13/14、真实 1×显示器和 PhotoKit 的缺口单独保留。
+脚本从干净已提交源码归档，在归档内完整验收后正常构建 Universal Release，核对版本/channel/build、App/Core 双架构、模型、图标、逐层签名、DMG、provenance 和 SHA256。已有目录/锁不覆盖，失败不留成功包；不安装或启动生产 App。包内发行说明来自根 [CHANGELOG](../../CHANGELOG.md)。
 
-本轮开发验收不自动 merge/release。之后如获发布授权，使用 `scripts/package-release.sh --scale-profile full --ui-profile native --ui-allow-focus`，并让 PATH 优先使用准备好的 venv。打包仍从干净已提交的精确归档执行完整验收，随后正常 Universal 构建、签名、DMG及校验；包装阶段上限 6 分钟，总上限 release/full 为 35/40 分钟。既有发布目录不覆盖。
+当前产物是 ad-hoc 签名，不等于 Developer ID、公证或 Gatekeeper 验收。新版本升级前退出 App、备份完整 Application Support/PhotoSync（含 WAL/SHM）；不支持直接降级，不用旧库覆盖新成功历史。
 
-## 已测耗时
+## 系统证据与缺口
 
-在上述参考环境、提交 `944e04a` 的全新本地 clone 上，full/native 为24分51秒（上限35分钟）；含983项XCTest、132项工具测试、四档规模、两组续体及54帧真实UI审阅。startup聚焦入口的新DerivedData构建加60项测试为70秒，复用构建后相同测试约16秒。其他机器以实际报告为准，超时仍失败。详情见[本轮验证记录](../validation/2026-10-24-portable-test-strategy.md)。
+| 已有证据 | 能说明什么 |
+| --- | --- |
+| 0.2 定向真实 QA：256 资产 / 262 表示、3,017 来源；87 组盲审为 36 重复 / 50 不重 / 1 不确定 | 86 组已定结论与算法一致，仅限候选范围；无全库召回或统计误跳过率保证 |
+| 自制 canary 导入、同路径/改名防重、精确删除后保留成功历史 | 该授权范围的真实 PhotoKit 路径通过，不能推广成后续写入授权 |
+| 0.3 自制照片/MOV/完整 Live Photo 共 3 项创建、原资源/身份/音轨验证及精确清理；PHLivePhotoView 播放 | 验证限定原生路径；最近删除保留，未验证 Photos.app 手势或外放听感 |
+| beta9 的 full/native 归档验收 | 同一源码自动回归与真实 QA UI，通过不证明现场偶发倒字已修复 |
+
+必须联网的 iCloud-only/跨设备传播、第二台 Mac、macOS 13/14 与 Intel 当前运行时、真实 1×屏幕及完整 VoiceOver 仍未覆盖。最低部署版本/Universal 编译或同机新 clone 不等于这些实机验收。
+
+普通 beta 可复用未变系统边界的历史证据；更改 PhotoKit 提交/授权/媒体读取或平台假设须补针对性验证。真实写入使用获准测试图库及自制素材，先记录精确新增范围，清理只限有成功证据的 QA 项；不切换图库、开关 iCloud 或清空最近删除。自动 fake 通过不能代替它。
+
+素材入口：[照片回归与许可](../../Tests/Fixtures/AdvancedDedup/README.md)、[Live Photo 自制素材](../../Tests/Fixtures/LivePhotoPortable/README.md)、[历史 schema](../../Tests/Fixtures/SchemaHistory/README.md)。历史原始报告用 Git 或对应发布包查询，不随版本重复抄入文档。
