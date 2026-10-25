@@ -12,13 +12,11 @@ macOS 菜单栏工具：把选定目录中的照片、视频导入系统“照�
 
 设置可调整图像处理峰值内存预算，默认 **2 GiB**；它用于解码和视觉判重，不是整个进程的内存上限。
 
-## 当前版本
+## 安装与数据
 
-**0.3.0 beta9 / build 26**，最低 macOS 13，Universal arm64/x86_64。本地包为 ad-hoc 签名，未做 Developer ID 签名或公证。
+支持 macOS 13 及以上，提供 Universal arm64/x86_64 本地包，使用 ad-hoc 签名，未做 Developer ID 签名或公证。发布变更见 [CHANGELOG](CHANGELOG.md)。
 
-已知 Live Photo 历史回放可能使已处理数回退；设置页错误文字偶发倒置尚未修复。详见[当前问题与开发入口](docs/README.md)、[版本变化](CHANGELOG.md)。
-
-运行数据在 `~/Library/Application Support/PhotoSync/`，日志在其 `Logs/` 子目录。升级前正常退出并备份完整目录（含 SQLite WAL/SHM）；当前 schema v12，不支持直接降级。升级后用旧库覆盖可能丢失新成功证据，导致重复导入。
+运行数据在 `~/Library/Application Support/PhotoSync/`，日志在其 `Logs/` 子目录。升级前正常退出并备份完整目录（含 SQLite WAL/SHM）；数据库升级后不支持直接降级。用旧库覆盖可能丢失新成功证据，导致重复导入。
 
 ## 开发
 
