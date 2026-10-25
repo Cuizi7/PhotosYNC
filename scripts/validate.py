@@ -13,6 +13,8 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import functools
+import importlib.util
 import json
 import math
 import os
@@ -37,6 +39,12 @@ PREPARATION_P95_BUDGET_MS = 2000
 SCALE_PROFILES = {
     "release": ((200000, 100000),),
     "full": ((100000, 0), (150000, 0), (200000, 0), (200000, 100000)),
+}
+CANONICAL_BUDGET_SECONDS = {"release": 25 * 60, "full": 35 * 60}
+RUNTIME_SCENARIOS = [f"R{i:02}" for i in range(1, 17)]
+ALLOWED_XCTEST_SKIPS = {
+    "AdvancedDedupRegressionTests/testControlledScaleThroughActualGraph": "Scale sampling is an explicit canonical subprocess",
+    "AdvancedDedupRegressionTests/testExistingVectorReplayUsesSQLiteBackend": "Saved-vector replay requires explicit local inputs",
 }
 
 EXCLUDED_MANIFEST_DIRECTORIES = {
@@ -81,6 +89,9 @@ def parser() -> argparse.ArgumentParser:
         "--scale-profile", choices=tuple(SCALE_PROFILES), default="release",
         help="release: maximum mixed sample (default); full: all four scale/distribution samples.",
     )
+    argument_parser.add_argument("--ui-profile", choices=("none", "native"), default="none")
+    argument_parser.add_argument("--ui-allow-focus", action="store_true",
+                                 help="Explicitly permit the isolated native UI host to take focus.")
     argument_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -97,6 +108,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
+    install_cancellation_handlers()
     arguments = parser().parse_args(arguments)
     source_root = Path(__file__).resolve().parent.parent
     output_dir = arguments.output_dir
@@ -107,7 +119,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         output_dir.mkdir()
         output_created = True
         validate(source_root=source_root, output_dir=output_dir, derived_data=arguments.derived_data,
-                 scale_profile=arguments.scale_profile)
+                 scale_profile=arguments.scale_profile, ui_profile=arguments.ui_profile, ui_allow_focus=arguments.ui_allow_focus)
     except (OSError, ValidationError, json.JSONDecodeError) as error:
         if output_created:
             write_failure(output_dir, error)
@@ -143,21 +155,34 @@ def prepare_paths(*, source_root: Path, output_dir: Path, derived_data: Path) ->
     derived_data.parent.mkdir(parents=True, exist_ok=True)
 
 
-def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_profile: str = "release") -> None:
+def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_profile: str = "release",
+             ui_profile: str = "none", ui_allow_focus: bool = False) -> None:
+    started = time.monotonic()
+    deadline = started + CANONICAL_BUDGET_SECONDS[scale_profile]
+    if inherited := os.environ.get("PHOTOSYNC_VALIDATION_DEADLINE"):
+        try: inherited_deadline = float(inherited)
+        except ValueError as error: raise ValidationError("Invalid inherited validation deadline") from error
+        if not math.isfinite(inherited_deadline): raise ValidationError("Invalid inherited validation deadline")
+        deadline = min(deadline, inherited_deadline)
+    run = functools.partial(run_command, deadline=deadline)
+    if ui_profile == "native" and not ui_allow_focus:
+        raise ValidationError("Native UI requires explicit --ui-allow-focus; no foreground actions were attempted.")
     environment = child_environment()
     for name in ("PHOTOSYNC_SCALE_REPRESENTATIONS", "PHOTOSYNC_SCALE_HISTORY", "PHOTOSYNC_SCALE_BUILD_CONFIGURATION"):
         environment.pop(name, None)
-    if environment.get("CI", "").lower() in {"1", "true", "yes"}:
-        raise ValidationError("The authorized local corpus includes non-redistributable user photos; public CI is not approved.")
+    # CI and local runs share the same exact approved-input gate; never substitute
+    # an external dataset or bypass the gate by removing an environment variable.
+    environment_check = run([sys.executable, "scripts/test-environment.py", "--check", "--output", str(output_dir / "environment.json")],
+        cwd=source_root, environment=environment, log_path=output_dir / "environment.log", timeout_seconds=60, label="portable test environment")
     environment["PHOTOSYNC_REGRESSION_DATASET"] = str(source_root / "Tests/Fixtures/AdvancedDedup")
     environment["PHOTOSYNC_ACCEPTANCE_OUTPUT"] = str(output_dir)
     environment["PHOTOSYNC_MODEL_CACHE_DIR"] = str(derived_data / "model-cache")
-    resources = run_command(
+    resources = run(
         [sys.executable, "scripts/advanced-dedup/release.py", "--resources",
          str(source_root / "Sources/PhotoSyncCore/Resources/AdvancedDedup"),
          "--output", str(output_dir / "resources.json")], cwd=source_root, environment=environment,
         log_path=output_dir / "resources.log", timeout_seconds=60, label="fixed model resources")
-    fixtures = run_command(
+    fixtures = run(
         [sys.executable, "scripts/dedup-fixtures/validate.py", "--dataset",
          str(source_root / "Tests/Fixtures/AdvancedDedup"), "--require-approved"],
         cwd=source_root, environment=environment, log_path=output_dir / "fixtures.log",
@@ -172,7 +197,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         },
     )
 
-    xcode_version = run_command(
+    xcode_version = run(
         ["xcodebuild", "-version"],
         cwd=source_root,
         environment=environment,
@@ -180,7 +205,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         timeout_seconds=TOOLCHAIN_TIMEOUT_SECONDS,
         label="xcodebuild version",
     )
-    swift_version = run_command(
+    swift_version = run(
         ["xcrun", "swift", "--version"],
         cwd=source_root,
         environment=environment,
@@ -188,7 +213,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         timeout_seconds=TOOLCHAIN_TIMEOUT_SECONDS,
         label="Swift version",
     )
-    build = run_command(
+    build = run(
         [
             "xcodebuild",
             "-project",
@@ -215,7 +240,17 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
     if not test_bundle.is_dir() or test_bundle.is_symlink():
         raise ValidationError(f"build-for-testing did not create the expected test bundle: {test_bundle}.")
 
-    xctest = run_command(
+    native_phases = []
+    native_evidence = None
+    if ui_profile == "native":
+        print(f"Native UI review will appear at {output_dir / 'native/index.html'}", flush=True)
+        native = run([sys.executable, "Tests/UIReview/run-native-scenes.py", "--derived-data", str(derived_data),
+            "--output-dir", str(output_dir / "native"), "--allow-focus", "--timeout", str(min(480, deadline - time.monotonic()))],
+            cwd=source_root, environment=environment, log_path=output_dir / "native.log", timeout_seconds=480, label="native Settings/MenuBarExtra review")
+        native_phases.append(phase_record("native-ui", native, output_dir))
+        native_evidence = {"result":"native/native-scenes.json", "sha256":sha256_file(output_dir / "native/native-scenes.json")}
+
+    xctest = run(
         ["xcrun", "xctest", str(test_bundle)],
         cwd=source_root,
         environment=environment,
@@ -229,7 +264,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
     # exposes internal APIs to this isolated test host; the packager still makes
     # its own normal Release build after canonical validation.
     scale_derived = derived_data / "ScaleRelease"
-    scale_build = run_command(
+    scale_build = run(
         ["xcodebuild", "-project", "PhotoSync.xcodeproj", "-scheme", "PhotoSync",
          "-configuration", "Release", "-destination", "platform=macOS",
          "-derivedDataPath", str(scale_derived), "CODE_SIGNING_ALLOWED=NO", "ENABLE_TESTABILITY=YES", "build-for-testing"],
@@ -244,7 +279,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         sample = str(count) if history_count == 0 else f"{count}-history-{history_count}"
         scale_environment = dict(environment, PHOTOSYNC_SCALE_REPRESENTATIONS=str(count),
                                  PHOTOSYNC_SCALE_HISTORY=str(history_count), PHOTOSYNC_SCALE_BUILD_CONFIGURATION="Release")
-        scale = run_command(
+        scale = run(
             ["xcrun", "xctest", "-XCTest",
              "PhotoSyncCoreTests.AdvancedDedupRegressionTests/testControlledScaleThroughActualGraph", str(scale_bundle)],
             cwd=source_root, environment=scale_environment, log_path=output_dir / f"scale-{sample}.log",
@@ -258,12 +293,13 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         scale_results[sample] = {"result": report.name, "result_sha256": sha256_file(report)}
         scale_phases.append(phase_record(f"scale-{sample}", scale, output_dir))
 
-    tool_tests = run_command(
+    tool_tests = run(
         [
             sys.executable,
             "-m",
             "unittest",
             "discover",
+            "-v",
             "-s",
             str(source_root / "Tests" / "Tools"),
             "-p",
@@ -276,13 +312,15 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         label="Python tool tests",
     )
     tool_test_count = validate_unittest_summary(tool_tests.log_path)
+    executed_scenarios = validate_runtime_scenarios(source_root / "Tests/Support/RuntimeScenarios.json", xctest.log_path, tool_tests.log_path)
+    runtime_artifacts = validate_runtime_artifacts(output_dir)
 
     continuations = {}
     continuation_phases = []
     for scenario in ("stamp", "advanced-preparation"):
         name = "continuation-race" if scenario == "stamp" else "continuation-advanced-preparation"
         continuation_output = output_dir / name
-        continuation = run_command(
+        continuation = run(
             [sys.executable, "scripts/test-continuation-race.py", "--output-dir", str(continuation_output),
              "--scenario", scenario], cwd=source_root, environment=environment,
             log_path=output_dir / f"{name}.log", timeout_seconds=CONTINUATION_TIMEOUT_SECONDS,
@@ -318,6 +356,17 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
 
     evidence = {
         "status": "passed",
+        "scope": "canonical",
+        "ui_profile": ui_profile,
+        "native_ui": native_evidence,
+        "required_scenarios": RUNTIME_SCENARIOS,
+        "executed_scenarios": executed_scenarios,
+        "runtime_scenarios_sha256": sha256_file(source_root / "Tests/Support/RuntimeScenarios.json"),
+        "runtime_artifacts": runtime_artifacts,
+        "environment": {"result":"environment.json", "sha256":sha256_file(output_dir / "environment.json")},
+        "timing_budget": {"maximum_seconds":CANONICAL_BUDGET_SECONDS[scale_profile], "elapsed_seconds":time.monotonic() - started,
+                          "remaining_seconds":max(0, deadline - time.monotonic())},
+        "coverage_gaps": ["Real Photos/iCloud writes and historical OS/hardware are not exercised by this synthetic gate"] + ([] if ui_profile == "native" else ["Native scene UI not selected"]),
         "scale_validation": {
             "profile": scale_profile,
             "required_samples": scale_sample_names(scale_profile),
@@ -343,12 +392,13 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
             "swift": phase_record("swift-version", swift_version, output_dir),
         },
         "phases": [
+            phase_record("environment", environment_check, output_dir),
             phase_record("build-for-testing", build, output_dir),
             phase_record("xctest", xctest, output_dir),
             phase_record("tool-tests", tool_tests, output_dir),
             phase_record("resources", resources, output_dir),
             phase_record("fixtures", fixtures, output_dir),
-        ] + scale_phases + continuation_phases,
+        ] + native_phases + scale_phases + continuation_phases,
         "xctest": {
             "test_count": xctest_count,
             "log": relative_to_output(xctest.log_path, output_dir),
@@ -370,6 +420,7 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
         },
     }
     validate_scale_evidence(evidence, output_dir=output_dir, expected_profile=scale_profile)
+    validate_portable_evidence(evidence, output_dir, expected_ui_profile=ui_profile)
     write_text(output_dir / "validation-report.md", format_report(evidence))
     write_json(output_dir / "validation.json", evidence)
 
@@ -377,9 +428,127 @@ def validate(*, source_root: Path, output_dir: Path, derived_data: Path, scale_p
 def child_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("RQDATAC2_CONF", None)
+    # Optional private replay and synthetic child controls are never inherited
+    # by the public gate. The dataset is retained for the input gate to reject;
+    # the owned overall deadline is the only inherited execution control.
+    for name in list(environment):
+        if name.startswith("PHOTOSYNC_") and name not in {"PHOTOSYNC_VALIDATION_DEADLINE", "PHOTOSYNC_REGRESSION_DATASET"}:
+            environment.pop(name)
     # Python test discovery must not mutate the frozen source snapshot with .pyc files.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def install_cancellation_handlers() -> None:
+    def cancelled(signum, frame):
+        raise InterruptedError(f"Validation cancelled by signal {signum}")
+    signal.signal(signal.SIGTERM, cancelled)
+    signal.signal(signal.SIGINT, cancelled)
+
+
+def validate_runtime_scenarios(manifest_path: Path, swift_log: Path, tools_log: Path) -> list[str]:
+    manifest = read_json(manifest_path)
+    if manifest.get("schemaVersion") != 1 or not manifest.get("scenarios"):
+        raise ValidationError("Runtime scenario manifest missing")
+    passed = {cls + "/" + method for cls, method in re.findall(
+        r"Test Case '-\[PhotoSyncCoreTests\.(\w+) (\w+)\]' passed", read_log(swift_log))}
+    tool_output = read_log(tools_log)
+    seen = []
+    for scenario in manifest["scenarios"]:
+        identity = scenario.get("id")
+        if not isinstance(identity, str) or identity in seen: raise ValidationError("Duplicate/missing scenario identity")
+        tests, tool_tests = scenario.get("tests", []), scenario.get("toolTests", [])
+        if not tests and not tool_tests: raise ValidationError(f"Scenario {identity} has no behavior checks")
+        if not set(tests).issubset(passed): raise ValidationError(f"Scenario {identity} did not execute every required XCTest")
+        for test in tool_tests:
+            cls, method = test.rsplit(".", 1)
+            pattern = re.escape(method) + r" \(" + re.escape(cls) + r"(?:\." + re.escape(method) + r")?\)[^\n]*\.\.\. ok"
+            if not re.search(pattern, tool_output): raise ValidationError(f"Scenario {identity} did not execute tool check {test}")
+        seen.append(identity)
+    return seen
+
+
+def validate_runtime_artifacts(output: Path) -> dict[str, dict[str, str]]:
+    restart = read_json(output / "runtime-restart.json")
+    if not isinstance(restart, list) or [r.get("phase") for r in restart] != ["seed", "resume", "settled"]:
+        raise ValidationError("Missing three-process cold restart evidence")
+    if len({r.get("pid") for r in restart}) != 3 or any(not isinstance(r.get("pid"), int) or r["pid"] <= 1 for r in restart):
+        raise ValidationError("Cold restart reused a process")
+    if [r.get("modelCalls") for r in restart] != [1000, 0, 0] or [r.get("liveReads") for r in restart] != [0, 40, 0] or [r.get("creates") for r in restart] != [0, 1, 0] or restart[-1].get("imported") != 201:
+        raise ValidationError("Cold restart lost history, repeated analysis or skipped actual submission")
+    resumed_events = restart[1].get("events", [])
+    times = {}
+    for row in resumed_events: times.setdefault(row.get("kind"), row.get("monotonicOffset"))
+    for event in ("first_source_entry", "first_submit_completed"):
+        try: elapsed = times[event] - times["runtime_started"]
+        except (KeyError, TypeError) as error: raise ValidationError("Missing cold startup event") from error
+        if not isinstance(elapsed, (float, int)) or not math.isfinite(elapsed) or not 0 <= elapsed < 2:
+            raise ValidationError("Synthetic dependency-ready startup exceeded 2 seconds")
+    checkpoints = ["intent", "placeholder", "system-committed", "verified", "retirement-unconfirmed", "retirement-confirmed"]
+    crash = read_json(output / "runtime-crash-boundaries.json")
+    if not isinstance(crash, list) or [r.get("checkpoint") for r in crash] != checkpoints:
+        raise ValidationError("Missing durable crash boundaries")
+    for row in crash:
+        name = row["checkpoint"]
+        if row.get("creates") != (0 if name == "intent" else 1) or row.get("retires") != (0 if name in {"intent", "placeholder"} else 1) or row.get("unknown") is not (name in {"intent", "placeholder", "retirement-unconfirmed"}):
+            raise ValidationError("Crash evidence repeated or invented an external mutation")
+    sequences = read_json(output / "runtime-sequences.json")
+    if not isinstance(sequences, list) or [r.get("seed") for r in sequences] != list(range(1, 21)) or any(len(r.get("events", [])) != 40 or r.get("creates") != 1 for r in sequences):
+        raise ValidationError("Missing bounded twenty-seed recovery evidence")
+    return {name: {"result":name + ".json", "sha256":sha256_file(output / (name + ".json"))}
+            for name in ("runtime-restart", "runtime-crash-boundaries", "runtime-sequences")}
+
+
+def validate_portable_evidence(evidence: dict, output: Path, *, expected_ui_profile: str) -> None:
+    if evidence.get("scope") != "canonical" or evidence.get("status") != "passed": raise ValidationError("Focused or incomplete evidence is not canonical")
+    if evidence.get("ui_profile") != expected_ui_profile: raise ValidationError("UI profile mismatch")
+    if evidence.get("required_scenarios") != RUNTIME_SCENARIOS or evidence.get("executed_scenarios") != RUNTIME_SCENARIOS:
+        raise ValidationError("Missing, duplicate or extra required runtime scenarios")
+    source_root = Path(__file__).resolve().parent.parent
+    if evidence.get("runtime_scenarios_sha256") != sha256_file(source_root / "Tests/Support/RuntimeScenarios.json"):
+        raise ValidationError("Runtime scenario identity mismatch")
+    timing = evidence.get("timing_budget", {})
+    elapsed, maximum = timing.get("elapsed_seconds"), timing.get("maximum_seconds")
+    if not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or not isinstance(maximum, (int, float)) or not 0 <= elapsed <= maximum <= 35 * 60:
+        raise ValidationError("Missing or exceeded canonical time budget")
+    entry = evidence.get("environment", {})
+    if entry.get("result") != "environment.json" or entry.get("sha256") != sha256_file(output / "environment.json"):
+        raise ValidationError("Environment evidence identity mismatch")
+    environment = read_json(output / "environment.json")
+    if environment.get("status") != "passed" or environment.get("inputs", {}).get("files_checked", 0) <= 0:
+        raise ValidationError("Missing approved environment/input proof")
+    if evidence.get("runtime_artifacts") != validate_runtime_artifacts(output): raise ValidationError("Runtime artifact hashes changed")
+    if expected_ui_profile == "native":
+        entry = evidence.get("native_ui", {}) or {}
+        path = output / "native/native-scenes.json"
+        if entry.get("result") != "native/native-scenes.json" or entry.get("sha256") != sha256_file(path): raise ValidationError("Native UI evidence changed")
+        native = read_json(path)
+        if native.get("status") != "passed" or native.get("scope") != "native" or native.get("sourceManifestSHA256") != evidence.get("source", {}).get("manifest_sha256"):
+            raise ValidationError("Native UI did not review this canonical source")
+        matrix = source_root / "Tests/UIReview/native-scenarios.json"
+        if native.get("scenarioManifestSHA256") != sha256_file(matrix): raise ValidationError("Native scenario identity mismatch")
+        bundle = path.parent / "PhotosYNC Native Review.app"
+        executable_name = native.get("appExecutable")
+        if native.get("engine") != "xcuitest" or not isinstance(executable_name, str) or Path(executable_name).name != executable_name:
+            raise ValidationError("Native evidence did not use the isolated XCUITest app")
+        if (native.get("binarySHA256") != sha256_file(bundle / "Contents/MacOS" / executable_name)
+                or native.get("coreFrameworkSHA256") != sha256_file(bundle / "Contents/Frameworks/PhotoSyncCore.framework/PhotoSyncCore")):
+            raise ValidationError("Native app binary changed after review")
+        spec = importlib.util.spec_from_file_location("photosync_native_consumer", source_root / "Tests/UIReview/run-native-scenes.py")
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        try:
+            test_log = path.parent / "xctest.log"
+            if native.get("uiTestLogSHA256") != sha256_file(test_log): raise ValueError("Native UI test log changed")
+            module.validate_xcuitest_log(read_log(test_log))
+            module.validate_matrix(native["frames"], read_json(matrix))
+            review = native.get("review", {})
+            review_path = path.parent / "ui-review.json"
+            if review.get("sha256") != sha256_file(review_path): raise ValueError("Native review receipt changed")
+            receipt = read_json(review_path)
+            if not native["reviewStartedAt"] <= receipt.get("reviewedAt", 0) <= native["reviewDeadline"]: raise ValueError("Native review was not timely")
+            module.validate_review(native, receipt, path.parent, check_deadline=False)
+        except (KeyError, TypeError, ValueError) as error: raise ValidationError(str(error)) from error
+    elif evidence.get("native_ui") is not None: raise ValidationError("Unselected UI evidence cannot be mixed into a run")
 
 
 def validate_model_execution(report: dict[str, Any]) -> None:
@@ -525,9 +694,13 @@ def run_command(
     log_path: Path,
     timeout_seconds: float,
     label: str,
+    deadline: float | None = None,
 ) -> CommandResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    if deadline is not None:
+        timeout_seconds = min(timeout_seconds, deadline - started)
+    if timeout_seconds <= 0: raise PhaseFailure(f"Overall deadline expired before {label}.")
     try:
         with log_path.open("wb") as log_file:
             process = subprocess.Popen(
@@ -542,11 +715,13 @@ def run_command(
             try:
                 return_code = process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired as error:
-                terminate_process_group(process)
                 elapsed = time.monotonic() - started
                 raise PhaseFailure(
                     f"{label} timed out after {elapsed:.1f}s; see {log_path.name}."
                 ) from error
+            finally:
+                if process.poll() is None:
+                    terminate_process_group(process)
     except OSError as error:
         raise PhaseFailure(f"{label} could not start: {error}.") from error
 
@@ -566,15 +741,26 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        process.wait()
+        pass
+    # A group leader exiting does not prove its descendants stopped. Finish
+    # reaping this owned group even when a descendant ignored SIGTERM.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=1)
 
 
 def validate_xctest_summary(log_path: Path) -> int:
     output = read_log(log_path)
+    skipped = re.findall(r"Test Case '-\[PhotoSyncCoreTests\.(\w+) (\w+)\]' skipped", output)
+    for cls, method in skipped:
+        identity = cls + "/" + method
+        reason = ALLOWED_XCTEST_SKIPS.get(identity)
+        if reason is None or not re.search(re.escape(f"[PhotoSyncCoreTests.{cls} {method}]") + r"[^\n]*" + re.escape(reason), output):
+            raise ValidationError(f"Unapproved XCTest skip: {identity}")
+    skipped_totals = re.findall(r"Executed\s+\d+\s+tests?,\s+with\s+(\d+)\s+tests?\s+skipped", output)
+    if skipped_totals and int(skipped_totals[-1]) != len(skipped): raise ValidationError("Unidentified XCTest skips")
     summaries = XCTEST_SUMMARY.findall(output)
     if not summaries:
         raise ValidationError("XCTest output did not contain a completed test summary.")
@@ -743,6 +929,10 @@ def format_report(evidence: dict[str, Any]) -> str:
             "# PhotosYNC validation",
             "",
             "Status: passed",
+            f"Scope: {evidence['scope']}",
+            f"UI profile: {evidence['ui_profile']}",
+            f"Runtime scenarios: {', '.join(evidence['executed_scenarios'])}",
+            f"Wall time: {evidence['timing_budget']['elapsed_seconds']:.1f}s / {evidence['timing_budget']['maximum_seconds']}s maximum",
             f"XCTest: {evidence['xctest']['test_count']} tests, 0 failures",
             f"Python tool tests: {evidence['tool_tests']['test_count']} tests, OK",
             f"Scale profile: {evidence['scale_validation']['profile']}",

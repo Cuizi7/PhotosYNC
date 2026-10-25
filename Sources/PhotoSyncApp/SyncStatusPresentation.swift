@@ -31,6 +31,7 @@ struct SyncStatusPresentation {
 
     func globalStatus(enabledSourceIDs: Set<UUID>, authorized: Bool, hasBlockingError: Bool) -> GlobalStatus {
         guard authorized, !hasBlockingError else { return .error }
+        if snapshot.storageRetryPending { return snapshot.isPaused ? .paused : .waiting }
         let initial = snapshot.summary == nil && snapshot.indexProgress == nil && snapshot.livePhotoInventory == nil && snapshot.latestScan.state == .notStarted
         if initial { return snapshot.isPaused ? .paused : .preparing }
         let issues = enabledIssues(for: enabledSourceIDs)
@@ -113,7 +114,7 @@ struct SyncStatusPresentation {
     var progressRows: [PreparationProgress] {
         var rows = [PreparationProgress]()
         if let p = snapshot.indexProgress, p.state != .ready || p.readErrorRepresentations > 0 || snapshot.indexActivity != .idle {
-            let active = !snapshot.isPaused && !unknownMutation && (snapshot.indexActivity == .working || snapshot.indexActivity == .queued)
+            let active = !snapshot.isPaused && !snapshot.storageRetryPending && !unknownMutation && (snapshot.indexActivity == .working || snapshot.indexActivity == .queued)
             let subtitle = snapshot.isPaused ? "视觉索引已暂停" : active ? "正在建立视觉索引" : p.requiresAttentionAssets > 0 ? "视觉索引" : "视觉索引等待恢复"
             let title: String, body: String
             if snapshot.isPaused { title = "已暂停"; body = "已完成的结果会保留。" }
@@ -136,7 +137,7 @@ struct SyncStatusPresentation {
             let stillIdentifying = identifying || inventory.map { $0.phase != .completed || $0.pending > 0 || $0.unresolved > 0 } == true
             let text = stillIdentifying && (!completing || identifying) ? inventory.map { known ? "已处理 \($0.processed) / \($0.inventoried) 项" : "已处理 \($0.processed) 项" } : nil
             let fraction = stillIdentifying && !completing && known ? ((inventory?.inventoried ?? 0) > 0 ? min(1, Double(inventory!.processed) / Double(inventory!.inventoried)) : 0) : nil
-            let active = !snapshot.isPaused && !unknownMutation && (identifying || completing)
+            let active = !snapshot.isPaused && !snapshot.storageRetryPending && !unknownMutation && (identifying || completing)
             let attention = (inventory?.requiresAttention ?? 0) > 0 || snapshot.livePhotoWork.requiresAttentionGroups > 0
             let subtitle = snapshot.isPaused ? "Live Photo 已暂停" : unknownMutation ? "Live Photo 等待确认" : active ? "正在配对 Live Photo" : attention ? "Live Photo 需处理" : "Live Photo 等待恢复"
             let title: String, body: String

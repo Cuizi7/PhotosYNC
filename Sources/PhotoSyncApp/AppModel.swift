@@ -150,6 +150,12 @@ final class AppModel: ObservableObject {
         state = initialState
         ready = true
     }
+#if NATIVE_SCENE_QA
+    func nativeReviewReplaceRuntime(_ runtime: SyncRuntime) {
+        precondition(!ownsSystemLifecycle)
+        self.runtime = runtime
+    }
+#endif
 
     var status: GlobalStatus {
         if qaBlockedReason != nil { return .error }
@@ -169,8 +175,9 @@ final class AppModel: ObservableObject {
         Set(state.sources.filter(\.enabled).map(\.id))
     }
     private var hasBlockingStatusError: Bool {
-        error != nil || state.message != nil || (state.snapshot.blockingError != nil && !hasUncertainSubmissionHint) ||
-            state.snapshot.summaryError != nil
+        error != nil || state.message != nil ||
+            (!state.snapshot.storageRetryPending &&
+             ((state.snapshot.blockingError != nil && !hasUncertainSubmissionHint) || state.snapshot.summaryError != nil))
     }
     private var hasUncertainSubmissionHint: Bool {
         if case .checkpointFailure = state.snapshot.recoveryHint { return false }
@@ -222,8 +229,9 @@ final class AppModel: ObservableObject {
     var syncDetailHelp: String? {
         state.snapshot.blockingError ?? state.snapshot.summaryError ?? state.messageDetail ?? state.warningDetail ?? errorDetail
     }
-    private var summaryFailureNotice: String? {
-        state.snapshot.summaryError == nil ? nil : "同步统计暂时读不到，稍后会自动重试。"
+    var summaryFailureNotice: String? {
+        guard state.snapshot.summaryError != nil, state.snapshot.blockingError == nil else { return nil }
+        return state.snapshot.storageRetryPending ? "本地数据库暂时被占用，稍后会自动重试。" : "同步统计暂时读不到，稍后会自动重试。"
     }
     /// Keeps raw system text out of the headline: a validation error already reads like a
     /// sentence for people, anything else shows a plain summary and keeps the detail for support.

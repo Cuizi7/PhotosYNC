@@ -142,6 +142,7 @@ enum SourceIssueText {
     static let authorizationRequired = "未获“照片”读写权限，同步已暂停。请在设置中点“授权访问照片”。"
     static let libraryUnavailable = "无法读取系统照片图库，已暂停导入。"
     static let storageStopped = "本地数据库不可用，同步已停止。"
+    static let storageBusy = "本地数据库暂时被占用，稍后会自动重试。"
 
     static func blockingSummary(for error: Error) -> String {
         if let error = error as? PhotoKitGatewayError {
@@ -251,6 +252,8 @@ public struct EngineSnapshot: Sendable {
     public var summary: SyncStatusSummary?
     /// A failed refresh retains `summary` when a prior value exists.
     public var summaryError: String?
+    /// Bounded SQLite lock contention, not corruption or permission failure.
+    public var storageRetryPending = false
     public var latestScan = ScanProgress()
     public var activeWork = false
     public var sourceActivities: [UUID: SourceActivity] = [:]
@@ -317,6 +320,8 @@ public actor SyncEngine {
     private var scanning = false
     private var recovering = false
     private var storageFailed = false
+    private var storageFailureRevision: UInt64 = 0
+    private var recoveringStorage = false
     private let livePhotoDirectoryObserver: (any LivePhotoDirectoryObserving)?
     private let livePhotoMetadata: @Sendable (UUID) -> any LivePhotoMetadataReading
     private var drainTask: Task<Void, Never>?
@@ -450,6 +455,7 @@ public actor SyncEngine {
     }
 
     public func scan(sourceIDs: [UUID]) async {
+        if storageFailed { _ = await recoverStorageIfPossible() }
         guard !scanning, !status.isPaused, !storageFailed else { return }
         let sources = Set(sourceIDs).subtracting(disabledSources)
         guard !sources.isEmpty else {
@@ -468,26 +474,18 @@ public actor SyncEngine {
         if !uncertainSubmissions.isEmpty {
             setUncertainSubmissionBlock()
         }
-        guard !storageFailed, status.blockingError == nil else {
+        guard !storageFailed, status.blockingError == nil || hasUncertainSubmissionBlock else {
             scanning = false
             await refreshSummary()
             finishRound(roundID)
             return
         }
-        let photoSnapshot: PhotosCandidateSnapshot
-        do { photoSnapshot = try await photos.candidateSnapshot() }
-        catch {
-            setBlockingError(error.localizedDescription, summary: SourceIssueText.blockingSummary(for: error))
-            interruptRound(roundID)
-            scanning = false
-            await refreshSummary()
-            finishRound(roundID)
-            return
-        }
+        // Inventory is independent of Photos candidate acquisition. Persist new files as
+        // pending; the serial drain owns all candidate-dependent decisions and writes.
         await withTaskGroup(of: Void.self) { group in
             for sourceID in sources {
                 group.addTask {
-                    await self.scanSource(sourceID, roundID: roundID, photosSnapshot: photoSnapshot)
+                    await self.scanSource(sourceID, roundID: roundID)
                 }
             }
         }
@@ -507,6 +505,9 @@ public actor SyncEngine {
         do {
             for record in try await allFiles(.importing) where record.attemptID != activeAttempt {
                 guard let attempt = record.attemptID else { continue }
+                // Durable attempts survive process-local gateway state. A missing fetch or
+                // failed recovery is not proof of non-submission; hold every new mutation.
+                uncertainSubmissions.insert(record.id)
                 do {
                     if try await store.isSourceRemoved(id: record.file.sourceID) {
                         removedSources.insert(record.file.sourceID)
@@ -547,7 +548,7 @@ public actor SyncEngine {
         } catch { stopStorage(error) }
     }
 
-    private func scanSource(_ sourceID: UUID, roundID: UUID, photosSnapshot: PhotosCandidateSnapshot) async {
+    private func scanSource(_ sourceID: UUID, roundID: UUID) async {
         activeSourceScans.insert(sourceID)
         defer { activeSourceScans.remove(sourceID) }
         status.sourcePhases[sourceID] = "扫描目录与元数据"
@@ -669,7 +670,7 @@ public actor SyncEngine {
                                 break scanLoop
                             }
                             let file = SourceFile(sourceID: sourceID, relativePath: relative, url: entry.url, stamp: stamp, metadata: info)
-                            try await saveScannedFile(file, initialSnapshot: photosSnapshot)
+                            _ = try await store.save(file, decision: .importNew)
                             resolveSourceIssue(sourceID, key: fileScanIssueKey(relative), runID: run)
                         } catch let error as SyncStoreError { throw error }
                         catch let error as PhotoKitGatewayError {
@@ -804,61 +805,6 @@ public actor SyncEngine {
     }
 
     private static let snapshotCommitAttempts = 3
-
-    private func saveScannedFile(_ file: SourceFile, initialSnapshot: PhotosCandidateSnapshot) async throws {
-        if file.metadata.kind == .image && usesAdvancedDedup {
-            _ = try await store.save(file, decision: .importNew)
-            return
-        }
-        var photoSnapshot = initialSnapshot
-        var localCandidates = try await store.candidates(filename: file.metadata.filename, excludingID: nil)
-        var candidates = photoSnapshot.candidates(named: file.metadata.filename) + localCandidates
-        var decision = policy.evaluate(file.metadata, candidates: candidates)
-        var evidence = matchingCandidates(decision, candidates: candidates)
-        var latestSnapshotChecked = false
-        var refreshLocalCandidates = false
-        var staleAttempts = 0
-
-        while true {
-            if case .skip = decision {
-                if !latestSnapshotChecked {
-                    let latestSnapshot = try await photos.candidateSnapshot()
-                    let generationChanged = latestSnapshot.generation != photoSnapshot.generation
-                    photoSnapshot = latestSnapshot
-                    if generationChanged || refreshLocalCandidates {
-                        localCandidates = try await store.candidates(filename: file.metadata.filename, excludingID: nil)
-                        candidates = photoSnapshot.candidates(named: file.metadata.filename) + localCandidates
-                        decision = policy.evaluate(file.metadata, candidates: candidates)
-                        evidence = matchingCandidates(decision, candidates: candidates)
-                    }
-                    latestSnapshotChecked = true
-                    refreshLocalCandidates = false
-                    if case .importNew = decision { continue }
-                }
-
-                switch try await store.saveWithSnapshotValidity(
-                    file,
-                    decision: decision,
-                    candidates: evidence,
-                    validity: photoSnapshot.candidateValidity
-                ) {
-                case .committed:
-                    return
-                case .staleSnapshot:
-                    staleAttempts += 1
-                    guard staleAttempts < Self.snapshotCommitAttempts else {
-                        throw PhotoKitGatewayError.libraryChanged
-                    }
-                    latestSnapshotChecked = false
-                    refreshLocalCandidates = true
-                    continue
-                }
-            } else {
-                _ = try await store.save(file, decision: decision, candidates: evidence)
-                return
-            }
-        }
-    }
 
     private func identifyDirectory(sourceID: UUID, folder: (url: URL, relative: String), entries: [DirectoryEntry], roundID: UUID) async throws -> Bool {
         guard let livePhotoDirectoryObserver else { return true }
@@ -1314,7 +1260,7 @@ public actor SyncEngine {
     }
 
     private func canScan(sourceID: UUID) -> Bool {
-        !status.isPaused && !storageFailed && status.blockingError == nil && !disabledSources.contains(sourceID)
+        !status.isPaused && !storageFailed && (status.blockingError == nil || hasUncertainSubmissionBlock) && !disabledSources.contains(sourceID)
     }
 
     private func canReadSource(_ sourceID: UUID) -> Bool {
@@ -1653,8 +1599,21 @@ public actor SyncEngine {
     private func refreshSummary() async {
         guard !storageFailed else { return }
         do {
-            status.summary = try await store.activeSourceSummary()
+            let summary = try await store.activeSourceSummary()
+            guard !storageFailed else { return }
+            status.summary = summary
             status.summaryError = nil
+            status.storageRetryPending = false
+        } catch let error as SyncStoreError {
+            guard !storageFailed else { return }
+            if case .busy = error {
+                if status.summaryError == nil { logger?.log(["scope": "storage", "event": "summary-lock-wait"]) }
+                status.summaryError = error.localizedDescription
+                status.storageRetryPending = true
+            } else {
+                status.summaryError = error.localizedDescription
+                stopStorage(error)
+            }
         } catch {
             status.summaryError = error.localizedDescription
             stopStorage(error)
@@ -1669,6 +1628,7 @@ public actor SyncEngine {
     }
 
     private func setBlockingError(_ message: String, summary: String) {
+        status.storageRetryPending = false
         status.blockingError = message
         status.blockingSummary = summary
         status.recoveryHint = nil
@@ -1711,14 +1671,43 @@ public actor SyncEngine {
 
     private func stopStorage(_ error: Error) {
         let firstStop = !storageFailed
+        storageFailureRevision &+= 1
         storageFailed = true
         status.blockingError = "Storage stopped: \(error.localizedDescription)"
-        status.blockingSummary = SourceIssueText.storageStopped
+        if case .busy = error as? SyncStoreError { status.storageRetryPending = true }
+        else { status.storageRetryPending = false }
+        status.blockingSummary = status.storageRetryPending ? SourceIssueText.storageBusy : SourceIssueText.storageStopped
         status.summaryError = error.localizedDescription
         status.recoveryHint = nil
         hasUncertainSubmissionBlock = false
         logger?.log(["error": error.localizedDescription, "scope": "storage"])
-        if firstStop { publishIssueNotification(SourceIssueText.storageStopped) }
+        if firstStop && !status.storageRetryPending { publishIssueNotification(SourceIssueText.storageStopped) }
+    }
+
+    /// Reopen only a typed lock failure, using this same store and gateway. The next
+    /// scan still reconciles every durable attempt before any new Photos mutation.
+    @discardableResult
+    public func recoverStorageIfPossible() async -> Bool {
+        guard storageFailed, status.storageRetryPending, !scanning, !recovering,
+              !recoveringStorage, drainTask == nil, activeAttempt == nil else { return false }
+        recoveringStorage = true
+        defer { recoveringStorage = false }
+        let failureRevision = storageFailureRevision
+        do {
+            let summary = try await store.activeSourceSummary()
+            guard storageFailed, status.storageRetryPending, storageFailureRevision == failureRevision,
+                  drainTask == nil, activeAttempt == nil else { return false }
+            storageFailed = false
+            status.summary = summary; status.summaryError = nil; status.storageRetryPending = false
+            clearBlockingError()
+            if !uncertainSubmissions.isEmpty { setUncertainSubmissionBlock() }
+            refreshSubmissionState()
+            logger?.log(["scope": "storage", "event": "lock-recovered"])
+            return true
+        } catch let error as SyncStoreError {
+            if case .busy = error { return false }
+            stopStorage(error); return false
+        } catch { stopStorage(error); return false }
     }
 }
 

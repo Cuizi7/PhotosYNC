@@ -130,19 +130,43 @@ class ReleaseFixture:
             '''))
 
     def release_path(self) -> Path:
-        return self.root / "outputs" / "releases" / "0.3.0-beta8"
+        return self.root / "outputs" / "releases" / "0.3.0-beta9"
 
     def _write_repository(self) -> None:
-        for relative in ("scripts", "Tests/Tools", "docs/release", "PhotoSync.xcodeproj"):
+        for relative in ("scripts", "Tests/Tools", "Tests/Support", "docs/release", "PhotoSync.xcodeproj"):
             (self.root / relative).mkdir(parents=True, exist_ok=True)
         shutil.copy2(VALIDATOR, self.root / "scripts" / "validate.py")
         shutil.copy2(PACKAGER, self.root / "scripts" / "package-release.sh")
         shutil.copy2(BUILD_DMG, self.root / "scripts" / "build-dmg.sh")
+        shutil.copy2(WORKTREE_ROOT / "scripts/run-bounded.py", self.root / "scripts/run-bounded.py")
+        (self.root / "Tests/Support/RuntimeScenarios.json").write_text(json.dumps({"schemaVersion":1,
+            "scenarios":[{"id":f"R{i:02}", "tests":["FixtureTests/testPortable"]} for i in range(1,17)]}))
+        # As with the model below, this CLI fixture replaces physical environment
+        # preparation only; its real exact-byte gate has independent unit tests.
+        (self.root / "scripts/test-environment.py").write_text(
+            "import argparse,json,os,sys\nfrom pathlib import Path\n"
+            "p=argparse.ArgumentParser();p.add_argument('--output');a,_=p.parse_known_args()\n"
+            "if os.environ.get('FAKE_ENVIRONMENT_MODE') == 'fail': sys.exit(27)\n"
+            "Path(a.output).write_text(json.dumps({'status':'passed','inputs':{'files_checked':1,'manifest_sha256':'f'*64}}))\n"
+        )
+        (self.root / "scripts/write-synthetic-runtime.py").write_text(textwrap.dedent('''\
+            import json,os
+            from pathlib import Path
+            root=Path(os.environ['PHOTOSYNC_ACCEPTANCE_OUTPUT'])
+            events=[{'kind':'runtime_started','monotonicOffset':0},{'kind':'first_source_entry','monotonicOffset':0.1},{'kind':'first_submit_completed','monotonicOffset':0.2}]
+            restarts=[{'phase':phase,'pid':10+i,'modelCalls':1000 if i==0 else 0,'liveReads':40 if i==1 else 0,'creates':1 if i==1 else 0,'imported':200 if i==0 else 201,'events':events} for i,phase in enumerate(['seed','resume','settled'])]
+            checkpoints=['intent','placeholder','system-committed','verified','retirement-unconfirmed','retirement-confirmed']
+            crashes=[{'checkpoint':p,'creates':0 if p=='intent' else 1,'retires':0 if p in ['intent','placeholder'] else 1,'unknown':p in ['intent','placeholder','retirement-unconfirmed']} for p in checkpoints]
+            sequences=[{'seed':i,'events':['fixture']*40,'creates':1} for i in range(1,21)]
+            for name,value in [('runtime-restart',restarts),('runtime-crash-boundaries',crashes),('runtime-sequences',sequences)]:
+                (root/(name+'.json')).write_text(json.dumps(value))
+            if os.environ.get('FAKE_RUNTIME_REPORT_MODE')=='missing': (root/'runtime-crash-boundaries.json').unlink()
+            '''))
         (self.root / ".gitignore").write_text("/work/\n/outputs/releases/\n")
         (self.root / "PhotoSync.xcodeproj" / "project.pbxproj").write_text("fixture project\n")
         (self.root / "Sources").mkdir()
         (self.root / "Sources" / "fixture.swift").write_text("let fixture = true\n")
-        (self.root / "docs/release/0.3.0-beta8.md").write_text("fixture release notes\n")
+        (self.root / "docs/release/0.3.0-beta9.md").write_text("fixture release notes\n")
         (self.root / "CHANGELOG.md").write_text("fixture changelog\n")
         (self.root / "Tests/Tools/test_fixture.py").write_text(
             "import unittest\n\n"
@@ -246,6 +270,17 @@ class ReleaseValidationTests(unittest.TestCase):
             [line.split(":", 1)[0] for line in self.fixture.event_lines()],
             ["xcodebuild", "xcrun", "xcodebuild", "xcrun", "xcodebuild", "xcrun", "continuation", "continuation"],
         )
+
+    def test_ci_uses_same_input_gate_and_missing_runtime_evidence_fails(self) -> None:
+        output = Path(self.temporary_directory.name) / "ci-approved"
+        result = self.fixture.run_validator(output, output.with_name("ci-derived"), CI="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for mode in ("environment", "runtime"):
+            failed = output.with_name(mode)
+            options = {"FAKE_ENVIRONMENT_MODE":"fail"} if mode == "environment" else {"FAKE_RUNTIME_REPORT_MODE":"missing"}
+            result = self.fixture.run_validator(failed, failed.with_name(mode + "-derived"), **options)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((failed / "validation.json").exists())
 
     def test_validator_full_profile_executes_all_four_samples(self) -> None:
         output_dir = Path(self.temporary_directory.name) / "full"
@@ -467,10 +502,10 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertTrue((release / "validation" / "validation-report.md").is_file())
         self.assertEqual((release / "CHANGELOG.md").read_text(), "fixture changelog\n")
         self.assertEqual((release / "RELEASE-NOTES.md").read_text(), "fixture release notes\n")
-        self.assertTrue((release / "PhotosYNC-0.3.0-beta8.dmg").is_file())
+        self.assertTrue((release / "PhotosYNC-0.3.0-beta9.dmg").is_file())
         provenance = (release / "PhotosYNC.provenance").read_text().splitlines()
-        self.assertIn("release=0.3.0-beta8", provenance)
-        self.assertIn("build_number=25", provenance)
+        self.assertIn("release=0.3.0-beta9", provenance)
+        self.assertIn("build_number=26", provenance)
         self.assertIn("signing=ad-hoc; notarized=no", provenance)
         self.assertIn("validation_scale_profile=release", provenance)
         self.assertIn("validation_scale_required_samples=200000-history-100000", provenance)
@@ -585,7 +620,7 @@ class ReleaseValidationTests(unittest.TestCase):
                 try:
                     release = fixture.release_path()
                     if case == "dirty":
-                        (fixture.root / "docs/release/0.3.0-beta8.md").write_text("changed\n")
+                        (fixture.root / "docs/release/0.3.0-beta9.md").write_text("changed\n")
                     elif case == "untracked":
                         (fixture.root / "untracked.txt").write_text("untracked\n")
                     elif case == "file":
@@ -598,7 +633,7 @@ class ReleaseValidationTests(unittest.TestCase):
                         release.parent.mkdir(parents=True, exist_ok=True)
                         release.symlink_to(fixture.root / "missing-release-target")
                     else:
-                        lock = release.parent / ".0.3.0-beta8.lock"
+                        lock = release.parent / ".0.3.0-beta9.lock"
                         lock.mkdir(parents=True)
                     result = fixture.run_packager()
                     self.assertNotEqual(result.returncode, 0)
@@ -623,8 +658,8 @@ class ReleaseValidationTests(unittest.TestCase):
 
     def assert_no_transient_release_paths(self, fixture: ReleaseFixture) -> None:
         release_root = fixture.release_path().parent
-        self.assertFalse((release_root / ".0.3.0-beta8.lock").exists())
-        self.assertEqual(list(release_root.glob(".0.3.0-beta8.staging.*")), [])
+        self.assertFalse((release_root / ".0.3.0-beta9.lock").exists())
+        self.assertEqual(list(release_root.glob(".0.3.0-beta9.staging.*")), [])
 
 
 _FAKE_XCODEBUILD = """#!/bin/sh
@@ -669,8 +704,8 @@ case " $* " in
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleExecutable</key><string>PhotosYNC</string>
 <key>CFBundleShortVersionString</key><string>0.3.0</string>
-<key>CFBundleVersion</key><string>25</string>
-<key>PhotoSyncReleaseChannel</key><string>beta8</string>
+<key>CFBundleVersion</key><string>26</string>
+<key>PhotoSyncReleaseChannel</key><string>beta9</string>
 </dict></plist>
 PLIST
       printf '#!/bin/sh\\nexit 0\\n' > "$app/Contents/MacOS/PhotosYNC"
@@ -746,6 +781,8 @@ BAD_SCALE
 fi
 case "${FAKE_XCTEST_MODE:-success}" in
   success)
+    python3 scripts/write-synthetic-runtime.py
+    printf "Test Case '-[PhotoSyncCoreTests.FixtureTests testPortable]' passed (0.01 seconds).\\n"
     # The real complete suite writes this functional two-row harness smoke. It
     # must survive packaging without being counted as a performance sample.
     cat > "$PHOTOSYNC_ACCEPTANCE_OUTPUT/scale-2.json" <<'SMOKE'

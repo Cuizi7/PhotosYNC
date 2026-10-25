@@ -178,7 +178,7 @@ struct SourceSettings: View {
     private var settingsIssueSummaries: [String] {
         let candidates: [String?] = [model.state.authorized ? model.syncDetail : nil,
             model.engineBlockingSummary,
-            model.state.snapshot.summaryError == nil ? nil : "同步统计暂时读不到，稍后会自动重试。",
+            model.summaryFailureNotice,
             model.state.message, model.state.warning, model.error]
         return candidates.compactMap { $0 }.reduce(into: []) { result, text in
             if !result.contains(text) { result.append(text) }

@@ -2,6 +2,38 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoIdentityTests: XCTestCase {
+    func testFrozenMovieDurationsPreserveIdentificationBoundary() async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/LivePhotoPortable/media")
+        for (name, expected, excluded) in [("below.mov", 9.999, false), ("equal.mov", 10.0, false), ("above.mov", 10.001, true)] {
+            let metadata = try await MetadataReader().read(url: root.appendingPathComponent(name), filename: name)
+            XCTAssertEqual(try XCTUnwrap(metadata.duration), expected, accuracy: 0.0001)
+            XCTAssertEqual(LivePhotoIdentificationPolicy.excludesVideo(kind: metadata.kind, duration: metadata.duration), excluded)
+            XCTAssertFalse(LivePhotoIdentificationPolicy.excludesVideo(kind: metadata.kind, duration: metadata.duration, hasIdentity: true))
+        }
+    }
+
+    func testFrozenPortableMediaExercisesRealMetadataReader() async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/LivePhotoPortable/media")
+        let reader = LivePhotoMetadataReader()
+        for (name, role) in [("paired.heic", LivePhotoRole.photo), ("paired.jpg", .photo), ("paired.mov", .motion)] {
+            let result = try await reader.inspect(url: root.appendingPathComponent(name), kind: role == .motion ? .video : .image)
+            guard case .identified(let identity) = result else { return XCTFail("Missing portable identity: \(name)") }
+            XCTAssertEqual(identity.contentIdentifier, "11111111-2222-3333-4444-555555555555")
+            XCTAssertEqual(identity.role, role)
+            if role == .motion { XCTAssertEqual(identity.hasAudio, true) }
+        }
+        let plain = try await reader.inspect(url: root.appendingPathComponent("plain.jpg"), kind: .image)
+        XCTAssertEqual(plain, .noIdentifier)
+        let missingTime = try await reader.inspect(url: root.appendingPathComponent("missing-time.mov"), kind: .video)
+        guard case .unresolved = missingTime else { return XCTFail("Missing timed metadata must remain unresolved") }
+        for (name, kind) in [("corrupt.heic", MediaKind.image), ("corrupt.mov", .video)] {
+            do { _ = try await reader.inspect(url: root.appendingPathComponent(name), kind: kind); XCTFail("Accepted malformed fixture") }
+            catch { }
+        }
+    }
+
     func testSyntheticPairedMovieContainsAudio() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("audio.mov")

@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "contentIdentifier": "11111111-2222-3333-4444-555555555555",
+  "source": "Project generated color blocks and a synthetic 440 Hz tone; no personal media.",
+  "license": "CC0-1.0",
+  "files": [
+    {
+      "path": "media/above.mov",
+      "sha256": "f26cdc8f5d3e4657283b3a317d6c804af3b2844a597eee0cbaa9ee27a424e6b4",
+      "bytes": 993,
+      "inspection": "noIdentifier",
+      "duration": 10.001
+    },
+    {
+      "path": "media/below.mov",
+      "sha256": "2ac087a24d2619b9d72630d68167071d3c836ac8d346198ef20c24b931fdbc9d",
+      "bytes": 993,
+      "inspection": "noIdentifier",
+      "duration": 9.999
+    },
+    {
+      "path": "media/corrupt.heic",
+      "sha256": "c9ccc97f89532d71b6fa4414538611988b2f43b2f16b8a8708af59667479fd10",
+      "bytes": 44,
+      "inspection": "error"
+    },
+    {
+      "path": "media/corrupt.mov",
+      "sha256": "f0cecc6a0fe9fa402337e1c04c5e69a44491fad4fe51328a3388fcb12a6fcfa9",
+      "bytes": 44,
+      "inspection": "error"
+    },
+    {
+      "path": "media/equal.mov",
+      "sha256": "a64600259610eedfed5dd0a43f1db67ba7c100709ac67d51699253f7d7855fcb",
+      "bytes": 993,
+      "inspection": "noIdentifier",
+      "duration": 10.0
+    },
+    {
+      "path": "media/missing-time.mov",
+      "sha256": "8529aff1543f3bf10787d0c5154ae390171aa380430da00f02637e8ae04e7948",
+      "bytes": 1161,
+      "inspection": "unresolved"
+    },
+    {
+      "path": "media/paired.heic",
+      "sha256": "57bead7a33d72aa6f669524a850ff83cde95da89a7e78d780bbd65c803d4f561",
+      "bytes": 688,
+      "inspection": "photo"
+    },
+    {
+      "path": "media/paired.jpg",
+      "sha256": "2e0c63785ed3f35844d3ab0402e84ff05cb1b100cc9e09f34f8455ecfd161875",
+      "bytes": 846,
+      "inspection": "photo"
+    },
+    {
+      "path": "media/paired.mov",
+      "sha256": "29f84a7e3696aa75a92078f12d9b764d1c0f21207afdd4bafebee49b513a28c8",
+      "bytes": 19911,
+      "inspection": "motion"
+    },
+    {
+      "path": "media/plain.jpg",
+      "sha256": "079887f4c4018c60dc4b6eb7482ed74e30642e3614c044b524cb5191c8445cf0",
+      "bytes": 706,
+      "inspection": "noIdentifier"
+    }
+  ]
+}

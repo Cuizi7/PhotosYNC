@@ -2,6 +2,64 @@ import XCTest
 @testable import PhotoSyncCore
 
 final class LivePhotoCoordinatorTests: XCTestCase {
+    func testVerifiedReplacementClosesHistoricalBlockedAttemptWithoutAnotherMutation() async throws {
+        for historical in [false, true] {
+            let f = try await completionFixture(photosOnly: true)
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            let assets = try await f.photos.livePhotoAssets(assetIDs: ["old-photo", "old-motion"], context: f.photos.context)
+            let photo = try XCTUnwrap(assets.first { $0.assetID == "old-photo" }).resources[0]
+            let motion = try XCTUnwrap(assets.first { $0.assetID == "old-motion" }).resources[0]
+            var old = LivePhotoOperation(context: f.photos.context, contentIdentifier: "pair", photo: photo, motion: motion)
+            old.stage = .blocked; old.error = "historical resource wait"
+            old.nextRetryAt = Date(timeIntervalSince1970: 1)
+            old.discoveryResources = [photo, motion]
+            if !historical { _ = try await f.store.reserveLivePhotoOperation(old) }
+            // Represents a later discovery, which older builds could leave alongside
+            // a blocked attempt. The actual coordinator still creates and verifies it.
+            let replacement = LivePhotoOperation(context: f.photos.context, contentIdentifier: "pair", photo: photo, motion: motion)
+            _ = try await f.store.reserveLivePhotoOperation(replacement)
+            let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+            for _ in 0..<3 { _ = try await c.advanceNext(now: Date(), refreshDiscovery: false) }
+            if historical { _ = try await f.store.reserveLivePhotoOperation(old) }
+            let restarted = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+            try await restarted.recover()
+            for _ in 0..<3 { _ = try await restarted.advanceNext(now: Date(), refreshDiscovery: false) }
+            let summary = try await restarted.summary(), saved = try await f.store.livePhotoOperation(id: old.id)
+            let creates = await f.photos.creates, retires = await f.photos.retires
+            XCTAssertEqual(saved?.stage, .complete, "historical=\(historical)")
+            XCTAssertEqual(saved?.creationEvidence, .notSubmitted, "Do not invent successful submission evidence")
+            XCTAssertEqual(saved?.supersededByOperationID, replacement.id)
+            XCTAssertNil(saved?.nextRetryAt)
+            XCTAssertEqual(summary.retryWaitingGroups, 0); XCTAssertEqual(summary.requiresAttentionGroups, 0)
+            XCTAssertEqual(creates, 1); XCTAssertEqual(retires, 1)
+        }
+    }
+
+    func testVerifiedTargetDoesNotClearUnknownOrUncoveredBlockedAttempt() async throws {
+        for unknown in [false, true] {
+            let f = try await completionFixture(photosOnly: true)
+            defer { try? FileManager.default.removeItem(at: f.root) }
+            let assets = try await f.photos.livePhotoAssets(assetIDs: ["old-photo", "old-motion"], context: f.photos.context)
+            let photo = try XCTUnwrap(assets.first { $0.assetID == "old-photo" }).resources[0]
+            let motion = try XCTUnwrap(assets.first { $0.assetID == "old-motion" }).resources[0]
+            let c = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+            for _ in 0..<4 { _ = try await c.advanceNext(now: Date(), refreshDiscovery: false) }
+            let changed = LivePhotoResourceRef.photos(contextID: f.photos.context.id, assetID: "old-photo", resourceKey: "original", revision: "edited")
+            var old = LivePhotoOperation(context: f.photos.context, contentIdentifier: "pair", photo: unknown ? photo : changed, motion: motion)
+            old.stage = .blocked; old.nextRetryAt = Date(timeIntervalSince1970: 1)
+            old.creationEvidence = unknown ? .unknown : .notSubmitted
+            _ = try await f.store.reserveLivePhotoOperation(old)
+            let restarted = LivePhotoCoordinator(store: f.store, photos: f.photos, metadata: CompletionMetadata())
+            try await restarted.recover()
+            for _ in 0..<2 { _ = try await restarted.advanceNext(now: Date(), refreshDiscovery: false) }
+            let saved = try await f.store.livePhotoOperation(id: old.id), summary = try await restarted.summary()
+            XCTAssertEqual(saved?.stage, .blocked)
+            XCTAssertEqual(summary.unknownMutation, unknown)
+            XCTAssertEqual(summary.retryWaitingGroups, 0, "Blocked attempts cannot be scheduled as automatic retries")
+            let creates = await f.photos.creates; XCTAssertEqual(creates, 1)
+        }
+    }
+
     func testDeletedHeldGroupReleasesUnsubmittedSourceDespiteRetryOrProtectionHold() async throws {
         for reason in [LivePhotoDeferralReason.workingSetLimit, .protectedInformation, .otherFailure] {
             let f = try await completionFixture(); defer { try? FileManager.default.removeItem(at: f.root) }
@@ -674,6 +732,25 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
     var liveCatalogCalls = 0
     var assets = [LivePhotoAssetDescriptor](), creates = 0, retires = 0, events = [String](), inputs = [String]()
     var blocks = Set<UUID>(), unknownRetirement = false, unknownTitle = false
+    private var nativeJournal: URL?, crashCheckpoint: String?
+    struct NativeJournal: Codable {
+        let assets: [LivePhotoAssetDescriptor], creates: Int, retires: Int
+    }
+    func attachNativeJournal(root: URL, restore: Bool, checkpoint: String?) throws {
+        try PortableRuntimeSession.validate(root)
+        let url = root.appendingPathComponent("native-journal.json")
+        if restore {
+            let saved = try JSONDecoder().decode(NativeJournal.self, from: Data(contentsOf: url))
+            assets = saved.assets; creates = saved.creates; retires = saved.retires
+        }
+        nativeJournal = url; crashCheckpoint = checkpoint
+        try saveNativeJournal()
+    }
+    private func saveNativeJournal() throws {
+        if let nativeJournal {
+            try JSONEncoder().encode(NativeJournal(assets: assets, creates: creates, retires: retires)).write(to: nativeJournal, options: .atomic)
+        }
+    }
     var unknownCaption = false, titles = [String: PreservedField<String>]()
     var retirementDeferrals = 0
     func deferNextRetirement() { retirementDeferrals += 1 }
@@ -700,9 +777,18 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
     func setLivePhotoRecoveryBlocks(_ ids: Set<UUID>) async { blocks = ids }
     func createLivePhoto(photoURL: URL, motionURL: URL, photoFilename: String?, motionFilename: String?, preservation: LivePhotoPreservationSnapshot, expectedGeneration: Int, beforeMutation: @escaping @Sendable () throws -> Bool, onPlaceholder: @escaping @Sendable (String) throws -> Void) async throws -> String {
         guard expectedGeneration == generation, try beforeMutation() else { throw PhotosAdmissionDeferred() }
+        if nativeJournal != nil, crashCheckpoint == "intent" { _exit(86) }
         creates += 1; events.append("create"); inputs = [photoURL.lastPathComponent, motionURL.lastPathComponent]
         createdResourceURLs = [.image: photoURL, .video: motionURL]
-        try onPlaceholder("complete"); addComplete(); if let gate = createGate { createGate = nil; await gate.hold() }; return "complete"
+        if nativeJournal != nil {
+            if crashCheckpoint == "placeholder" {
+                try onPlaceholder("complete"); try saveNativeJournal(); _exit(86)
+            }
+            // This journal represents the independent system, not local success.
+            addComplete(); try saveNativeJournal(); try onPlaceholder("complete")
+            if crashCheckpoint == "system-committed" { _exit(86) }
+        } else { try onPlaceholder("complete"); addComplete() }
+        if let gate = createGate { createGate = nil; await gate.hold() }; return "complete"
     }
     func verifyLivePhoto(assetID: String, operation: LivePhotoOperation) async throws -> LivePhotoVerification { events.append("verify"); return .init(assetID: assetID, revision: "r1", passed: true, details: ["fake verified native content"]) }
     func retireLivePhotoComponents(assetIDs: [String], expectedGeneration: Int, beforeMutation: @escaping @Sendable () throws -> Bool) async throws {
@@ -712,6 +798,8 @@ actor CompletionPhotos: LivePhotoPhotosGateway {
         if let gate = retirementGate { retirementGate = nil; await gate.hold() }
         if unknownRetirement { throw PhotoKitGatewayError.resultUnknown("test") }
         assets.removeAll { assetIDs.contains($0.assetID) }
+        try saveNativeJournal()
+        if nativeJournal != nil, crashCheckpoint == "retirement-unconfirmed" { _exit(86) }
     }
     func livePhotoAssets(assetIDs: [String], context: LibraryContext) async throws -> [LivePhotoAssetDescriptor] { assets.filter { assetIDs.contains($0.assetID) } }
     func livePhotoPreservationSnapshot(assetID: String, context: LibraryContext) async throws -> LivePhotoPreservationSnapshot {

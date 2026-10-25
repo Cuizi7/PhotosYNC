@@ -184,15 +184,12 @@ def unified_diff(before: str, after: str, fromfile: str, tofile: str) -> str:
 
 
 def stop_own_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
     try:
         process.wait(timeout=2)
-        return
     except subprocess.TimeoutExpired:
         pass
     try:
@@ -229,6 +226,9 @@ def run_process(
         except subprocess.TimeoutExpired:
             stop_own_process_group(process)
             return ProcessResult(list(command), process.returncode, True, time.monotonic() - start)
+        finally:
+            if process.poll() is None:
+                stop_own_process_group(process)
 
 
 def compile_probe(scenario: Path, timeout_seconds: float) -> ProcessResult:
@@ -439,6 +439,9 @@ def run(args: argparse.Namespace, output: Path) -> dict[str, Any]:
 
 
 def main() -> int:
+    def cancelled(signum, frame): raise InterruptedError(f"Continuation cancelled by signal {signum}")
+    signal.signal(signal.SIGTERM, cancelled)
+    signal.signal(signal.SIGINT, cancelled)
     args = parse_arguments()
     output: Path | None = None
     try:

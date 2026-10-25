@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "fixtures": [
+    {
+      "version": 1,
+      "ref": "5666851^",
+      "commit": "34e6043cee9de91bd7c4a277b643f977795bfeda",
+      "path": "v01.sql",
+      "sha256": "cd822e39a8fe6eb43c74d3aa782d34752f44cd8e31aec47284c65f7807201a4a",
+      "kind": "development-final"
+    },
+    {
+      "version": 2,
+      "ref": "3f54d9c^",
+      "commit": "5a9ff815e3bd3898d17ffd37ad40ded8c4edfdd8",
+      "path": "v02.sql",
+      "sha256": "832fadd25c44c1844de9bc5664e3ee9b9e325989993fcf6bf9ecb412c0526f65",
+      "kind": "development-final"
+    },
+    {
+      "version": 3,
+      "ref": "v0.1.0",
+      "commit": "ebda47f9e61091f1473d8d8260670193c905e922",
+      "path": "v03.sql",
+      "sha256": "8b87ac51bfddb438443306353f39512a5b221834ed68c08a04377cf86cab00ba",
+      "kind": "published"
+    },
+    {
+      "version": 4,
+      "ref": "a32fd9f^",
+      "commit": "e9a5eed97628539572c83169d01a6e1ecebd257b",
+      "path": "v04.sql",
+      "sha256": "e976f37981e8db4772b3961da8717cbfab6f2207f025d9d0f654d6a92335f177",
+      "kind": "development-final"
+    },
+    {
+      "version": 5,
+      "ref": "5b40b85^",
+      "commit": "8dcb52c42f1409844747ba571baac4a022a5b5d2",
+      "path": "v05.sql",
+      "sha256": "acfce83c87f0651a26ad763faf5d5161ae8350563e85dc235919b6c2f1232354",
+      "kind": "development-final"
+    },
+    {
+      "version": 6,
+      "ref": "e014e53^",
+      "commit": "bb99bb3461548f8eb9564f97a1de3a59cb998650",
+      "path": "v06.sql",
+      "sha256": "77a90c157efaa844bda5fb214c6f0cbb35fc102c91fb20ea6c9285352bdb30c1",
+      "kind": "development-final"
+    },
+    {
+      "version": 7,
+      "ref": "c0fda23^",
+      "commit": "08846d2843c07c45c6b54510bdc2801f6a3d52f5",
+      "path": "v07.sql",
+      "sha256": "e10f096884805f69002552d0c84658cf1c01f15532e687b71296d3ab98c8f693",
+      "kind": "development-final"
+    },
+    {
+      "version": 8,
+      "ref": "v0.2.3",
+      "commit": "fe1d24a9d3ec99f5f5bb8f1c70c28f5bb0b6adc1",
+      "path": "v08.sql",
+      "sha256": "e8ea245f840b69ae8bcb00c967c522b537f9f51cd446ae6358d404a7a5fa1b4f",
+      "kind": "published"
+    },
+    {
+      "version": 9,
+      "ref": "v0.2.6",
+      "commit": "444e104a4ef4c3c5d4c3b0006bc179c9375b7ef8",
+      "path": "v09.sql",
+      "sha256": "002e36849a99ce5e0e3c173eb7ce982e639b94b2b9f08271d6a27cbccd7c19fd",
+      "kind": "published"
+    },
+    {
+      "version": 10,
+      "ref": "v0.2.9",
+      "commit": "43b2b4c96e4745a4f4cb1460e8d097e86cabb443",
+      "path": "v10.sql",
+      "sha256": "357ae13311a33d96e9e29aa296a204902041c939748f6304aff2ff1554e199a7",
+      "kind": "published"
+    },
+    {
+      "version": 11,
+      "ref": "v0.3.0-beta7",
+      "commit": "958acbb5256f1e36effa433574bfa9ee86c9c27b",
+      "path": "v11.sql",
+      "sha256": "e50930ebaf2cc32fd6cf4693de73ec5921b0695d732a7f3d866993e5f7d9bf1b",
+      "kind": "published"
+    },
+    {
+      "version": 12,
+      "ref": "v0.3.0-beta8",
+      "commit": "a6d290196999b035283d878c8b6a3d046db64ab3",
+      "path": "v12.sql",
+      "sha256": "b6e7467007ffd392b0d22101280dcca64508719d4656351ebf42a644fa62254c",
+      "kind": "published"
+    }
+  ]
+}

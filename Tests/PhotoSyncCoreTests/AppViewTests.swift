@@ -6,6 +6,26 @@ import Vision
 
 @MainActor
 final class AppViewTests: XCTestCase {
+    func testStorageWaitAndPermanentFailureHaveConsistentCopy() async throws {
+        let model = try await makeModel(sourceCount: 1)
+        model.state.snapshot.waitingSources = [:]
+        model.state.snapshot.summaryError = "database is locked"
+        model.state.snapshot.blockingError = "Storage stopped: database is locked"
+        model.state.snapshot.blockingSummary = "本地数据库暂时被占用，稍后会自动重试。"
+        model.state.snapshot.storageRetryPending = true
+        XCTAssertEqual(model.status, .waiting, "A recoverable lock does not need user action")
+        model.state.snapshot.storageRetryPending = false
+        model.state.snapshot.blockingSummary = "本地数据库不可用，同步已停止。"
+        model.state.snapshot.blockingError = "synthetic permanent storage failure"
+        model.state.snapshot.summaryError = "synthetic permanent storage failure"
+        XCTAssertEqual(model.status, .error)
+        _ = try measure(SourceSettings(model: model), width: 600, minimumHeight: 0) { host in
+            let text = try self.recognizedText(in: host).map(\.text).joined(separator: "\n")
+            XCTAssertTrue(text.contains("同步已停止"), text)
+            XCTAssertFalse(text.contains("稍后会自动重试"), "Permanent stop must not promise an automatic retry: \(text)")
+        }
+    }
+
     func testAttentionAndSubmittedPauseHelpFitCompactNativePopover() throws {
         for submittedPause in [false, true] {
             var snapshot = EngineSnapshot()

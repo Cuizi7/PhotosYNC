@@ -135,11 +135,15 @@ actor FakePhotosGateway: PhotosGateway {
     private var candidateGeneration = 0
     private var candidateSnapshotCalls = 0
     private var candidateSnapshotErrorAfterFirst: PhotoKitGatewayError?
+    private var candidateSnapshotError: PhotoKitGatewayError?
+    func setCandidateSnapshotError(_ error: PhotoKitGatewayError?) { candidateSnapshotError = error }
     private var candidateSnapshotMutationAfterCall: Int?
     private let candidateValidityState = TestCandidateValidityState()
     private var loadFailure = false
     var evidence: ImportEvidence = .unknown
     private var creationGate: EngineTestGate?
+    private var snapshotGate: EngineTestGate?
+    func setSnapshotGate(_ gate: EngineTestGate?) { snapshotGate = gate }
     private var creationError: PhotoKitGatewayError?
     private var failIndexAfterCreate = false
     func setCreationGate(_ gate: EngineTestGate) { creationGate = gate }
@@ -159,7 +163,9 @@ actor FakePhotosGateway: PhotosGateway {
         return candidates
     }
     func candidateSnapshot() async throws -> PhotosCandidateSnapshot {
+        if let snapshotGate { await snapshotGate.wait() }
         candidateSnapshotCalls += 1
+        if let candidateSnapshotError { throw candidateSnapshotError }
         if candidateSnapshotCalls > 1, let error = candidateSnapshotErrorAfterFirst { throw error }
         if loadFailure { throw PhotoKitGatewayError.libraryUnavailable }
         let snapshot = PhotosCandidateSnapshot(
@@ -223,6 +229,25 @@ actor EngineTestGate {
         await withCheckedContinuation { waiters.append($0) }
     }
     func release() { released = true; waiters.forEach { $0.resume() }; waiters = [] }
+}
+
+/// Owns only an isolated fixture connection. Used to exercise real SQLite busy handling.
+final class FixtureDatabaseLock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: OpaquePointer?
+    init(url: URL) throws {
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              sqlite3_exec(handle, "BEGIN EXCLUSIVE", nil, nil, nil) == SQLITE_OK else {
+            if let handle { sqlite3_close(handle) }; handle = nil
+            throw FixtureError.unavailable("fixture exclusive lock")
+        }
+    }
+    func release() {
+        lock.lock(); defer { lock.unlock() }
+        if let handle { sqlite3_exec(handle, "ROLLBACK", nil, nil, nil); sqlite3_close(handle) }
+        handle = nil
+    }
+    deinit { release() }
 }
 
 /// Records blocking-issue announcements so a test can assert what a person would be told.

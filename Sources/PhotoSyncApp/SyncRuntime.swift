@@ -125,8 +125,11 @@ actor SyncRuntime {
     typealias AdvancedFactory = @Sendable (SyncStore, ReadExecutor, @escaping SyncEngine.DirectoryFactory,
                                            @escaping @Sendable () -> Date, RunLogger?) async throws -> AdvancedRuntimeGraph
     private let executor: ReadExecutor
+    private let injectedDirectory: SyncEngine.DirectoryFactory?
     private var advancedFactory: AdvancedFactory?
+    private let bootstrapFactory: AdvancedFactory?
     private let validatesBundledConfiguration: Bool
+    private let configurationLoader: @Sendable (URL) async throws -> DedupConfiguration
     private let notification: (@Sendable (String, String) -> Void)?
     private var advancedGraph: AdvancedRuntimeGraph?
     private var livePhotoInventory: LivePhotoInventoryCoordinator?
@@ -165,6 +168,7 @@ actor SyncRuntime {
     private var round: Task<Void, Never>?
     private var state = RuntimeState()
     private var started = false
+    private var bootstrapRetryAt: Date?
     private var stopped = false
     private var loggingWarning: String?
     private var loggingWarningDetail: String?
@@ -179,13 +183,17 @@ actor SyncRuntime {
     private let dueRetryQueryFailureSummary = "无法读取本地同步数据库，稍后会自动重试。"
 
     init(
-        store: SyncStore,
+        store: SyncStore?,
         engine: SyncEngine? = nil,
         executor: ReadExecutor = ReadExecutor(),
         advancedFactory: AdvancedFactory? = nil,
         livePhotoMetadata: (any LivePhotoMetadataReading)? = nil,
         logsURL: URL = URL(fileURLWithPath: "/unused"),
         databaseURL: URL = URL(fileURLWithPath: "/unused"),
+        directory: SyncEngine.DirectoryFactory? = nil,
+        configurationLoader: @escaping @Sendable (URL) async throws -> DedupConfiguration = { root in
+            try await Task.detached(priority: .utility) { try DedupConfiguration.loadValidated(resourceDirectory: root) }.value
+        },
         now: @escaping @Sendable () -> Date,
         authorized: @escaping @Sendable () -> Bool,
         requestAuthorization: @escaping @Sendable () async -> Bool = { false },
@@ -198,8 +206,11 @@ actor SyncRuntime {
         handledImageMemoryLimit = ImageMemoryLimit(rawValue: imageMemoryPreferences?.integer(forKey: ImageMemoryLimit.handledKey) ?? 0) ?? .mib512
         self.store = store; self.engine = engine
         self.livePhotoMetadata = livePhotoMetadata ?? LivePhotoMetadataReader(executor: executor)
-        self.executor = executor; self.advancedFactory = advancedFactory; self.notification = notification
-        validatesBundledConfiguration = false
+        self.executor = executor; self.advancedFactory = store == nil ? nil : advancedFactory; self.notification = notification
+        bootstrapFactory = advancedFactory
+        injectedDirectory = directory
+        self.configurationLoader = configurationLoader
+        validatesBundledConfiguration = store == nil
         self.now = now; self.authorized = authorized
         self.logsURL = logsURL
         self.databaseURL = databaseURL
@@ -229,10 +240,15 @@ actor SyncRuntime {
         handledImageMemoryLimit = ImageMemoryLimit(rawValue: UserDefaults.standard.integer(forKey: ImageMemoryLimit.handledKey)) ?? .mib512
         let sharedExecutor = ReadExecutor()
         executor = sharedExecutor
+        injectedDirectory = nil
         livePhotoMetadata = LivePhotoMetadataReader(executor: sharedExecutor)
         notification = nil
         advancedFactory = nil
+        bootstrapFactory = nil
         validatesBundledConfiguration = true
+        configurationLoader = { root in
+            try await Task.detached(priority: .utility) { try DedupConfiguration.loadValidated(resourceDirectory: root) }.value
+        }
         now = { Date() }
         authorized = { PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized }
         requestAuthorizationAction = {
@@ -293,16 +309,18 @@ actor SyncRuntime {
     }
 
     func bootstrap() async {
-        guard !started else { return }
+        guard !started, !stopped else { return }
         started = true
-        do {
-            let logger = try RunLogger(directory: logsURL, onFailure: { [weak self] message in
-                Task { await self?.logFailed(message) }
-            })
-            self.logger = logger
-        } catch {
-            // Logging is intentionally non-blocking: continue opening the store and syncing.
-            logFailed(error.localizedDescription)
+        if logger == nil {
+            do {
+                let logger = try RunLogger(directory: logsURL, onFailure: { [weak self] message in
+                    Task { await self?.logFailed(message) }
+                })
+                self.logger = logger
+            } catch {
+                // Logging is intentionally non-blocking: continue opening the store and syncing.
+                logFailed(error.localizedDescription)
+            }
         }
         do {
             store = try SyncStore(url: databaseURL, readExecutor: executor)
@@ -316,22 +334,30 @@ actor SyncRuntime {
             setBootstrapFailure(summary: "无法读取来源配置，同步尚未启动。", error: error)
             return
         }
+        bootstrapRetryAt = nil
+        state.message = nil; state.messageDetail = nil
+        state.snapshot.summaryError = nil; state.snapshot.storageRetryPending = false
         if validatesBundledConfiguration {
             do {
                 let root = try DedupConfiguration.bundledResourceDirectory()
-                let configuration = try await Task.detached(priority: .utility) {
-                    try DedupConfiguration.loadValidated(resourceDirectory: root)
-                }.value
+                let configuration = try await configurationLoader(root)
                 // Freeze the validated records once per process, even with no enabled
                 // source. Only expensive model/gateway construction waits for eligibility.
                 guard let store else { throw AdvancedDedupError.invalidConfiguration }
                 try await store.rebindEquivalentSourceFingerprints(to: configuration.fingerprint)
                 let authorization = authorized
-                advancedFactory = { store, executor, directory, now, logger in
-                    try await AdvancedRuntimeGraph.load(store: store, executor: executor, directory: directory,
-                        now: now, resourceDirectory: root, configuration: configuration, logger: logger, authorized: authorization)
+                if advancedFactory == nil {
+                    advancedFactory = bootstrapFactory ?? { store, executor, directory, now, logger in
+                        try await AdvancedRuntimeGraph.load(store: store, executor: executor, directory: directory,
+                            now: now, resourceDirectory: root, configuration: configuration, logger: logger, authorized: authorization)
+                    }
                 }
-            } catch { advancedLoadFailed(error); return }
+            } catch {
+                if case .busy = error as? SyncStoreError {
+                    setBootstrapFailure(summary: "无法准备本地同步数据库，同步尚未启动。", error: error)
+                } else { advancedLoadFailed(error) }
+                return
+            }
         }
         await tick(force: true)
     }
@@ -342,6 +368,14 @@ actor SyncRuntime {
     }
 
     private func setBootstrapFailure(summary: String, error: Error) {
+        if case .busy = error as? SyncStoreError {
+            started = false; bootstrapRetryAt = now().addingTimeInterval(5)
+            if !state.snapshot.storageRetryPending { logger?.log(["phase":"bootstrap", "event":"database-lock-wait"]) }
+            state.snapshot.storageRetryPending = true; state.snapshot.summaryError = error.localizedDescription
+            state.message = nil; state.messageDetail = nil
+            return
+        }
+        bootstrapRetryAt = nil; state.snapshot.storageRetryPending = false
         state.message = summary
         state.messageDetail = error.localizedDescription
     }
@@ -353,10 +387,15 @@ actor SyncRuntime {
             do {
                 state.snapshot.summary = try await store.activeSourceSummary()
                 state.snapshot.summaryError = nil
+                state.snapshot.storageRetryPending = false
             } catch {
                 state.snapshot.summaryError = error.localizedDescription
+                if case .busy = error as? SyncStoreError { state.snapshot.storageRetryPending = true }
+                else { state.snapshot.storageRetryPending = false }
             }
         }
+        // A successful statistics read does not complete deferred initialization.
+        if bootstrapRetryAt != nil { state.snapshot.storageRetryPending = true }
         if let graph = advancedGraph {
             // UI polling publishes aggregates at the profile cadence; transitions are also
             // published when an owned batch ends. No per-representation main-actor traffic.
@@ -497,6 +536,10 @@ actor SyncRuntime {
     func tick(force: Bool = false, includeAdvanced: Bool = true, retryModel: Bool = false, retryLivePhoto: Bool = false, retryIndexReadLimits: Bool = false) async {
         guard !stopped else { return }
         refreshAuthorization()
+        if let retry = bootstrapRetryAt {
+            if !state.snapshot.isPaused, state.authorized, force || now() >= retry { await bootstrap() }
+            return
+        }
         await applyAnalysisEligibility()
         guard eligibleForWork else { return }
         if retryLivePhoto { manualLivePhotoRetryPending = true; nextLivePhotoWorkAt = nil }
@@ -505,6 +548,12 @@ actor SyncRuntime {
         await applyImageMemoryLimitIfReady()
         guard eligibleForWork else { return }
         if engine == nil { startAdvancedGraphIfNeeded(); return }
+        if let engine, await engine.recoverStorageIfPossible() {
+            pendingAdvancedScan = true
+            if state.message == dueRetryQueryFailureSummary {
+                state.message = nil; state.messageDetail = nil
+            }
+        }
         if eligibleForImageWork, let model = advancedGraph?.model as? any ModelExecutionRecovering {
             // Coalesce ticks while the single physical queue is loading/validating.
             guard modelRecovery == nil else { return }
@@ -573,6 +622,15 @@ actor SyncRuntime {
                 }
             } catch {
                 guard !stopped else { return }
+                if case .busy = error as? SyncStoreError {
+                    // Publish the engine's recoverable wait instead of a second,
+                    // user-action error which could outlive the lock itself.
+                    state.acceptEngineSnapshot(await engine.snapshot())
+                    if state.message == dueRetryQueryFailureSummary {
+                        state.message = nil; state.messageDetail = nil
+                    }
+                    return
+                }
                 state.message = dueRetryQueryFailureSummary
                 state.messageDetail = error.localizedDescription
                 return
@@ -678,7 +736,7 @@ actor SyncRuntime {
         state.snapshot.indexProgress = IndexProgress(state: .preparing, totalsKnown: false, totalAssets: 0,
             readyAssets: 0, totalRepresentations: 0, readyRepresentations: 0, excludedAssets: 0, issue: nil)
         let executor = self.executor, now = self.now
-        let directory: SyncEngine.DirectoryFactory = { DirectoryReader(sourceID: $0, executor: executor) }
+        let directory: SyncEngine.DirectoryFactory = injectedDirectory ?? { DirectoryReader(sourceID: $0, executor: executor) }
         loading = Task { [weak self] in
             do {
                 let graph = try await advancedFactory(store, executor, directory, now, self?.logger)

@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -148,6 +149,43 @@ class ContinuationRaceRunnerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("finite", result.stderr)
         self.assertFalse(output.exists())
+
+    def test_cancelling_validator_reaps_nested_runner_and_term_ignoring_descendant(self) -> None:
+        output = self.root / "cancelled"
+        leader, descendant = self.root / "compiler.pid", self.root / "descendant.pid"
+        stubborn = "import os,signal,time;from pathlib import Path;signal.signal(signal.SIGTERM,signal.SIG_IGN);Path(" + repr(str(descendant)) + ").write_text(str(os.getpid()));time.sleep(30)"
+        compiler = self.fake_bin / "xcrun"
+        compiler.write_text("#!" + sys.executable + "\nimport os,sys,time,subprocess\nfrom pathlib import Path\n"
+            "subprocess.Popen([sys.executable,'-c'," + repr(stubborn) + "])\n"
+            "Path(" + repr(str(leader)) + ").write_text(str(os.getpid()))\ntime.sleep(30)\n")
+        wrapper = self.root / "validator.py"
+        wrapper.write_text("import importlib.util,sys\nfrom pathlib import Path\n"
+            "s=importlib.util.spec_from_file_location('gate'," + repr(str(WORKTREE_ROOT / "scripts/validate.py")) + ")\n"
+            "g=importlib.util.module_from_spec(s);sys.modules[s.name]=g;s.loader.exec_module(g);g.install_cancellation_handlers()\n"
+            "g.run_command([sys.executable," + repr(str(self.script)) + ",'--output-dir'," + repr(str(output)) + ",'--timeout-seconds','30'],cwd=Path(" + repr(str(self.repository)) + "),environment=g.child_environment(),log_path=Path(" + repr(str(self.root / "wrapper.log")) + "),timeout_seconds=30,label='continuation')\n")
+        environment = dict(os.environ, PATH=str(self.fake_bin) + os.pathsep + os.environ["PATH"])
+        process = subprocess.Popen([sys.executable, str(wrapper)], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        owned = []
+        try:
+            deadline = time.monotonic() + 4
+            while (not leader.exists() or not descendant.exists()) and time.monotonic() < deadline and process.poll() is None: time.sleep(0.01)
+            self.assertTrue(leader.exists() and descendant.exists(), "Nested child barriers were not reached")
+            owned = [int(leader.read_text()), int(descendant.read_text())]
+            process.terminate(); process.wait(timeout=4)
+            for pid in owned:
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+                    if not status or status.startswith("Z"): break
+                    time.sleep(0.01)
+                self.assertTrue(not status or status.startswith("Z"), "Cancelled validation left a live nested process")
+            self.assertFalse((output / "result.json").exists())
+            self.assertEqual(self.failure(output)["status"], "failed")
+        finally:
+            if process.poll() is None: process.kill(); process.wait(timeout=1)
+            for pid in owned:
+                try: os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError: pass
 
     def run_runner(
         self, output: Path, *, mode: str = "success", timeout_seconds: str = "2", scenario: str = "stamp"

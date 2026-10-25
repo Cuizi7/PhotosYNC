@@ -171,6 +171,9 @@ public struct LivePhotoOperation: Codable, Equatable, Sendable {
     public var nextRetryAt: Date?
     public var deferralReason: LivePhotoDeferralReason?
     public var limitedResources: [LivePhotoResourceRef]?
+    /// An unsubmitted attempt can finish because a later verified operation
+    /// covers its exact resources. Its own submission evidence stays unchanged.
+    public var supersededByOperationID: UUID?
     public init(id: UUID = UUID(), groupID: UUID = UUID(), context: LibraryContext, contentIdentifier: String,
                 photo: LivePhotoResourceRef, motion: LivePhotoResourceRef, sourceFileIDs: [UUID] = [], oldAssetIDs: [String] = []) {
         self.id = id; self.groupID = groupID; self.context = context; self.contentIdentifier = contentIdentifier

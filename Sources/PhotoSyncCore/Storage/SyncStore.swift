@@ -98,6 +98,7 @@ public struct RegisteredSource: Sendable {
 
 public enum SyncStoreError: Error, LocalizedError {
     case sqlite(String)
+    case busy(String)
     case constraint(String)
     case notFound(UUID)
     case invalidTransition(String)
@@ -105,7 +106,7 @@ public enum SyncStoreError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .sqlite(let message), .constraint(let message), .invalidTransition(let message): return message
+        case .sqlite(let message), .busy(let message), .constraint(let message), .invalidTransition(let message): return message
         case .notFound(let id): return "No file record exists for \(id.uuidString)."
         case .unsupportedSchema(let version): return "Database schema version \(version) is newer than this app supports."
         }
@@ -144,6 +145,9 @@ public final class SyncStore: @unchecked Sendable {
         }
         database = handle
         do {
+            // A short external reader/writer must not poison an otherwise healthy store.
+            // Longer contention remains a typed, bounded result; never wait indefinitely.
+            guard sqlite3_busy_timeout(handle, 1000) == SQLITE_OK else { throw databaseError() }
             try execute("PRAGMA foreign_keys = ON")
             try execute("PRAGMA mmap_size = 2147483648")
             vectorQueryMmapBytes = try int64(one("PRAGMA mmap_size", [])![0])
@@ -579,6 +583,9 @@ public final class SyncStore: @unchecked Sendable {
     /// numbers went instead of seeing the totals silently reset.
     public func activeSourceSummary() async throws -> SyncStatusSummary {
         try await perform {
+            guard sqlite3_get_autocommit(self.database) != 0 else {
+                throw SyncStoreError.sqlite("An unresolved database transaction prevents a safe summary")
+            }
             guard let row = try self.one("""
                 WITH scoped AS (
                     SELECT file_record.state AS state,
@@ -2320,7 +2327,50 @@ public final class SyncStore: @unchecked Sendable {
             op.verification = verification; op.stage = verification.passed ? .readyToRetire : .verifying
             op.error = verification.passed ? nil : "完整资源尚待核实"; op.nextRetryAt = verification.passed ? nil : Date().addingTimeInterval(60)
             try self.writeLivePhotoOperation(op)
+            if verification.passed { try self.settleSupersededLivePhotoAttempts(verified: op) }
         } }
+    }
+
+    /// Repairs older persisted attempts once per recovery. Same-group identity
+    /// alone is insufficient: the verified operation must cover every frozen ref.
+    func settleSupersededLivePhotoAttempts(context: LibraryContext) async throws {
+        try await perform { try self.transaction {
+            let rows = try self.rows("SELECT o.payload FROM live_photo_operation o JOIN live_photo_group g ON g.id=o.group_id WHERE g.context_id=? AND g.deleted=0 AND o.stage IN ('readyToRetire','retiring','complete')", [.text(context.id.uuidString)])
+            for row in rows {
+                let verified = try self.decoder.decode(LivePhotoOperation.self, from: self.blob(row[0]))
+                try self.settleSupersededLivePhotoAttempts(verified: verified)
+            }
+        } }
+    }
+
+    private func settleSupersededLivePhotoAttempts(verified: LivePhotoOperation) throws {
+        guard let target = verified.targetID, verified.verification?.passed == true,
+              verified.verification?.assetID == target,
+              let group = try one("SELECT deleted FROM live_photo_group WHERE id=?", [.text(verified.groupID.uuidString)]), try int64(group[0]) == 0 else { return }
+        func requiredResources(_ op: LivePhotoOperation) -> Set<LivePhotoResourceRef> {
+            var refs = Set([op.photo, op.motion] + (op.discoveryResources ?? []) + (op.equivalentResources ?? []) + (op.limitedResources ?? []))
+            for id in op.sourceFileIDs {
+                if let stamp = op.sourceStamps?[id.uuidString] { refs.insert(.source(fileID: id, stamp: stamp)) }
+            }
+            return refs
+        }
+        // discoveryResources includes possibilities, not proof of equivalence.
+        var covered = Set([verified.photo, verified.motion] + (verified.equivalentResources ?? []))
+        for id in verified.sourceFileIDs {
+            if let stamp = verified.sourceStamps?[id.uuidString] { covered.insert(.source(fileID: id, stamp: stamp)) }
+        }
+        let rows = try self.rows("SELECT payload FROM live_photo_operation WHERE group_id=? AND stage='blocked' AND holds_unknown=0", [.text(verified.groupID.uuidString)])
+        for row in rows {
+            var old = try decoder.decode(LivePhotoOperation.self, from: blob(row[0]))
+            guard old.id != verified.id, old.context.id == verified.context.id, old.targetID == nil,
+                  [.notSubmitted, .failed].contains(old.creationEvidence), [.notSubmitted, .failed].contains(old.retirementEvidence),
+                  old.sourceFileIDs.allSatisfy({ old.sourceStamps?[$0.uuidString] != nil }),
+                  requiredResources(old).isSubset(of: covered) else { continue }
+            old.stage = .complete; old.supersededByOperationID = verified.id
+            old.nextRetryAt = nil; old.error = nil; old.deferralReason = nil
+            try writeLivePhotoOperation(old)
+            try execute("UPDATE file_record SET live_photo_operation_id=NULL WHERE live_photo_operation_id=?", [.text(old.id.uuidString)])
+        }
     }
     func beginLivePhotoRetirement(operationID: UUID, assetIDs: [String]) async throws -> Bool {
         try await perform { try self.transaction {
@@ -2780,7 +2830,8 @@ public final class SyncStore: @unchecked Sendable {
             defer { sqlite3_free(message) }
             guard result == SQLITE_OK else {
                 let detail = message.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(database))
-                throw SyncStoreError.sqlite(detail)
+                throw result & 0xff == SQLITE_BUSY || result & 0xff == SQLITE_LOCKED
+                    ? SyncStoreError.busy(detail) : SyncStoreError.sqlite(detail)
             }
         } else {
             _ = try statement(sql, bindings, collect: false)
@@ -2850,7 +2901,11 @@ public final class SyncStore: @unchecked Sendable {
 
     private func databaseError() -> SyncStoreError {
         let message = String(cString: sqlite3_errmsg(database))
-        return sqlite3_errcode(database) == SQLITE_CONSTRAINT ? .constraint(message) : .sqlite(message)
+        switch sqlite3_errcode(database) & 0xff {
+        case SQLITE_BUSY, SQLITE_LOCKED: return .busy(message)
+        case SQLITE_CONSTRAINT: return .constraint(message)
+        default: return .sqlite(message)
+        }
     }
 
     private static let fileColumns = "file_record.id, file_record.source_id, relative_path, source.path, size, modified_ns, metadata_json, state, attempt_id, placeholder_id, success_id, retry_count, next_retry_at, created_order"

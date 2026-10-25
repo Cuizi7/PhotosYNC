@@ -3,6 +3,51 @@ import XCTest
 import SQLite3
 
 final class StoreTests: XCTestCase {
+    func testCommitPinnedHistoricalSchemasPreserveSuccessAndUnknown() async throws {
+        let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Fixtures/SchemaHistory")
+        for version in 1...12 {
+            let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+            let database = root.appendingPathComponent("history.sqlite"), sourceID = UUID(), successID = UUID(), unknownID = UUID(), attempt = UUID()
+            let sql = try String(contentsOf: fixtures.appendingPathComponent(String(format: "v%02d.sql", version)), encoding: .utf8)
+            try injectEngineSQL(sql + "PRAGMA user_version=\(version);", at: database)
+            let metadata = String(data: try JSONEncoder().encode(media("fixture.jpg")), encoding: .utf8)!.replacingOccurrences(of: "'", with: "''")
+            try injectEngineSQL("""
+                INSERT INTO source(id,path,enabled) VALUES('\(sourceID.uuidString)','\(root.path)',1);
+                INSERT INTO file_record(id,created_order,source_id,relative_path,filename,size,modified_ns,metadata_json,state,rule_version,success_id,success_metadata_json)
+                VALUES('\(successID.uuidString)',1,'\(sourceID.uuidString)','success.jpg','success.jpg',1,1,'\(metadata)','imported',1,'synthetic-success','\(metadata)');
+                INSERT INTO file_record(id,created_order,source_id,relative_path,filename,size,modified_ns,metadata_json,state,rule_version,attempt_id,placeholder_id)
+                VALUES('\(unknownID.uuidString)',2,'\(sourceID.uuidString)','unknown.jpg','unknown.jpg',1,1,'\(metadata)','importing',1,'\(attempt.uuidString)','synthetic-unknown');
+                """, at: database)
+            let store = try SyncStore(url: database)
+            let success = try await store.successIdentifier(of: successID), unknown = try await store.sourceFile(id: unknownID)
+            XCTAssertEqual(success, "synthetic-success", "v\(version)")
+            XCTAssertEqual(unknown?.attemptID, attempt); XCTAssertEqual(unknown?.placeholderID, "synthetic-unknown")
+            XCTAssertEqual(unknown?.state, .importing)
+            XCTAssertEqual(try engineSQLInteger("PRAGMA user_version", at: database), 12)
+            let summary = try await store.activeSourceSummary(); XCTAssertEqual(summary.imported, 1); XCTAssertEqual(summary.importing, 1)
+            let context = LibraryContext(id: UUID(), epoch: 1)
+            try await store.ensureLivePhotoInventory(context: context)
+            let item = livePhotoAsset(context: context, id: "synthetic-descriptor")
+            try await store.enqueueLivePhotoAssets(context: context, assets: [item])
+            try await store.markLivePhotoDescriptorUnresolved(context: context, assetID: item.assetID)
+            let unknownCandidate = try await store.hasUnresolvedLivePhotoCandidates(context: context)
+            XCTAssertTrue(unknownCandidate, "Migrated schema must support new descriptor recovery")
+        }
+    }
+
+    func testBriefExternalLockDoesNotFailAValidRead() async throws {
+        let root = try makeRoot(), db = root.appendingPathComponent("busy.sqlite")
+        let store = try SyncStore(url: db)
+        _ = try await store.registerSource(url: root)
+        let blocker = try FixtureDatabaseLock(url: db)
+        // This is a real SQLite wait, not a scheduler race. Release independently of
+        // the store's serial queue; the generous bounded handler must bridge 50 ms.
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) { blocker.release() }
+        defer { blocker.release() }
+        do { _ = try await store.activeSourceSummary() }
+        catch { XCTFail("A brief external read/write lock must not fail the operation: \(error)") }
+    }
+
     func testDeletedLocalCandidateCannotBecomeNewSkipEvidence() async throws {
         let root = try makeRoot()
         let store = try SyncStore(url: root.appendingPathComponent("state.sqlite"))

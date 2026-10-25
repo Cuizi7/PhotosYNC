@@ -5,6 +5,27 @@ import CoreML
 @testable import PhotoSyncCore
 
 final class AdvancedRuntimeTests: XCTestCase {
+    func testPeriodicTickResumesTransientStorageLockWithoutManualScan() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        let runtime = SyncRuntime(store: f.store, engine: f.engine, now: { Date(timeIntervalSince1970: 1000) }, authorized: { true })
+        try await runtime.prepareInjectedRuntime()
+        let blocker = try FixtureDatabaseLock(url: f.databaseURL)
+        await runtime.tick(force: true); await runtime.waitForRound()
+        await runtime.tick()
+        let waiting = await runtime.current()
+        XCTAssertTrue(waiting.snapshot.storageRetryPending)
+        XCTAssertNil(waiting.message, "A known lock is one recoverable wait, not a second action-required error")
+        blocker.release()
+        await runtime.tick(); await runtime.waitForRound()
+        let state = await runtime.current(), creates = await f.photos.createCount
+        XCTAssertEqual(creates, 1)
+        XCTAssertNil(state.snapshot.blockingError)
+        XCTAssertNil(state.message)
+        XCTAssertFalse(state.snapshot.storageRetryPending)
+        await runtime.stop(); await runtime.waitForRound()
+        try FileManager.default.removeItem(at: f.databaseURL.deletingLastPathComponent())
+    }
+
     func testPeriodicMaintenanceRetainsIndexButExplicitForceStillReconciles() async throws {
         let clock = P12Clock(), f = try await fixture(taskCount: 1, now: { clock.value })
         await f.runtime.tick(force: true); await f.runtime.waitForRound()
@@ -1102,7 +1123,7 @@ private actor P8Gate {
     func release() { open = true; blocked?.resume(); blocked = nil }
 }
 
-private final class P12Clock: @unchecked Sendable {
+final class P12Clock: @unchecked Sendable {
     private let lock = NSLock(); private var date = Date(timeIntervalSince1970: 1000)
     var value: Date { lock.lock(); defer { lock.unlock() }; return date }
     func advance(_ seconds: Double) { lock.lock(); date.addTimeInterval(seconds); lock.unlock() }

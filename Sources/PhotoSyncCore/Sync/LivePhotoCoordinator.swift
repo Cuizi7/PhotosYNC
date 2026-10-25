@@ -96,6 +96,7 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
         let binding = try await store.livePhotoIdentityBinding(context: currentContext)
         guard !paused, try await photos.verifyLivePhotoContext(context: currentContext, anchorAssetIDs: binding.anchors, allowUnanchored: !binding.requiresProof) else { return }
         workContext = currentContext
+        try await store.settleSupersededLivePhotoAttempts(context: currentContext)
         for original in operations where original.context.id == currentContext.id {
             guard !paused else { return }
             var op = original
@@ -132,10 +133,11 @@ public actor LivePhotoCoordinator: LivePhotoDirectoryObserving {
             }
             if op.deferralReason == .protectedInformation { continue }
             if op.deferralReason == .workingSetLimit { value.resourceLimitedGroups += 1 }
-            if let retry = op.nextRetryAt {
+            if op.stage == .blocked { value.requiresAttentionGroups += 1 }
+            else if let retry = op.nextRetryAt {
                 if retry == .distantFuture { value.requiresAttentionGroups += 1 }
                 else { value.retryWaitingGroups += 1; value.nextRetryAt = min(value.nextRetryAt ?? retry, retry) }
-            } else if op.stage == .blocked { value.requiresAttentionGroups += 1 }
+            }
             if let error = op.error {
                 if !op.holdsUnknownMutation { limited.insert(op.groupID) }
                 if value.issue == nil { value.issue = SourceIssue(summary: op.nextRetryAt == .distantFuture || op.stage == .blocked ? "部分 Live Photo 需要处理，请重新尝试或查看诊断。" : "部分 Live Photo 暂时无法处理，稍后自动重试。", detail: error, kind: .submission) }

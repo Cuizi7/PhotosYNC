@@ -5,6 +5,101 @@ import SQLite3
 @testable import PhotoSyncCore
 
 final class EngineTests: XCTestCase {
+    func testStorageLockAfterPhotosSuccessRecoversWithoutDuplicateCreate() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1), gate = EngineTestGate()
+        defer { try? FileManager.default.removeItem(at: f.databaseURL.deletingLastPathComponent()) }
+        await f.photos.setCreationGate(gate)
+        let scan = Task { await f.engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let blocker = try FixtureDatabaseLock(url: f.databaseURL)
+        await gate.release(); await scan.value
+        blocker.release()
+        let creates = await f.photos.createCount
+        XCTAssertEqual(creates, 1)
+        let uncertain = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(uncertain?.state, .importing)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let stillBlocked = await f.engine.snapshot(), beforeProof = await f.photos.createCount
+        XCTAssertTrue(stillBlocked.unknownSubmissionBlock); XCTAssertEqual(beforeProof, 1)
+        await f.photos.setEvidence(.found(identifier: "fake-1"))
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let recovered = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+        XCTAssertEqual(recovered?.state, .imported)
+        XCTAssertEqual(recovered?.successID, "fake-1")
+        let finalCreates = await f.photos.createCount
+        XCTAssertEqual(finalCreates, 1)
+    }
+
+    func testSummaryLockRetainsStatisticsAndRecoversWithoutStoppingSync() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        defer { try? FileManager.default.removeItem(at: f.databaseURL.deletingLastPathComponent()) }
+        let before = await f.engine.snapshot()
+        let blocker = try FixtureDatabaseLock(url: f.databaseURL)
+        let busy = await f.engine.snapshot()
+        blocker.release()
+        XCTAssertEqual(busy.summary, before.summary)
+        XCTAssertNotNil(busy.summaryError)
+        XCTAssertNil(busy.blockingError, "A read-only statistics lock must not permanently stop storage")
+        let recovered = await f.engine.snapshot()
+        XCTAssertNil(recovered.summaryError); XCTAssertNil(recovered.blockingError)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let creates = await f.photos.createCount
+        XCTAssertEqual(creates, 1)
+    }
+
+    func testStorageLockBeforeSubmissionCanResumeOnceLockIsReleased() async throws {
+        let f = try await makeEngineFixture(sourceCount: 1)
+        defer { try? FileManager.default.removeItem(at: f.databaseURL.deletingLastPathComponent()) }
+        let blocker = try FixtureDatabaseLock(url: f.databaseURL)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        blocker.release()
+        let heldCreates = await f.photos.createCount
+        XCTAssertEqual(heldCreates, 0)
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let final = await f.engine.snapshot(), creates = await f.photos.createCount
+        XCTAssertNil(final.blockingError)
+        XCTAssertEqual(creates, 1, "A bounded SQLite lock must not poison this engine forever")
+    }
+
+    func testUnknownImportBlocksMutationButNotHealthySourceInventory() async throws {
+        let f = try await makeEngineFixture(sourceCount: 2)
+        defer { try? FileManager.default.removeItem(at: f.databaseURL.deletingLastPathComponent()) }
+        let file = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
+        let id = try await f.store.save(file, decision: .importNew)
+        try await f.store.beginAttempt(fileID: id, attemptID: UUID())
+        await f.engine.scan(sourceIDs: f.sourceIDs)
+        let other = try await f.store.file(sourceID: f.sourceIDs[1], relativePath: "same.jpg")
+        XCTAssertEqual(other?.state, .pending, "Unknown submission must not erase the ability to inventory healthy files")
+        let snapshot = await f.engine.snapshot(), creates = await f.photos.createCount
+        XCTAssertTrue(snapshot.unknownSubmissionBlock)
+        XCTAssertEqual(creates, 0)
+        let original = try await f.store.state(of: id)
+        XCTAssertEqual(original, .importing)
+    }
+
+    func testSlowColdCandidateLoadDoesNotBlockSourceInventoryOrPermitEarlyWrites() async throws {
+        let f = try await makeEngineFixture(sourceCount: 2), gate = EngineTestGate()
+        defer { try? FileManager.default.removeItem(at: f.databaseURL.deletingLastPathComponent()) }
+        await f.photos.setSnapshotGate(gate)
+        let scan = Task { await f.engine.scan(sourceIDs: f.sourceIDs) }
+        let entered = await engineEventually { await gate.entered }
+        XCTAssertTrue(entered)
+        let enumerated = await engineEventually {
+            let first = try? await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
+            let second = try? await f.store.file(sourceID: f.sourceIDs[1], relativePath: "same.jpg")
+            return first != nil && second != nil
+        }
+        XCTAssertTrue(enumerated, "A cold Photos candidate fetch must not prevent source inventory")
+        let before = try await f.store.activeSourceSummary(), creates = await f.photos.createCount
+        XCTAssertEqual(before.pending, 2)
+        XCTAssertEqual(before.imported, 0); XCTAssertEqual(before.skipped, 0); XCTAssertEqual(creates, 0)
+        await gate.release(); await scan.value
+        let after = try await f.store.activeSourceSummary()
+        XCTAssertEqual(after.imported, 1); XCTAssertEqual(after.skipped, 1)
+        XCTAssertEqual(after.pending, 0)
+    }
+
     // Missing root admission used to fan one outage into a retry on every pending row.
     func testUnavailableRootHoldsLargePendingQueueAndHealthySourceContinues() async throws {
         let f = try await makeEngineFixture(sourceCount: 2)
@@ -944,7 +1039,7 @@ final class EngineTests: XCTestCase {
         let scan = Task { await engine.scan(sourceIDs: f.sourceIDs) }
         let entered = await engineEventually { await gate.entered }
         XCTAssertTrue(entered)
-        await f.photos.setCandidateSnapshotErrorAfterFirst(.authorizationRequired)
+        await f.photos.setCandidateSnapshotError(.authorizationRequired)
         await gate.release()
         await scan.value
 
@@ -955,14 +1050,14 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(snapshot.latestScan.failedFiles, 0)
         XCTAssertTrue(snapshot.waitingSources.isEmpty)
         let record = try await f.store.file(sourceID: f.sourceIDs[0], relativePath: "same.jpg")
-        XCTAssertNil(record)
+        XCTAssertEqual(record?.state, .pending, "Inventory persists independently; a denied Photos read must not decide skip/import")
     }
 
     func testScanDoesNotPersistSkipWhenPhotosChangesAfterLatestSnapshot() async throws {
         let f = try await makeEngineFixture(sourceCount: 1)
         let sourceFile = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
         await f.photos.setCandidates([MatchCandidate(key: "photos-duplicate", metadata: sourceFile.metadata)])
-        await f.photos.setCandidateSnapshotMutationAfterCall(2)
+        await f.photos.setCandidateSnapshotMutationAfterCall(1)
 
         await f.engine.scan(sourceIDs: f.sourceIDs)
 
@@ -977,7 +1072,7 @@ final class EngineTests: XCTestCase {
         let sourceFile = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
         _ = try await f.store.save(sourceFile, decision: .importNew)
         await f.photos.setCandidates([MatchCandidate(key: "photos-duplicate", metadata: sourceFile.metadata)])
-        await f.photos.setCandidateSnapshotMutationAfterCall(2)
+        await f.photos.setCandidateSnapshotMutationAfterCall(1)
 
         await f.engine.scan(sourceIDs: f.sourceIDs)
 
@@ -1909,7 +2004,7 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
-    func testHistoricalUnknownAllowsDifferentNameAndDefiniteRecoveryRetries() async throws {
+    func testHistoricalUnknownHoldsDifferentNameUntilDefiniteRecovery() async throws {
         let f = try await makeEngineFixture()
         let first = try await engineSourceFile(sourceID: f.sourceIDs[0], directory: f.directories[0])
         let firstID = try await f.store.save(first, decision: .importNew)
@@ -1917,7 +2012,9 @@ final class EngineTests: XCTestCase {
         try FileManager.default.moveItem(at: f.directories[1].appendingPathComponent("same.jpg"), to: f.directories[1].appendingPathComponent("different.jpg"))
         await f.engine.scan(sourceIDs: f.sourceIDs)
         let count = await f.photos.createCount
-        XCTAssertEqual(count, 1)
+        XCTAssertEqual(count, 0, "The shared Photos mutation lane remains blocked after an uncertain historical attempt")
+        let different = try await f.store.file(sourceID: f.sourceIDs[1], relativePath: "different.jpg")
+        XCTAssertEqual(different?.state, .pending)
         let firstState = try await f.store.state(of: firstID)
         XCTAssertEqual(firstState, .importing)
         await f.photos.setEvidence(.definitelyNotCommitted)

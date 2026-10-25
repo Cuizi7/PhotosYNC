@@ -6,14 +6,24 @@ import SwiftUI
 @main
 struct PhotoSyncApp: App {
     @StateObject private var model: AppModel
-    private let instanceLock: SingleInstanceLock
+    private let instanceLock: SingleInstanceLock?
 
     init() {
+#if NATIVE_SCENE_QA
+        instanceLock = nil
+        _model = StateObject(wrappedValue: NativeSceneSession.makeModel())
+#else
         instanceLock = Self.acquireInstanceLock()
         _model = StateObject(wrappedValue: AppModel())
+#endif
     }
 
     var body: some Scene {
+#if NATIVE_SCENE_QA
+        WindowGroup("PhotosYNC Native Driver") {
+            NativeSceneLauncher(model: model).frame(width: 2, height: 2)
+        }.defaultSize(width: 2, height: 2)
+#endif
         MenuBarExtra {
             StatusMenu(model: model)
         } label: {

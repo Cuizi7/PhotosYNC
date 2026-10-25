@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "sequenceSeeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "eventsPerSeed": 40,
+  "crashCheckpoints": [
+    "intent",
+    "placeholder",
+    "system-committed",
+    "verified",
+    "retirement-unconfirmed",
+    "retirement-confirmed"
+  ],
+  "scenarios": [
+    {
+      "id": "R01",
+      "tests": [
+        "StartupRecoveryTests/testColdRestartAcrossProcesses"
+      ]
+    },
+    {
+      "id": "R02",
+      "tests": [
+        "StartupRecoveryTests/testBootstrapInventoriesSourceWhileColdCandidateLoadIsHeld",
+        "EngineTests/testUnknownImportBlocksMutationButNotHealthySourceInventory"
+      ]
+    },
+    {
+      "id": "R03",
+      "tests": [
+        "PhotoKitContractTests/testCandidateSnapshotGroupsByFilenameAndReusesUnchangedIndex",
+        "PhotoKitContractTests/testNonincrementalCandidateChangeRebuildsBeforeReturningSnapshot"
+      ]
+    },
+    {
+      "id": "R04",
+      "tests": [
+        "AdvancedRuntimeTests/testHeldLivePhotoReadDoesNotBlockReconciliationOrSourceScan",
+        "AdvancedRuntimeTests/testOneWakeDrainsLivePhotoBacklogAndStopsAtIdleOrHeldItems"
+      ]
+    },
+    {
+      "id": "R05",
+      "tests": [
+        "EngineTests/testRootLossDuringScanConvergesBeforeReadingSiblingsAndRecovers",
+        "EngineTests/testChildDirectoryFailuresUsePartialMessagesAndScanHealthySibling"
+      ]
+    },
+    {
+      "id": "R06",
+      "tests": [
+        "AdvancedRuntimeTests/testNativeSourceDirectoryPairUsesRuntimeGroupAndNeverSingleImport",
+        "LivePhotoCoordinatorTests/testLaterHalfReusesTargetWhileOldCleanupIsRetained"
+      ]
+    },
+    {
+      "id": "R07",
+      "tests": [
+        "LivePhotoIdentityTests/testFrozenMovieDurationsPreserveIdentificationBoundary",
+        "LivePhotoIdentityTests/testFrozenPortableMediaExercisesRealMetadataReader"
+      ]
+    },
+    {
+      "id": "R08",
+      "tests": [
+        "RuntimeEventSequenceTests/testDurableLivePhotoCrashBoundariesAcrossProcesses",
+        "RuntimeEventSequenceTests/testTwentySeedsOfFortyRecoveryEventsKeepMutationInvariants"
+      ]
+    },
+    {
+      "id": "R09",
+      "tests": [
+        "LivePhotoCoordinatorTests/testVerifiedReplacementClosesHistoricalBlockedAttemptWithoutAnotherMutation",
+        "LivePhotoCoordinatorTests/testVerifiedTargetDoesNotClearUnknownOrUncoveredBlockedAttempt"
+      ]
+    },
+    {
+      "id": "R10",
+      "tests": [
+        "LivePhotoKitContractTests/testCompletedInventoryBytesSurviveClassificationTimeoutAndAreReused",
+        "LivePhotoResourceTests/testCloudDeadlineCancelsOnceAndDrainsUntilTerminal"
+      ]
+    },
+    {
+      "id": "R11",
+      "tests": [
+        "AdvancedRuntimeTests/testHigherImageBudgetReopensHeldItemsOnceAndSameBudgetRestartDoesNot",
+        "AdvancedRuntimeTests/testImageBudgetIncreaseWaitsForOldReadFailureBeforeRearming"
+      ]
+    },
+    {
+      "id": "R12",
+      "tests": [
+        "AdvancedRuntimeTests/testContinuousWorkerRechecksStopAuthorizationAndPhysicalAdmission",
+        "PhotosIndexCoordinatorTests/testPauseAndContextChangeDuringAdmissionCannotStartStaleWork"
+      ]
+    },
+    {
+      "id": "R13",
+      "tests": [
+        "StoreTests/testCommitPinnedHistoricalSchemasPreserveSuccessAndUnknown",
+        "StartupRecoveryTests/testBootstrapLockRecoversOnPeriodicTickInSameRuntime",
+        "StartupRecoveryTests/testLockAfterConfigurationValidationUsesDatabaseRecoveryNotConfigurationFailure",
+        "EngineTests/testStorageLockAfterPhotosSuccessRecoversWithoutDuplicateCreate"
+      ]
+    },
+    {
+      "id": "R14",
+      "tests": [
+        "AdvancedDedupRegressionTests/testFrozenCorpusContentAndActions"
+      ]
+    },
+    {
+      "id": "R15",
+      "tests": [
+        "DedupLoggingTests/testReconcileDiagnosticCountsAreCommittedRepresentationMutations",
+        "PhotoKitContractTests/testGatewayWallTimingSeparatesCatalogEvidenceAndNotificationStages"
+      ]
+    },
+    {
+      "id": "R16",
+      "tests": [],
+      "toolTests": [
+        "test_release_validation.ReleaseValidationTests.test_validator_rejects_nonzero_zero_and_failed_xctest_summaries",
+        "test_release_validation.ReleaseValidationTests.test_packager_rejects_tampered_scale_contract_and_report_evidence",
+        "test_native_scene_runner.NativeSceneRunnerTests.test_review_requires_current_identity_every_frame_and_explicit_verdict"
+      ]
+    }
+  ]
+}

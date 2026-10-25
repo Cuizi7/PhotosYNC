@@ -2,7 +2,11 @@
 
 PhotosYNC scans selected filesystem folders and saves eligible images and videos to the current macOS System Photo Library. Source files stay in place and are read-only. Precisely matched Live Photo components become one native Live Photo; replaced standalone assets can be removed only after their original content and protected information are verified as preserved.
 
-## 0.3.0 beta8 — Native Live Photo completion
+## 0.3.0 beta9 — Startup and recovery fixes
+
+Safe source enumeration now advances while candidate preparation is pending; imports still require a valid candidate snapshot and retain unknown-write protection. Exactly covered obsolete Live Photo attempts settle after a newer complete target is verified. Transient SQLite BUSY/LOCKED recovers through the same runtime instead of permanently stopping synchronization.
+
+A reproducible isolated test gate now covers historical cold starts, crash recovery, fixed event sequences and actual Settings/MenuBarExtra interactions. **Known issue: occasional inverted Settings error text remains unreproduced and unfixed.** See [test commands](docs/testing/README.md) and [validation evidence](docs/validation/2026-10-24-portable-test-strategy.md).
 
 Live Photo identity reads exceeding the fixed encoded-resource limit now finish as normal skips without a warning or held task. Unchanged periodic index maintenance reuses a valid continuously observed publication instead of traversing the entire catalog. Task help contains one title and one body paragraph; completed/skipped work does not leave a Live Photo help entry.
 
@@ -16,7 +20,7 @@ Schema v11 adds a resumable, one-time library identification task. Its completed
 
 The menu, settings and details use the same six states: 正在准备, 正在同步, 等待恢复, 已暂停, 需要处理 and 同步完成. Visual indexing and Live Photo pairing have independent progress; cloud downloads are internal steps. Long Live Photo reads run independently of visual work. Existing completed identification results and successful import history remain intact. Each task uses one compact caption and its own equal-width solid progress track. Normal queued work keeps its activity state; notification classification no longer imposes a minute-long retry on the whole Live Photo queue. Deterministic decoding limits stop automatic rereads until the image memory limit is raised, an explicit scan is requested, or an exact input change is confirmed.
 
-After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta8.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
+After verifying a complete Live Photo and preservation of the exact original resources, completion removes the precise standalone components without protecting their titles. Unknown, different or changing titles do not prevent removal; their text may be lost. Other protected information, edits, extra resources and resource revisions still constrain removal. There is no public stable physical-library identifier: restoring historical work requires positive known-asset evidence; an unconfirmed library context waits. See the [release notes](docs/release/0.3.0-beta9.md), [design](docs/superpowers/specs/2026-10-21-native-live-photo-completion-design.md), [runtime contract](docs/specs/2026-09-18-runtime-state-and-recovery.md) and [implementation validation](docs/validation/2026-10-21-live-photo-completion.md) for evidence and remaining system checks. Package provenance records this beta's exact source and validation results.
 
 ## Previous stable: 0.2.9
 
@@ -36,7 +40,7 @@ Photos now streams its precisely selected original or edited-current encoded res
 
 Fixed model weights use Git LFS; install Git LFS with repository-local filters (`git lfs install --local --skip-repo`) and hydrate the exact checkout before building. The package entry point verifies and hydrates archived pointers from local objects only, and fails on absent/corrupt resources. It does not download a model at App runtime.
 
-The user-selected threshold remains 0.98. Settings controls the shared image-processing peak memory budget (default 2 GiB; choices 512 MiB, 1, 2, 4 and 8 GiB); readable still images exceeding it retain conservative original import. Models, Photos and system caches use additional memory. Existing physical reads keep their acquired allowance; a higher limit rearms held decode-limit results once after old work drains. Model/profile identities and successful history remain intact. This is not an independently calibrated statistical acceptance. See [current validation and limitations](docs/release/0.2.0-advanced-dedup-validation.md), including the reproduced and corrected R2 decode integration defect. The six cleaned user attachments are authorized as PhotosYNC test material in this public repository; their exact hashes and scope are recorded in [publication authorization](Tests/Fixtures/AdvancedDedup/PUBLICATION_AUTHORIZATION.md). They are not App resources. Public CI is not configured, and the existing `CI=true` refusal remains unchanged.
+The user-selected threshold remains 0.98. Settings controls the shared image-processing peak memory budget (default 2 GiB; choices 512 MiB, 1, 2, 4 and 8 GiB); readable still images exceeding it retain conservative original import. Models, Photos and system caches use additional memory. Existing physical reads keep their acquired allowance; a higher limit rearms held decode-limit results once after old work drains. Model/profile identities and successful history remain intact. This is not an independently calibrated statistical acceptance. See [current validation and limitations](docs/release/0.2.0-advanced-dedup-validation.md), including the reproduced and corrected R2 decode integration defect. The six cleaned user attachments are authorized as PhotosYNC test material in this public repository; their exact hashes and scope are recorded in [publication authorization](Tests/Fixtures/AdvancedDedup/PUBLICATION_AUTHORIZATION.md). They are not App resources. Public CI is not configured. The test gate allows only the exact approved corpus, including under `CI=true`; external corpus paths are rejected.
 
 ## Install a local build
 
@@ -46,12 +50,13 @@ For a local build on macOS 13 or later with Xcode installed:
 
 ```sh
 # Xcode 26+ is required to compile the Icon Composer source.
-# Run from a clean committed checkout. Existing release directories are preserved.
-scripts/package-release.sh --scale-profile full
+# Prepare the isolated test environment as described in docs/testing/README.md.
+# Run from a clean committed checkout with an approved foreground QA phase. Existing release directories are preserved.
+PATH="$PWD/work/test-environment/venv/bin:$PATH" scripts/package-release.sh --scale-profile full --ui-profile native --ui-allow-focus
 ```
 
-Release configuration: **0.3.0 beta8 (build 25)**, targeting
-`outputs/releases/0.3.0-beta8/`; see [release notes](docs/release/0.3.0-beta8.md)
+Release configuration: **0.3.0 beta9 (build 26)**, targeting
+`outputs/releases/0.3.0-beta9/`; see [release notes](docs/release/0.3.0-beta9.md)
 and the [changelog](CHANGELOG.md).
 The release package must archive the exact main commit and run full acceptance;
 its provenance and validation records identify the actual source, completion
@@ -115,6 +120,8 @@ PhotosYNC does not synchronize deletions, re-import assets removed from Photos, 
 ## Automated acceptance and local release
 
 Run `python3 scripts/validate.py --output-dir "$PWD/work/validation-check" --derived-data "$PWD/work/validation-check-derived"` with a fresh evidence path for development acceptance. It runs the complete hostless XCTest bundle, synthetic tool tests and the version-controlled continuation-race regression. Failed, empty or timed-out runs do not produce a successful acceptance record.
+
+Use the [portable test guide](docs/testing/README.md) to prepare a fresh checkout with pinned dependencies and inputs. Run the gate with that venv's Python. Focused suites are bounded to eight minutes and do not produce canonical evidence; full acceptance requires named runtime scenarios and current-run reports. UI changes additionally select `--ui-profile native --ui-allow-focus` for the isolated actual Settings/MenuBarExtra scene and explicit pixel review. Background or offscreen captures cannot substitute for that native gate.
 
 Scale validation defaults to `--scale-profile release`: one optimized sample with 200,000 representations plus 100,000 success-history vectors, including large media and the 60-second idle/resume check. Use `--scale-profile full` for index, candidate-query, cache, SQLite, preprocessing/model performance or resource-behavior changes, scale-harness/budget changes, and performance investigations. Full runs 100k, 150k, 200k, and 200k + 100k history. The smaller samples cover zero/half edited-representation distributions; the maximum mixed sample does not prove those performance shapes. Selection is explicit, not inferred from Git changes. All performance thresholds remain unchanged.
 

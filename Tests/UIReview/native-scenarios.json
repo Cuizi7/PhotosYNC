@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "scenarios": [
+    {"id":"U01","steps":["taskVisualUnknown","taskLiveKnown","tasksMixed","tasksKnown","syncing"]},
+    {"id":"U02","steps":["database-errors","database-wait","recovered"]},
+    {"id":"U03","steps":["tasksWaiting","tasksPaused","tasksMixed","completed"]},
+    {"id":"U04","steps":["hover-visualIndex","hover-livePhoto"]},
+    {"id":"U05","steps":["reopen-1","reopen-2","reopen-3","reopen-4","reopen-5","selection","scroll"]},
+    {"id":"U06","steps":["memory-default","memory-change","memory-reopen","empty"]}
+  ],
+  "appearances":["light","dark"],
+  "requiredMenuFrames":["U01/tasksMixed","U03/tasksWaiting"],
+  "copy": {
+    "database-errors":["本地数据库不可用，同步已停止。","无法读取来源配置，同步尚未启动。"],
+    "database-wait":["本地数据库暂时被占用，稍后会自动重试。"],
+    "hover-visualIndex":["视觉索引","分析照片内容，帮助避免重复导入。"],
+    "hover-livePhoto":["Live Photo 配对","识别照片与视频的配对关系，找到另一半后自动补齐。"],
+    "memory-default":["图像处理内存峰值上限","2 GiB（默认）"],
+    "memory-change":["图像处理内存峰值上限","4 GiB"],
+    "memory-reopen":["图像处理内存峰值上限","4 GiB"]
+  }
+}
